@@ -10,6 +10,9 @@ describe('console router guards', () => {
   it('redirects a student away from admin routes', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin'); expect(router.currentRoute.value.fullPath).toBe('/student')
   })
+  it('allows an admin to open the student management route', async () => {
+    const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin/students'); expect(router.currentRoute.value.fullPath).toBe('/admin/students')
+  })
   it('redirects an authenticated user away from login without a loop', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/login'); expect(router.currentRoute.value.fullPath).toBe('/admin')
   })

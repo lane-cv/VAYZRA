@@ -33,7 +33,7 @@ watch(() => route.fullPath, () => closeDrawer())
       <p class="role-label">{{ isAdmin ? '教师空间' : '学生空间' }}</p>
       <nav ref="navigation">
         <RouterLink v-if="isAdmin" to="/admin" @click="closeDrawer()">仪表盘</RouterLink>
-        <button v-if="isAdmin" class="future-link" type="button" aria-label="学生管理（即将开放）">学生管理 <small>即将开放</small></button>
+        <RouterLink v-if="isAdmin" to="/admin/students" @click="closeDrawer()">学生管理</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
       </nav>
       <p class="sidebar-note">高中数学 · 物理<br>循序渐进，稳步提升</p>

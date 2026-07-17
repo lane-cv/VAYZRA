@@ -4,11 +4,14 @@ import { createPinia } from 'pinia'
 import { reactive } from 'vue'
 import { routeLocationKey, routerKey } from 'vue-router'
 import ConsoleLayout from './ConsoleLayout.vue'
+import { useSessionStore } from '../stores/session'
 
-function mountLayout() {
+function mountLayout(role: 'admin' | 'student' = 'student') {
+  const pinia = createPinia()
+  useSessionStore(pinia).setUser({ id: 'u1', username: role === 'admin' ? 'teacher' : 'student01', displayName: role === 'admin' ? '张老师' : '林同学', role, mustChangePassword: false })
   const route = reactive({ fullPath: '/student' })
   const replace = vi.fn()
-  const wrapper = mount(ConsoleLayout, { attachTo: document.body, global: { plugins: [createPinia()], provide: { [routerKey as symbol]: { replace }, [routeLocationKey as symbol]: route }, stubs: { RouterLink: { template: '<a href="#"><slot /></a>' }, RouterView: true } } })
+  const wrapper = mount(ConsoleLayout, { attachTo: document.body, global: { plugins: [pinia], provide: { [routerKey as symbol]: { replace }, [routeLocationKey as symbol]: route }, stubs: { RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' }, RouterView: true } } })
   return { wrapper, route }
 }
 
@@ -25,6 +28,11 @@ describe('ConsoleLayout drawer', () => {
     expect(document.activeElement).toBe(wrapper.get('nav a').element)
     expect(trigger.attributes('aria-expanded')).toBe('true')
     expect(wrapper.get('aside').attributes('aria-hidden')).toBeUndefined()
+  })
+  it('links teachers to student management', () => {
+    const { wrapper } = mountLayout('admin')
+    expect(wrapper.get('a[href="/admin/students"]').text()).toContain('学生管理')
+    expect(wrapper.text()).not.toContain('即将开放')
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
     const { wrapper, route } = mountLayout(); const trigger = wrapper.get('button[aria-label="打开导航"]')
