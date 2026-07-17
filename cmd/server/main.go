@@ -17,6 +17,7 @@ import (
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/redisx"
+	"happylearn.local/app/internal/students"
 )
 
 func main() {
@@ -70,6 +71,7 @@ type applicationDependencies struct {
 	open        func(context.Context, string) (*pgxpool.Pool, error)
 	migrate     func(context.Context, *pgxpool.Pool) error
 	newAuth     func(*pgxpool.Pool) (auth.HTTPService, error)
+	newStudents func(*pgxpool.Pool) students.HTTPService
 	ready       func(*pgxpool.Pool) func(context.Context) error
 	close       func(*pgxpool.Pool)
 	openRedis   func(string) (*redis.Client, error)
@@ -79,9 +81,10 @@ type applicationDependencies struct {
 
 func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
 	return buildApplication(ctx, cfg, applicationDependencies{
-		open:    database.Open,
-		migrate: database.Migrate,
-		newAuth: newProductionAuthService,
+		open:        database.Open,
+		migrate:     database.Migrate,
+		newAuth:     newProductionAuthService,
+		newStudents: newProductionStudentService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -109,6 +112,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if err != nil {
 		closePool()
 		return nil, nil, errors.New("initialize authentication service")
+	}
+	var studentService students.HTTPService
+	if deps.newStudents != nil {
+		studentService = deps.newStudents(pool)
 	}
 	ready := deps.ready(pool)
 	if ready == nil {
@@ -138,6 +145,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	return app.New(app.Dependencies{
 		Ready:             ready,
 		Auth:              service,
+		Students:          studentService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
@@ -159,4 +167,10 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 		return nil, errors.New("initialize authentication service")
 	}
 	return service, nil
+}
+
+func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {
+	users := auth.NewPostgresUserStore(pool)
+	hasher := auth.NewPasswordHasher(auth.Argon2Params{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2, SaltLength: 16, KeyLength: 32})
+	return students.NewService(users, students.NewPostgresUnitOfWork(pool), hasher, nil)
 }

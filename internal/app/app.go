@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/students"
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
@@ -17,6 +18,7 @@ import (
 type Dependencies struct {
 	Ready             func(context.Context) error
 	Auth              auth.HTTPService
+	Students          students.HTTPService
 	PublicOrigin      string
 	CookieSecure      bool
 	TrustedProxyCIDRs []netip.Prefix
@@ -56,6 +58,9 @@ func New(d Dependencies) http.Handler {
 				private.Post("/auth/change-password", authHTTP.ChangePassword)
 				private.Post("/auth/logout", authHTTP.Logout)
 				private.Post("/auth/logout-others", authHTTP.LogoutOthers)
+				if d.Students != nil {
+					private.Mount("/admin/students", students.NewHandler(d.Students).Routes())
+				}
 			})
 		})
 	}

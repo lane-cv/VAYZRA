@@ -303,6 +303,11 @@ func UserFromContext(ctx context.Context) (User, bool) {
 	return user, ok
 }
 
+// ContextWithUser is intended for trusted in-process middleware and tests.
+func ContextWithUser(ctx context.Context, user User) context.Context {
+	return context.WithValue(ctx, userContextKey{}, user)
+}
+
 func RequireRole(role Role) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

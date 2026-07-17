@@ -20,6 +20,20 @@ func StartPostgres(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("open postgres test pool: %v", err)
 	}
-	t.Cleanup(pool.Close)
+	lockConn, err := pool.Acquire(context.Background())
+	if err != nil {
+		pool.Close()
+		t.Fatalf("acquire postgres test lock: %v", err)
+	}
+	if _, err := lockConn.Exec(context.Background(), "SELECT pg_advisory_lock(845103119)"); err != nil {
+		lockConn.Release()
+		pool.Close()
+		t.Fatalf("lock postgres test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock(845103119)")
+		lockConn.Release()
+		pool.Close()
+	})
 	return pool
 }
