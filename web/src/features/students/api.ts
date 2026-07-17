@@ -13,9 +13,9 @@ export type Student = {
 
 export type StudentPage = { data: Student[]; nextCursor: string | null }
 
-export async function listStudents(cursor?: string): Promise<StudentPage> {
+export async function listStudents(cursor?: string, signal?: AbortSignal): Promise<StudentPage> {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
-  const result = await requestWithMeta<Student[]>(`/admin/students${query}`)
+  const result = await requestWithMeta<Student[]>(`/admin/students${query}`, { signal })
   const nextCursor = typeof result.meta?.nextCursor === 'string' ? result.meta.nextCursor : null
   return { data: result.data, nextCursor }
 }
