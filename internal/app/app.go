@@ -21,6 +21,10 @@ func New(d Dependencies) http.Handler {
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	r.Get("/api/v1/health/ready", func(w http.ResponseWriter, r *http.Request) {
+		if d.Ready == nil {
+			httpx.Error(w, r, http.StatusServiceUnavailable, "not_ready", "服务暂不可用")
+			return
+		}
 		if err := d.Ready(r.Context()); err != nil {
 			httpx.Error(w, r, http.StatusServiceUnavailable, "not_ready", "服务暂不可用")
 			return

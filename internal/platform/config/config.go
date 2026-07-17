@@ -30,6 +30,9 @@ func Load(getenv func(string) string) (Config, error) {
 	if v := getenv("HAPPYLEARN_LISTEN"); v != "" {
 		c.ListenAddress = v
 	}
+	if c.Environment != "development" && c.Environment != "production" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_ENV must be development or production")
+	}
 	c.DatabaseURL = getenv("HAPPYLEARN_DATABASE_URL")
 	c.RedisURL = getenv("HAPPYLEARN_REDIS_URL")
 	c.PublicOrigin = strings.TrimRight(getenv("HAPPYLEARN_PUBLIC_ORIGIN"), "/")

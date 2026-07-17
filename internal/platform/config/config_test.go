@@ -28,3 +28,17 @@ func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 		t.Fatalf("unexpected session TTLs: %#v", cfg)
 	}
 }
+
+func TestLoadRejectsUnknownEnvironment(t *testing.T) {
+	env := map[string]string{
+		"HAPPYLEARN_ENV":           "prodution",
+		"HAPPYLEARN_DATABASE_URL":  "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":     "redis://localhost:6379/0",
+		"HAPPYLEARN_PUBLIC_ORIGIN": "https://learn.example.com",
+	}
+
+	_, err := Load(func(k string) string { return env[k] })
+	if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_ENV") {
+		t.Fatalf("expected invalid environment error, got %v", err)
+	}
+}

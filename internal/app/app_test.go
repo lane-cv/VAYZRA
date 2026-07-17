@@ -41,3 +41,20 @@ func TestReadinessReturnsStableError(t *testing.T) {
 		t.Fatalf("unexpected body: %s", got)
 	}
 }
+
+func TestReadinessWithoutDependencyReturnsStableError(t *testing.T) {
+	h := New(Dependencies{})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/health/ready", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if got := w.Header().Get("X-Request-ID"); got == "" {
+		t.Fatal("missing request ID")
+	}
+	if got := w.Body.String(); !strings.Contains(got, `"code":"not_ready"`) || !strings.Contains(got, `"requestId":`) {
+		t.Fatalf("unexpected body: %s", got)
+	}
+}
