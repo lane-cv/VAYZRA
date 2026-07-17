@@ -9,18 +9,18 @@
     "build": "vue-tsc --noEmit && vite build"
   },
   "dependencies": {
-    "element-plus": ">=2.11 <3",
-    "pinia": ">=3 <4",
-    "vue": ">=3.5 <4",
-    "vue-router": ">=4.5 <5"
+    "element-plus": "2.14.3",
+    "pinia": "3.0.4",
+    "vue": "3.5.40",
+    "vue-router": "4.6.4"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": ">=6 <7",
-    "@vue/test-utils": ">=2.4 <3",
-    "jsdom": ">=26 <28",
-    "typescript": ">=5.9 <6",
-    "vite": ">=7 <9",
-    "vitest": ">=3 <5",
-    "vue-tsc": ">=3 <4"
+    "@vitejs/plugin-vue": "6.0.8",
+    "@vue/test-utils": "2.4.11",
+    "jsdom": "27.4.0",
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vitest": "4.1.10",
+    "vue-tsc": "3.3.7"
   }
 }
