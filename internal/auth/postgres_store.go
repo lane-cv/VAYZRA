@@ -123,11 +123,14 @@ func NewPostgresSessionStore(pool *pgxpool.Pool) *PostgresSessionStore {
 }
 
 func (s *PostgresSessionStore) Create(ctx context.Context, params CreateSessionParams) error {
+	if params.ID == uuid.Nil {
+		params.ID = uuid.New()
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO sessions (
-			user_id, token_hash, user_agent, ip, created_at, last_seen_at, idle_expires_at, absolute_expires_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		params.UserID, params.TokenHash[:], params.UserAgent, params.IP, params.CreatedAt.UTC(), params.LastSeenAt.UTC(),
+			id, user_id, token_hash, user_agent, ip, created_at, last_seen_at, idle_expires_at, absolute_expires_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		params.ID, params.UserID, params.TokenHash[:], params.UserAgent, params.IP, params.CreatedAt.UTC(), params.LastSeenAt.UTC(),
 		params.IdleExpiresAt.UTC(), params.AbsoluteExpiresAt.UTC())
 	if err != nil {
 		return mapStoreError(err)
@@ -170,8 +173,10 @@ func (s *PostgresSessionStore) FindActiveByTokenHash(ctx context.Context, tokenH
 func (s *PostgresSessionStore) Touch(ctx context.Context, id uuid.UUID, lastSeenAt, idleExpiresAt time.Time) error {
 	result, err := s.pool.Exec(ctx, `
 		UPDATE sessions
-		SET last_seen_at = $2, idle_expires_at = LEAST($3, absolute_expires_at)
-		WHERE id = $1 AND revoked_at IS NULL AND absolute_expires_at > $2`,
+		SET
+			last_seen_at = CASE WHEN last_seen_at <= $2 - interval '5 minutes' THEN $2 ELSE last_seen_at END,
+			idle_expires_at = CASE WHEN last_seen_at <= $2 - interval '5 minutes' THEN LEAST($3, absolute_expires_at) ELSE idle_expires_at END
+		WHERE id = $1 AND revoked_at IS NULL AND idle_expires_at > $2 AND absolute_expires_at > $2`,
 		id, lastSeenAt.UTC(), idleExpiresAt.UTC())
 	if err != nil {
 		return mapStoreError(err)
@@ -201,6 +206,26 @@ func (s *PostgresSessionStore) RevokeAllForUser(ctx context.Context, userID uuid
 		UPDATE sessions
 		SET revoked_at = now(), revoke_reason = $2
 		WHERE user_id = $1 AND revoked_at IS NULL`, userID, reason)
+	return mapStoreError(err)
+}
+
+func (s *PostgresSessionStore) RevokeAllExceptForUser(ctx context.Context, userID, exceptID uuid.UUID, reason string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sessions
+		SET revoked_at = now(), revoke_reason = $3
+		WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, userID, exceptID, reason)
+	return mapStoreError(err)
+}
+
+func (s *PostgresSessionStore) RecordLoginEvent(ctx context.Context, event LoginEvent) error {
+	var userID any
+	if event.UserID != nil {
+		userID = *event.UserID
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO login_events (user_id, username, success, reason, ip, user_agent, occurred_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		userID, normalizeUsername(event.Username), event.Success, event.Reason, event.IP, event.UserAgent, event.OccurredAt.UTC())
 	return mapStoreError(err)
 }
 

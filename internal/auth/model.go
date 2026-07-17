@@ -56,6 +56,7 @@ type CreateUserParams struct {
 }
 
 type CreateSessionParams struct {
+	ID                uuid.UUID
 	UserID            uuid.UUID
 	TokenHash         [32]byte
 	UserAgent         string
