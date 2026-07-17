@@ -241,7 +241,12 @@ func (h *Handler) clearAuthenticationCookies(w http.ResponseWriter) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	contentTypes := r.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		httpx.Error(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type", "仅支持 JSON 请求")
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
 	if err != nil || mediaType != "application/json" {
 		httpx.Error(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type", "仅支持 JSON 请求")
 		return false

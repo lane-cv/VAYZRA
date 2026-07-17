@@ -63,6 +63,17 @@ func TestLoginRejectsInvalidJSONContentTypeAndOversizedBodies(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsMultipleContentTypeValues(t *testing.T) {
+	h := newHTTPTestHandler(&fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.Header.Add("Content-Type", "application/json")
+	r.Header.Add("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
 func TestLoginCredentialFailuresUseSameGenericResponse(t *testing.T) {
 	var bodies []string
 	for _, err := range []error{ErrInvalidCredentials, ErrInvalidCredentials, errors.New("disabled")} {
