@@ -28,7 +28,7 @@ type SessionStore interface {
 	Touch(context.Context, uuid.UUID, time.Time, time.Time) error
 	Revoke(context.Context, uuid.UUID, string) error
 	RevokeAllForUser(context.Context, uuid.UUID, string) error
-	RevokeAllExceptForUser(context.Context, uuid.UUID, uuid.UUID, string) error
+	RevokeAllExceptForUser(context.Context, uuid.UUID, uuid.UUID, time.Time, string) error
 }
 
 type PasswordRotationStore interface {

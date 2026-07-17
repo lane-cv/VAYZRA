@@ -195,7 +195,13 @@ func (s *Service) LogoutOthers(ctx context.Context, rawToken string) error {
 	if err != nil {
 		return err
 	}
-	return s.sessions.RevokeAllExceptForUser(ctx, current.User.ID, current.Session.ID, "logout others")
+	if err := s.sessions.RevokeAllExceptForUser(ctx, current.User.ID, current.Session.ID, s.now().UTC(), "logout others"); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return ErrUnauthenticated
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Service) createSession(ctx context.Context, user User, ip net.IP, userAgent string) (Authentication, string, error) {

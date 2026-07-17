@@ -135,7 +135,7 @@ func TestPostgresSessionPredicatesAndLoginEventPersistence(t *testing.T) {
 	if err != nil || !first.LastSeenAt.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("throttled touch session=%#v err=%v", first, err)
 	}
-	if err := sessions.RevokeAllExceptForUser(ctx, user.ID, firstID, "logout others"); err != nil {
+	if err := sessions.RevokeAllExceptForUser(ctx, user.ID, firstID, now.Add(6*time.Minute), "logout others"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := sessions.FindActiveByTokenHash(ctx, firstHash, now.Add(6*time.Minute)); err != nil {
@@ -154,5 +154,52 @@ func TestPostgresSessionPredicatesAndLoginEventPersistence(t *testing.T) {
 	}
 	if username != "session_predicates" || !success || reason != "success" {
 		t.Fatalf("login event username=%q success=%v reason=%q", username, success, reason)
+	}
+}
+
+func TestPostgresLogoutOthersDoesNotRevokeReplacementAfterStaleAuthentication(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAuthTables(t, pool)
+	users := auth.NewPostgresUserStore(pool)
+	sessions := auth.NewPostgresSessionStore(pool)
+	user, err := users.Create(ctx, auth.CreateUserParams{Username: "logout_race", DisplayName: "logout race", Role: auth.RoleStudent, PasswordHash: "old-password-hash", MustChangePassword: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC)
+	oldID := uuid.New()
+	oldHash := tokenHashForIntegration("logout-old")
+	if err := sessions.Create(ctx, auth.CreateSessionParams{ID: oldID, UserID: user.ID, TokenHash: oldHash, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(time.Hour), AbsoluteExpiresAt: now.Add(2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	staleAuthenticated := make(chan struct{})
+	allowMutation := make(chan struct{})
+	logoutResult := make(chan error, 1)
+	go func() {
+		if _, _, err := sessions.FindActiveByTokenHash(ctx, oldHash, now); err != nil {
+			logoutResult <- err
+			return
+		}
+		close(staleAuthenticated)
+		<-allowMutation
+		logoutResult <- sessions.RevokeAllExceptForUser(ctx, user.ID, oldID, now.Add(time.Minute), "logout others")
+	}()
+	<-staleAuthenticated
+
+	replacement := auth.CreateSessionParams{ID: uuid.New(), UserID: user.ID, TokenHash: tokenHashForIntegration("logout-replacement"), CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(time.Hour), AbsoluteExpiresAt: now.Add(2 * time.Hour)}
+	if err := sessions.RotatePassword(ctx, auth.PasswordRotationParams{UserID: user.ID, ExpectedPasswordHash: "old-password-hash", PasswordHash: "new-password-hash", MustChangePassword: false, ReplacementSession: replacement}); err != nil {
+		t.Fatal(err)
+	}
+	close(allowMutation)
+	if err := <-logoutResult; !errors.Is(err, auth.ErrNotFound) {
+		t.Fatalf("stale logout-others error=%v", err)
+	}
+	if _, _, err := sessions.FindActiveByTokenHash(ctx, replacement.TokenHash, now.Add(time.Minute)); err != nil {
+		t.Fatalf("replacement session revoked by stale logout-others: %v", err)
 	}
 }

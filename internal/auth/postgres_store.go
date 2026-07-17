@@ -210,12 +210,35 @@ func (s *PostgresSessionStore) RevokeAllForUser(ctx context.Context, userID uuid
 	return mapStoreError(err)
 }
 
-func (s *PostgresSessionStore) RevokeAllExceptForUser(ctx context.Context, userID, exceptID uuid.UUID, reason string) error {
-	_, err := s.pool.Exec(ctx, `
+func (s *PostgresSessionStore) RevokeAllExceptForUser(ctx context.Context, userID, exceptID uuid.UUID, now time.Time, reason string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return mapStoreError(err)
+	}
+	defer tx.Rollback(context.Background())
+
+	var retainedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM sessions
+		WHERE id = $1
+			AND user_id = $2
+			AND revoked_at IS NULL
+			AND idle_expires_at > $3
+			AND absolute_expires_at > $3
+		FOR UPDATE`, exceptID, userID, now.UTC()).Scan(&retainedID); err != nil {
+		return mapStoreError(err)
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE sessions
 		SET revoked_at = now(), revoke_reason = $3
-		WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, userID, exceptID, reason)
-	return mapStoreError(err)
+		WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, userID, retainedID, reason); err != nil {
+		return mapStoreError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return mapStoreError(err)
+	}
+	return nil
 }
 
 func (s *PostgresSessionStore) RecordLoginEvent(ctx context.Context, event LoginEvent) error {

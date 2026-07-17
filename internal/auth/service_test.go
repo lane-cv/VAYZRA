@@ -176,16 +176,17 @@ func TestChangePasswordRejectsInvalidCurrentPasswordAndLogoutOperationsRevoke(t 
 }
 
 type testStores struct {
-	users          map[string]User
-	sessions       map[[32]byte]*Session
-	events         []LoginEvent
-	now            time.Time
-	touchCount     int
-	revokeAllCount int
-	rotationCalls  int
-	rotationErr    error
-	eventErr       error
-	hasher         PasswordHasher
+	users           map[string]User
+	sessions        map[[32]byte]*Session
+	events          []LoginEvent
+	now             time.Time
+	touchCount      int
+	revokeAllCount  int
+	rotationCalls   int
+	rotationErr     error
+	eventErr        error
+	logoutOthersErr error
+	hasher          PasswordHasher
 }
 
 func newTestService(t *testing.T, now time.Time) (*Service, *testStores) {
@@ -294,11 +295,24 @@ func (f testSessionStore) RevokeAllForUser(_ context.Context, userID uuid.UUID, 
 	}
 	return nil
 }
-func (f testSessionStore) RevokeAllExceptForUser(_ context.Context, userID, exceptID uuid.UUID, reason string) error {
+func (f testSessionStore) RevokeAllExceptForUser(_ context.Context, userID, exceptID uuid.UUID, now time.Time, reason string) error {
+	if f.s.logoutOthersErr != nil {
+		return f.s.logoutOthersErr
+	}
+	retained := false
+	for _, session := range f.s.sessions {
+		if session.ID == exceptID && session.UserID == userID && session.RevokedAt == nil && session.IdleExpiresAt.After(now) && session.AbsoluteExpiresAt.After(now) {
+			retained = true
+			break
+		}
+	}
+	if !retained {
+		return ErrNotFound
+	}
 	for _, session := range f.s.sessions {
 		if session.UserID == userID && session.ID != exceptID && session.RevokedAt == nil {
-			now := f.s.now
-			session.RevokedAt, session.RevokeReason = &now, &reason
+			revokedAt := f.s.now
+			session.RevokedAt, session.RevokeReason = &revokedAt, &reason
 		}
 	}
 	return nil
