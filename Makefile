@@ -1,6 +1,32 @@
-.PHONY: test-go test-web verify
+GO ?= go
+PNPM ?= pnpm
+GOBIN ?= $(CURDIR)/.tools/bin
+GOVULNCHECK := $(GOBIN)/govulncheck
+
+.PHONY: test-go test-web tools verify e2e
+
 test-go:
-	go test ./...
+	$(GO) test ./...
+
 test-web:
-	pnpm test && pnpm typecheck && pnpm build
-verify: test-go test-web
+	$(PNPM) test
+	$(PNPM) typecheck
+	$(PNPM) build
+
+tools: $(GOVULNCHECK)
+
+$(GOVULNCHECK): go.mod go.sum
+	@mkdir -p $(GOBIN)
+	GOBIN=$(GOBIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+verify: tools
+	$(GO) test -race ./...
+	$(GO) vet ./...
+	$(GOVULNCHECK) ./...
+	$(PNPM) test
+	$(PNPM) typecheck
+	$(PNPM) build
+	docker compose -f deploy/compose.dev.yml config --quiet
+
+e2e:
+	$(PNPM) exec playwright test tests/e2e/auth-students.spec.ts

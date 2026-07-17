@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/google/uuid"
 
@@ -112,6 +113,17 @@ func TestAuthRoutesForwardTrustedProxyConfiguration(t *testing.T) {
 
 	if w.Code != http.StatusOK || svc.loginInput.IP == nil || svc.loginInput.IP.String() != "198.51.100.4" {
 		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.loginInput, w.Body.String())
+	}
+}
+
+func TestApplicationServesConsoleFromStaticFiles(t *testing.T) {
+	h := New(Dependencies{StaticFiles: fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html>console</html>")},
+	}})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/students", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "console") {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
 }
 

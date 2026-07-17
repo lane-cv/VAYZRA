@@ -151,6 +151,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Limiter:           limiter,
 		Captchas:          captchas,
+		StaticFiles:       os.DirFS("web/dist"),
 	}), closeResources, nil
 }
 

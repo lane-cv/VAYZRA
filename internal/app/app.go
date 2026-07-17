@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"io/fs"
 	"net/http"
 	"net/netip"
 
@@ -13,6 +14,7 @@ import (
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
+	"happylearn.local/app/internal/platform/staticweb"
 )
 
 type Dependencies struct {
@@ -24,6 +26,7 @@ type Dependencies struct {
 	TrustedProxyCIDRs []netip.Prefix
 	Limiter           redisx.Limiter
 	Captchas          redisx.CaptchaService
+	StaticFiles       fs.FS
 }
 
 func New(d Dependencies) http.Handler {
@@ -63,6 +66,9 @@ func New(d Dependencies) http.Handler {
 				}
 			})
 		})
+	}
+	if d.StaticFiles != nil {
+		r.NotFound(staticweb.New(d.StaticFiles).ServeHTTP)
 	}
 	return r
 }

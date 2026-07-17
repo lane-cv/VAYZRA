@@ -11,3 +11,7 @@ data/
 .tmp-go-mod-cache/
 node_modules/
 web/dist/
+
+.tools/
+playwright-report/
+test-results/

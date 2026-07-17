@@ -1,0 +1,135 @@
+# HappyLearn local development and Ubuntu container runbook
+
+This phase produces one same-origin Go/API and Vue-console image. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL and Redis remain private to the Docker network. This runbook does not deploy to a remote server.
+
+## Prerequisites
+
+- Docker Engine with the Compose plugin (Ubuntu 24.04 or Docker Desktop for local work)
+- Go `1.26.5`, Node `24.18.0`, and pnpm `11.9.0`
+- `openssl` for generating local-only secrets
+
+Use the fixed Compose project name below so network and cleanup targets stay narrow:
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d
+docker compose -p happylearn-dev -f deploy/compose.dev.yml ps
+```
+
+Wait until both services report `healthy`. PostgreSQL is available only at `127.0.0.1:54329` and Redis only at `127.0.0.1:56379` for local development.
+
+## Local configuration, migration, and bootstrap
+
+Create a private local secret directory and environment file. The values below are development-only placeholders; do not reuse them outside local testing.
+
+```bash
+install -d -m 0700 .secrets
+umask 077
+openssl rand -base64 48 > .secrets/login-throttle-secret
+cat > .env <<EOF
+HAPPYLEARN_ENV=development
+HAPPYLEARN_LISTEN=:8080
+HAPPYLEARN_DATABASE_URL=postgres://happylearn:happylearn_dev@127.0.0.1:54329/happylearn?sslmode=disable
+HAPPYLEARN_REDIS_URL=redis://127.0.0.1:56379/0
+HAPPYLEARN_LOGIN_THROTTLE_SECRET=$(cat .secrets/login-throttle-secret)
+HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:8080
+HAPPYLEARN_TRUSTED_PROXY_CIDRS=
+EOF
+chmod 600 .env .secrets/login-throttle-secret
+```
+
+Build the console before starting the Go server; server startup applies the embedded migrations. Create the sole teacher once using a password file with owner-only permissions.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+set -a; . ./.env; set +a
+go run ./cmd/server
+# In a second terminal, after the server has applied migrations:
+read -rs -p 'Development teacher password: ' HAPPYLEARN_BOOTSTRAP_PASSWORD; echo
+printf '%s' "$HAPPYLEARN_BOOTSTRAP_PASSWORD" > .secrets/admin-password
+unset HAPPYLEARN_BOOTSTRAP_PASSWORD
+chmod 600 .secrets/admin-password
+go run ./cmd/admin create-teacher --username admin --display-name '教师' --password-file .secrets/admin-password
+shred -u .secrets/admin-password
+```
+
+The running server exposes `GET /api/v1/health/live` and `GET /api/v1/health/ready` on the same `http://127.0.0.1:8080` origin as the Vue application.
+
+## Test and acceptance commands
+
+Run all unit, integration, static-web, frontend, type, build, vulnerability, and Compose validation checks:
+
+```bash
+make verify
+```
+
+For browser acceptance, start the server as above and use new test-only passwords (never production values):
+
+```bash
+export E2E_ADMIN_PASSWORD='replace-with-a-local-test-password'
+export E2E_STUDENT_PASSWORD='replace-with-a-local-temporary-password'
+export E2E_STUDENT_NEW_PASSWORD='replace-with-a-local-changed-password'
+pnpm exec playwright install chromium
+pnpm exec playwright test tests/e2e/auth-students.spec.ts
+unset E2E_ADMIN_PASSWORD E2E_STUDENT_PASSWORD E2E_STUDENT_NEW_PASSWORD
+```
+
+## Container image and read-only smoke test
+
+Build the phase image after a clean frontend build is available to the Docker build stages:
+
+```bash
+docker build -t happylearn:phase1 .
+```
+
+For a local container smoke test, create a separate owner-only file using the Compose-network hostnames, then run the image with a read-only root filesystem. Replace `CHANGE_ME_LOCAL_ONLY` with a generated local secret, never a real production secret.
+
+```bash
+umask 077
+cat > .env.container <<'EOF'
+HAPPYLEARN_ENV=development
+HAPPYLEARN_LISTEN=:8080
+HAPPYLEARN_DATABASE_URL=postgres://happylearn:happylearn_dev@postgres:5432/happylearn?sslmode=disable
+HAPPYLEARN_REDIS_URL=redis://redis:6379/0
+HAPPYLEARN_LOGIN_THROTTLE_SECRET=CHANGE_ME_LOCAL_ONLY_AT_LEAST_32_BYTES_LONG
+HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:8080
+EOF
+chmod 600 .env.container
+docker run --rm --name happylearn-phase1 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --user 10001:10001 --network happylearn-dev_happylearn --env-file .env.container -p 8080:8080 happylearn:phase1
+# In another terminal:
+curl --fail http://127.0.0.1:8080/api/v1/health/live
+curl --fail http://127.0.0.1:8080/api/v1/health/ready
+docker inspect -f '{{.Config.User}}' happylearn-phase1
+```
+
+## Backup and restore
+
+Back up the named development database before testing migrations or restores:
+
+```bash
+mkdir -p backups
+docker compose -p happylearn-dev -f deploy/compose.dev.yml exec -T postgres \
+  pg_dump -U happylearn -Fc happylearn > backups/happylearn-dev-$(date +%F).dump
+```
+
+**Destructive development-only restore:** this replaces data in the `happylearn` database of the explicitly named `happylearn-dev` Compose project. Confirm the backup file and project name before running it.
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml exec -T postgres \
+  pg_restore -U happylearn --clean --if-exists --no-owner -d happylearn < backups/happylearn-dev-YYYY-MM-DD.dump
+```
+
+## Shutdown and destructive cleanup
+
+Stop the local stack without deleting data:
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml down
+```
+
+**Destructive development-only cleanup:** this removes only the volumes attached to the named `happylearn-dev` Compose project; it does not target other Docker projects, images, or host paths.
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml down --volumes --remove-orphans
+```
