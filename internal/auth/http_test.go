@@ -1,0 +1,257 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"happylearn.local/app/internal/platform/httpx"
+)
+
+func TestLoginSetsOpaqueCookieAndReturnsSafeUser(t *testing.T) {
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	h := newHTTPTestHandler(svc)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if !hasSecureHTTPOnlyCookie(w.Result().Cookies(), "hl_session") {
+		t.Fatal("missing secure session cookie")
+	}
+	if !hasReadableCookie(w.Result().Cookies(), httpx.CSRFCookieName) {
+		t.Fatal("missing readable csrf cookie")
+	}
+	if strings.Contains(w.Body.String(), "opaque-token") || strings.Contains(w.Body.String(), "password") || strings.Contains(w.Body.String(), "hash") {
+		t.Fatalf("secret leaked: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"data":{"id":`) || strings.Contains(w.Body.String(), "passwordHash") {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+}
+
+func TestLoginRejectsInvalidJSONContentTypeAndOversizedBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name, contentType, body string
+		want                    int
+	}{
+		{"malformed", "application/json", `{`, http.StatusBadRequest},
+		{"unknown field", "application/json", `{"username":"student01","password":"Long Temporary Password 42!","extra":true}`, http.StatusBadRequest},
+		{"trailing JSON", "application/json", `{"username":"student01","password":"Long Temporary Password 42!"} {}`, http.StatusBadRequest},
+		{"unsupported content type", "text/plain", `{"username":"student01","password":"Long Temporary Password 42!"}`, http.StatusUnsupportedMediaType},
+		{"too large", "application/json", `{"username":"student01","password":"` + strings.Repeat("a", 33*1024) + `"}`, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHTTPTestHandler(&fakeHTTPService{loginAuth: activeAuthentication(false)})
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.want || strings.Contains(w.Body.String(), "Long Temporary Password") {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestLoginCredentialFailuresUseSameGenericResponse(t *testing.T) {
+	var bodies []string
+	for _, err := range []error{ErrInvalidCredentials, ErrInvalidCredentials, errors.New("disabled")} {
+		svc := &fakeHTTPService{loginErr: err}
+		h := newHTTPTestHandler(svc)
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"wrong"}`))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		bodies = append(bodies, w.Body.String())
+	}
+	if bodies[0] != bodies[1] || bodies[1] != bodies[2] {
+		t.Fatalf("credential responses differ: %#v", bodies)
+	}
+}
+
+func TestAuthenticateRejectsUnauthenticatedMe(t *testing.T) {
+	h := newHTTPTestHandler(&fakeHTTPService{authenticateErr: ErrUnauthenticated})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestForcedPasswordChangeRestrictsOtherMutations(t *testing.T) {
+	svc := &fakeHTTPService{authenticateAuth: activeAuthentication(true)}
+	h := newHTTPTestHandler(svc)
+	r := authenticatedRequest(http.MethodPost, "/api/v1/auth/logout-others", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden || svc.logoutOthersToken != "" {
+		t.Fatalf("status=%d calls=%q body=%s", w.Code, svc.logoutOthersToken, w.Body.String())
+	}
+}
+
+func TestLogoutClearsCookiesAndLogoutOthersRetainsCurrentSession(t *testing.T) {
+	t.Run("logout", func(t *testing.T) {
+		svc := &fakeHTTPService{authenticateAuth: activeAuthentication(false)}
+		h := newHTTPTestHandler(svc)
+		r := authenticatedRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusNoContent || svc.logoutToken != "opaque-token" {
+			t.Fatalf("status=%d token=%q body=%s", w.Code, svc.logoutToken, w.Body.String())
+		}
+		if !hasDeletedCookie(w.Result().Cookies(), "hl_session") || !hasDeletedCookie(w.Result().Cookies(), httpx.CSRFCookieName) {
+			t.Fatal("logout did not clear auth cookies")
+		}
+	})
+	t.Run("logout others", func(t *testing.T) {
+		svc := &fakeHTTPService{authenticateAuth: activeAuthentication(false)}
+		h := newHTTPTestHandler(svc)
+		r := authenticatedRequest(http.MethodPost, "/api/v1/auth/logout-others", nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusNoContent || svc.logoutOthersToken != "opaque-token" {
+			t.Fatalf("status=%d token=%q body=%s", w.Code, svc.logoutOthersToken, w.Body.String())
+		}
+		for _, cookie := range w.Result().Cookies() {
+			if cookie.Name == "hl_session" && cookie.MaxAge < 0 {
+				t.Fatal("logout others cleared current session")
+			}
+		}
+	})
+}
+
+func TestChangePasswordRotatesSessionAndCSRFToken(t *testing.T) {
+	svc := &fakeHTTPService{authenticateAuth: activeAuthentication(true), changeRawToken: "replacement-token", changeAuth: activeAuthentication(false)}
+	h := newHTTPTestHandler(svc)
+	r := authenticatedRequest(http.MethodPost, "/api/v1/auth/change-password", strings.NewReader(`{"currentPassword":"Long Temporary Password 42!","newPassword":"Changed Temporary Password 42!"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || svc.changeInput.SessionToken != "opaque-token" {
+		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.changeInput, w.Body.String())
+	}
+	if !hasSecureHTTPOnlyCookie(w.Result().Cookies(), "hl_session") || !hasReadableCookie(w.Result().Cookies(), httpx.CSRFCookieName) {
+		t.Fatal("password change did not rotate cookies")
+	}
+}
+
+type fakeHTTPService struct {
+	loginAuth, authenticateAuth, changeAuth Authentication
+	loginRawToken, changeRawToken           string
+	loginErr, authenticateErr, changeErr    error
+	changeInput                             ChangePasswordInput
+	logoutToken, logoutOthersToken          string
+}
+
+func (s *fakeHTTPService) Login(_ context.Context, _ LoginInput) (Authentication, string, error) {
+	return s.loginAuth, s.loginRawToken, s.loginErr
+}
+func (s *fakeHTTPService) Authenticate(_ context.Context, _ string) (Authentication, error) {
+	return s.authenticateAuth, s.authenticateErr
+}
+func (s *fakeHTTPService) ChangePassword(_ context.Context, input ChangePasswordInput) (Authentication, string, error) {
+	s.changeInput = input
+	return s.changeAuth, s.changeRawToken, s.changeErr
+}
+func (s *fakeHTTPService) Logout(_ context.Context, raw string) error {
+	s.logoutToken = raw
+	return nil
+}
+func (s *fakeHTTPService) LogoutOthers(_ context.Context, raw string) error {
+	s.logoutOthersToken = raw
+	return nil
+}
+
+func newHTTPTestHandler(svc *fakeHTTPService) http.Handler {
+	h := NewHTTPHandler(svc, HTTPConfig{CookieSecure: true})
+	r := chi.NewRouter()
+	r.Post("/api/v1/auth/login", h.Login)
+	r.Group(func(private chi.Router) {
+		private.Use(h.Authenticate)
+		private.Get("/api/v1/auth/me", h.Me)
+		private.Post("/api/v1/auth/change-password", h.ChangePassword)
+		private.Post("/api/v1/auth/logout", h.Logout)
+		private.Post("/api/v1/auth/logout-others", h.LogoutOthers)
+	})
+	return r
+}
+
+func activeAuthentication(mustChange bool) Authentication {
+	return Authentication{User: User{ID: uuid.MustParse("84c0f591-e99a-4a91-8250-25c159e1823a"), Username: "student01", DisplayName: "林同学", Role: RoleStudent, Status: StatusActive, MustChangePassword: mustChange}}
+}
+
+func authenticatedRequest(method, target string, body io.Reader) *http.Request {
+	r := httptest.NewRequest(method, target, body)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	return r
+}
+
+func hasSecureHTTPOnlyCookie(cookies []*http.Cookie, name string) bool {
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.Value != "" && cookie.Secure && cookie.HttpOnly && cookie.Path == "/" && cookie.SameSite == http.SameSiteLaxMode && cookie.MaxAge > 0 && cookie.MaxAge <= 30*24*60*60 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasReadableCookie(cookies []*http.Cookie, name string) bool {
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.Value != "" && cookie.Secure && !cookie.HttpOnly && cookie.Path == "/" && cookie.SameSite == http.SameSiteLaxMode {
+			return true
+		}
+	}
+	return false
+}
+
+func hasDeletedCookie(cookies []*http.Cookie, name string) bool {
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.MaxAge < 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRoleContextAndRequireRole(t *testing.T) {
+	user := activeAuthentication(false).User
+	ctx := context.WithValue(context.Background(), userContextKey{}, user)
+	got, ok := UserFromContext(ctx)
+	if !ok || got.ID != user.ID {
+		t.Fatalf("context user = %#v, %t", got, ok)
+	}
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want int
+	}{
+		{"missing principal", context.Background(), http.StatusUnauthorized},
+		{"wrong role", context.WithValue(context.Background(), userContextKey{}, user), http.StatusForbidden},
+		{"matching role", context.WithValue(context.Background(), userContextKey{}, User{Role: RoleAdmin}), http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := RequireRole(RoleAdmin)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+			r := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(tc.ctx)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}

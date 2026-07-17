@@ -6,6 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
+
+	"happylearn.local/app/internal/auth"
 )
 
 func TestLivenessIncludesRequestID(t *testing.T) {
@@ -58,3 +62,47 @@ func TestReadinessWithoutDependencyReturnsStableError(t *testing.T) {
 		t.Fatalf("unexpected body: %s", got)
 	}
 }
+
+func TestAuthRoutesUseOriginAndCSRFProtection(t *testing.T) {
+	h := New(Dependencies{Ready: func(context.Context) error { return nil }, Auth: appFakeAuth{}, PublicOrigin: "https://learn.example.com", CookieSecure: true})
+	login := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	login.Header.Set("Content-Type", "application/json")
+	login.Header.Set("Origin", "https://learn.example.com")
+	loginResult := httptest.NewRecorder()
+	h.ServeHTTP(loginResult, login)
+	if loginResult.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loginResult.Code, loginResult.Body.String())
+	}
+
+	logout := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	logout.Header.Set("Origin", "https://learn.example.com")
+	logout.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	logoutResult := httptest.NewRecorder()
+	h.ServeHTTP(logoutResult, logout)
+	if logoutResult.Code != http.StatusForbidden || !strings.Contains(logoutResult.Body.String(), `"csrf_invalid"`) {
+		t.Fatalf("logout status=%d body=%s", logoutResult.Code, logoutResult.Body.String())
+	}
+
+	crossSite := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	crossSite.Header.Set("Content-Type", "application/json")
+	crossSite.Header.Set("Origin", "https://evil.example")
+	crossSiteResult := httptest.NewRecorder()
+	h.ServeHTTP(crossSiteResult, crossSite)
+	if crossSiteResult.Code != http.StatusForbidden || !strings.Contains(crossSiteResult.Body.String(), `"forbidden"`) {
+		t.Fatalf("cross-site status=%d body=%s", crossSiteResult.Code, crossSiteResult.Body.String())
+	}
+}
+
+type appFakeAuth struct{}
+
+func (appFakeAuth) Login(context.Context, auth.LoginInput) (auth.Authentication, string, error) {
+	return auth.Authentication{User: auth.User{ID: uuid.MustParse("84c0f591-e99a-4a91-8250-25c159e1823a"), Username: "student01", Role: auth.RoleStudent, Status: auth.StatusActive}}, "opaque-token", nil
+}
+func (appFakeAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
+	return auth.Authentication{}, auth.ErrUnauthenticated
+}
+func (appFakeAuth) ChangePassword(context.Context, auth.ChangePasswordInput) (auth.Authentication, string, error) {
+	return auth.Authentication{}, "", auth.ErrUnauthenticated
+}
+func (appFakeAuth) Logout(context.Context, string) error       { return nil }
+func (appFakeAuth) LogoutOthers(context.Context, string) error { return nil }
