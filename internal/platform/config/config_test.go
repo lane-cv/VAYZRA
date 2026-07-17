@@ -30,6 +30,39 @@ func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 	}
 }
 
+func TestLoadParsesTrustedProxyCIDRs(t *testing.T) {
+	env := map[string]string{
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
+		"HAPPYLEARN_TRUSTED_PROXY_CIDRS":   " 10.0.0.0/8,2001:db8::/32 ",
+	}
+
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 2 || cfg.TrustedProxyCIDRs[0].String() != "10.0.0.0/8" || cfg.TrustedProxyCIDRs[1].String() != "2001:db8::/32" {
+		t.Fatalf("trusted proxy CIDRs = %#v", cfg.TrustedProxyCIDRs)
+	}
+}
+
+func TestLoadRejectsInvalidTrustedProxyCIDRs(t *testing.T) {
+	for _, raw := range []string{"not-a-cidr", "10.0.0.0/8,"} {
+		env := map[string]string{
+			"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+			"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+			"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+			"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
+			"HAPPYLEARN_TRUSTED_PROXY_CIDRS":   raw,
+		}
+		if _, err := Load(func(k string) string { return env[k] }); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_TRUSTED_PROXY_CIDRS") {
+			t.Fatalf("raw=%q error=%v", raw, err)
+		}
+	}
+}
+
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 	env := map[string]string{
 		"HAPPYLEARN_ENV":                   "prodution",

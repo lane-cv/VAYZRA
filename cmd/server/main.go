@@ -136,12 +136,13 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		}
 	}
 	return app.New(app.Dependencies{
-		Ready:        ready,
-		Auth:         service,
-		PublicOrigin: cfg.PublicOrigin,
-		CookieSecure: cfg.CookieSecure,
-		Limiter:      limiter,
-		Captchas:     captchas,
+		Ready:             ready,
+		Auth:              service,
+		PublicOrigin:      cfg.PublicOrigin,
+		CookieSecure:      cfg.CookieSecure,
+		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
+		Limiter:           limiter,
+		Captchas:          captchas,
 	}), closeResources, nil
 }
 

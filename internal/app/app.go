@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"net/http"
+	"net/netip"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,12 +15,13 @@ import (
 )
 
 type Dependencies struct {
-	Ready        func(context.Context) error
-	Auth         auth.HTTPService
-	PublicOrigin string
-	CookieSecure bool
-	Limiter      redisx.Limiter
-	Captchas     redisx.CaptchaService
+	Ready             func(context.Context) error
+	Auth              auth.HTTPService
+	PublicOrigin      string
+	CookieSecure      bool
+	TrustedProxyCIDRs []netip.Prefix
+	Limiter           redisx.Limiter
+	Captchas          redisx.CaptchaService
 }
 
 func New(d Dependencies) http.Handler {
@@ -40,7 +42,9 @@ func New(d Dependencies) http.Handler {
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	if d.Auth != nil {
-		authHTTP := auth.NewHTTPHandler(d.Auth, auth.HTTPConfig{CookieSecure: d.CookieSecure, Limiter: d.Limiter, Captchas: d.Captchas})
+		authHTTP := auth.NewHTTPHandler(d.Auth, auth.HTTPConfig{
+			CookieSecure: d.CookieSecure, Limiter: d.Limiter, Captchas: d.Captchas, TrustedProxyCIDRs: d.TrustedProxyCIDRs,
+		})
 		r.Route("/api/v1", func(api chi.Router) {
 			api.Use(httpx.OriginGuard(d.PublicOrigin))
 			api.Use(httpx.CSRF)

@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -31,16 +32,18 @@ type HTTPService interface {
 }
 
 type HTTPConfig struct {
-	CookieSecure bool
-	Limiter      redisx.Limiter
-	Captchas     redisx.CaptchaService
+	CookieSecure      bool
+	Limiter           redisx.Limiter
+	Captchas          redisx.CaptchaService
+	TrustedProxyCIDRs []netip.Prefix
 }
 
 type Handler struct {
-	service      HTTPService
-	cookieSecure bool
-	limiter      redisx.Limiter
-	captchas     redisx.CaptchaService
+	service           HTTPService
+	cookieSecure      bool
+	limiter           redisx.Limiter
+	captchas          redisx.CaptchaService
+	trustedProxyCIDRs []netip.Prefix
 }
 
 type UserView struct {
@@ -55,7 +58,10 @@ type userContextKey struct{}
 type sessionTokenContextKey struct{}
 
 func NewHTTPHandler(service HTTPService, cfg HTTPConfig) *Handler {
-	return &Handler{service: service, cookieSecure: cfg.CookieSecure, limiter: cfg.Limiter, captchas: cfg.Captchas}
+	return &Handler{
+		service: service, cookieSecure: cfg.CookieSecure, limiter: cfg.Limiter, captchas: cfg.Captchas,
+		trustedProxyCIDRs: append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...),
+	}
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +78,11 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}
-	ip := requestIP(r)
+	ip, err := h.clientIP(r)
+	if err != nil {
+		httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
+		return
+	}
 	ipValue := ""
 	if ip != nil {
 		ipValue = ip.String()
@@ -220,8 +230,13 @@ func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusUnauthorized, "unauthenticated", "请先登录")
 		return
 	}
+	ip, err := h.clientIP(r)
+	if err != nil {
+		httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
+		return
+	}
 	authentication, replacement, err := h.service.ChangePassword(r.Context(), ChangePasswordInput{
-		SessionToken: rawToken, CurrentPassword: input.CurrentPassword, NewPassword: input.NewPassword, IP: requestIP(r), UserAgent: r.UserAgent(),
+		SessionToken: rawToken, CurrentPassword: input.CurrentPassword, NewPassword: input.NewPassword, IP: ip, UserAgent: r.UserAgent(),
 	})
 	if err != nil {
 		if errors.Is(err, ErrUnauthenticated) {
@@ -355,12 +370,12 @@ func writeJSONDecodeError(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
 }
 
-func requestIP(r *http.Request) net.IP {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func (h *Handler) clientIP(r *http.Request) (net.IP, error) {
+	addr, err := httpx.ClientIP(r, h.trustedProxyCIDRs)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return net.ParseIP(host)
+	return append(net.IP(nil), addr.AsSlice()...), nil
 }
 
 func sessionCookie(r *http.Request) (string, bool) {

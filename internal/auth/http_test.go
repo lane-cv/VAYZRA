@@ -6,12 +6,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
@@ -143,6 +146,79 @@ func TestLoginChallengeIsVerifiedBeforePasswordAndChallengeImageIsNoStore(t *tes
 		t.Fatalf("status=%d headers=%v size=%d", challengeResult.Code, challengeResult.Header(), challengeResult.Body.Len())
 	}
 }
+
+func TestLoginRequiresChallengeAfterRedisOutageWhenFailuresReachedThreshold(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	limiter := redisx.NewLoginLimiter(rdb, redisx.Policy{Secret: []byte("test-limiter-secret")})
+	for range 3 {
+		if err := limiter.RecordFailure(context.Background(), "student01", "192.0.2.4"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mini.Close()
+
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	h := newHTTPTestHandlerWithThrottle(svc, limiter, nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "192.0.2.4:1234"
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), `"login_challenge_required"`) || svc.loginCalls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, svc.loginCalls, w.Body.String())
+	}
+}
+
+func TestLoginUsesClientIPFromTrustedProxy(t *testing.T) {
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	h := NewHTTPHandler(svc, HTTPConfig{TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "198.51.100.4")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Login(w, r)
+
+	if w.Code != http.StatusOK || svc.loginInput.IP == nil || svc.loginInput.IP.String() != "198.51.100.4" {
+		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.loginInput, w.Body.String())
+	}
+}
+
+func TestLoginRejectsMalformedTrustedProxyForwardingBeforeLimiterAndService(t *testing.T) {
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	limiter := &fakeLoginLimiter{decision: redisx.Decision{Allowed: false}}
+	h := NewHTTPHandler(svc, HTTPConfig{Limiter: limiter, TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "not-an-ip")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Login(w, r)
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"invalid_request"`) || limiter.allowCalls != 0 || svc.loginCalls != 0 {
+		t.Fatalf("status=%d limiter=%d calls=%d body=%s", w.Code, limiter.allowCalls, svc.loginCalls, w.Body.String())
+	}
+}
+
+func TestChangePasswordRejectsMalformedTrustedProxyForwardingBeforeService(t *testing.T) {
+	svc := &fakeHTTPService{changeRawToken: "replacement-token", changeAuth: activeAuthentication(false)}
+	h := NewHTTPHandler(svc, HTTPConfig{TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/change-password", strings.NewReader(`{"currentPassword":"Long Temporary Password 42!","newPassword":"Changed Temporary Password 42!"}`))
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "not-an-ip")
+	r.Header.Set("Content-Type", "application/json")
+	r = r.WithContext(context.WithValue(r.Context(), sessionTokenContextKey{}, "opaque-token"))
+	w := httptest.NewRecorder()
+	h.ChangePassword(w, r)
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"invalid_request"`) || svc.changeInput.SessionToken != "" {
+		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.changeInput, w.Body.String())
+	}
+}
+
 func TestAuthenticateRejectsUnauthenticatedMe(t *testing.T) {
 	h := newHTTPTestHandler(&fakeHTTPService{authenticateErr: ErrUnauthenticated})
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
@@ -214,13 +290,15 @@ type fakeHTTPService struct {
 	loginAuth, authenticateAuth, changeAuth Authentication
 	loginRawToken, changeRawToken           string
 	loginErr, authenticateErr, changeErr    error
+	loginInput                              LoginInput
 	changeInput                             ChangePasswordInput
 	logoutToken, logoutOthersToken          string
 	loginCalls                              int
 }
 
-func (s *fakeHTTPService) Login(_ context.Context, _ LoginInput) (Authentication, string, error) {
+func (s *fakeHTTPService) Login(_ context.Context, input LoginInput) (Authentication, string, error) {
 	s.loginCalls++
+	s.loginInput = input
 	return s.loginAuth, s.loginRawToken, s.loginErr
 }
 func (s *fakeHTTPService) Authenticate(_ context.Context, _ string) (Authentication, error) {
@@ -261,10 +339,12 @@ func newHTTPTestHandlerWithThrottle(svc *fakeHTTPService, limiter redisx.Limiter
 type fakeLoginLimiter struct {
 	decision     redisx.Decision
 	username, ip string
+	allowCalls   int
 }
 
 func (f *fakeLoginLimiter) Allow(_ context.Context, username, ip string) (redisx.Decision, error) {
 	f.username, f.ip = username, ip
+	f.allowCalls++
 	return f.decision, nil
 }
 func (f *fakeLoginLimiter) RecordFailure(context.Context, string, string) error { return nil }

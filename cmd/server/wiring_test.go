@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -54,6 +55,36 @@ func TestBuildApplicationWiresAuthRoutesAndConfiguredSecurity(t *testing.T) {
 	}
 }
 
+func TestBuildApplicationForwardsTrustedProxyCIDRs(t *testing.T) {
+	svc := &serverCapturingAuth{}
+	h, closeResources, err := buildApplication(context.Background(), config.Config{
+		DatabaseURL:       "postgres://app:secret@db.example/happylearn",
+		PublicOrigin:      "https://learn.example.com",
+		TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return svc, nil },
+		ready:   func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		close:   func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeResources)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "198.51.100.4")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Origin", "https://learn.example.com")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK || svc.loginInput.IP == nil || svc.loginInput.IP.String() != "198.51.100.4" {
+		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.loginInput, w.Body.String())
+	}
+}
+
 func TestBuildApplicationClosesPoolAndHidesMigrationFailure(t *testing.T) {
 	closed := false
 	secret := "postgres://app:very-secret@db.example/happylearn"
@@ -67,6 +98,16 @@ func TestBuildApplicationClosesPoolAndHidesMigrationFailure(t *testing.T) {
 	if closeResources != nil || err == nil || strings.Contains(err.Error(), secret) || !closed {
 		t.Fatalf("closeResourcesNil=%t error=%v", closeResources == nil, err)
 	}
+}
+
+type serverCapturingAuth struct {
+	serverFakeAuth
+	loginInput auth.LoginInput
+}
+
+func (s *serverCapturingAuth) Login(_ context.Context, input auth.LoginInput) (auth.Authentication, string, error) {
+	s.loginInput = input
+	return serverFakeAuth{}.Login(context.Background(), input)
 }
 
 type serverFakeAuth struct{}

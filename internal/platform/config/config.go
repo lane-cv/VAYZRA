@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -12,6 +13,7 @@ type Config struct {
 	DatabaseURL         string
 	RedisURL            string
 	LoginThrottleSecret string
+	TrustedProxyCIDRs   []netip.Prefix
 	PublicOrigin        string
 	SessionIdleTTL      time.Duration
 	SessionAbsoluteTTL  time.Duration
@@ -37,6 +39,15 @@ func Load(getenv func(string) string) (Config, error) {
 	c.DatabaseURL = getenv("HAPPYLEARN_DATABASE_URL")
 	c.RedisURL = getenv("HAPPYLEARN_REDIS_URL")
 	c.LoginThrottleSecret = getenv("HAPPYLEARN_LOGIN_THROTTLE_SECRET")
+	if raw := getenv("HAPPYLEARN_TRUSTED_PROXY_CIDRS"); raw != "" {
+		for _, value := range strings.Split(raw, ",") {
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+			if err != nil {
+				return Config{}, fmt.Errorf("HAPPYLEARN_TRUSTED_PROXY_CIDRS is invalid")
+			}
+			c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, prefix)
+		}
+	}
 
 	c.PublicOrigin = strings.TrimRight(getenv("HAPPYLEARN_PUBLIC_ORIGIN"), "/")
 	c.CookieSecure = c.Environment == "production"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -64,7 +65,7 @@ func TestReadinessWithoutDependencyReturnsStableError(t *testing.T) {
 }
 
 func TestAuthRoutesUseOriginAndCSRFProtection(t *testing.T) {
-	h := New(Dependencies{Ready: func(context.Context) error { return nil }, Auth: appFakeAuth{}, PublicOrigin: "https://learn.example.com", CookieSecure: true})
+	h := New(Dependencies{Ready: func(context.Context) error { return nil }, Auth: &appFakeAuth{}, PublicOrigin: "https://learn.example.com", CookieSecure: true})
 	login := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
 	login.Header.Set("Content-Type", "application/json")
 	login.Header.Set("Origin", "https://learn.example.com")
@@ -93,16 +94,40 @@ func TestAuthRoutesUseOriginAndCSRFProtection(t *testing.T) {
 	}
 }
 
-type appFakeAuth struct{}
+func TestAuthRoutesForwardTrustedProxyConfiguration(t *testing.T) {
+	svc := &appFakeAuth{}
+	h := New(Dependencies{
+		Ready:             func(context.Context) error { return nil },
+		Auth:              svc,
+		PublicOrigin:      "https://learn.example.com",
+		TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "198.51.100.4")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Origin", "https://learn.example.com")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
 
-func (appFakeAuth) Login(context.Context, auth.LoginInput) (auth.Authentication, string, error) {
+	if w.Code != http.StatusOK || svc.loginInput.IP == nil || svc.loginInput.IP.String() != "198.51.100.4" {
+		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.loginInput, w.Body.String())
+	}
+}
+
+type appFakeAuth struct {
+	loginInput auth.LoginInput
+}
+
+func (a *appFakeAuth) Login(_ context.Context, input auth.LoginInput) (auth.Authentication, string, error) {
+	a.loginInput = input
 	return auth.Authentication{User: auth.User{ID: uuid.MustParse("84c0f591-e99a-4a91-8250-25c159e1823a"), Username: "student01", Role: auth.RoleStudent, Status: auth.StatusActive}}, "opaque-token", nil
 }
-func (appFakeAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
+func (*appFakeAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
 	return auth.Authentication{}, auth.ErrUnauthenticated
 }
-func (appFakeAuth) ChangePassword(context.Context, auth.ChangePasswordInput) (auth.Authentication, string, error) {
+func (*appFakeAuth) ChangePassword(context.Context, auth.ChangePasswordInput) (auth.Authentication, string, error) {
 	return auth.Authentication{}, "", auth.ErrUnauthenticated
 }
-func (appFakeAuth) Logout(context.Context, string) error       { return nil }
-func (appFakeAuth) LogoutOthers(context.Context, string) error { return nil }
+func (*appFakeAuth) Logout(context.Context, string) error       { return nil }
+func (*appFakeAuth) LogoutOthers(context.Context, string) error { return nil }
