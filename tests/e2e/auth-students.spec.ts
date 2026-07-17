@@ -29,11 +29,28 @@ test('teacher creates student and student is isolated from admin APIs', async ({
     await changePassword(studentPage, studentPassword!, studentNewPassword!)
     const denied = await studentPage.request.get('/api/v1/admin/students')
     expect(denied.status()).toBe(403)
+    expect(denied.headers()['x-request-id']).toBeTruthy()
+    expect((await denied.json()).error.requestId).toBeTruthy()
     await expect(studentPage.getByText('学生管理')).toHaveCount(0)
 
     const students = await adminPage.request.get('/api/v1/admin/students')
     const record = (await students.json()).data.find((item: { username: string }) => item.username === username)
     expect(record).toBeTruthy()
+    const studentHeaders = await csrfHeader(studentPage)
+    for (const [path, data] of [
+      ['/api/v1/admin/students', { username: `forbidden-${suffix}`, displayName: 'No', temporaryPassword: studentPassword! }],
+      [`/api/v1/admin/students/${record.id}/status`, { status: 'disabled' }],
+      [`/api/v1/admin/students/${record.id}/reset-password`, { temporaryPassword: studentPassword! }],
+    ] as const) {
+      const response = await studentPage.request.post(path, { data, headers: studentHeaders })
+      expect(response.status()).toBe(403)
+    }
+    const origin = new URL(adminPage.url()).origin
+    for (const headers of [{ Origin: origin }, { Origin: origin, 'X-CSRF-Token': 'invalid' }, { Origin: 'https://evil.example', 'X-CSRF-Token': (await csrfHeader(adminPage))['X-CSRF-Token'] }]) {
+      const response = await adminPage.request.post(`/api/v1/admin/students/${record.id}/status`, { data: { status: 'disabled' }, headers })
+      expect(response.status()).toBe(403)
+      expect(response.headers()['x-request-id']).toBeTruthy()
+    }
     const disabled = await adminPage.request.post(`/api/v1/admin/students/${record.id}/status`, {
       data: { status: 'disabled' }, headers: await csrfHeader(adminPage),
     })
@@ -47,7 +64,10 @@ test('teacher creates student and student is isolated from admin APIs', async ({
 
 test('authentication errors are generic and mutation defenses expose request IDs', async ({ request }) => {
   const origin = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:8080'
-  const requestOptions = { headers: { Origin: origin }, data: { username: 'missing-e2e', password: 'wrong password 123' } }
+  const success = await request.post('/api/v1/auth/login', { headers: { Origin: origin }, data: { username: 'admin', password: adminPassword! } })
+  expect(success.status()).toBe(200)
+  expect(JSON.stringify(await success.json())).not.toMatch(/hl_session|cookie|token/i)
+  const requestOptions = { headers: { Origin: origin }, data: { username: `missing-${Date.now()}`, password: 'wrong password 123' } }
   const unknown = await request.post('/api/v1/auth/login', requestOptions)
   const wrong = await request.post('/api/v1/auth/login', { headers: { Origin: origin }, data: { username: 'admin', password: 'wrong password 123' } })
   expect(unknown.status()).toBe(401)

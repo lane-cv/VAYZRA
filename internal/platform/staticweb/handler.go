@@ -23,13 +23,13 @@ type Handler struct{ files fs.FS }
 func New(files fs.FS) *Handler { return &Handler{files: files} }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/api/") {
-		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
 		return
 	}
 	name, valid := safeName(r.URL.Path)

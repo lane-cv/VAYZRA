@@ -29,4 +29,4 @@ verify: tools
 	docker compose -f deploy/compose.dev.yml config --quiet
 
 e2e:
-	$(PNPM) exec playwright test tests/e2e/auth-students.spec.ts
+	bash scripts/e2e-disposable.sh

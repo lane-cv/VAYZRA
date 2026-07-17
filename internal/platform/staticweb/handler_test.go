@@ -28,6 +28,18 @@ func TestUnknownAPIRouteDoesNotReturnSPA(t *testing.T) {
 	}
 }
 
+func TestAPIMissAlwaysUsesJSONNotFoundContract(t *testing.T) {
+	h := New(testFS())
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(method, "/api/v1/missing", nil))
+			if w.Code != http.StatusNotFound || !strings.HasPrefix(w.Header().Get("Content-Type"), "application/json") || strings.Contains(w.Body.String(), "<html") {
+				t.Fatalf("status=%d content-type=%q body=%q", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+			}
+		})
+	}
+}
 func TestClientRouteReturnsIndex(t *testing.T) {
 	h := New(testFS())
 	r := httptest.NewRequest(http.MethodGet, "/admin/students", nil)

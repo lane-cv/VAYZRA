@@ -2,6 +2,9 @@
 
 This phase produces one same-origin Go/API and Vue-console image. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL and Redis remain private to the Docker network. This runbook does not deploy to a remote server.
 
+## Shell requirement
+
+All commands in this runbook are Bash commands. On Windows, run them from WSL2 or Git Bash; native PowerShell is not supported by these snippets.
 ## Prerequisites
 
 - Docker Engine with the Compose plugin (Ubuntu 24.04 or Docker Desktop for local work)
@@ -45,6 +48,7 @@ pnpm build
 set -a; . ./.env; set +a
 go run ./cmd/server
 # In a second terminal, after the server has applied migrations:
+set -a; . ./.env; set +a
 read -rs -p 'Development teacher password: ' HAPPYLEARN_BOOTSTRAP_PASSWORD; echo
 printf '%s' "$HAPPYLEARN_BOOTSTRAP_PASSWORD" > .secrets/admin-password
 unset HAPPYLEARN_BOOTSTRAP_PASSWORD
@@ -63,7 +67,13 @@ Run all unit, integration, static-web, frontend, type, build, vulnerability, and
 make verify
 ```
 
-For browser acceptance, start the server as above and use new test-only passwords (never production values):
+For browser acceptance, use the disposable runner. It creates a uniquely named `happylearn_e2e_*` database, dedicated Redis DB 15, generated test-only credentials, and a read-only app container; its Bash trap removes them even when Playwright fails. It never touches the main development database and disables traces, screenshots, videos, and artifact uploads because forms contain credentials:
+
+```bash
+make e2e
+```
+
+For manual diagnosis only, start the server as above and use new test-only passwords (never production values):
 
 ```bash
 export E2E_ADMIN_PASSWORD='replace-with-a-local-test-password'
