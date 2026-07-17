@@ -36,3 +36,12 @@ func TestRequestIDReplacesInvalidClientID(t *testing.T) {
 		t.Fatalf("generated request ID = %q", got)
 	}
 }
+
+func TestNoStoreAppliesToEmptyResponses(t *testing.T) {
+	h := NoStore(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil))
+	if w.Code != http.StatusNoContent || w.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("status=%d cache=%q", w.Code, w.Header().Get("Cache-Control"))
+	}
+}

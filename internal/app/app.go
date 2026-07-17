@@ -51,6 +51,7 @@ func New(d Dependencies) http.Handler {
 			CookieSecure: d.CookieSecure, Limiter: d.Limiter, Captchas: d.Captchas, TrustedProxyCIDRs: d.TrustedProxyCIDRs,
 		})
 		r.Route("/api/v1", func(api chi.Router) {
+			api.Use(httpx.NoStore)
 			api.Use(httpx.OriginGuard(d.PublicOrigin))
 			api.Use(httpx.CSRF)
 			api.Get("/auth/challenge", authHTTP.Challenge)

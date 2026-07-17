@@ -12,6 +12,15 @@ import (
 	"happylearn.local/app/internal/auth"
 )
 
+func TestAdminStudentsListIsNeverStored(t *testing.T) {
+	h := NewHandler(fakeHTTPService{})
+	r := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(withUser(context.Background(), auth.User{Role: auth.RoleAdmin, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("status=%d cache=%q", w.Code, w.Header().Get("Cache-Control"))
+	}
+}
 func TestRoutesRejectStudentAndStrictlyDecodeCreate(t *testing.T) {
 	h := NewHandler(fakeHTTPService{})
 	studentRequest := httptest.NewRequest(http.MethodGet, "/", nil)

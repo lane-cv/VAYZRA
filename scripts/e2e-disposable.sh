@@ -28,10 +28,26 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+wait_for() {
+  local label="$1" container="$2"; shift 2
+  local attempt=1 max_attempts=60
+  until "$@"; do
+    if (( attempt >= max_attempts )); then
+      echo "timed out waiting for $label after ${max_attempts}s" >&2
+      docker ps -a --filter "name=^/${container}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' >&2 || true
+      docker inspect --format '{{json .State}}' "$container" >&2 || true
+      docker logs --tail 100 "$container" >&2 || true
+      return 1
+    fi
+    sleep 1
+    ((attempt++))
+  done
+}
+
 docker network create "$network" >/dev/null
 docker run -d --name "$postgres" --network "$network" -e POSTGRES_USER=happylearn -e POSTGRES_PASSWORD=happylearn_e2e -e POSTGRES_DB=postgres postgres:18.4 >/dev/null
 docker run -d --name "$redis" --network "$network" redis:8.8 >/dev/null
-until docker exec "$postgres" pg_isready -U happylearn -d postgres >/dev/null; do sleep 1; done
+wait_for "PostgreSQL readiness" "$postgres" docker exec "$postgres" pg_isready -U happylearn -d postgres >/dev/null
 docker exec "$postgres" psql -U happylearn -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$database\"" >/dev/null
 
 port=$((20000 + RANDOM % 20000))
@@ -49,7 +65,7 @@ EOF
 
 docker build -t happylearn:e2e . >/dev/null
 docker run -d --name "$app" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --user 10001:10001 --network "$network" --network-alias app --env-file "$env_file" -p 127.0.0.1:$port:8080 happylearn:e2e >/dev/null
-until curl --fail --silent "$base_url/api/v1/health/ready" >/dev/null; do sleep 1; done
+wait_for "application readiness" "$app" curl --fail --silent "$base_url/api/v1/health/ready" >/dev/null
 
 docker run --rm --network "$network" -e HAPPYLEARN_ENV=development -e HAPPYLEARN_DATABASE_URL="postgres://happylearn:happylearn_e2e@postgres:5432/$database?sslmode=disable" -e HAPPYLEARN_REDIS_URL="redis://redis:6379/$redis_db" -e HAPPYLEARN_LOGIN_THROTTLE_SECRET="local-e2e-throttle-secret-$nonce" -e HAPPYLEARN_PUBLIC_ORIGIN="$base_url" -e E2E_ADMIN_PASSWORD="$admin_password" -v "$PWD:/src:ro" -w /src golang:1.26.5-bookworm sh -c 'umask 077; printf %s "$E2E_ADMIN_PASSWORD" >/tmp/password; go run ./cmd/admin create-teacher --username admin --display-name "E2E Teacher" --password-file /tmp/password; rm -f /tmp/password' >/dev/null
 

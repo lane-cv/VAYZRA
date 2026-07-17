@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -24,6 +25,27 @@ import (
 
 const captchaTTL = 5 * time.Minute
 
+var ErrCaptchaRateLimited = errors.New("captcha issuance rate limited")
+
+type CaptchaPolicy struct {
+	Window time.Duration
+	PerIP  int
+	Global int
+}
+
+func (p CaptchaPolicy) normalized() CaptchaPolicy {
+	if p.Window <= 0 {
+		p.Window = captchaTTL
+	}
+	if p.PerIP <= 0 {
+		p.PerIP = 10
+	}
+	if p.Global <= 0 {
+		p.Global = 1000
+	}
+	return p
+}
+
 // Challenge is returned to the browser as an image body and opaque ID header.
 type Challenge struct {
 	ID  string
@@ -32,7 +54,7 @@ type Challenge struct {
 
 // CaptchaService is consumed by the authentication HTTP boundary.
 type CaptchaService interface {
-	Create(context.Context) (Challenge, error)
+	Create(context.Context, string) (Challenge, error)
 	Verify(context.Context, string, string) (bool, error)
 }
 
@@ -42,9 +64,15 @@ type CaptchaStore struct {
 	rdb    *redis.Client
 	secret []byte
 	random io.Reader
+	policy CaptchaPolicy
+	render func(string, io.Reader) ([]byte, error)
 }
 
 func NewCaptchaStore(rdb *redis.Client, secret []byte) *CaptchaStore {
+	return NewCaptchaStoreWithPolicy(rdb, secret, CaptchaPolicy{})
+}
+
+func NewCaptchaStoreWithPolicy(rdb *redis.Client, secret []byte, policy CaptchaPolicy) *CaptchaStore {
 	copySecret := append([]byte(nil), secret...)
 	if len(copySecret) == 0 {
 		copySecret = make([]byte, 32)
@@ -52,11 +80,11 @@ func NewCaptchaStore(rdb *redis.Client, secret []byte) *CaptchaStore {
 			panic("read captcha secret")
 		}
 	}
-	return &CaptchaStore{rdb: rdb, secret: copySecret, random: rand.Reader}
+	return &CaptchaStore{rdb: rdb, secret: copySecret, random: rand.Reader, policy: policy.normalized(), render: renderCaptcha}
 }
 
-func (s *CaptchaStore) Create(ctx context.Context) (Challenge, error) {
-	if s.rdb == nil {
+func (s *CaptchaStore) Create(ctx context.Context, ip string) (Challenge, error) {
+	if s.rdb == nil || ip == "" {
 		return Challenge{}, fmt.Errorf("captcha storage unavailable")
 	}
 	idBytes := make([]byte, 32)
@@ -68,18 +96,35 @@ func (s *CaptchaStore) Create(ctx context.Context) (Challenge, error) {
 	if err != nil {
 		return Challenge{}, err
 	}
-	pngBody, err := renderCaptcha(answer, s.random)
+	policy := s.policy.normalized()
+	stored, err := issueCaptchaScript.Run(ctx, s.rdb, []string{s.ipKey(ip), s.globalKey(), s.key(id)}, policy.PerIP, policy.Global, policy.Window.Milliseconds(), s.answerHash(answer), captchaTTL.Milliseconds()).Int()
+	if err != nil {
+		return Challenge{}, fmt.Errorf("store captcha: %w", err)
+	}
+	if stored != 1 {
+		return Challenge{}, ErrCaptchaRateLimited
+	}
+	pngBody, err := s.render(answer, s.random)
 	if err != nil {
 		return Challenge{}, err
 	}
 	if len(pngBody) == 0 || len(pngBody) > 50*1024 {
 		return Challenge{}, fmt.Errorf("render captcha image")
 	}
-	if err := s.rdb.Set(ctx, s.key(id), s.answerHash(answer), captchaTTL).Err(); err != nil {
-		return Challenge{}, fmt.Errorf("store captcha: %w", err)
-	}
 	return Challenge{ID: id, PNG: pngBody}, nil
 }
+
+var issueCaptchaScript = redis.NewScript(`
+local ip = tonumber(redis.call('GET', KEYS[1]) or '0')
+local global = tonumber(redis.call('GET', KEYS[2]) or '0')
+if ip >= tonumber(ARGV[1]) or global >= tonumber(ARGV[2]) then return 0 end
+ip = redis.call('INCR', KEYS[1])
+if ip == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+global = redis.call('INCR', KEYS[2])
+if global == 1 then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+redis.call('PSETEX', KEYS[3], ARGV[5], ARGV[4])
+return 1
+`)
 
 func (s *CaptchaStore) Verify(ctx context.Context, id, answer string) (bool, error) {
 	if s.rdb == nil || id == "" {
@@ -116,11 +161,16 @@ func (s *CaptchaStore) newAnswer() (string, error) {
 	return answer.String(), nil
 }
 
-func (s *CaptchaStore) key(id string) string {
+func (s *CaptchaStore) key(id string) string { return s.hmacKey("captcha-id", id) }
+func (s *CaptchaStore) ipKey(ip string) string {
+	return "hl:captcha:ip:" + s.hmacKey("captcha-ip", ip)[11:]
+}
+func (s *CaptchaStore) globalKey() string { return "hl:captcha:global" }
+func (s *CaptchaStore) hmacKey(namespace, value string) string {
 	h := hmac.New(sha256.New, s.secret)
-	_, _ = h.Write([]byte("captcha-id"))
+	_, _ = h.Write([]byte(namespace))
 	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(id))
+	_, _ = h.Write([]byte(value))
 	return "hl:captcha:" + hex.EncodeToString(h.Sum(nil))
 }
 

@@ -77,3 +77,28 @@ func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 		t.Fatalf("expected invalid environment error, got %v", err)
 	}
 }
+
+func TestLoadValidatesAndNormalizesPublicOrigin(t *testing.T) {
+	base := map[string]string{"HAPPYLEARN_DATABASE_URL": "postgres://app:test@localhost/app", "HAPPYLEARN_REDIS_URL": "redis://localhost:6379/0", "HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789"}
+	for _, raw := range []string{"", "/relative", "https://user@learn.example.com", "ftp://learn.example.com", "https://learn.example.com/path", "https://learn.example.com?q=1", "https://learn.example.com#fragment", "https://one.example,https://two.example"} {
+		env := make(map[string]string, len(base)+1)
+		for k, v := range base {
+			env[k] = v
+		}
+		env["HAPPYLEARN_PUBLIC_ORIGIN"] = raw
+		if _, err := Load(func(k string) string { return env[k] }); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_PUBLIC_ORIGIN") {
+			t.Fatalf("raw=%q err=%v", raw, err)
+		}
+	}
+	for raw, want := range map[string]string{"https://LEARN.example.com/": "https://learn.example.com", "http://learn.example.com:80/": "http://learn.example.com", "https://learn.example.com:443": "https://learn.example.com"} {
+		env := make(map[string]string, len(base)+1)
+		for k, v := range base {
+			env[k] = v
+		}
+		env["HAPPYLEARN_PUBLIC_ORIGIN"] = raw
+		cfg, err := Load(func(k string) string { return env[k] })
+		if err != nil || cfg.PublicOrigin != want {
+			t.Fatalf("raw=%q cfg=%q err=%v", raw, cfg.PublicOrigin, err)
+		}
+	}
+}

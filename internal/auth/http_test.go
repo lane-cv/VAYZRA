@@ -141,10 +141,28 @@ func TestLoginChallengeIsVerifiedBeforePasswordAndChallengeImageIsNoStore(t *tes
 	}
 
 	challenge := httptest.NewRequest(http.MethodGet, "/api/v1/auth/challenge", nil)
+	challenge.RemoteAddr = "192.0.2.4:1234"
 	challengeResult := httptest.NewRecorder()
 	h.ServeHTTP(challengeResult, challenge)
-	if challengeResult.Code != http.StatusOK || challengeResult.Header().Get("Cache-Control") != "no-store" || challengeResult.Header().Get("Content-Type") != "image/png" || challengeResult.Header().Get("X-Challenge-ID") != "challenge-id" || challengeResult.Body.Len() != len(captchas.challenge.PNG) {
+	if challengeResult.Code != http.StatusOK || challengeResult.Header().Get("Cache-Control") != "no-store, private" || challengeResult.Header().Get("Content-Type") != "image/png" || challengeResult.Header().Get("X-Challenge-ID") != "challenge-id" || challengeResult.Body.Len() != len(captchas.challenge.PNG) {
 		t.Fatalf("status=%d headers=%v size=%d", challengeResult.Code, challengeResult.Header(), challengeResult.Body.Len())
+	}
+}
+
+func TestChallengeUsesTrustedClientIPAndReturnsRateLimitWithoutIssuingImage(t *testing.T) {
+	svc := &fakeHTTPService{}
+	captchas := &fakeCaptchaStore{createErr: redisx.ErrCaptchaRateLimited}
+	h := NewHTTPHandler(svc, HTTPConfig{Captchas: captchas, TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/challenge", nil)
+	r.RemoteAddr = "10.1.2.3:443"
+	r.Header.Set("X-Forwarded-For", "198.51.100.4")
+	w := httptest.NewRecorder()
+	h.Challenge(w, r)
+	if w.Code != http.StatusTooManyRequests || captchas.ip != "198.51.100.4" || captchas.createCalls != 1 || strings.Contains(w.Body.String(), "198.51.100.4") {
+		t.Fatalf("status=%d captcha=%#v body=%s", w.Code, captchas, w.Body.String())
+	}
+	if w.Header().Get("Cache-Control") != "no-store, private" || !strings.Contains(w.Body.String(), `"requestId":`) {
+		t.Fatalf("headers=%v body=%s", w.Header(), w.Body.String())
 	}
 }
 
@@ -255,6 +273,15 @@ func TestChangePasswordRejectsMalformedTrustedProxyForwardingBeforeService(t *te
 	}
 }
 
+func TestMeResponseIsNeverStored(t *testing.T) {
+	h := NewHTTPHandler(&fakeHTTPService{}, HTTPConfig{})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil).WithContext(ContextWithUser(context.Background(), activeAuthentication(false).User))
+	w := httptest.NewRecorder()
+	h.Me(w, r)
+	if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("status=%d cache=%q", w.Code, w.Header().Get("Cache-Control"))
+	}
+}
 func TestAuthenticateRejectsUnauthenticatedMe(t *testing.T) {
 	h := newHTTPTestHandler(&fakeHTTPService{authenticateErr: ErrUnauthenticated})
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
@@ -387,12 +414,18 @@ func (f *fakeLoginLimiter) RecordFailure(context.Context, string, string) error 
 func (f *fakeLoginLimiter) RecordSuccess(context.Context, string, string) error { return nil }
 
 type fakeCaptchaStore struct {
-	challenge  redisx.Challenge
-	valid      bool
-	id, answer string
+	challenge      redisx.Challenge
+	valid          bool
+	id, answer, ip string
+	createErr      error
+	createCalls    int
 }
 
-func (f *fakeCaptchaStore) Create(context.Context) (redisx.Challenge, error) { return f.challenge, nil }
+func (f *fakeCaptchaStore) Create(_ context.Context, ip string) (redisx.Challenge, error) {
+	f.ip = ip
+	f.createCalls++
+	return f.challenge, f.createErr
+}
 func (f *fakeCaptchaStore) Verify(_ context.Context, id, answer string) (bool, error) {
 	f.id, f.answer = id, answer
 	return f.valid, nil

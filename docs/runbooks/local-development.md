@@ -143,3 +143,7 @@ docker compose -p happylearn-dev -f deploy/compose.dev.yml down
 ```bash
 docker compose -p happylearn-dev -f deploy/compose.dev.yml down --volumes --remove-orphans
 ```
+
+## CI branch protection
+
+The repository workflow verifies pushes to `master` and `main`. Branch protection is an external repository setting and must be configured in the hosting provider; this repository does not claim that setting is enabled.

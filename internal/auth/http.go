@@ -147,12 +147,21 @@ func (h *Handler) Challenge(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
 		return
 	}
-	challenge, err := h.captchas.Create(r.Context())
+	ip, err := h.clientIP(r)
+	if err != nil {
+		httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
+		return
+	}
+	challenge, err := h.captchas.Create(r.Context(), ip.String())
+	if errors.Is(err, redisx.ErrCaptchaRateLimited) {
+		httpx.Error(w, r, http.StatusTooManyRequests, "rate_limited", "请求过于频繁，请稍后重试")
+		return
+	}
 	if err != nil || challenge.ID == "" || len(challenge.PNG) == 0 || len(challenge.PNG) > 50*1024 {
 		httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", "no-store, private")
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("X-Challenge-ID", challenge.ID)
 	w.WriteHeader(http.StatusOK)

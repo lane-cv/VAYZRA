@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -49,7 +50,14 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 	}
 
-	c.PublicOrigin = strings.TrimRight(getenv("HAPPYLEARN_PUBLIC_ORIGIN"), "/")
+	c.PublicOrigin = getenv("HAPPYLEARN_PUBLIC_ORIGIN")
+	if c.PublicOrigin != "" {
+		var originErr error
+		c.PublicOrigin, originErr = normalizePublicOrigin(c.PublicOrigin)
+		if originErr != nil {
+			return Config{}, fmt.Errorf("HAPPYLEARN_PUBLIC_ORIGIN is invalid")
+		}
+	}
 	c.CookieSecure = c.Environment == "production"
 
 	for _, required := range []struct {
@@ -70,4 +78,20 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	return c, nil
+}
+
+func normalizePublicOrigin(raw string) (string, error) {
+	if raw == "" || strings.TrimSpace(raw) != raw || strings.Contains(raw, ",") {
+		return "", fmt.Errorf("invalid origin")
+	}
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" {
+		return "", fmt.Errorf("invalid origin")
+	}
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && !((u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443")) {
+		host = host + ":" + port
+	}
+	return u.Scheme + "://" + host, nil
 }

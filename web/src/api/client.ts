@@ -18,7 +18,7 @@ export async function requestWithMeta<T>(path: string, options: RequestOptions =
     headers.set('X-CSRF-Token', csrfToken)
   }
   let response: Response
-  try { response = await fetch(`/api/v1${path}`, { ...init, method, body: json === undefined ? undefined : JSON.stringify(json), headers, credentials: 'include' }) } catch { throw new APIError(0, 'network_error', '网络连接异常，请稍后重试', '') }
+  try { response = await fetch(`/api/v1${path}`, { ...init, method, body: json === undefined ? undefined : JSON.stringify(json), headers, credentials: 'include', cache: 'no-store' }) } catch { throw new APIError(0, 'network_error', '网络连接异常，请稍后重试', '') }
   if (response.status === 204) return { data: undefined as T }
   const payload = await parseJSON(response)
   if (!response.ok) {

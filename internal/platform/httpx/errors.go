@@ -6,9 +6,17 @@ import (
 )
 
 func JSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Cache-Control", "no-store, private")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func NoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, private")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func Error(w http.ResponseWriter, r *http.Request, status int, code, message string) {
