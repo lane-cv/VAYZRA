@@ -14,25 +14,39 @@ const challengeImageUrl = ref('')
 const pending = ref(false)
 const message = ref('')
 let objectUrl = ''
+let challengeGeneration = 0
+let challengeController: AbortController | undefined
 
 function clearChallengeImage() {
   if (objectUrl) URL.revokeObjectURL(objectUrl)
   objectUrl = ''
+  challengeId.value = ''
   challengeImageUrl.value = ''
 }
 
 async function refreshChallenge() {
+  const generation = ++challengeGeneration
+  challengeController?.abort()
+  const controller = new AbortController()
+  challengeController = controller
   message.value = ''
   clearChallengeImage()
   try {
-    const response = await fetch('/api/v1/auth/challenge', { credentials: 'include', headers: { Accept: 'image/png' }, cache: 'no-store' })
+    const response = await fetch('/api/v1/auth/challenge', { credentials: 'include', headers: { Accept: 'image/png' }, cache: 'no-store', signal: controller.signal })
     const id = response.headers.get('X-Challenge-ID')
     if (!response.ok || !id) throw new Error('challenge')
+    const nextObjectUrl = URL.createObjectURL(await response.blob())
+    if (generation !== challengeGeneration) {
+      URL.revokeObjectURL(nextObjectUrl)
+      return
+    }
     challengeId.value = id
-    objectUrl = URL.createObjectURL(await response.blob())
-    challengeImageUrl.value = objectUrl
+    objectUrl = nextObjectUrl
+    challengeImageUrl.value = nextObjectUrl
     challengeAnswer.value = ''
   } catch {
+    if (generation !== challengeGeneration || controller.signal.aborted) return
+    clearChallengeImage()
     message.value = '验证码暂时无法加载，请稍后重试'
   }
 }
@@ -65,7 +79,7 @@ async function performSubmit() {
 
 function hasCode(error: unknown, code: string): boolean { return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === code }
 
-onBeforeUnmount(clearChallengeImage)
+onBeforeUnmount(() => { challengeGeneration += 1; challengeController?.abort(); clearChallengeImage() })
 </script>
 
 <template>

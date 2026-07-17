@@ -1,33 +1,45 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { request } from '../api/client'
 import { useSessionStore } from '../stores/session'
 
 const session = useSessionStore()
 const router = useRouter()
+const route = useRoute()
 const drawerOpen = ref(false)
 const logoutPending = ref(false)
+const menuTrigger = ref<HTMLButtonElement>()
+const navigation = ref<HTMLElement>()
+const mediaQuery = typeof window === 'undefined' ? undefined : window.matchMedia('(max-width: 760px)')
+const isMobile = ref(mediaQuery?.matches ?? false)
 const isAdmin = computed(() => session.user?.role === 'admin')
-async function logout() { if (logoutPending.value) return; logoutPending.value = true; try { await request('/auth/logout', { method: 'POST' }) } catch { /* The server session may already be expired. */ } finally { session.clear(); drawerOpen.value = false; logoutPending.value = false; await router.replace('/login') } }
+function closeDrawer(restoreFocus = false) { drawerOpen.value = false; if (restoreFocus) void nextTick(() => menuTrigger.value?.focus()) }
+function openDrawer() { drawerOpen.value = true; void nextTick(() => navigation.value?.querySelector<HTMLElement>('a, button')?.focus()) }
+function handleKeydown(event: KeyboardEvent) { if (event.key === 'Escape' && drawerOpen.value) closeDrawer(true) }
+function updateViewport(event: MediaQueryListEvent) { isMobile.value = event.matches; if (!event.matches) drawerOpen.value = false }
+async function logout() { if (logoutPending.value) return; logoutPending.value = true; try { await request('/auth/logout', { method: 'POST' }) } catch { /* The server session may already be expired. */ } finally { session.clear(); closeDrawer(); logoutPending.value = false; await router.replace('/login') } }
 async function logoutOthers() { try { await request('/auth/logout-others', { method: 'POST' }) } catch { /* The current session remains usable; no secret is displayed. */ } }
+onMounted(() => { document.addEventListener('keydown', handleKeydown); mediaQuery?.addEventListener('change', updateViewport) })
+onBeforeUnmount(() => { document.removeEventListener('keydown', handleKeydown); mediaQuery?.removeEventListener('change', updateViewport) })
+watch(() => route.fullPath, () => closeDrawer())
 </script>
 
 <template>
   <div class="console-shell" :class="{ 'drawer-open': drawerOpen }">
-    <button class="scrim" aria-label="关闭导航" @click="drawerOpen = false"></button>
-    <aside class="sidebar" aria-label="主导航">
+    <button class="scrim" aria-label="关闭导航" @click="closeDrawer()"></button>
+    <aside id="console-navigation" class="sidebar" aria-label="主导航" :aria-hidden="isMobile && !drawerOpen ? 'true' : undefined" :inert="isMobile && !drawerOpen || undefined">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>HappyLearn</span></div>
       <p class="role-label">{{ isAdmin ? '教师空间' : '学生空间' }}</p>
-      <nav>
-        <RouterLink v-if="isAdmin" to="/admin" @click="drawerOpen = false">仪表盘</RouterLink>
+      <nav ref="navigation">
+        <RouterLink v-if="isAdmin" to="/admin" @click="closeDrawer()">仪表盘</RouterLink>
         <button v-if="isAdmin" class="future-link" type="button" aria-label="学生管理（即将开放）">学生管理 <small>即将开放</small></button>
-        <RouterLink v-if="!isAdmin" to="/student" @click="drawerOpen = false">学习首页</RouterLink>
+        <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
       </nav>
       <p class="sidebar-note">高中数学 · 物理<br>循序渐进，稳步提升</p>
     </aside>
     <div class="content-wrap">
-      <header><button class="menu-button" aria-label="打开导航" @click="drawerOpen = true">菜单</button><div class="header-actions"><span class="unread" aria-label="未读消息 0">消息 <b>0</b></span><button class="quiet-button" type="button" @click="logoutOthers">结束其他会话</button><span class="display-name">{{ session.user?.displayName }}</span><button class="logout-button" type="button" :disabled="logoutPending" @click="logout">退出</button></div></header>
+      <header><button ref="menuTrigger" class="menu-button" aria-label="打开导航" :aria-expanded="drawerOpen" aria-controls="console-navigation" @click="openDrawer">菜单</button><div class="header-actions"><span class="unread" aria-label="未读消息 0">消息 <b>0</b></span><button class="quiet-button" type="button" @click="logoutOthers">结束其他会话</button><span class="display-name">{{ session.user?.displayName }}</span><button class="logout-button" type="button" :disabled="logoutPending" @click="logout">退出</button></div></header>
       <main class="page-content"><RouterView /></main>
     </div>
   </div>
