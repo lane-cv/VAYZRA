@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -162,6 +163,41 @@ func TestLoginRequiresChallengeAfterRedisOutageWhenFailuresReachedThreshold(t *t
 	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
 	h := newHTTPTestHandlerWithThrottle(svc, limiter, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "192.0.2.4:1234"
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), `"login_challenge_required"`) || svc.loginCalls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, svc.loginCalls, w.Body.String())
+	}
+}
+
+func TestLoginChallengeSurvivesFallbackPressureDuringRedisOutage(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	limiter := redisx.NewLoginLimiter(rdb, redisx.Policy{Secret: []byte("test-limiter-secret")})
+	for range 3 {
+		if err := limiter.RecordFailure(context.Background(), "victim", "192.0.2.4"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mini.Close()
+
+	for i := 0; i < 4097; i++ {
+		ip := fmt.Sprintf("198.51.%d.%d", i/256, i%256)
+		if i%2 == 1 {
+			ip = fmt.Sprintf("2001:db8::%x", i)
+		}
+		if _, err := limiter.Allow(context.Background(), fmt.Sprintf("pressure-%d", i), ip); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	h := newHTTPTestHandlerWithThrottle(svc, limiter, nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"victim","password":"Long Temporary Password 42!"}`))
 	r.RemoteAddr = "192.0.2.4:1234"
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

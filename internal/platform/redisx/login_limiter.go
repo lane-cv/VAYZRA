@@ -25,6 +25,7 @@ const (
 	challengeFailures      = 3
 	fallbackWindow         = 10 * time.Second
 	fallbackMaxKeys        = 4096
+	challengeMaxKeys       = 4096
 	redisCooldown          = 2 * time.Second
 )
 
@@ -59,9 +60,11 @@ type LoginLimiter struct {
 	policy Policy
 
 	localMu          sync.Mutex
-	local            *localLRU
+	fallback         *localLRU
+	challenges       *localLRU
 	now              func() time.Time
 	breakerUntil     time.Time
+	probing          bool
 	warnAfter        time.Time
 	degradationCount atomic.Uint64
 }
@@ -78,7 +81,9 @@ func NewLoginLimiter(rdb *redis.Client, policy Policy) *LoginLimiter {
 		}
 	}
 	policy.Secret = append([]byte(nil), policy.Secret...)
-	return &LoginLimiter{rdb: rdb, policy: policy, local: newLocalLRU(fallbackMaxKeys), now: time.Now}
+	return &LoginLimiter{
+		rdb: rdb, policy: policy, fallback: newLocalLRU(fallbackMaxKeys), challenges: newLocalLRU(challengeMaxKeys), now: time.Now,
+	}
 }
 
 func normalizedPolicy(policy Policy) Policy {
@@ -122,12 +127,11 @@ return {1, 0, 0}
 // account challenge requirement. The circuit prevents connection-attempt storms.
 func (l *LoginLimiter) Allow(ctx context.Context, username, ip string) (Decision, error) {
 	keys := l.keys(username, ip)
-	if pending := l.localChallenge(keys.account); pending {
-		if !l.redisAvailable() {
-			return Decision{Allowed: true, ChallengeRequired: true}, nil
-		}
+	available := l.redisAvailable()
+	if pending := l.localChallenge(keys.account); pending && !available {
+		return Decision{Allowed: true, ChallengeRequired: true}, nil
 	}
-	if l.rdb == nil || !l.redisAvailable() {
+	if l.rdb == nil || !available {
 		decision := l.allowFallback("f:" + keys.account + ":" + keys.ip)
 		if l.localChallenge(keys.account) {
 			decision.ChallengeRequired = true
@@ -149,6 +153,8 @@ func (l *LoginLimiter) Allow(ctx context.Context, username, ip string) (Decision
 	}
 	if result[2] == 1 {
 		l.setLocalChallenge(keys.account)
+	} else {
+		l.clearLocalChallenge(keys.account)
 	}
 	return Decision{Allowed: true, ChallengeRequired: result[2] == 1 || l.localChallenge(keys.account)}, nil
 }
@@ -189,10 +195,24 @@ func (l *LoginLimiter) breakerOpen() bool {
 	defer l.localMu.Unlock()
 	return l.breakerUntil.After(l.now())
 }
-func (l *LoginLimiter) redisAvailable() bool { return !l.breakerOpen() }
+func (l *LoginLimiter) redisAvailable() bool {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	if l.breakerUntil.After(l.now()) {
+		return false
+	}
+	if !l.breakerUntil.IsZero() {
+		if l.probing {
+			return false
+		}
+		l.probing = true
+	}
+	return true
+}
 func (l *LoginLimiter) resetBreaker() {
 	l.localMu.Lock()
 	l.breakerUntil = time.Time{}
+	l.probing = false
 	l.localMu.Unlock()
 }
 func (l *LoginLimiter) tripBreaker(operation string) {
@@ -200,6 +220,7 @@ func (l *LoginLimiter) tripBreaker(operation string) {
 	l.degradationCount.Add(1)
 	l.localMu.Lock()
 	l.breakerUntil = now.Add(redisCooldown)
+	l.probing = false
 	warn := !l.warnAfter.After(now)
 	if warn {
 		l.warnAfter = now.Add(time.Minute)
@@ -227,17 +248,21 @@ func newLocalLRU(capacity int) *localLRU {
 }
 func (lru *localLRU) Len() int { return len(lru.entries) }
 func (lru *localLRU) get(key string, now time.Time) bool {
+	_, ok := lru.getExpiry(key, now)
+	return ok
+}
+func (lru *localLRU) getExpiry(key string, now time.Time) (time.Time, bool) {
 	e, ok := lru.entries[key]
 	if !ok {
-		return false
+		return time.Time{}, false
 	}
 	if !e.expires.After(now) {
 		lru.order.Remove(e.element)
 		delete(lru.entries, key)
-		return false
+		return time.Time{}, false
 	}
 	lru.order.MoveToFront(e.element)
-	return true
+	return e.expires, true
 }
 func (lru *localLRU) set(key string, expiry time.Time) {
 	if e, ok := lru.entries[key]; ok {
@@ -267,25 +292,29 @@ func (l *LoginLimiter) allowFallback(key string) Decision {
 	now := l.now()
 	l.localMu.Lock()
 	defer l.localMu.Unlock()
-	if l.local.get(key, now) {
-		return Decision{RetryAfter: fallbackWindow}
+	if expiry, ok := l.fallback.getExpiry(key, now); ok {
+		return Decision{RetryAfter: expiry.Sub(now)}
 	}
-	l.local.set(key, now.Add(fallbackWindow))
+	l.fallback.set(key, now.Add(fallbackWindow))
 	return Decision{Allowed: true}
 }
 func (l *LoginLimiter) localChallenge(account string) bool {
 	l.localMu.Lock()
 	defer l.localMu.Unlock()
-	return l.local.get("c:"+account, l.now())
+	return l.challenges.get("c:"+account, l.now())
 }
 func (l *LoginLimiter) setLocalChallenge(account string) {
 	l.localMu.Lock()
-	l.local.set("c:"+account, l.now().Add(l.policy.Window))
-	l.localMu.Unlock()
+	defer l.localMu.Unlock()
+	key := "c:" + account
+	if l.challenges.get(key, l.now()) {
+		return
+	}
+	l.challenges.set(key, l.now().Add(l.policy.Window))
 }
 func (l *LoginLimiter) clearLocalChallenge(account string) {
 	l.localMu.Lock()
-	l.local.delete("c:" + account)
+	l.challenges.delete("c:" + account)
 	l.localMu.Unlock()
 }
 

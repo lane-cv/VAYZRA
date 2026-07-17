@@ -14,6 +14,7 @@ import (
 	"image/draw"
 	"image/png"
 	"io"
+	"math"
 	"math/big"
 	"strings"
 	"time"
@@ -131,12 +132,31 @@ func (s *CaptchaStore) answerHash(answer string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+type glyphTransform struct {
+	x, y           int
+	scaleX, scaleY int
+	shear          int
+	rotation       int
+}
+
 func renderCaptcha(answer string, random io.Reader) ([]byte, error) {
+	imageBody, _, err := renderCaptchaImage(answer, random)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, imageBody); err != nil {
+		return nil, fmt.Errorf("encode captcha: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+func renderCaptchaImage(answer string, random io.Reader) (*image.RGBA, []glyphTransform, error) {
 	imageBody := image.NewRGBA(image.Rect(0, 0, 140, 48))
 	draw.Draw(imageBody, imageBody.Bounds(), &image.Uniform{C: color.RGBA{245, 248, 252, 255}}, image.Point{}, draw.Src)
 	noise := make([]byte, 192)
 	if _, err := io.ReadFull(random, noise); err != nil {
-		return nil, fmt.Errorf("generate captcha distortion: %w", err)
+		return nil, nil, fmt.Errorf("generate captcha distortion: %w", err)
 	}
 	for offset := 0; offset+2 < len(noise); offset += 3 {
 		x, y := int(noise[offset])%140, int(noise[offset+1])%48
@@ -146,14 +166,25 @@ func renderCaptcha(answer string, random io.Reader) ([]byte, error) {
 		y := 5 + int(noise[x%len(noise)]%35)
 		imageBody.Set(x, y, color.RGBA{150, 170, 195, 180})
 	}
+	transformBytes := make([]byte, len(answer)*6)
+	if _, err := io.ReadFull(random, transformBytes); err != nil {
+		return nil, nil, fmt.Errorf("generate captcha glyph transforms: %w", err)
+	}
+	transforms := make([]glyphTransform, 0, len(answer))
 	for index, letter := range answer {
-		drawGlyph(imageBody, 8+index*26, 8+(index%2)*2, letter, color.RGBA{25 + uint8(index*23), 55, 105 + uint8(index*19), 255})
+		offset := index * 6
+		transform := glyphTransform{
+			x:        8 + index*26 + int(transformBytes[offset]%5) - 2,
+			y:        8 + int(transformBytes[offset+1]%5) - 2,
+			scaleX:   3 + int(transformBytes[offset+2]%2),
+			scaleY:   3 + int(transformBytes[offset+3]%2),
+			shear:    int(transformBytes[offset+4]%3) - 1,
+			rotation: int(transformBytes[offset+5]%7) - 3,
+		}
+		drawGlyph(imageBody, letter, color.RGBA{25 + uint8(index*23), 55, 105 + uint8(index*19), 255}, transform)
+		transforms = append(transforms, transform)
 	}
-	var out bytes.Buffer
-	if err := png.Encode(&out, imageBody); err != nil {
-		return nil, fmt.Errorf("encode captcha: %w", err)
-	}
-	return out.Bytes(), nil
+	return imageBody, transforms, nil
 }
 
 var glyphs = map[rune][]string{
@@ -171,16 +202,27 @@ var glyphs = map[rune][]string{
 	'Z': {"11111", "00001", "00010", "00100", "01000", "10000", "11111"},
 }
 
-func drawGlyph(dst *image.RGBA, x, y int, letter rune, c color.Color) {
+func drawGlyph(dst *image.RGBA, letter rune, c color.Color, transform glyphTransform) {
 	pattern := glyphs[letter]
+	centerX := float64(5*transform.scaleX) / 2
+	centerY := float64(7*transform.scaleY) / 2
+	angle := float64(transform.rotation) * math.Pi / 180
+	cosine, sine := math.Cos(angle), math.Sin(angle)
 	for row, line := range pattern {
 		for column, value := range line {
 			if value != '1' {
 				continue
 			}
-			for dy := 0; dy < 4; dy++ {
-				for dx := 0; dx < 4; dx++ {
-					dst.Set(x+column*4+dx, y+row*4+dy, c)
+			for dy := 0; dy < transform.scaleY; dy++ {
+				for dx := 0; dx < transform.scaleX; dx++ {
+					glyphX := float64(column*transform.scaleX + dx)
+					glyphY := float64(row*transform.scaleY + dy)
+					shearedX := glyphX + float64((row-3)*transform.shear)
+					x := int(math.Round(float64(transform.x) + centerX + (shearedX-centerX)*cosine - (glyphY-centerY)*sine))
+					y := int(math.Round(float64(transform.y) + centerY + (shearedX-centerX)*sine + (glyphY-centerY)*cosine))
+					if image.Pt(x, y).In(dst.Bounds()) {
+						dst.Set(x, y, c)
+					}
 				}
 			}
 		}
