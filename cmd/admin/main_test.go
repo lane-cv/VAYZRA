@@ -17,6 +17,9 @@ func TestReadPasswordFileRejectsInsecureAndEmptyFiles(t *testing.T) {
 	if _, err := readPasswordFile(path); err == nil {
 		t.Fatal("empty password accepted")
 	}
+	if runtime.GOOS == "windows" {
+		return
+	}
 	if err := os.WriteFile(path, []byte("Temporary Password 42!\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

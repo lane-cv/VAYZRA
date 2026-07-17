@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,9 @@ import (
 )
 
 func TestRunCreateTeacherCreatesOnlyOneAdmin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows password-file security semantics fail closed")
+	}
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(ctx, pool); err != nil {

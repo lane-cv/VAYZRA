@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -18,9 +19,16 @@ import (
 
 const maxRequestBody = 32 * 1024
 
-type Handler struct{ service HTTPService }
+type HTTPConfig struct{ TrustedProxyCIDRs []netip.Prefix }
+type Handler struct {
+	service           HTTPService
+	trustedProxyCIDRs []netip.Prefix
+}
 
-func NewHandler(service HTTPService) *Handler { return &Handler{service: service} }
+func NewHandler(service HTTPService) *Handler { return NewHandlerWithConfig(service, HTTPConfig{}) }
+func NewHandlerWithConfig(service HTTPService, cfg HTTPConfig) *Handler {
+	return &Handler{service: service, trustedProxyCIDRs: append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...)}
+}
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(auth.RequireRole(auth.RoleAdmin))
@@ -44,7 +52,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	users, next, err := h.service.List(r.Context(), principal(r), limit, after)
+	actor, err := h.principal(r)
+	if err != nil {
+		bad(w, r)
+		return
+	}
+	users, next, err := h.service.List(r.Context(), actor, limit, after)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -79,7 +92,12 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		bad(w, r)
 		return
 	}
-	student, err := h.service.Create(r.Context(), principal(r), CreateInput{Username: input.Username, DisplayName: input.DisplayName, TemporaryPassword: input.TemporaryPassword})
+	actor, err := h.principal(r)
+	if err != nil {
+		bad(w, r)
+		return
+	}
+	student, err := h.service.Create(r.Context(), actor, CreateInput{Username: input.Username, DisplayName: input.DisplayName, TemporaryPassword: input.TemporaryPassword})
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -103,7 +121,12 @@ func (h *Handler) SetStatus(w http.ResponseWriter, r *http.Request) {
 		bad(w, r)
 		return
 	}
-	if err := h.service.SetStatus(r.Context(), principal(r), id, input.Status); err != nil {
+	actor, err := h.principal(r)
+	if err != nil {
+		bad(w, r)
+		return
+	}
+	if err := h.service.SetStatus(r.Context(), actor, id, input.Status); err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
@@ -124,7 +147,12 @@ func (h *Handler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		bad(w, r)
 		return
 	}
-	if err := h.service.ResetPassword(r.Context(), principal(r), id, input.TemporaryPassword); err != nil {
+	actor, err := h.principal(r)
+	if err != nil {
+		bad(w, r)
+		return
+	}
+	if err := h.service.ResetPassword(r.Context(), actor, id, input.TemporaryPassword); err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
@@ -143,13 +171,16 @@ type StudentView struct {
 func studentView(u auth.User) StudentView {
 	return StudentView{ID: u.ID.String(), Username: u.Username, DisplayName: u.DisplayName, Status: u.Status, MustChangePassword: u.MustChangePassword, CreatedAt: u.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")}
 }
-func principal(r *http.Request) Principal {
+func (h *Handler) principal(r *http.Request) (Principal, error) {
 	user, _ := auth.UserFromContext(r.Context())
-	ip, _ := clientIP(r)
-	return Principal{User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: ip}
+	ip, err := h.clientIP(r)
+	if err != nil {
+		return Principal{}, err
+	}
+	return Principal{User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: ip}, nil
 }
-func clientIP(r *http.Request) (net.IP, error) {
-	addr, err := httpx.ClientIP(r, nil)
+func (h *Handler) clientIP(r *http.Request) (net.IP, error) {
+	addr, err := httpx.ClientIP(r, h.trustedProxyCIDRs)
 	if err != nil {
 		return nil, err
 	}

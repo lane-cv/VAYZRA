@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -100,25 +99,6 @@ func parseCreateTeacher(args []string) (createTeacherArgs, error) {
 		return createTeacherArgs{}, errors.New("invalid create-teacher flags")
 	}
 	return result, nil
-}
-func readPasswordFile(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, errors.New("invalid password file")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
-		return nil, errors.New("invalid password file")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 || len(data) > maxPasswordFileBytes {
-		return nil, errors.New("invalid password file")
-	}
-	data = []byte(strings.TrimSuffix(string(data), "\n"))
-	data = []byte(strings.TrimSuffix(string(data), "\r"))
-	if len(data) == 0 {
-		return nil, errors.New("invalid password file")
-	}
-	return data, nil
 }
 func zero(value []byte) {
 	for i := range value {

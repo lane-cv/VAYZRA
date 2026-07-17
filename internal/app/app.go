@@ -59,7 +59,7 @@ func New(d Dependencies) http.Handler {
 				private.Post("/auth/logout", authHTTP.Logout)
 				private.Post("/auth/logout-others", authHTTP.LogoutOthers)
 				if d.Students != nil {
-					private.Mount("/admin/students", students.NewHandler(d.Students).Routes())
+					private.Mount("/admin/students", students.NewHandlerWithConfig(d.Students, students.HTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 			})
 		})

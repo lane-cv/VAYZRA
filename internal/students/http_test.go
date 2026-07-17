@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -51,6 +52,43 @@ func TestRoutesRejectInvalidIDAndStatus(t *testing.T) {
 	}
 }
 
+func TestCreateUsesTrustedForwardedClientIPAndRejectsMalformedForwarding(t *testing.T) {
+	svc := &capturingHTTPService{}
+	h := NewHandlerWithConfig(svc, HTTPConfig{TrustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
+	admin := auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"username":"student01","displayName":"甲","temporaryPassword":"Temporary Password 42!"}`))
+	request.RemoteAddr = "10.1.2.3:443"
+	request.Header.Set("X-Forwarded-For", "198.51.100.4")
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(withUser(request.Context(), admin))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, request)
+	if w.Code != http.StatusCreated || svc.actor.IP.String() != "198.51.100.4" {
+		t.Fatalf("status=%d actor=%#v", w.Code, svc.actor)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"username":"student02","displayName":"乙","temporaryPassword":"Temporary Password 42!"}`))
+	request.RemoteAddr = "203.0.113.8:443"
+	request.Header.Set("X-Forwarded-For", "198.51.100.4")
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(withUser(request.Context(), admin))
+	w = httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, request)
+	if w.Code != http.StatusCreated || svc.actor.IP.String() != "203.0.113.8" {
+		t.Fatalf("untrusted status=%d actor=%#v", w.Code, svc.actor)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"username":"student01","displayName":"甲","temporaryPassword":"Temporary Password 42!"}`))
+	request.RemoteAddr = "10.1.2.3:443"
+	request.Header.Set("X-Forwarded-For", "not-an-ip")
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(withUser(request.Context(), admin))
+	w = httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, request)
+	if w.Code != http.StatusBadRequest || svc.creates != 2 {
+		t.Fatalf("status=%d creates=%d", w.Code, svc.creates)
+	}
+}
+
 type fakeHTTPService struct{}
 
 func (fakeHTTPService) List(context.Context, Principal, int, uuid.UUID) ([]auth.User, uuid.UUID, error) {
@@ -65,4 +103,16 @@ func (fakeHTTPService) SetStatus(context.Context, Principal, uuid.UUID, auth.Sta
 func (fakeHTTPService) ResetPassword(context.Context, Principal, uuid.UUID, string) error { return nil }
 func withUser(ctx context.Context, user auth.User) context.Context {
 	return auth.ContextWithUser(ctx, user)
+}
+
+type capturingHTTPService struct {
+	fakeHTTPService
+	actor   Principal
+	creates int
+}
+
+func (s *capturingHTTPService) Create(_ context.Context, actor Principal, _ CreateInput) (auth.User, error) {
+	s.actor = actor
+	s.creates++
+	return auth.User{ID: uuid.New(), Role: auth.RoleStudent}, nil
 }
