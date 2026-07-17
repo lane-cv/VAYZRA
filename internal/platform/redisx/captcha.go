@@ -38,12 +38,12 @@ type CaptchaService interface {
 // CaptchaStore holds only HMACed answers in Redis. The plaintext answer exists
 // only while Create renders the server-generated image.
 type CaptchaStore struct {
-	rdb    redis.UniversalClient
+	rdb    *redis.Client
 	secret []byte
 	random io.Reader
 }
 
-func NewCaptchaStore(rdb redis.UniversalClient, secret []byte) *CaptchaStore {
+func NewCaptchaStore(rdb *redis.Client, secret []byte) *CaptchaStore {
 	copySecret := append([]byte(nil), secret...)
 	if len(copySecret) == 0 {
 		copySecret = make([]byte, 32)
@@ -67,7 +67,7 @@ func (s *CaptchaStore) Create(ctx context.Context) (Challenge, error) {
 	if err != nil {
 		return Challenge{}, err
 	}
-	pngBody, err := renderCaptcha(answer)
+	pngBody, err := renderCaptcha(answer, s.random)
 	if err != nil {
 		return Challenge{}, err
 	}
@@ -131,11 +131,19 @@ func (s *CaptchaStore) answerHash(answer string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func renderCaptcha(answer string) ([]byte, error) {
+func renderCaptcha(answer string, random io.Reader) ([]byte, error) {
 	imageBody := image.NewRGBA(image.Rect(0, 0, 140, 48))
 	draw.Draw(imageBody, imageBody.Bounds(), &image.Uniform{C: color.RGBA{245, 248, 252, 255}}, image.Point{}, draw.Src)
+	noise := make([]byte, 192)
+	if _, err := io.ReadFull(random, noise); err != nil {
+		return nil, fmt.Errorf("generate captcha distortion: %w", err)
+	}
+	for offset := 0; offset+2 < len(noise); offset += 3 {
+		x, y := int(noise[offset])%140, int(noise[offset+1])%48
+		imageBody.Set(x, y, color.RGBA{80 + noise[offset+2]%120, 100, 150, 150})
+	}
 	for x := 0; x < 140; x += 7 {
-		y := 5 + (x*11)%35
+		y := 5 + int(noise[x%len(noise)]%35)
 		imageBody.Set(x, y, color.RGBA{150, 170, 195, 180})
 	}
 	for index, letter := range answer {

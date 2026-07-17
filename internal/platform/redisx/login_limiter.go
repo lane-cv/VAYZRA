@@ -1,6 +1,7 @@
 package redisx
 
 import (
+	"container/list"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -23,6 +25,7 @@ const (
 	challengeFailures      = 3
 	fallbackWindow         = 10 * time.Second
 	fallbackMaxKeys        = 4096
+	redisCooldown          = 2 * time.Second
 )
 
 // Decision is the result of checking a login request before password work.
@@ -52,17 +55,21 @@ type Limiter interface {
 // LoginLimiter keeps the shared counters in Redis and only retains a bounded
 // ten-second fallback state when Redis cannot be reached.
 type LoginLimiter struct {
-	rdb    redis.UniversalClient
+	rdb    *redis.Client
 	policy Policy
 
-	fallbackMu sync.Mutex
-	fallback   map[string]time.Time
+	localMu          sync.Mutex
+	local            *localLRU
+	now              func() time.Time
+	breakerUntil     time.Time
+	warnAfter        time.Time
+	degradationCount atomic.Uint64
 }
 
 // NewLoginLimiter constructs a limiter. A random secret keeps accidental,
 // non-production uses private; production wiring always supplies a persistent
 // application-specific secret from configuration.
-func NewLoginLimiter(rdb redis.UniversalClient, policy Policy) *LoginLimiter {
+func NewLoginLimiter(rdb *redis.Client, policy Policy) *LoginLimiter {
 	policy = normalizedPolicy(policy)
 	if len(policy.Secret) == 0 {
 		policy.Secret = make([]byte, 32)
@@ -71,7 +78,7 @@ func NewLoginLimiter(rdb redis.UniversalClient, policy Policy) *LoginLimiter {
 		}
 	}
 	policy.Secret = append([]byte(nil), policy.Secret...)
-	return &LoginLimiter{rdb: rdb, policy: policy, fallback: make(map[string]time.Time)}
+	return &LoginLimiter{rdb: rdb, policy: policy, local: newLocalLRU(fallbackMaxKeys), now: time.Now}
 }
 
 func normalizedPolicy(policy Policy) Policy {
@@ -111,53 +118,175 @@ if account >= tonumber(ARGV[1]) then return {1, 0, 1} end
 return {1, 0, 0}
 `)
 
-// Allow returns a safe local fallback decision rather than making Redis an
-// availability dependency. Redis errors are observed internally and are not
-// returned to HTTP clients.
+// Allow fails over to bounded local state while preserving a recently observed
+// account challenge requirement. The circuit prevents connection-attempt storms.
 func (l *LoginLimiter) Allow(ctx context.Context, username, ip string) (Decision, error) {
 	keys := l.keys(username, ip)
-	if l.rdb == nil {
-		return l.allowFallback(keys.account + ":" + keys.ip), nil
+	if pending := l.localChallenge(keys.account); pending {
+		if !l.redisAvailable() {
+			return Decision{Allowed: true, ChallengeRequired: true}, nil
+		}
+	}
+	if l.rdb == nil || !l.redisAvailable() {
+		decision := l.allowFallback("f:" + keys.account + ":" + keys.ip)
+		if l.localChallenge(keys.account) {
+			decision.ChallengeRequired = true
+		}
+		return decision, nil
 	}
 	result, err := allowScript.Run(ctx, l.rdb, []string{keys.account, keys.ip, keys.accountLock, keys.ipLock}, challengeFailures).Int64Slice()
 	if err != nil || len(result) != 3 {
-		l.redisUnavailable("allow")
-		return l.allowFallback(keys.account + ":" + keys.ip), nil
+		l.tripBreaker("allow")
+		decision := l.allowFallback("f:" + keys.account + ":" + keys.ip)
+		if l.localChallenge(keys.account) {
+			decision.ChallengeRequired = true
+		}
+		return decision, nil
 	}
+	l.resetBreaker()
 	if result[0] == 0 {
 		return Decision{RetryAfter: time.Duration(result[1]) * time.Millisecond}, nil
 	}
-	return Decision{Allowed: true, ChallengeRequired: result[2] == 1}, nil
+	if result[2] == 1 {
+		l.setLocalChallenge(keys.account)
+	}
+	return Decision{Allowed: true, ChallengeRequired: result[2] == 1 || l.localChallenge(keys.account)}, nil
 }
 
-// RecordFailure increments account and IP counters together in one Redis
-// script. A Redis outage is intentionally non-fatal because Allow's bounded
-// local fallback protects the next request.
 func (l *LoginLimiter) RecordFailure(ctx context.Context, username, ip string) error {
-	if l.rdb == nil {
-		l.redisUnavailable("record_failure")
+	keys := l.keys(username, ip)
+	if l.rdb == nil || !l.redisAvailable() {
 		return nil
 	}
-	keys := l.keys(username, ip)
-	_, err := recordFailureScript.Run(ctx, l.rdb, []string{keys.account, keys.ip, keys.accountLock, keys.ipLock}, l.policy.Window.Milliseconds(), l.policy.Lockout.Milliseconds(), l.policy.AccountFailures, l.policy.IPFailures).Result()
+	counts, err := recordFailureScript.Run(ctx, l.rdb, []string{keys.account, keys.ip, keys.accountLock, keys.ipLock}, l.policy.Window.Milliseconds(), l.policy.Lockout.Milliseconds(), l.policy.AccountFailures, l.policy.IPFailures).Int64Slice()
 	if err != nil {
-		l.redisUnavailable("record_failure")
+		l.tripBreaker("record_failure")
 		return nil
+	}
+	l.resetBreaker()
+	if len(counts) >= 1 && counts[0] >= challengeFailures {
+		l.setLocalChallenge(keys.account)
 	}
 	return nil
 }
 
-// RecordSuccess clears only account-scoped failures. Shared IP state remains
-// intact so a successful account cannot reset an attacker's IP reputation.
 func (l *LoginLimiter) RecordSuccess(ctx context.Context, username, ip string) error {
-	if l.rdb == nil {
-		l.redisUnavailable("record_success")
+	keys := l.keys(username, ip)
+	l.clearLocalChallenge(keys.account)
+	if l.rdb == nil || !l.redisAvailable() {
 		return nil
 	}
-	if err := l.rdb.Del(ctx, l.keys(username, ip).account).Err(); err != nil {
-		l.redisUnavailable("record_success")
+	if err := l.rdb.Del(ctx, keys.account).Err(); err != nil {
+		l.tripBreaker("record_success")
+	} else {
+		l.resetBreaker()
 	}
 	return nil
+}
+
+func (l *LoginLimiter) breakerOpen() bool {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	return l.breakerUntil.After(l.now())
+}
+func (l *LoginLimiter) redisAvailable() bool { return !l.breakerOpen() }
+func (l *LoginLimiter) resetBreaker() {
+	l.localMu.Lock()
+	l.breakerUntil = time.Time{}
+	l.localMu.Unlock()
+}
+func (l *LoginLimiter) tripBreaker(operation string) {
+	now := l.now()
+	l.degradationCount.Add(1)
+	l.localMu.Lock()
+	l.breakerUntil = now.Add(redisCooldown)
+	warn := !l.warnAfter.After(now)
+	if warn {
+		l.warnAfter = now.Add(time.Minute)
+	}
+	l.localMu.Unlock()
+	if warn {
+		log.Printf("level=warn event=login_limiter_redis_unavailable metric=login_limiter_redis_errors_total operation=%s", operation)
+	}
+}
+func (l *LoginLimiter) DegradationCount() uint64 { return l.degradationCount.Load() }
+
+type localEntry struct {
+	key     string
+	expires time.Time
+	element *list.Element
+}
+type localLRU struct {
+	entries  map[string]*localEntry
+	order    *list.List
+	capacity int
+}
+
+func newLocalLRU(capacity int) *localLRU {
+	return &localLRU{entries: make(map[string]*localEntry), order: list.New(), capacity: capacity}
+}
+func (lru *localLRU) Len() int { return len(lru.entries) }
+func (lru *localLRU) get(key string, now time.Time) bool {
+	e, ok := lru.entries[key]
+	if !ok {
+		return false
+	}
+	if !e.expires.After(now) {
+		lru.order.Remove(e.element)
+		delete(lru.entries, key)
+		return false
+	}
+	lru.order.MoveToFront(e.element)
+	return true
+}
+func (lru *localLRU) set(key string, expiry time.Time) {
+	if e, ok := lru.entries[key]; ok {
+		e.expires = expiry
+		lru.order.MoveToFront(e.element)
+		return
+	}
+	if len(lru.entries) >= lru.capacity {
+		back := lru.order.Back()
+		if back != nil {
+			old := back.Value.(*localEntry)
+			delete(lru.entries, old.key)
+			lru.order.Remove(back)
+		}
+	}
+	e := &localEntry{key: key, expires: expiry}
+	e.element = lru.order.PushFront(e)
+	lru.entries[key] = e
+}
+func (lru *localLRU) delete(key string) {
+	if e, ok := lru.entries[key]; ok {
+		lru.order.Remove(e.element)
+		delete(lru.entries, key)
+	}
+}
+func (l *LoginLimiter) allowFallback(key string) Decision {
+	now := l.now()
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	if l.local.get(key, now) {
+		return Decision{RetryAfter: fallbackWindow}
+	}
+	l.local.set(key, now.Add(fallbackWindow))
+	return Decision{Allowed: true}
+}
+func (l *LoginLimiter) localChallenge(account string) bool {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	return l.local.get("c:"+account, l.now())
+}
+func (l *LoginLimiter) setLocalChallenge(account string) {
+	l.localMu.Lock()
+	l.local.set("c:"+account, l.now().Add(l.policy.Window))
+	l.localMu.Unlock()
+}
+func (l *LoginLimiter) clearLocalChallenge(account string) {
+	l.localMu.Lock()
+	l.local.delete("c:" + account)
+	l.localMu.Unlock()
 }
 
 type limiterKeys struct {
@@ -191,36 +320,4 @@ func canonicalIP(value string) string {
 		return "invalid"
 	}
 	return address.Unmap().String()
-}
-
-func (l *LoginLimiter) allowFallback(key string) Decision {
-	now := time.Now()
-	l.fallbackMu.Lock()
-	defer l.fallbackMu.Unlock()
-	for candidate, expiresAt := range l.fallback {
-		if !expiresAt.After(now) {
-			delete(l.fallback, candidate)
-		}
-	}
-	if expiresAt, ok := l.fallback[key]; ok {
-		return Decision{RetryAfter: time.Until(expiresAt)}
-	}
-	if len(l.fallback) >= fallbackMaxKeys {
-		var oldest string
-		var oldestExpiry time.Time
-		for candidate, expiresAt := range l.fallback {
-			if oldest == "" || expiresAt.Before(oldestExpiry) {
-				oldest, oldestExpiry = candidate, expiresAt
-			}
-		}
-		delete(l.fallback, oldest)
-	}
-	l.fallback[key] = now.Add(fallbackWindow)
-	return Decision{Allowed: true}
-}
-
-func (l *LoginLimiter) redisUnavailable(operation string) {
-	// Deliberately structured and credential-free: usernames, IPs, answers,
-	// Redis URLs, and request bodies must never reach logs or metrics.
-	log.Printf("level=warn event=login_limiter_redis_unavailable metric=login_limiter_redis_errors_total operation=%s", operation)
 }

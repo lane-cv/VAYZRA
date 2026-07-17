@@ -17,9 +17,9 @@ func NewClient(rawURL string) (*redis.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse redis URL: %w", err)
 	}
-	options.DialTimeout = 2 * time.Second
-	options.ReadTimeout = 2 * time.Second
-	options.WriteTimeout = 2 * time.Second
+	options.DialTimeout = 250 * time.Millisecond
+	options.ReadTimeout = 250 * time.Millisecond
+	options.WriteTimeout = 250 * time.Millisecond
 	options.MaxRetries = 0
 	return redis.NewClient(options), nil
 }

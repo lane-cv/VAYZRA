@@ -17,7 +17,7 @@ func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 	env := map[string]string{
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
-		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
 		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
 	}
 
@@ -35,7 +35,7 @@ func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 		"HAPPYLEARN_ENV":                   "prodution",
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
-		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
 		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
 	}
 

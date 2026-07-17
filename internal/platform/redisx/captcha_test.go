@@ -10,7 +10,7 @@ import (
 func TestCaptchaVerifyIsOneTimeAndRejectsWrongAnswers(t *testing.T) {
 	rdb, _ := startRedis(t)
 	store := NewCaptchaStore(rdb, []byte("test-captcha-secret"))
-	store.random = bytes.NewReader(bytes.Repeat([]byte{0}, 128))
+	store.random = bytes.NewReader(bytes.Repeat([]byte{0}, 512))
 	challenge, err := store.Create(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +40,7 @@ func TestCaptchaVerifyIsOneTimeAndRejectsWrongAnswers(t *testing.T) {
 func TestCaptchaExpiresAndFailsClosedWhenRedisIsUnavailable(t *testing.T) {
 	rdb, mini := startRedis(t)
 	store := NewCaptchaStore(rdb, []byte("test-captcha-secret"))
-	store.random = bytes.NewReader(bytes.Repeat([]byte{0}, 128))
+	store.random = bytes.NewReader(bytes.Repeat([]byte{0}, 512))
 	challenge, err := store.Create(context.Background())
 	if err != nil {
 		t.Fatal(err)
