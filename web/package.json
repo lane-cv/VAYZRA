@@ -1,0 +1,26 @@
+{
+  "name": "@happylearn/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "vitest run",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "vue-tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "element-plus": ">=2.11 <3",
+    "pinia": ">=3 <4",
+    "vue": ">=3.5 <4",
+    "vue-router": ">=4.5 <5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": ">=6 <7",
+    "@vue/test-utils": ">=2.4 <3",
+    "jsdom": ">=26 <28",
+    "typescript": ">=5.9 <6",
+    "vite": ">=7 <9",
+    "vitest": ">=3 <5",
+    "vue-tsc": ">=3 <4"
+  }
+}
