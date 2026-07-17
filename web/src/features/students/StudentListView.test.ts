@@ -54,6 +54,8 @@ describe('StudentListView', () => {
     vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveList = resolve }))
     const wrapper = mountStudentList()
     expect(wrapper.get('[role="status"]').text()).toContain('正在加载学生')
+    expect(wrapper.text()).not.toContain('还没有学生账号')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
     resolveList?.(new Response(JSON.stringify({ error: { code: 'internal_error', message: '服务暂不可用', requestId: 'req-students-1' } }), { status: 500 }))
     await flushPromises()
     expect(wrapper.get('[role="alert"]').text()).toContain('支持编号：req-students-1')

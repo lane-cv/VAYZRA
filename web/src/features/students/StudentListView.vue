@@ -244,8 +244,8 @@ onBeforeUnmount(() => { loadGeneration += 1; activeLoad?.abort(); setBackgroundI
       <p>{{ loadError }}<span v-if="loadRequestId"> 支持编号：{{ loadRequestId }}</span></p>
       <button type="button" aria-label="重试加载学生" @click="retryLoad">重试</button>
     </section>
-    <section v-else-if="students.length === 0" class="state empty" aria-live="polite"><h2>还没有学生账号</h2><p>可使用“创建学生”添加第一位学生。</p></section>
-    <div v-else-if="!loadError" class="student-table-wrap">
+    <section v-else-if="!loading && students.length === 0" class="state empty" aria-live="polite"><h2>还没有学生账号</h2><p>可使用“创建学生”添加第一位学生。</p></section>
+    <div v-else-if="!loadError && students.length > 0" class="student-table-wrap">
       <table>
         <thead><tr><th scope="col">账号</th><th scope="col">姓名</th><th scope="col">状态</th><th scope="col">首次密码</th><th scope="col">创建时间</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
         <tbody>
