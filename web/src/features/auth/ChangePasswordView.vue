@@ -13,19 +13,22 @@ const pending = ref(false)
 const message = ref('')
 const requestId = ref('')
 const logoutPending = ref(false)
+let authOperation = 0
 
 function clearPasswords() { currentPassword.value = ''; newPassword.value = ''; confirmation.value = '' }
-async function logout() { if (logoutPending.value || pending.value) return; logoutPending.value = true; try { await session.logout() } catch { message.value = '退出登录未获确认，但已清除本机登录状态' } finally { logoutPending.value = false; await router.replace('/login') } }
+async function logout() { if (logoutPending.value || pending.value) return; authOperation += 1; clearPasswords(); logoutPending.value = true; try { await session.logout() } catch { message.value = '退出登录未获确认，但已清除本机登录状态' } finally { logoutPending.value = false; await router.replace('/login') } }
 function submit() { void performSubmit() }
 
 async function performSubmit() {
-  if (pending.value) return
+  if (pending.value || logoutPending.value) return
   requestId.value = ''
   if (!currentPassword.value || !newPassword.value || !confirmation.value) { message.value = '请填写全部密码字段'; return }
   if (newPassword.value !== confirmation.value) { message.value = '两次输入的新密码不一致'; return }
+  const operation = ++authOperation
   pending.value = true; message.value = ''
   try {
     await request<UserView>('/auth/change-password', { method: 'POST', json: { currentPassword: currentPassword.value, newPassword: newPassword.value } })
+    if (operation !== authOperation) return
     clearPasswords()
     await session.refresh()
     if (!session.user) { await router.replace('/login'); return }
@@ -43,11 +46,11 @@ async function performSubmit() {
     <section class="auth-card" aria-labelledby="change-title">
       <p class="eyebrow">首次登录保护</p><h1 id="change-title">设置新的登录密码</h1><p class="intro">为了保护你的学习记录，请先完成密码更新。</p>
       <button class="text-button" type="button" :disabled="pending || logoutPending" @click="logout">{{ logoutPending ? '正在退出…' : '退出登录' }}</button><form @submit.prevent="submit" novalidate>
-        <label for="current-password">当前密码</label><input id="current-password" v-model="currentPassword" aria-label="当前密码" type="password" autocomplete="current-password" :disabled="pending" />
-        <label for="new-password">新密码</label><input id="new-password" v-model="newPassword" aria-label="新密码" type="password" autocomplete="new-password" :disabled="pending" />
-        <label for="confirm-password">确认新密码</label><input id="confirm-password" v-model="confirmation" aria-label="确认新密码" type="password" autocomplete="new-password" :disabled="pending" />
+        <label for="current-password">当前密码</label><input id="current-password" v-model="currentPassword" aria-label="当前密码" type="password" autocomplete="current-password" :disabled="pending || logoutPending" />
+        <label for="new-password">新密码</label><input id="new-password" v-model="newPassword" aria-label="新密码" type="password" autocomplete="new-password" :disabled="pending || logoutPending" />
+        <label for="confirm-password">确认新密码</label><input id="confirm-password" v-model="confirmation" aria-label="确认新密码" type="password" autocomplete="new-password" :disabled="pending || logoutPending" />
         <p v-if="message" class="form-message" role="alert">{{ message }}<span v-if="requestId"> 支持编号：{{ requestId }}</span></p>
-        <button class="primary-button" type="submit" :disabled="pending">{{ pending ? '正在更新…' : '保存新密码' }}</button>
+        <button class="primary-button" type="submit" :disabled="pending || logoutPending">{{ pending ? '正在更新…' : '保存新密码' }}</button>
       </form>
     </section>
   </main>

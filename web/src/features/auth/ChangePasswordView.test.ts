@@ -33,4 +33,26 @@ describe('ChangePasswordView', () => {
     expect(wrapper.text()).not.toContain('private-current'); expect(wrapper.text()).not.toContain('private-new')
     expect(replace).toHaveBeenCalledWith('/login')
   })
+  it('serializes logout against password updates and clears secrets immediately', async () => {
+    let resolveLogout!: (response: Response) => void
+    const logoutResponse = new Promise<Response>((resolve) => { resolveLogout = resolve })
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((url) => String(url).includes('/auth/logout') ? logoutResponse : Promise.resolve(new Response(JSON.stringify({ data: null }))))
+    const { wrapper } = mountView()
+    await wrapper.get('input[aria-label="当前密码"]').setValue('private-current'); await wrapper.get('input[aria-label="新密码"]').setValue('private-new'); await wrapper.get('input[aria-label="确认新密码"]').setValue('private-new')
+    await wrapper.get('button[type="button"]').trigger('click')
+    expect((wrapper.get('input[aria-label="当前密码"]').element as HTMLInputElement).value).toBe('')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined(); expect(wrapper.get('input[aria-label="新密码"]').attributes('disabled')).toBeDefined()
+    await (wrapper.vm as any).performSubmit(); expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes('/auth/change-password'))).toHaveLength(0)
+    resolveLogout(new Response(null, { status: 204 })); await flushPromises()
+  })
+  it('refuses logout while a password update is pending', async () => {
+    let resolveChange!: (response: Response) => void
+    const changeResponse = new Promise<Response>((resolve) => { resolveChange = resolve })
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((url) => String(url).includes('/auth/change-password') ? changeResponse : Promise.resolve(new Response(JSON.stringify({ data: { id: 'u1', username: 'student', displayName: '学生', role: 'student', mustChangePassword: false } }))))
+    const { wrapper } = mountView()
+    await wrapper.get('input[aria-label="当前密码"]').setValue('old'); await wrapper.get('input[aria-label="新密码"]').setValue('new'); await wrapper.get('input[aria-label="确认新密码"]').setValue('new'); await wrapper.get('form').trigger('submit')
+    expect(wrapper.get('button[type="button"]').attributes('disabled')).toBeDefined()
+    await (wrapper.vm as any).logout(); expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes('/auth/logout'))).toHaveLength(0)
+    resolveChange(new Response(JSON.stringify({ data: {} }))); await flushPromises()
+  })
 })

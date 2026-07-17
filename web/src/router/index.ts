@@ -22,9 +22,15 @@ const homeFor = (role: Role) => role === 'admin' ? '/admin' : '/student'
 
 export function createAppRouter(history: RouterHistory = createWebHistory()) {
   const router = createRouter({ history, routes })
+  let skipBootstrapForLogin = false
   router.beforeEach(async (to) => {
     const session = useSessionStore()
-    try { await session.bootstrap() } catch { session.clear() }
+    if (to.name === 'login' && skipBootstrapForLogin) { skipBootstrapForLogin = false; return true }
+    try { await session.bootstrap() } catch {
+      if (to.name === 'login') return true
+      skipBootstrapForLogin = true
+      return { path: '/login' }
+    }
     const user = session.user
     if (!user) return to.meta.requiresAuth ? { path: '/login' } : true
     if (user.mustChangePassword && !to.meta.allowDuringPasswordChange) return { path: '/change-password' }

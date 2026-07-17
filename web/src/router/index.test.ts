@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { createAppRouter } from './index'
 import { useSessionStore } from '../stores/session'
@@ -12,5 +12,13 @@ describe('console router guards', () => {
   })
   it('redirects an authenticated user away from login without a loop', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/login'); expect(router.currentRoute.value.fullPath).toBe('/admin')
+  })
+  it('keeps a transient bootstrap failure retryable while reaching login without a loop', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(new Response(JSON.stringify({ data: { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false } })))
+    const session = useSessionStore(); const router = createAppRouter()
+    await router.push('/student')
+    expect(router.currentRoute.value.fullPath).toBe('/login'); expect(session.bootstrapStatus).toBe('idle'); expect(session.user).toBeNull()
+    await router.push('/student')
+    expect(router.currentRoute.value.fullPath).toBe('/admin'); expect(session.bootstrapStatus).toBe('ready'); expect(session.user?.role).toBe('admin')
   })
 })
