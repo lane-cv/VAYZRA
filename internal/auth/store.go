@@ -30,3 +30,7 @@ type SessionStore interface {
 	RevokeAllForUser(context.Context, uuid.UUID, string) error
 	RevokeAllExceptForUser(context.Context, uuid.UUID, uuid.UUID, string) error
 }
+
+type PasswordRotationStore interface {
+	RotatePassword(context.Context, PasswordRotationParams) error
+}

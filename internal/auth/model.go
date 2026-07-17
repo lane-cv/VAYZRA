@@ -66,3 +66,11 @@ type CreateSessionParams struct {
 	IdleExpiresAt     time.Time
 	AbsoluteExpiresAt time.Time
 }
+
+type PasswordRotationParams struct {
+	UserID               uuid.UUID
+	ExpectedPasswordHash string
+	PasswordHash         string
+	MustChangePassword   bool
+	ReplacementSession   CreateSessionParams
+}

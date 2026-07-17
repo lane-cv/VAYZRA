@@ -37,6 +37,25 @@ func TestPasswordHasherRejectsMalformedOrNonArgon2idPHC(t *testing.T) {
 	}
 }
 
+func TestParsePHCRejectsUnsafeWorkParametersBeforeComparison(t *testing.T) {
+	for _, encoded := range []string{
+		"$argon2id$v=19$m=131073,t=3,p=2$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
+		"$argon2id$v=19$m=65536,t=5,p=2$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
+		"$argon2id$v=19$m=65536,t=3,p=5$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
+	} {
+		if _, _, _, err := parsePHC(encoded); err == nil {
+			t.Fatalf("accepted unsafe PHC parameters: %q", encoded)
+		}
+	}
+}
+
+func TestPasswordHasherRejectsOversizedPHCWithoutCredentialDetail(t *testing.T) {
+	h := NewPasswordHasher(Argon2Params{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2, SaltLength: 16, KeyLength: 32})
+	encoded := "$argon2id$v=19$m=65536,t=3,p=2$" + strings.Repeat("A", 600) + "$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"
+	if err := h.Compare(encoded, "Correct Horse Battery Staple 42!"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("error=%v", err)
+	}
+}
 func TestPasswordPolicyUsesUnicodeCodePointsAndRejectsEdgeWhitespace(t *testing.T) {
 	for _, password := range []string{"short", strings.Repeat("a", 129), " leading space password", "trailing space password ", strings.Repeat("密", 11)} {
 		if err := ValidatePassword(password); err == nil {
@@ -45,5 +64,11 @@ func TestPasswordPolicyUsesUnicodeCodePointsAndRejectsEdgeWhitespace(t *testing.
 	}
 	if err := ValidatePassword(strings.Repeat("密", 12)); err != nil {
 		t.Fatalf("rejected twelve Unicode code points: %v", err)
+	}
+}
+
+func TestPasswordPolicyRejectsInvalidUTF8(t *testing.T) {
+	if err := ValidatePassword(string([]byte{0xff, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'})); err == nil {
+		t.Fatal("accepted invalid UTF-8 password")
 	}
 }

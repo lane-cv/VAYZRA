@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"strings"
@@ -229,6 +230,57 @@ func (s *PostgresSessionStore) RecordLoginEvent(ctx context.Context, event Login
 	return mapStoreError(err)
 }
 
+func (s *PostgresSessionStore) RotatePassword(ctx context.Context, params PasswordRotationParams) error {
+	if params.UserID == uuid.Nil || params.ReplacementSession.UserID != params.UserID || params.ReplacementSession.ID == uuid.Nil {
+		return ErrConflict
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return mapStoreError(err)
+	}
+	defer tx.Rollback(context.Background())
+
+	var currentHash string
+	var status Status
+	if err := tx.QueryRow(ctx, `
+		SELECT password_hash, status
+		FROM users
+		WHERE id = $1 AND deleted_at IS NULL
+		FOR UPDATE`, params.UserID).Scan(&currentHash, &status); err != nil {
+		return mapStoreError(err)
+	}
+	if status != StatusActive || subtle.ConstantTimeCompare([]byte(currentHash), []byte(params.ExpectedPasswordHash)) != 1 {
+		return ErrConflict
+	}
+	result, err := tx.Exec(ctx, `
+		UPDATE users
+		SET password_hash = $2, must_change_password = $3, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL`, params.UserID, params.PasswordHash, params.MustChangePassword)
+	if err != nil {
+		return mapStoreError(err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions
+		SET revoked_at = now(), revoke_reason = 'password changed'
+		WHERE user_id = $1 AND revoked_at IS NULL`, params.UserID); err != nil {
+		return mapStoreError(err)
+	}
+	p := params.ReplacementSession
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sessions (
+			id, user_id, token_hash, user_agent, ip, created_at, last_seen_at, idle_expires_at, absolute_expires_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		p.ID, p.UserID, p.TokenHash[:], p.UserAgent, p.IP, p.CreatedAt.UTC(), p.LastSeenAt.UTC(), p.IdleExpiresAt.UTC(), p.AbsoluteExpiresAt.UTC()); err != nil {
+		return mapStoreError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return mapStoreError(err)
+	}
+	return nil
+}
 func scanUser(row pgx.Row) (User, error) {
 	var user User
 	if err := row.Scan(

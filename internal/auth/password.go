@@ -88,9 +88,20 @@ func (h PasswordHasher) hashWithSalt(password string, salt []byte) (string, erro
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash)), nil
 }
 
+const (
+	maxPHCEncodedLength  = 512
+	maxPHCBase64Length   = 88
+	maxArgon2MemoryKiB   = 128 * 1024
+	maxArgon2Iterations  = 4
+	maxArgon2Parallelism = 4
+)
+
 func parsePHC(encoded string) (Argon2Params, []byte, []byte, error) {
+	if len(encoded) > maxPHCEncodedLength {
+		return Argon2Params{}, nil, nil, errors.New("invalid PHC format")
+	}
 	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" {
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || len(parts[4]) > maxPHCBase64Length || len(parts[5]) > maxPHCBase64Length {
 		return Argon2Params{}, nil, nil, errors.New("invalid PHC format")
 	}
 	paramParts := strings.Split(parts[3], ",")
@@ -161,7 +172,7 @@ func validateArgon2Params(params Argon2Params) error {
 }
 
 func validateArgon2Work(params Argon2Params) error {
-	if params.MemoryKiB < 8*uint32(params.Parallelism) || params.MemoryKiB > 1024*1024 || params.Iterations == 0 || params.Iterations > 10 || params.Parallelism == 0 || params.Parallelism > 64 {
+	if params.MemoryKiB < 8*uint32(params.Parallelism) || params.MemoryKiB > maxArgon2MemoryKiB || params.Iterations == 0 || params.Iterations > maxArgon2Iterations || params.Parallelism == 0 || params.Parallelism > maxArgon2Parallelism {
 		return errors.New("invalid Argon2 parameters")
 	}
 	return nil

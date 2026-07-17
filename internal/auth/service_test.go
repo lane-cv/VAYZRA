@@ -130,8 +130,8 @@ func TestChangePasswordVerifiesCurrentRevokesSessionsAndReplacesCurrentSession(t
 	if err != nil || replacement == "" || replacement == rawA {
 		t.Fatalf("change err=%v replacement=%q", err, replacement)
 	}
-	if stores.users["student01"].MustChangePassword || stores.revokeAllCount != 1 {
-		t.Fatalf("user=%#v revocations=%d", stores.users["student01"], stores.revokeAllCount)
+	if stores.users["student01"].MustChangePassword || stores.rotationCalls != 1 {
+		t.Fatalf("user=%#v rotations=%d", stores.users["student01"], stores.rotationCalls)
 	}
 	if _, err := svc.Authenticate(context.Background(), rawA); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("old current token error=%v", err)
@@ -176,14 +176,16 @@ func TestChangePasswordRejectsInvalidCurrentPasswordAndLogoutOperationsRevoke(t 
 }
 
 type testStores struct {
-	users             map[string]User
-	sessions          map[[32]byte]*Session
-	events            []LoginEvent
-	now               time.Time
-	touchCount        int
-	revokeAllCount    int
-	dummyCompareCount int
-	hasher            PasswordHasher
+	users          map[string]User
+	sessions       map[[32]byte]*Session
+	events         []LoginEvent
+	now            time.Time
+	touchCount     int
+	revokeAllCount int
+	rotationCalls  int
+	rotationErr    error
+	eventErr       error
+	hasher         PasswordHasher
 }
 
 func newTestService(t *testing.T, now time.Time) (*Service, *testStores) {
@@ -191,7 +193,11 @@ func newTestService(t *testing.T, now time.Time) (*Service, *testStores) {
 	h := NewPasswordHasher(Argon2Params{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32})
 	s := &testStores{users: make(map[string]User), sessions: make(map[[32]byte]*Session), now: now, hasher: h}
 	s.users["student01"] = s.userWithPassword(t, "student01", StatusActive, true)
-	return NewService(ServiceConfig{Users: testUserStore{s}, Sessions: testSessionStore{s}, LoginEvents: testEventStore{s}, Hasher: h, Now: func() time.Time { return s.now }}), s
+	svc, err := NewService(ServiceConfig{Users: testUserStore{s}, Sessions: testSessionStore{s}, LoginEvents: testEventStore{s}, PasswordRotations: testPasswordRotationStore{s}, Hasher: h, Now: func() time.Time { return s.now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc, s
 }
 
 func (s *testStores) userWithPassword(t *testing.T, username string, status Status, mustChange bool) User {
@@ -301,8 +307,42 @@ func (f testSessionStore) RevokeAllExceptForUser(_ context.Context, userID, exce
 type testEventStore struct{ s *testStores }
 
 func (f testEventStore) RecordLoginEvent(_ context.Context, event LoginEvent) error {
+	if f.s.eventErr != nil {
+		return f.s.eventErr
+	}
 	f.s.events = append(f.s.events, event)
 	return nil
 }
 
 func tokenHash(raw string) [32]byte { return sha256.Sum256([]byte(raw)) }
+
+type testPasswordRotationStore struct{ s *testStores }
+
+func (f testPasswordRotationStore) RotatePassword(_ context.Context, params PasswordRotationParams) error {
+	f.s.rotationCalls++
+	if f.s.rotationErr != nil {
+		return f.s.rotationErr
+	}
+	for key, user := range f.s.users {
+		if user.ID != params.UserID {
+			continue
+		}
+		if user.PasswordHash != params.ExpectedPasswordHash || params.ReplacementSession.UserID != user.ID {
+			return ErrConflict
+		}
+		user.PasswordHash = params.PasswordHash
+		user.MustChangePassword = params.MustChangePassword
+		f.s.users[key] = user
+		for _, session := range f.s.sessions {
+			if session.UserID == user.ID && session.RevokedAt == nil {
+				now := f.s.now
+				reason := "password changed"
+				session.RevokedAt, session.RevokeReason = &now, &reason
+			}
+		}
+		p := params.ReplacementSession
+		f.s.sessions[p.TokenHash] = &Session{ID: p.ID, UserID: p.UserID, TokenHash: p.TokenHash, UserAgent: p.UserAgent, IP: p.IP, CreatedAt: p.CreatedAt, LastSeenAt: p.LastSeenAt, IdleExpiresAt: p.IdleExpiresAt, AbsoluteExpiresAt: p.AbsoluteExpiresAt}
+		return nil
+	}
+	return ErrNotFound
+}

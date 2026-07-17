@@ -16,7 +16,10 @@ const (
 	sessionTouchPeriod = 5 * time.Minute
 )
 
-var ErrUnauthenticated = errors.New("unauthenticated")
+var (
+	ErrUnauthenticated      = errors.New("unauthenticated")
+	ErrInvalidConfiguration = errors.New("invalid auth service configuration")
+)
 
 type LoginEvent struct {
 	UserID     *uuid.UUID
@@ -33,20 +36,23 @@ type LoginEventStore interface {
 }
 
 type ServiceConfig struct {
-	Users       UserStore
-	Sessions    SessionStore
-	LoginEvents LoginEventStore
-	Hasher      PasswordHasher
-	Now         func() time.Time
+	Users             UserStore
+	Sessions          SessionStore
+	LoginEvents       LoginEventStore
+	PasswordRotations PasswordRotationStore
+	Hasher            PasswordHasher
+	Now               func() time.Time
 }
 
 type Service struct {
-	users       UserStore
-	sessions    SessionStore
-	loginEvents LoginEventStore
-	hasher      PasswordHasher
-	dummyHash   string
-	now         func() time.Time
+	users             UserStore
+	sessions          SessionStore
+	loginEvents       LoginEventStore
+	passwordRotations PasswordRotationStore
+	hasher            PasswordHasher
+	dummyHash         string
+	compare           func(string, string) error
+	now               func() time.Time
 }
 
 type LoginInput struct {
@@ -69,17 +75,30 @@ type Authentication struct {
 	Session Session
 }
 
-func NewService(config ServiceConfig) *Service {
+func NewService(config ServiceConfig) (*Service, error) {
+	if config.Users == nil || config.Sessions == nil || config.LoginEvents == nil || config.PasswordRotations == nil {
+		return nil, ErrInvalidConfiguration
+	}
 	hasher := config.Hasher
 	if hasher.params == (Argon2Params{}) {
 		hasher = NewPasswordHasher(Argon2Params{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2, SaltLength: 16, KeyLength: 32})
+	}
+	if err := validateArgon2Params(hasher.params); err != nil {
+		return nil, ErrInvalidConfiguration
+	}
+	dummySalt := make([]byte, hasher.params.SaltLength)
+	for i := range dummySalt {
+		dummySalt[i] = byte(i)
+	}
+	dummyHash, err := hasher.hashWithSalt("HappyLearn invalid login dummy password", dummySalt)
+	if err != nil {
+		return nil, ErrInvalidConfiguration
 	}
 	now := config.Now
 	if now == nil {
 		now = time.Now
 	}
-	dummyHash, _ := hasher.hashWithSalt("HappyLearn invalid login dummy password", []byte("0123456789abcdef"))
-	return &Service{users: config.Users, sessions: config.Sessions, loginEvents: config.LoginEvents, hasher: hasher, dummyHash: dummyHash, now: now}
+	return &Service{users: config.Users, sessions: config.Sessions, loginEvents: config.LoginEvents, passwordRotations: config.PasswordRotations, hasher: hasher, dummyHash: dummyHash, compare: hasher.Compare, now: now}, nil
 }
 
 func (s *Service) Login(ctx context.Context, input LoginInput) (Authentication, string, error) {
@@ -87,12 +106,12 @@ func (s *Service) Login(ctx context.Context, input LoginInput) (Authentication, 
 	user, err := s.users.FindByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			_ = s.hasher.Compare(s.dummyHash, input.Password)
+			_ = s.compare(s.dummyHash, input.Password)
 			return Authentication{}, "", s.failedLogin(ctx, nil, username, "unknown_user", input)
 		}
 		return Authentication{}, "", ErrInvalidCredentials
 	}
-	if err := s.hasher.Compare(user.PasswordHash, input.Password); err != nil {
+	if err := s.compare(user.PasswordHash, input.Password); err != nil {
 		return Authentication{}, "", s.failedLogin(ctx, &user.ID, username, "invalid_password", input)
 	}
 	if user.Status != StatusActive {
@@ -104,7 +123,7 @@ func (s *Service) Login(ctx context.Context, input LoginInput) (Authentication, 
 	}
 	if err := s.recordLoginEvent(ctx, &user.ID, username, true, "success", input.IP, input.UserAgent); err != nil {
 		_ = s.sessions.Revoke(ctx, result.Session.ID, "login event failed")
-		return Authentication{}, "", err
+		return Authentication{}, "", ErrInvalidCredentials
 	}
 	return result, raw, nil
 }
@@ -116,10 +135,7 @@ func (s *Service) Authenticate(ctx context.Context, rawToken string) (Authentica
 	now := s.now().UTC()
 	hash := sha256.Sum256([]byte(rawToken))
 	session, user, err := s.sessions.FindActiveByTokenHash(ctx, hash, now)
-	if err != nil {
-		return Authentication{}, ErrUnauthenticated
-	}
-	if user.Status != StatusActive {
+	if err != nil || user.Status != StatusActive {
 		return Authentication{}, ErrUnauthenticated
 	}
 	if now.Sub(session.LastSeenAt) >= sessionTouchPeriod {
@@ -141,7 +157,7 @@ func (s *Service) ChangePassword(ctx context.Context, input ChangePasswordInput)
 	if err != nil {
 		return Authentication{}, "", err
 	}
-	if err := s.hasher.Compare(current.User.PasswordHash, input.CurrentPassword); err != nil {
+	if err := s.compare(current.User.PasswordHash, input.CurrentPassword); err != nil {
 		return Authentication{}, "", ErrInvalidCredentials
 	}
 	if err := ValidatePassword(input.NewPassword); err != nil {
@@ -151,15 +167,16 @@ func (s *Service) ChangePassword(ctx context.Context, input ChangePasswordInput)
 	if err != nil {
 		return Authentication{}, "", err
 	}
-	if err := s.users.UpdatePassword(ctx, current.User.ID, newHash, false); err != nil {
+	session, raw, err := s.newSession(current.User, input.IP, input.UserAgent)
+	if err != nil {
 		return Authentication{}, "", err
 	}
-	if err := s.sessions.RevokeAllForUser(ctx, current.User.ID, "password changed"); err != nil {
-		return Authentication{}, "", err
+	if err := s.passwordRotations.RotatePassword(ctx, PasswordRotationParams{UserID: current.User.ID, ExpectedPasswordHash: current.User.PasswordHash, PasswordHash: newHash, MustChangePassword: false, ReplacementSession: createSessionParams(session)}); err != nil {
+		return Authentication{}, "", ErrInvalidCredentials
 	}
 	current.User.PasswordHash = newHash
 	current.User.MustChangePassword = false
-	return s.createSession(ctx, current.User, input.IP, input.UserAgent)
+	return Authentication{User: current.User, Session: session}, raw, nil
 }
 
 func (s *Service) Logout(ctx context.Context, rawToken string) error {
@@ -182,28 +199,34 @@ func (s *Service) LogoutOthers(ctx context.Context, rawToken string) error {
 }
 
 func (s *Service) createSession(ctx context.Context, user User, ip net.IP, userAgent string) (Authentication, string, error) {
-	raw, hash, err := NewSessionToken()
+	session, raw, err := s.newSession(user, ip, userAgent)
 	if err != nil {
 		return Authentication{}, "", err
 	}
-	now := s.now().UTC()
-	session := Session{ID: uuid.New(), UserID: user.ID, TokenHash: hash, UserAgent: userAgent, IP: ip, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(sessionIdleTTL), AbsoluteExpiresAt: now.Add(sessionAbsoluteTTL)}
-	if err := s.sessions.Create(ctx, CreateSessionParams{ID: session.ID, UserID: session.UserID, TokenHash: session.TokenHash, UserAgent: session.UserAgent, IP: session.IP, CreatedAt: session.CreatedAt, LastSeenAt: session.LastSeenAt, IdleExpiresAt: session.IdleExpiresAt, AbsoluteExpiresAt: session.AbsoluteExpiresAt}); err != nil {
+	if err := s.sessions.Create(ctx, createSessionParams(session)); err != nil {
 		return Authentication{}, "", err
 	}
 	return Authentication{User: user, Session: session}, raw, nil
 }
 
-func (s *Service) failedLogin(ctx context.Context, userID *uuid.UUID, username, reason string, input LoginInput) error {
-	if err := s.recordLoginEvent(ctx, userID, username, false, reason, input.IP, input.UserAgent); err != nil {
-		return ErrInvalidCredentials
+func (s *Service) newSession(user User, ip net.IP, userAgent string) (Session, string, error) {
+	raw, hash, err := NewSessionToken()
+	if err != nil {
+		return Session{}, "", err
 	}
+	now := s.now().UTC()
+	return Session{ID: uuid.New(), UserID: user.ID, TokenHash: hash, UserAgent: userAgent, IP: ip, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(sessionIdleTTL), AbsoluteExpiresAt: now.Add(sessionAbsoluteTTL)}, raw, nil
+}
+
+func createSessionParams(session Session) CreateSessionParams {
+	return CreateSessionParams{ID: session.ID, UserID: session.UserID, TokenHash: session.TokenHash, UserAgent: session.UserAgent, IP: session.IP, CreatedAt: session.CreatedAt, LastSeenAt: session.LastSeenAt, IdleExpiresAt: session.IdleExpiresAt, AbsoluteExpiresAt: session.AbsoluteExpiresAt}
+}
+
+func (s *Service) failedLogin(ctx context.Context, userID *uuid.UUID, username, reason string, input LoginInput) error {
+	_ = s.recordLoginEvent(ctx, userID, username, false, reason, input.IP, input.UserAgent)
 	return ErrInvalidCredentials
 }
 
 func (s *Service) recordLoginEvent(ctx context.Context, userID *uuid.UUID, username string, success bool, reason string, ip net.IP, userAgent string) error {
-	if s.loginEvents == nil {
-		return nil
-	}
 	return s.loginEvents.RecordLoginEvent(ctx, LoginEvent{UserID: userID, Username: username, Success: success, Reason: reason, IP: ip, UserAgent: userAgent, OccurredAt: s.now().UTC()})
 }
