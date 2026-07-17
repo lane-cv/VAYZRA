@@ -8,5 +8,6 @@ data/
 
 .pnpm-store/
 .tmp-go-build-cache/
+.tmp-go-mod-cache/
 node_modules/
 web/dist/
