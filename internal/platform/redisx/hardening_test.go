@@ -107,6 +107,39 @@ func TestLimiterFallbackReturnsRemainingRetryAfter(t *testing.T) {
 	}
 }
 
+func TestLimiterLocalChallengeExpiresWithRedisAccountWindow(t *testing.T) {
+	rdb, mini := startRedis(t)
+	limiter := NewLoginLimiter(rdb, testPolicy())
+	now := time.Now()
+	limiter.now = func() time.Time { return now }
+	for _, advance := range []time.Duration{0, 7 * time.Minute, 7 * time.Minute} {
+		if advance > 0 {
+			mini.FastForward(advance)
+			now = now.Add(advance)
+		}
+		if err := limiter.RecordFailure(context.Background(), "student01", "192.0.2.4"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys := limiter.keys("student01", "192.0.2.4")
+	limiter.localMu.Lock()
+	expires, ok := limiter.challenges.getExpiry("c:"+keys.account, now)
+	limiter.localMu.Unlock()
+	if !ok || expires.Sub(now) < 59*time.Second || expires.Sub(now) > time.Minute {
+		t.Fatalf("local challenge remaining=%s exists=%t, want about 1m", expires.Sub(now), ok)
+	}
+
+	mini.FastForward(time.Minute + time.Millisecond)
+	now = now.Add(time.Minute + time.Millisecond)
+	if err := rdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := limiter.Allow(context.Background(), "student01", "192.0.2.4")
+	if err != nil || decision.ChallengeRequired {
+		t.Fatalf("decision=%#v err=%v", decision, err)
+	}
+}
+
 func TestLimiterDoesNotRenewLocalChallengeOnAuthoritativeAllow(t *testing.T) {
 	rdb, _ := startRedis(t)
 	limiter := NewLoginLimiter(rdb, testPolicy())

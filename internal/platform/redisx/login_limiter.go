@@ -104,12 +104,16 @@ func normalizedPolicy(policy Policy) Policy {
 
 var recordFailureScript = redis.NewScript(`
 local account = redis.call('INCR', KEYS[1])
-if redis.call('PTTL', KEYS[1]) < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+local accountTTL = redis.call('PTTL', KEYS[1])
+if accountTTL < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  accountTTL = redis.call('PTTL', KEYS[1])
+end
 local ip = redis.call('INCR', KEYS[2])
 if redis.call('PTTL', KEYS[2]) < 0 then redis.call('PEXPIRE', KEYS[2], ARGV[1]) end
 if account >= tonumber(ARGV[3]) then redis.call('PSETEX', KEYS[3], ARGV[2], '1') end
 if ip >= tonumber(ARGV[4]) then redis.call('PSETEX', KEYS[4], ARGV[2], '1') end
-return {account, ip}
+return {account, ip, accountTTL}
 `)
 
 var allowScript = redis.NewScript(`
@@ -117,10 +121,11 @@ local accountLock = redis.call('PTTL', KEYS[3])
 local ipLock = redis.call('PTTL', KEYS[4])
 local retry = accountLock
 if ipLock > retry then retry = ipLock end
-if retry > 0 then return {0, retry, 0} end
+if retry > 0 then return {0, retry, 0, 0} end
 local account = tonumber(redis.call('GET', KEYS[1])) or 0
-if account >= tonumber(ARGV[1]) then return {1, 0, 1} end
-return {1, 0, 0}
+local accountTTL = redis.call('PTTL', KEYS[1])
+if account >= tonumber(ARGV[1]) then return {1, 0, 1, accountTTL} end
+return {1, 0, 0, accountTTL}
 `)
 
 // Allow fails over to bounded local state while preserving a recently observed
@@ -139,7 +144,7 @@ func (l *LoginLimiter) Allow(ctx context.Context, username, ip string) (Decision
 		return decision, nil
 	}
 	result, err := allowScript.Run(ctx, l.rdb, []string{keys.account, keys.ip, keys.accountLock, keys.ipLock}, challengeFailures).Int64Slice()
-	if err != nil || len(result) != 3 {
+	if err != nil || len(result) != 4 {
 		l.tripBreaker("allow")
 		decision := l.allowFallback("f:" + keys.account + ":" + keys.ip)
 		if l.localChallenge(keys.account) {
@@ -152,7 +157,7 @@ func (l *LoginLimiter) Allow(ctx context.Context, username, ip string) (Decision
 		return Decision{RetryAfter: time.Duration(result[1]) * time.Millisecond}, nil
 	}
 	if result[2] == 1 {
-		l.setLocalChallenge(keys.account)
+		l.setLocalChallenge(keys.account, time.Duration(result[3])*time.Millisecond)
 	} else {
 		l.clearLocalChallenge(keys.account)
 	}
@@ -165,13 +170,15 @@ func (l *LoginLimiter) RecordFailure(ctx context.Context, username, ip string) e
 		return nil
 	}
 	counts, err := recordFailureScript.Run(ctx, l.rdb, []string{keys.account, keys.ip, keys.accountLock, keys.ipLock}, l.policy.Window.Milliseconds(), l.policy.Lockout.Milliseconds(), l.policy.AccountFailures, l.policy.IPFailures).Int64Slice()
-	if err != nil {
+	if err != nil || len(counts) != 3 || counts[0] < 0 || counts[1] < 0 {
 		l.tripBreaker("record_failure")
 		return nil
 	}
 	l.resetBreaker()
-	if len(counts) >= 1 && counts[0] >= challengeFailures {
-		l.setLocalChallenge(keys.account)
+	if counts[0] >= challengeFailures {
+		l.setLocalChallenge(keys.account, time.Duration(counts[2])*time.Millisecond)
+	} else {
+		l.clearLocalChallenge(keys.account)
 	}
 	return nil
 }
@@ -303,14 +310,23 @@ func (l *LoginLimiter) localChallenge(account string) bool {
 	defer l.localMu.Unlock()
 	return l.challenges.get("c:"+account, l.now())
 }
-func (l *LoginLimiter) setLocalChallenge(account string) {
-	l.localMu.Lock()
-	defer l.localMu.Unlock()
-	key := "c:" + account
-	if l.challenges.get(key, l.now()) {
+func (l *LoginLimiter) setLocalChallenge(account string, ttl time.Duration) {
+	if ttl <= 0 {
+		l.clearLocalChallenge(account)
 		return
 	}
-	l.challenges.set(key, l.now().Add(l.policy.Window))
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	now := l.now()
+	key := "c:" + account
+	deadline := now.Add(ttl)
+	if existing, ok := l.challenges.getExpiry(key, now); ok {
+		if existing.After(deadline) {
+			l.challenges.set(key, deadline)
+		}
+		return
+	}
+	l.challenges.set(key, deadline)
 }
 func (l *LoginLimiter) clearLocalChallenge(account string) {
 	l.localMu.Lock()
