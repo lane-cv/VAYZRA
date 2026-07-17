@@ -102,3 +102,48 @@ func TestLoadValidatesAndNormalizesPublicOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRequiresHTTPSPublicOriginInProduction(t *testing.T) {
+	base := map[string]string{
+		"HAPPYLEARN_ENV":                   "production",
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+	}
+
+	base["HAPPYLEARN_PUBLIC_ORIGIN"] = "http://learn.example.com"
+	if _, err := Load(func(k string) string { return base[k] }); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_PUBLIC_ORIGIN") {
+		t.Fatalf("expected production HTTP origin rejection, got %v", err)
+	}
+
+	base["HAPPYLEARN_PUBLIC_ORIGIN"] = "https://learn.example.com"
+	cfg, err := Load(func(k string) string { return base[k] })
+	if err != nil {
+		t.Fatalf("expected production HTTPS origin acceptance, got %v", err)
+	}
+	if cfg.PublicOrigin != "https://learn.example.com" {
+		t.Fatalf("public origin = %q", cfg.PublicOrigin)
+	}
+}
+
+func TestLoadPreservesIPv6BracketsWhenNormalizingPublicOrigin(t *testing.T) {
+	base := map[string]string{
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+	}
+	for raw, want := range map[string]string{
+		"https://[2001:db8::1]/":     "https://[2001:db8::1]",
+		"https://[2001:db8::1]:8443": "https://[2001:db8::1]:8443",
+	} {
+		env := make(map[string]string, len(base)+1)
+		for k, v := range base {
+			env[k] = v
+		}
+		env["HAPPYLEARN_PUBLIC_ORIGIN"] = raw
+		cfg, err := Load(func(k string) string { return env[k] })
+		if err != nil || cfg.PublicOrigin != want {
+			t.Fatalf("raw=%q cfg=%q err=%v", raw, cfg.PublicOrigin, err)
+		}
+	}
+}

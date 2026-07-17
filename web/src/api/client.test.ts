@@ -16,6 +16,11 @@ describe('request', () => {
     await request('/auth/me')
     expect(new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers).get('Accept')).toBe('application/json')
   })
+  it('disables the browser cache for API requests', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ data: { id: 'u1' } })))
+    await request('/auth/me')
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/auth/me', expect.objectContaining({ cache: 'no-store' }))
+  })
   it('serializes JSON bodies and unwraps the data envelope', async () => {
     document.cookie = 'hl_csrf=csrf-value; path=/'
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ data: { id: 'u1' } })))

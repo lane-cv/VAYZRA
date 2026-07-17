@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -57,6 +58,9 @@ func Load(getenv func(string) string) (Config, error) {
 		if originErr != nil {
 			return Config{}, fmt.Errorf("HAPPYLEARN_PUBLIC_ORIGIN is invalid")
 		}
+		if c.Environment == "production" && !strings.HasPrefix(c.PublicOrigin, "https://") {
+			return Config{}, fmt.Errorf("HAPPYLEARN_PUBLIC_ORIGIN must use https in production")
+		}
 	}
 	c.CookieSecure = c.Environment == "production"
 
@@ -90,8 +94,13 @@ func normalizePublicOrigin(raw string) (string, error) {
 	}
 	host := strings.ToLower(u.Hostname())
 	port := u.Port()
-	if port != "" && !((u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443")) {
-		host = host + ":" + port
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
 	}
 	return u.Scheme + "://" + host, nil
 }
