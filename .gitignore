@@ -6,3 +6,7 @@ backups/
 data/
 *.log
 
+.pnpm-store/
+.tmp-go-build-cache/
+node_modules/
+web/dist/

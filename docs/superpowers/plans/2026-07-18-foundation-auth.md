@@ -159,7 +159,7 @@ describe('App', () => {
   "name": "happylearn-workspace",
   "private": true,
   "engines": { "node": ">=24 <25", "pnpm": ">=11 <12" },
-  "packageManager": "pnpm@11",
+  "packageManager": "pnpm@11.9.0",
   "scripts": {
     "test": "pnpm --dir web test",
     "typecheck": "pnpm --dir web typecheck",
