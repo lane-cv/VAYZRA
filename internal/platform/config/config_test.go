@@ -15,9 +15,10 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 
 func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 	env := map[string]string{
-		"HAPPYLEARN_DATABASE_URL":  "postgres://app:test@localhost/app",
-		"HAPPYLEARN_REDIS_URL":     "redis://localhost:6379/0",
-		"HAPPYLEARN_PUBLIC_ORIGIN": "https://learn.example.com",
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret",
+		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
 	}
 
 	cfg, err := Load(func(k string) string { return env[k] })
@@ -31,10 +32,11 @@ func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 	env := map[string]string{
-		"HAPPYLEARN_ENV":           "prodution",
-		"HAPPYLEARN_DATABASE_URL":  "postgres://app:test@localhost/app",
-		"HAPPYLEARN_REDIS_URL":     "redis://localhost:6379/0",
-		"HAPPYLEARN_PUBLIC_ORIGIN": "https://learn.example.com",
+		"HAPPYLEARN_ENV":                   "prodution",
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret",
+		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
 	}
 
 	_, err := Load(func(k string) string { return env[k] })

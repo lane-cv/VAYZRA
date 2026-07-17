@@ -1,0 +1,180 @@
+package redisx
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
+	"io"
+	"math/big"
+	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+const captchaTTL = 5 * time.Minute
+
+// Challenge is returned to the browser as an image body and opaque ID header.
+type Challenge struct {
+	ID  string
+	PNG []byte
+}
+
+// CaptchaService is consumed by the authentication HTTP boundary.
+type CaptchaService interface {
+	Create(context.Context) (Challenge, error)
+	Verify(context.Context, string, string) (bool, error)
+}
+
+// CaptchaStore holds only HMACed answers in Redis. The plaintext answer exists
+// only while Create renders the server-generated image.
+type CaptchaStore struct {
+	rdb    redis.UniversalClient
+	secret []byte
+	random io.Reader
+}
+
+func NewCaptchaStore(rdb redis.UniversalClient, secret []byte) *CaptchaStore {
+	copySecret := append([]byte(nil), secret...)
+	if len(copySecret) == 0 {
+		copySecret = make([]byte, 32)
+		if _, err := rand.Read(copySecret); err != nil {
+			panic("read captcha secret")
+		}
+	}
+	return &CaptchaStore{rdb: rdb, secret: copySecret, random: rand.Reader}
+}
+
+func (s *CaptchaStore) Create(ctx context.Context) (Challenge, error) {
+	if s.rdb == nil {
+		return Challenge{}, fmt.Errorf("captcha storage unavailable")
+	}
+	idBytes := make([]byte, 32)
+	if _, err := io.ReadFull(s.random, idBytes); err != nil {
+		return Challenge{}, fmt.Errorf("generate captcha ID: %w", err)
+	}
+	id := base64.RawURLEncoding.EncodeToString(idBytes)
+	answer, err := s.newAnswer()
+	if err != nil {
+		return Challenge{}, err
+	}
+	pngBody, err := renderCaptcha(answer)
+	if err != nil {
+		return Challenge{}, err
+	}
+	if len(pngBody) == 0 || len(pngBody) > 50*1024 {
+		return Challenge{}, fmt.Errorf("render captcha image")
+	}
+	if err := s.rdb.Set(ctx, s.key(id), s.answerHash(answer), captchaTTL).Err(); err != nil {
+		return Challenge{}, fmt.Errorf("store captcha: %w", err)
+	}
+	return Challenge{ID: id, PNG: pngBody}, nil
+}
+
+func (s *CaptchaStore) Verify(ctx context.Context, id, answer string) (bool, error) {
+	if s.rdb == nil || id == "" {
+		return false, fmt.Errorf("captcha storage unavailable")
+	}
+	stored, err := consumeCaptchaScript.Run(ctx, s.rdb, []string{s.key(id)}).Text()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("consume captcha: %w", err)
+	}
+	return hmac.Equal([]byte(stored), []byte(s.answerHash(answer))), nil
+}
+
+var consumeCaptchaScript = redis.NewScript(`
+local value = redis.call('GET', KEYS[1])
+if value then redis.call('DEL', KEYS[1]) end
+return value
+`)
+
+func (s *CaptchaStore) newAnswer() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPRSTUVWXYZ"
+	var answer strings.Builder
+	answer.Grow(5)
+	limit := big.NewInt(int64(len(alphabet)))
+	for range 5 {
+		index, err := rand.Int(s.random, limit)
+		if err != nil {
+			return "", fmt.Errorf("generate captcha answer: %w", err)
+		}
+		answer.WriteByte(alphabet[index.Int64()])
+	}
+	return answer.String(), nil
+}
+
+func (s *CaptchaStore) key(id string) string {
+	h := hmac.New(sha256.New, s.secret)
+	_, _ = h.Write([]byte("captcha-id"))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(id))
+	return "hl:captcha:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func (s *CaptchaStore) answerHash(answer string) string {
+	h := hmac.New(sha256.New, s.secret)
+	_, _ = h.Write([]byte("captcha-answer"))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strings.ToUpper(strings.TrimSpace(answer))))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func renderCaptcha(answer string) ([]byte, error) {
+	imageBody := image.NewRGBA(image.Rect(0, 0, 140, 48))
+	draw.Draw(imageBody, imageBody.Bounds(), &image.Uniform{C: color.RGBA{245, 248, 252, 255}}, image.Point{}, draw.Src)
+	for x := 0; x < 140; x += 7 {
+		y := 5 + (x*11)%35
+		imageBody.Set(x, y, color.RGBA{150, 170, 195, 180})
+	}
+	for index, letter := range answer {
+		drawGlyph(imageBody, 8+index*26, 8+(index%2)*2, letter, color.RGBA{25 + uint8(index*23), 55, 105 + uint8(index*19), 255})
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, imageBody); err != nil {
+		return nil, fmt.Errorf("encode captcha: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+var glyphs = map[rune][]string{
+	'A': {"01110", "10001", "10001", "11111", "10001", "10001", "10001"}, 'B': {"11110", "10001", "11110", "10001", "10001", "10001", "11110"},
+	'C': {"01111", "10000", "10000", "10000", "10000", "10000", "01111"}, 'D': {"11110", "10001", "10001", "10001", "10001", "10001", "11110"},
+	'E': {"11111", "10000", "11110", "10000", "10000", "10000", "11111"}, 'F': {"11111", "10000", "11110", "10000", "10000", "10000", "10000"},
+	'G': {"01111", "10000", "10000", "10111", "10001", "10001", "01111"}, 'H': {"10001", "10001", "11111", "10001", "10001", "10001", "10001"},
+	'J': {"00111", "00010", "00010", "00010", "10010", "10010", "01100"}, 'K': {"10001", "10010", "11100", "10100", "10010", "10001", "10001"},
+	'L': {"10000", "10000", "10000", "10000", "10000", "10000", "11111"}, 'M': {"10001", "11011", "10101", "10101", "10001", "10001", "10001"},
+	'N': {"10001", "11001", "10101", "10011", "10001", "10001", "10001"}, 'P': {"11110", "10001", "10001", "11110", "10000", "10000", "10000"},
+	'R': {"11110", "10001", "10001", "11110", "10100", "10010", "10001"}, 'S': {"01111", "10000", "10000", "01110", "00001", "00001", "11110"},
+	'T': {"11111", "00100", "00100", "00100", "00100", "00100", "00100"}, 'U': {"10001", "10001", "10001", "10001", "10001", "10001", "01110"},
+	'V': {"10001", "10001", "10001", "10001", "10001", "01010", "00100"}, 'W': {"10001", "10001", "10001", "10101", "10101", "10101", "01010"},
+	'X': {"10001", "01010", "00100", "00100", "00100", "01010", "10001"}, 'Y': {"10001", "01010", "00100", "00100", "00100", "00100", "00100"},
+	'Z': {"11111", "00001", "00010", "00100", "01000", "10000", "11111"},
+}
+
+func drawGlyph(dst *image.RGBA, x, y int, letter rune, c color.Color) {
+	pattern := glyphs[letter]
+	for row, line := range pattern {
+		for column, value := range line {
+			if value != '1' {
+				continue
+			}
+			for dy := 0; dy < 4; dy++ {
+				for dx := 0; dx < 4; dx++ {
+					dst.Set(x+column*4+dx, y+row*4+dy, c)
+				}
+			}
+		}
+	}
+}

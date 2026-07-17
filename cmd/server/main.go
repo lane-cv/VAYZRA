@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"happylearn.local/app/internal/app"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/redisx"
 )
 
 func main() {
@@ -65,11 +67,14 @@ func newServer(address string, handler http.Handler) *http.Server {
 }
 
 type applicationDependencies struct {
-	open    func(context.Context, string) (*pgxpool.Pool, error)
-	migrate func(context.Context, *pgxpool.Pool) error
-	newAuth func(*pgxpool.Pool) (auth.HTTPService, error)
-	ready   func(*pgxpool.Pool) func(context.Context) error
-	close   func(*pgxpool.Pool)
+	open        func(context.Context, string) (*pgxpool.Pool, error)
+	migrate     func(context.Context, *pgxpool.Pool) error
+	newAuth     func(*pgxpool.Pool) (auth.HTTPService, error)
+	ready       func(*pgxpool.Pool) func(context.Context) error
+	close       func(*pgxpool.Pool)
+	openRedis   func(string) (*redis.Client, error)
+	newThrottle func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
+	closeRedis  func(*redis.Client)
 }
 
 func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
@@ -80,7 +85,13 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
-		close: func(pool *pgxpool.Pool) { pool.Close() },
+		close:     func(pool *pgxpool.Pool) { pool.Close() },
+		openRedis: redisx.NewClient,
+		newThrottle: func(client *redis.Client, cfg config.Config) (redisx.Limiter, redisx.CaptchaService) {
+			policy := redisx.Policy{Secret: []byte(cfg.LoginThrottleSecret), Window: 15 * time.Minute, AccountFailures: 5, IPFailures: 20, Lockout: 15 * time.Minute}
+			return redisx.NewLoginLimiter(client, policy), redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
+		},
+		closeRedis: func(client *redis.Client) { _ = client.Close() },
 	})
 }
 
@@ -104,12 +115,34 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		closePool()
 		return nil, nil, errors.New("initialize readiness check")
 	}
+	var limiter redisx.Limiter
+	var captchas redisx.CaptchaService
+	closeResources := closePool
+	if deps.openRedis != nil {
+		client, err := deps.openRedis(cfg.RedisURL)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize login throttling")
+		}
+		if deps.newThrottle == nil || deps.closeRedis == nil {
+			closePool()
+			_ = client.Close()
+			return nil, nil, errors.New("initialize login throttling")
+		}
+		limiter, captchas = deps.newThrottle(client, cfg)
+		closeResources = func() {
+			deps.closeRedis(client)
+			closePool()
+		}
+	}
 	return app.New(app.Dependencies{
 		Ready:        ready,
 		Auth:         service,
 		PublicOrigin: cfg.PublicOrigin,
 		CookieSecure: cfg.CookieSecure,
-	}), closePool, nil
+		Limiter:      limiter,
+		Captchas:     captchas,
+	}), closeResources, nil
 }
 
 func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {

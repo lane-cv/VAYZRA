@@ -7,14 +7,15 @@ import (
 )
 
 type Config struct {
-	Environment        string
-	ListenAddress      string
-	DatabaseURL        string
-	RedisURL           string
-	PublicOrigin       string
-	SessionIdleTTL     time.Duration
-	SessionAbsoluteTTL time.Duration
-	CookieSecure       bool
+	Environment         string
+	ListenAddress       string
+	DatabaseURL         string
+	RedisURL            string
+	LoginThrottleSecret string
+	PublicOrigin        string
+	SessionIdleTTL      time.Duration
+	SessionAbsoluteTTL  time.Duration
+	CookieSecure        bool
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -35,6 +36,7 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	c.DatabaseURL = getenv("HAPPYLEARN_DATABASE_URL")
 	c.RedisURL = getenv("HAPPYLEARN_REDIS_URL")
+	c.LoginThrottleSecret = getenv("HAPPYLEARN_LOGIN_THROTTLE_SECRET")
 	c.PublicOrigin = strings.TrimRight(getenv("HAPPYLEARN_PUBLIC_ORIGIN"), "/")
 	c.CookieSecure = c.Environment == "production"
 
@@ -44,6 +46,7 @@ func Load(getenv func(string) string) (Config, error) {
 	}{
 		{"HAPPYLEARN_DATABASE_URL", c.DatabaseURL},
 		{"HAPPYLEARN_REDIS_URL", c.RedisURL},
+		{"HAPPYLEARN_LOGIN_THROTTLE_SECRET", c.LoginThrottleSecret},
 		{"HAPPYLEARN_PUBLIC_ORIGIN", c.PublicOrigin},
 	} {
 		if required.value == "" {

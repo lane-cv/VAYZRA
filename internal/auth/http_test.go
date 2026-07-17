@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"happylearn.local/app/internal/platform/httpx"
+	"happylearn.local/app/internal/platform/redisx"
 )
 
 func TestLoginSetsOpaqueCookieAndReturnsSafeUser(t *testing.T) {
@@ -93,6 +95,54 @@ func TestLoginCredentialFailuresUseSameGenericResponse(t *testing.T) {
 	}
 }
 
+func TestLoginRateLimitUsesRemoteAddressAndSkipsPasswordVerification(t *testing.T) {
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	limiter := &fakeLoginLimiter{decision: redisx.Decision{Allowed: false, RetryAfter: 2100 * time.Millisecond}}
+	h := newHTTPTestHandlerWithThrottle(svc, limiter, nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":" Student01 ","password":"Long Temporary Password 42!"}`))
+	r.RemoteAddr = "192.0.2.4:1234"
+	r.Header.Set("X-Forwarded-For", "203.0.113.77")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "3" || svc.loginCalls != 0 {
+		t.Fatalf("status=%d retry=%q calls=%d body=%s", w.Code, w.Header().Get("Retry-After"), svc.loginCalls, w.Body.String())
+	}
+	if limiter.username != " Student01 " || limiter.ip != "192.0.2.4" || strings.Contains(w.Body.String(), "Student01") {
+		t.Fatalf("limiter=%#v body=%s", limiter, w.Body.String())
+	}
+}
+
+func TestLoginChallengeIsVerifiedBeforePasswordAndChallengeImageIsNoStore(t *testing.T) {
+	svc := &fakeHTTPService{loginRawToken: "opaque-token", loginAuth: activeAuthentication(false)}
+	limiter := &fakeLoginLimiter{decision: redisx.Decision{Allowed: true, ChallengeRequired: true}}
+	captchas := &fakeCaptchaStore{challenge: redisx.Challenge{ID: "challenge-id", PNG: []byte("png")}}
+	h := newHTTPTestHandlerWithThrottle(svc, limiter, captchas)
+
+	missing := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!"}`))
+	missing.Header.Set("Content-Type", "application/json")
+	missingResult := httptest.NewRecorder()
+	h.ServeHTTP(missingResult, missing)
+	if missingResult.Code != http.StatusUnauthorized || !strings.Contains(missingResult.Body.String(), `"login_challenge_required"`) || !strings.Contains(missingResult.Body.String(), `"challengeUrl":"/api/v1/auth/challenge"`) || svc.loginCalls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", missingResult.Code, svc.loginCalls, missingResult.Body.String())
+	}
+
+	captchas.valid = true
+	valid := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"student01","password":"Long Temporary Password 42!","challengeId":"challenge-id","challengeAnswer":"ABCDE"}`))
+	valid.Header.Set("Content-Type", "application/json")
+	validResult := httptest.NewRecorder()
+	h.ServeHTTP(validResult, valid)
+	if validResult.Code != http.StatusOK || svc.loginCalls != 1 || captchas.id != "challenge-id" || captchas.answer != "ABCDE" {
+		t.Fatalf("status=%d calls=%d captcha=%#v body=%s", validResult.Code, svc.loginCalls, captchas, validResult.Body.String())
+	}
+
+	challenge := httptest.NewRequest(http.MethodGet, "/api/v1/auth/challenge", nil)
+	challengeResult := httptest.NewRecorder()
+	h.ServeHTTP(challengeResult, challenge)
+	if challengeResult.Code != http.StatusOK || challengeResult.Header().Get("Cache-Control") != "no-store" || challengeResult.Header().Get("Content-Type") != "image/png" || challengeResult.Header().Get("X-Challenge-ID") != "challenge-id" || challengeResult.Body.Len() != len(captchas.challenge.PNG) {
+		t.Fatalf("status=%d headers=%v size=%d", challengeResult.Code, challengeResult.Header(), challengeResult.Body.Len())
+	}
+}
 func TestAuthenticateRejectsUnauthenticatedMe(t *testing.T) {
 	h := newHTTPTestHandler(&fakeHTTPService{authenticateErr: ErrUnauthenticated})
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
@@ -166,9 +216,11 @@ type fakeHTTPService struct {
 	loginErr, authenticateErr, changeErr    error
 	changeInput                             ChangePasswordInput
 	logoutToken, logoutOthersToken          string
+	loginCalls                              int
 }
 
 func (s *fakeHTTPService) Login(_ context.Context, _ LoginInput) (Authentication, string, error) {
+	s.loginCalls++
 	return s.loginAuth, s.loginRawToken, s.loginErr
 }
 func (s *fakeHTTPService) Authenticate(_ context.Context, _ string) (Authentication, error) {
@@ -188,8 +240,13 @@ func (s *fakeHTTPService) LogoutOthers(_ context.Context, raw string) error {
 }
 
 func newHTTPTestHandler(svc *fakeHTTPService) http.Handler {
-	h := NewHTTPHandler(svc, HTTPConfig{CookieSecure: true})
+	return newHTTPTestHandlerWithThrottle(svc, nil, nil)
+}
+
+func newHTTPTestHandlerWithThrottle(svc *fakeHTTPService, limiter redisx.Limiter, captchas redisx.CaptchaService) http.Handler {
+	h := NewHTTPHandler(svc, HTTPConfig{CookieSecure: true, Limiter: limiter, Captchas: captchas})
 	r := chi.NewRouter()
+	r.Get("/api/v1/auth/challenge", h.Challenge)
 	r.Post("/api/v1/auth/login", h.Login)
 	r.Group(func(private chi.Router) {
 		private.Use(h.Authenticate)
@@ -201,6 +258,29 @@ func newHTTPTestHandler(svc *fakeHTTPService) http.Handler {
 	return r
 }
 
+type fakeLoginLimiter struct {
+	decision     redisx.Decision
+	username, ip string
+}
+
+func (f *fakeLoginLimiter) Allow(_ context.Context, username, ip string) (redisx.Decision, error) {
+	f.username, f.ip = username, ip
+	return f.decision, nil
+}
+func (f *fakeLoginLimiter) RecordFailure(context.Context, string, string) error { return nil }
+func (f *fakeLoginLimiter) RecordSuccess(context.Context, string, string) error { return nil }
+
+type fakeCaptchaStore struct {
+	challenge  redisx.Challenge
+	valid      bool
+	id, answer string
+}
+
+func (f *fakeCaptchaStore) Create(context.Context) (redisx.Challenge, error) { return f.challenge, nil }
+func (f *fakeCaptchaStore) Verify(_ context.Context, id, answer string) (bool, error) {
+	f.id, f.answer = id, answer
+	return f.valid, nil
+}
 func activeAuthentication(mustChange bool) Authentication {
 	return Authentication{User: User{ID: uuid.MustParse("84c0f591-e99a-4a91-8250-25c159e1823a"), Username: "student01", DisplayName: "林同学", Role: RoleStudent, Status: StatusActive, MustChangePassword: mustChange}}
 }

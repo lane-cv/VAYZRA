@@ -10,6 +10,7 @@ import (
 	"happylearn.local/app/internal/auth"
 
 	"happylearn.local/app/internal/platform/httpx"
+	"happylearn.local/app/internal/platform/redisx"
 )
 
 type Dependencies struct {
@@ -17,6 +18,8 @@ type Dependencies struct {
 	Auth         auth.HTTPService
 	PublicOrigin string
 	CookieSecure bool
+	Limiter      redisx.Limiter
+	Captchas     redisx.CaptchaService
 }
 
 func New(d Dependencies) http.Handler {
@@ -37,10 +40,11 @@ func New(d Dependencies) http.Handler {
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	if d.Auth != nil {
-		authHTTP := auth.NewHTTPHandler(d.Auth, auth.HTTPConfig{CookieSecure: d.CookieSecure})
+		authHTTP := auth.NewHTTPHandler(d.Auth, auth.HTTPConfig{CookieSecure: d.CookieSecure, Limiter: d.Limiter, Captchas: d.Captchas})
 		r.Route("/api/v1", func(api chi.Router) {
 			api.Use(httpx.OriginGuard(d.PublicOrigin))
 			api.Use(httpx.CSRF)
+			api.Get("/auth/challenge", authHTTP.Challenge)
 			api.Post("/auth/login", authHTTP.Login)
 			api.Group(func(private chi.Router) {
 				private.Use(authHTTP.Authenticate)

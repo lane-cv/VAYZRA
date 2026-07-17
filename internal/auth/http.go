@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"happylearn.local/app/internal/platform/httpx"
+	"happylearn.local/app/internal/platform/redisx"
 )
 
 const (
@@ -29,11 +32,15 @@ type HTTPService interface {
 
 type HTTPConfig struct {
 	CookieSecure bool
+	Limiter      redisx.Limiter
+	Captchas     redisx.CaptchaService
 }
 
 type Handler struct {
 	service      HTTPService
 	cookieSecure bool
+	limiter      redisx.Limiter
+	captchas     redisx.CaptchaService
 }
 
 type UserView struct {
@@ -48,13 +55,15 @@ type userContextKey struct{}
 type sessionTokenContextKey struct{}
 
 func NewHTTPHandler(service HTTPService, cfg HTTPConfig) *Handler {
-	return &Handler{service: service, cookieSecure: cfg.CookieSecure}
+	return &Handler{service: service, cookieSecure: cfg.CookieSecure, limiter: cfg.Limiter, captchas: cfg.Captchas}
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username        string `json:"username"`
+		Password        string `json:"password"`
+		ChallengeID     string `json:"challengeId"`
+		ChallengeAnswer string `json:"challengeAnswer"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -63,14 +72,52 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}
+	ip := requestIP(r)
+	ipValue := ""
+	if ip != nil {
+		ipValue = ip.String()
+	}
+	if h.limiter != nil {
+		decision, err := h.limiter.Allow(r.Context(), input.Username, ipValue)
+		if err != nil {
+			httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
+			return
+		}
+		if !decision.Allowed {
+			seconds := int(math.Ceil(decision.RetryAfter.Seconds()))
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			httpx.Error(w, r, http.StatusTooManyRequests, "login_rate_limited", "登录操作过于频繁，请稍后重试")
+			return
+		}
+		if decision.ChallengeRequired {
+			if h.captchas == nil {
+				h.writeChallengeRequired(w, r)
+				return
+			}
+			verified, err := h.captchas.Verify(r.Context(), input.ChallengeID, input.ChallengeAnswer)
+			if err != nil || !verified {
+				h.writeChallengeRequired(w, r)
+				return
+			}
+		}
+	}
 	authentication, rawToken, err := h.service.Login(r.Context(), LoginInput{
-		Username: input.Username, Password: input.Password, IP: requestIP(r), UserAgent: r.UserAgent(),
+		Username: input.Username, Password: input.Password, IP: ip, UserAgent: r.UserAgent(),
 	})
 	if err != nil {
+		if h.limiter != nil {
+			_ = h.limiter.RecordFailure(r.Context(), input.Username, ipValue)
+		}
 		// Login failure must not disclose whether the username, password, or
 		// account status caused the rejection.
 		httpx.Error(w, r, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
+	}
+	if h.limiter != nil {
+		_ = h.limiter.RecordSuccess(r.Context(), input.Username, ipValue)
 	}
 	if rawToken == "" {
 		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
@@ -85,6 +132,40 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}{Data: userView(authentication.User)})
 }
 
+func (h *Handler) Challenge(w http.ResponseWriter, r *http.Request) {
+	if h.captchas == nil {
+		httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
+		return
+	}
+	challenge, err := h.captchas.Create(r.Context())
+	if err != nil || challenge.ID == "" || len(challenge.PNG) == 0 || len(challenge.PNG) > 50*1024 {
+		httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("X-Challenge-ID", challenge.ID)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(challenge.PNG)
+}
+
+func (h *Handler) writeChallengeRequired(w http.ResponseWriter, r *http.Request) {
+	httpx.JSON(w, http.StatusUnauthorized, struct {
+		Error struct {
+			Code         string `json:"code"`
+			Message      string `json:"message"`
+			RequestID    string `json:"requestId"`
+			ChallengeURL string `json:"challengeUrl"`
+		} `json:"error"`
+	}{
+		Error: struct {
+			Code         string `json:"code"`
+			Message      string `json:"message"`
+			RequestID    string `json:"requestId"`
+			ChallengeURL string `json:"challengeUrl"`
+		}{Code: "login_challenge_required", Message: "请完成验证码后重试", RequestID: httpx.RequestIDFromContext(r.Context()), ChallengeURL: "/api/v1/auth/challenge"},
+	})
+}
 func (h *Handler) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.service == nil {
