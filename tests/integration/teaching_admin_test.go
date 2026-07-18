@@ -98,4 +98,6 @@ func TestTeachingPublicationFailureLeavesCurrentRevisionUntouched(t *testing.T) 
 
 type rejectPublication struct{}
 
-func (rejectPublication) Check(context.Context, uuid.UUID) error { return errors.New("blocked") }
+func (rejectPublication) Check(context.Context, teaching.PublicationReader, teaching.Draft) error {
+	return errors.New("blocked")
+}

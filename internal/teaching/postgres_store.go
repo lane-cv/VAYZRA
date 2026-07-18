@@ -220,16 +220,23 @@ func (s *PostgresStore) SaveDraft(ctx context.Context, in SaveDraftInput) (Draft
 	return s.GetDraft(ctx, in.LessonID)
 }
 func (s *PostgresStore) Publish(ctx context.Context, in PublishInput) (Revision, error) {
-	var locked uuid.UUID
-	if err := s.q.QueryRow(ctx, `SELECT d.lesson_id FROM lesson_drafts d JOIN lessons l ON l.id=d.lesson_id JOIN chapters c ON c.id=l.chapter_id JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id WHERE d.lesson_id=$1 AND l.archived_at IS NULL AND c.archived_at IS NULL AND s.archived_at IS NULL AND t.archived_at IS NULL AND g.archived_at IS NULL FOR UPDATE OF d,l,c,s,t,g`, in.LessonID).Scan(&locked); errors.Is(err, pgx.ErrNoRows) {
-		return Revision{}, ErrNotPublishable
-	} else if err != nil {
-		return Revision{}, mapTeachingError(err)
-	}
-	d, err := s.GetDraft(ctx, in.LessonID)
+	d, err := s.LockDraftForPublication(ctx, in.LessonID)
 	if err != nil {
 		return Revision{}, err
 	}
+	return s.PublishSnapshot(ctx, in, d)
+}
+func (s *PostgresStore) LockDraftForPublication(ctx context.Context, lessonID uuid.UUID) (Draft, error) {
+	var locked uuid.UUID
+	if err := s.q.QueryRow(ctx, `SELECT d.lesson_id FROM lesson_drafts d JOIN lessons l ON l.id=d.lesson_id JOIN chapters c ON c.id=l.chapter_id JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id WHERE d.lesson_id=$1 AND l.archived_at IS NULL AND c.archived_at IS NULL AND s.archived_at IS NULL AND t.archived_at IS NULL AND g.archived_at IS NULL FOR UPDATE OF d,l,c,s,t,g`, lessonID).Scan(&locked); errors.Is(err, pgx.ErrNoRows) {
+		return Draft{}, ErrNotPublishable
+	} else if err != nil {
+		return Draft{}, mapTeachingError(err)
+	}
+	return s.GetDraft(ctx, lessonID)
+}
+func (s *PostgresStore) PublishSnapshot(ctx context.Context, in PublishInput, d Draft) (Revision, error) {
+
 	if d.LockVersion != in.ExpectedVersion {
 		return Revision{}, ErrConflict
 	}
@@ -239,7 +246,7 @@ func (s *PostgresStore) Publish(ctx context.Context, in PublishInput) (Revision,
 	}
 	var revision Revision
 	revision.LessonID, revision.Version, revision.SourceDraftVersion, revision.Title, revision.Summary, revision.BodyMarkdown, revision.SortKey, revision.PublishedBy = in.LessonID, version, d.LockVersion, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID
-	err = s.q.QueryRow(ctx, `INSERT INTO lesson_revisions (lesson_id,version,source_draft_version,title,summary,body_markdown,sort_key,published_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,published_at`, in.LessonID, version, d.LockVersion, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID).Scan(&revision.ID, &revision.PublishedAt)
+	err := s.q.QueryRow(ctx, `INSERT INTO lesson_revisions (lesson_id,version,source_draft_version,title,summary,body_markdown,sort_key,published_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,published_at`, in.LessonID, version, d.LockVersion, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID).Scan(&revision.ID, &revision.PublishedAt)
 	if err != nil {
 		return Revision{}, mapTeachingError(err)
 	}

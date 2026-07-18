@@ -35,11 +35,14 @@ func (h *AdminHandler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(httpx.NoStore)
 	r.Use(auth.RequireRole(auth.RoleAdmin))
+	r.Get("/catalog", h.ListCatalog)
 	r.Post("/catalog/{kind}", h.CreateCatalog)
 	r.Patch("/catalog/{kind}/{id}", h.RenameCatalog)
 	r.Post("/catalog/{kind}/{id}/reorder", h.ReorderCatalog)
 	r.Post("/catalog/{kind}/{id}/archive", h.ArchiveCatalog)
 	r.Post("/lessons", h.CreateLesson)
+	r.Get("/lessons/{id}", h.GetLesson)
+	r.Get("/lessons/{id}/revisions", h.ListRevisions)
 	r.Put("/lessons/{id}/draft", h.SaveDraft)
 	r.Post("/lessons/{id}/publish", h.Publish)
 	r.Post("/lessons/{id}/archive", h.ArchiveLesson)
@@ -70,8 +73,8 @@ func (h *AdminHandler) CreateCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, struct {
-		Data CatalogNode `json:"data"`
-	}{node})
+		Data adminCatalogDTO `json:"data"`
+	}{adminCatalogNodeView(node)})
 }
 func (h *AdminHandler) RenameCatalog(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -94,8 +97,8 @@ func (h *AdminHandler) RenameCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, struct {
-		Data CatalogNode `json:"data"`
-	}{node})
+		Data adminCatalogDTO `json:"data"`
+	}{adminCatalogNodeView(node)})
 }
 func (h *AdminHandler) ReorderCatalog(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -161,19 +164,23 @@ func (h *AdminHandler) CreateLesson(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, struct {
-		Data Draft `json:"data"`
-	}{draft})
+		Data adminDraftDTO `json:"data"`
+	}{adminDraftView(draft)})
 }
 func (h *AdminHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title          string          `json:"title"`
-		Summary        string          `json:"summary"`
-		BodyMarkdown   string          `json:"bodyMarkdown"`
-		SortKey        int64           `json:"sortKey"`
-		Audience       Audience        `json:"audience"`
-		ExternalVideos []ExternalVideo `json:"externalVideos"`
+		Title          string               `json:"title"`
+		Summary        string               `json:"summary"`
+		BodyMarkdown   string               `json:"bodyMarkdown"`
+		SortKey        int64                `json:"sortKey"`
+		Audience       adminAudienceRequest `json:"audience"`
+		ExternalVideos []adminVideoRequest  `json:"externalVideos"`
 	}
 	if !decodeAdminJSON(w, r, &body) {
+		return
+	}
+	audience, videos, ok := adminDraftChildren(w, r, body.Audience, body.ExternalVideos)
+	if !ok {
 		return
 	}
 	id, ok := routeUUID(w, r, "id")
@@ -188,15 +195,15 @@ func (h *AdminHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	draft, err := h.service.SaveDraft(r.Context(), actor, SaveDraftInput{LessonID: id, ExpectedVersion: version, Title: body.Title, Summary: body.Summary, BodyMarkdown: body.BodyMarkdown, SortKey: body.SortKey, Audience: body.Audience, ExternalVideos: body.ExternalVideos})
+	draft, err := h.service.SaveDraft(r.Context(), actor, SaveDraftInput{LessonID: id, ExpectedVersion: version, Title: body.Title, Summary: body.Summary, BodyMarkdown: body.BodyMarkdown, SortKey: body.SortKey, Audience: audience, ExternalVideos: videos})
 	if err != nil {
 		adminError(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", strconv.FormatInt(draft.LockVersion, 10))
 	httpx.JSON(w, http.StatusOK, struct {
-		Data Draft `json:"data"`
-	}{draft})
+		Data adminDraftDTO `json:"data"`
+	}{adminDraftView(draft)})
 }
 func (h *AdminHandler) ArchiveLesson(w http.ResponseWriter, r *http.Request) {
 	if !requireEmptyBody(w, r) {
@@ -238,8 +245,8 @@ func (h *AdminHandler) Publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, struct {
-		Data Revision `json:"data"`
-	}{revision})
+		Data adminRevisionDTO `json:"data"`
+	}{adminRevisionView(revision)})
 }
 func (h *AdminHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 	if !requireEmptyBody(w, r) {

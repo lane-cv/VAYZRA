@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type AudienceMode string
@@ -88,6 +89,38 @@ type Lesson struct {
 	ChapterID           uuid.UUID
 	PublishedRevisionID uuid.UUID
 	ArchivedAt          *time.Time
+}
+
+type AdminCatalogItem struct {
+	ID          uuid.UUID
+	ParentID    uuid.UUID
+	Kind        string
+	Name        string
+	Description string
+	SortKey     int64
+	ArchivedAt  *time.Time
+	Published   bool
+}
+type AdminCatalogCursor struct {
+	Rank    int
+	SortKey int64
+	ID      uuid.UUID
+}
+type AdminCatalogInput struct {
+	Kind            string
+	ParentID        uuid.UUID
+	IncludeArchived bool
+	Limit           int
+	After           AdminCatalogCursor
+}
+type AdminLessonDetail struct {
+	Lesson    Lesson
+	Draft     Draft
+	Published *Revision
+}
+type RevisionCursor struct {
+	Version int64
+	ID      uuid.UUID
 }
 
 type CatalogCreateInput struct {
@@ -173,6 +206,10 @@ type ProgressInput struct {
 	ObservedAt  time.Time
 }
 
+type PublicationReader interface {
+	PublicationQuery(context.Context, string, ...any) (pgx.Rows, error)
+	PublicationQueryRow(context.Context, string, ...any) pgx.Row
+}
 type PublicationCheck interface {
-	Check(ctx context.Context, lessonID uuid.UUID) error
+	Check(context.Context, PublicationReader, Draft) error
 }

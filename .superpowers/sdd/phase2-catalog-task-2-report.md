@@ -44,3 +44,29 @@ The local PATH lacked Go, so the initial written RED test could not be executed 
 - Added lesson archive service/store/HTTP behavior with atomic `lesson.archived` audit, bounded empty-body enforcement for publish/withdraw, and action-to-target audit validation.
 - Final suite: `go test ./internal/teaching ./internal/audit ./internal/app ./cmd/server ./tests/integration -run "Teaching|Publication|Admin|Audit|SaveDraft|Publish" -count=1` passed against disposable PostgreSQL on localhost:55433.
 - Self-review: second publication preserves draft-video IDs while every revision snapshot receives fresh IDs; archived lessons and archived ancestors cannot publish; cross-domain audit actions are rejected.
+
+## Gate Remediation 2
+
+### Implementation
+
+- Added authenticated no-store admin reads: `GET /api/v1/admin/catalog` supports `kind`, `parentId`, `includeArchived`, bounded `limit` (1–200), and a stable opaque `(rank,sortKey,id)` cursor; `GET /api/v1/admin/lessons/{id}` returns lesson status, draft, audience/videos, and current publication; `GET /api/v1/admin/lessons/{id}/revisions` returns bounded newest-first history with an opaque `(version,id)` cursor.
+- Admin HTTP requests/responses now use explicit lower-camel DTOs. Revision DTOs include `sourceDraftVersion`; no domain structs are serialized by the admin handler.
+- Publication now runs `LockDraftForPublication` inside the unit of work, revalidates the exact persisted draft and active hierarchy, confirms exact audience semantics and active students, invokes `PublicationCheck.Check(ctx, txReader, lockedDraft)`, then snapshots/finalizes/switches pointer/writes outbox and audit in the same transaction.
+- `PublicationReader` is the smallest transaction-scoped query capability compatible with future secure-file binding readiness queries; the catalog no-op remains constructor-injected and private.
+- Server-side publication validation rejects invalid bounds/modes, all-mode user IDs, empty selected audiences, inactive selected students, control/NUL content, unsafe Markdown/LaTeX constructs, unbalanced fenced blocks, and invalid external videos.
+- Draft saves canonicalize HTTPS scheme/host, strip port 443 and an empty fragment, reject credentials/control characters, and preserve path/query and meaningful fragments.
+- Added focused archive success/forbidden/body tests and publish/withdraw oversized-body 413/no-dispatch coverage.
+
+### RED/GREEN evidence
+
+- RED: `go test ./internal/teaching -run "NormalizeExternal|DraftValidation" -count=1` failed to compile on the missing transaction reader/checker contract, URL normalization, persisted validation, and new store methods.
+- GREEN focused: `go test ./internal/teaching -run "NormalizeExternal|DraftValidation|AdminRead|SaveDraft|Publish" -count=1` passed.
+- GREEN isolated PostgreSQL: `go test ./tests/integration -run "PublicationCheckRuns|PersistedUnsafe|AdminReadStore|TeachingAdmin|Publication" -count=1` passed against disposable PostgreSQL on localhost:55435. It proves the readiness checker runs while the draft row is locked and that checker failure rolls back revision/finalization/pointer/outbox/audit.
+- Final: `go vet ./internal/teaching ./internal/app ./cmd/server` passed; `go test -race ./internal/teaching -count=1` passed; `go test ./internal/teaching ./internal/app ./cmd/server ./tests/integration -count=1` passed.
+
+### Self-review
+
+- Admin list cursors are bounded before decoding and use deterministic SQL ordering.
+- Active-only catalog reads propagate ancestor archive state; `includeArchived=true` exposes archived branches explicitly rather than making them look active.
+- Revision detail/history and current publication all preserve `sourceDraftVersion`; no uniqueness constraint was added, so withdrawal and republish remain supported.
+- No student read DTOs or Task 3 behavior were changed.

@@ -30,6 +30,9 @@ type AdminHTTPService interface {
 	Publish(context.Context, Principal, PublishInput) (Revision, error)
 	Withdraw(context.Context, Principal, uuid.UUID) error
 	ArchiveLesson(context.Context, Principal, uuid.UUID) error
+	ListAdminCatalog(context.Context, Principal, AdminCatalogInput) ([]AdminCatalogItem, AdminCatalogCursor, error)
+	GetAdminLesson(context.Context, Principal, uuid.UUID) (AdminLessonDetail, error)
+	ListAdminRevisions(context.Context, Principal, uuid.UUID, int, RevisionCursor) ([]Revision, RevisionCursor, error)
 }
 
 type Service struct {
@@ -42,7 +45,7 @@ type Service struct {
 // catalog gate until file readiness is implemented in the next phase.
 type allowPublication struct{}
 
-func (allowPublication) Check(context.Context, uuid.UUID) error { return nil }
+func (allowPublication) Check(context.Context, PublicationReader, Draft) error { return nil }
 
 func NewService(store CatalogStore, publication PublicationCheck, now func() time.Time) *Service {
 	if publication == nil {
@@ -170,13 +173,32 @@ func (s *Service) Publish(ctx context.Context, actor Principal, in PublishInput)
 	if in.LessonID == uuid.Nil || in.ExpectedVersion < 1 {
 		return Revision{}, ErrInvalid
 	}
-	if err := s.publication.Check(ctx, in.LessonID); err != nil {
-		return Revision{}, ErrNotPublishable
-	}
 	var revision Revision
 	err := s.withTx(ctx, func(store TxStore, writer audit.Writer) error {
-		var err error
-		revision, err = store.Publish(ctx, in)
+		draft, err := store.LockDraftForPublication(ctx, in.LessonID)
+		if err != nil {
+			return err
+		}
+		if draft.LockVersion != in.ExpectedVersion {
+			return ErrConflict
+		}
+		persisted := SaveDraftInput{LessonID: draft.LessonID, ExpectedVersion: draft.LockVersion, Title: draft.Title, Summary: draft.Summary, BodyMarkdown: draft.BodyMarkdown, SortKey: draft.SortKey, Audience: draft.Audience, ExternalVideos: draft.ExternalVideos, ActorID: actor.User.ID}
+		if !validPersistedDraft(persisted) {
+			return ErrNotPublishable
+		}
+		if draft.Audience.Mode == AudienceSelected {
+			eligible, err := store.EligibleAudienceUsers(ctx, draft.Audience.UserIDs)
+			if err != nil {
+				return err
+			}
+			if eligible != len(draft.Audience.UserIDs) {
+				return ErrNotPublishable
+			}
+		}
+		if err := s.publication.Check(ctx, store, draft); err != nil {
+			return ErrNotPublishable
+		}
+		revision, err = store.PublishSnapshot(ctx, in, draft)
 		if err != nil {
 			return err
 		}
@@ -184,6 +206,37 @@ func (s *Service) Publish(ctx context.Context, actor Principal, in PublishInput)
 	})
 	return revision, err
 }
+func (s *Service) ListAdminCatalog(ctx context.Context, actor Principal, in AdminCatalogInput) ([]AdminCatalogItem, AdminCatalogCursor, error) {
+	if err := authorize(actor); err != nil {
+		return nil, AdminCatalogCursor{}, err
+	}
+	if in.Limit < 1 || in.Limit > 200 {
+		return nil, AdminCatalogCursor{}, ErrInvalid
+	}
+	if in.Kind != "" && in.Kind != "grade" && in.Kind != "term" && in.Kind != "subject" && in.Kind != "chapter" && in.Kind != "lesson" {
+		return nil, AdminCatalogCursor{}, ErrInvalid
+	}
+	return s.store.ListAdminCatalog(ctx, in)
+}
+func (s *Service) GetAdminLesson(ctx context.Context, actor Principal, id uuid.UUID) (AdminLessonDetail, error) {
+	if err := authorize(actor); err != nil {
+		return AdminLessonDetail{}, err
+	}
+	if id == uuid.Nil {
+		return AdminLessonDetail{}, ErrInvalid
+	}
+	return s.store.GetAdminLesson(ctx, id)
+}
+func (s *Service) ListAdminRevisions(ctx context.Context, actor Principal, lessonID uuid.UUID, limit int, after RevisionCursor) ([]Revision, RevisionCursor, error) {
+	if err := authorize(actor); err != nil {
+		return nil, RevisionCursor{}, err
+	}
+	if lessonID == uuid.Nil || limit < 1 || limit > 100 {
+		return nil, RevisionCursor{}, ErrInvalid
+	}
+	return s.store.ListAdminRevisions(ctx, lessonID, limit, after)
+}
+
 func (s *Service) ArchiveLesson(ctx context.Context, actor Principal, lessonID uuid.UUID) error {
 	if err := authorize(actor); err != nil {
 		return err
@@ -218,7 +271,11 @@ func (s *Service) withTx(ctx context.Context, fn func(TxStore, audit.Writer) err
 	if uow, ok := s.store.(UnitOfWork); ok {
 		return uow.WithinTx(ctx, fn)
 	}
-	return fn(s.store, discardTeachingAudit{})
+	store, ok := s.store.(TxStore)
+	if !ok {
+		return ErrInvalid
+	}
+	return fn(store, discardTeachingAudit{})
 }
 
 type discardTeachingAudit struct{}
@@ -249,7 +306,11 @@ func validText(v string, max int) bool {
 func normalizedDraftInput(in SaveDraftInput, actorID uuid.UUID) SaveDraftInput {
 	in.ActorID, in.Title, in.Summary = actorID, strings.TrimSpace(in.Title), strings.TrimSpace(in.Summary)
 	for i := range in.ExternalVideos {
-		in.ExternalVideos[i].URL = strings.TrimSpace(in.ExternalVideos[i].URL)
+		normalized, err := normalizeExternalURL(in.ExternalVideos[i].URL)
+		if err != nil {
+			normalized = ""
+		}
+		in.ExternalVideos[i].URL = normalized
 		in.ExternalVideos[i].Title = strings.TrimSpace(in.ExternalVideos[i].Title)
 		in.ExternalVideos[i].Description = strings.TrimSpace(in.ExternalVideos[i].Description)
 	}
@@ -260,6 +321,9 @@ func validDraft(in SaveDraftInput) bool {
 		return false
 	}
 	if in.Audience.Mode != AudienceAll && in.Audience.Mode != AudienceSelected {
+		return false
+	}
+	if in.Audience.Mode == AudienceAll && len(in.Audience.UserIDs) != 0 {
 		return false
 	}
 	if in.Audience.Mode == AudienceSelected && len(in.Audience.UserIDs) == 0 {
@@ -279,13 +343,44 @@ func validDraft(in SaveDraftInput) bool {
 	}
 	return true
 }
-func validExternalURL(raw string) bool {
-	if strings.ContainsAny(raw, "\r\n\t") {
+func validPersistedDraft(in SaveDraftInput) bool {
+	if !validDraft(in) {
 		return false
 	}
-	u, err := url.Parse(raw)
-	return err == nil && u.IsAbs() && u.Scheme == "https" && u.Host != "" && u.User == nil
+	lower := strings.ToLower(in.BodyMarkdown)
+	for _, bad := range []string{"<script", "javascript:", "\\write18", "\\input{", "\\include{"} {
+		if strings.Contains(lower, bad) {
+			return false
+		}
+	}
+	if strings.Count(in.BodyMarkdown, "```")%2 != 0 || strings.ContainsRune(in.BodyMarkdown, '\x00') {
+		return false
+	}
+	return true
 }
+func normalizeExternalURL(raw string) (string, error) {
+	if strings.ContainsAny(raw, "\r\n\t") {
+		return "", ErrInvalid
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.User != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return "", ErrInvalid
+	}
+	u.Scheme = "https"
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && port != "443" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	u.Host = host
+	if u.Fragment == "" {
+		u.RawFragment = ""
+	}
+	return u.String(), nil
+}
+func validExternalURL(raw string) bool { _, err := normalizeExternalURL(raw); return err == nil }
 
 var _ AdminHTTPService = (*Service)(nil)
 var _ = errors.Is
