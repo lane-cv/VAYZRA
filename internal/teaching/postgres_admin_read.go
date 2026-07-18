@@ -5,14 +5,10 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
-func (s *PostgresStore) PublicationQuery(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	return s.q.Query(ctx, sql, args...)
-}
-func (s *PostgresStore) PublicationQueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	return s.q.QueryRow(ctx, sql, args...)
+func (s *PostgresStore) PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error) {
+	return nil, nil
 }
 
 func (s *PostgresStore) EligibleAudienceUsers(ctx context.Context, ids []uuid.UUID) (int, error) {

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 func (s *fakeCatalogStore) ListAdminCatalog(context.Context, AdminCatalogInput) ([]AdminCatalogItem, AdminCatalogCursor, error) {
@@ -25,7 +24,6 @@ func (s *fakeCatalogStore) PublishSnapshot(ctx context.Context, in PublishInput,
 func (s *fakeCatalogStore) EligibleAudienceUsers(_ context.Context, ids []uuid.UUID) (int, error) {
 	return len(ids), nil
 }
-func (s *fakeCatalogStore) PublicationQuery(context.Context, string, ...any) (pgx.Rows, error) {
+func (s *fakeCatalogStore) PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error) {
 	return nil, nil
 }
-func (s *fakeCatalogStore) PublicationQueryRow(context.Context, string, ...any) pgx.Row { return nil }

@@ -70,3 +70,4 @@ The local PATH lacked Go, so the initial written RED test could not be executed 
 - Active-only catalog reads propagate ancestor archive state; `includeArchived=true` exposes archived branches explicitly rather than making them look active.
 - Revision detail/history and current publication all preserve `sourceDraftVersion`; no uniqueness constraint was added, so withdrawal and republish remain supported.
 - No student read DTOs or Task 3 behavior were changed.
+- Post-review refinement: narrowed `PublicationReader` from generic SQL query methods to the typed `PublicationBlockers(ctx, lessonID, sourceDraftVersion)` capability required by the secure-files plan; the relevant package suite passed again.

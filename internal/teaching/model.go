@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 type AudienceMode string
@@ -207,8 +206,7 @@ type ProgressInput struct {
 }
 
 type PublicationReader interface {
-	PublicationQuery(context.Context, string, ...any) (pgx.Rows, error)
-	PublicationQueryRow(context.Context, string, ...any) pgx.Row
+	PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error)
 }
 type PublicationCheck interface {
 	Check(context.Context, PublicationReader, Draft) error
