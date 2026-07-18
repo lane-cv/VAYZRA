@@ -238,8 +238,8 @@ func (s *PostgresStore) Publish(ctx context.Context, in PublishInput) (Revision,
 		return Revision{}, mapTeachingError(err)
 	}
 	var revision Revision
-	revision.LessonID, revision.Version, revision.Title, revision.Summary, revision.BodyMarkdown, revision.SortKey, revision.PublishedBy = in.LessonID, version, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID
-	err = s.q.QueryRow(ctx, `INSERT INTO lesson_revisions (lesson_id,version,title,summary,body_markdown,sort_key,published_by) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,published_at`, in.LessonID, version, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID).Scan(&revision.ID, &revision.PublishedAt)
+	revision.LessonID, revision.Version, revision.SourceDraftVersion, revision.Title, revision.Summary, revision.BodyMarkdown, revision.SortKey, revision.PublishedBy = in.LessonID, version, d.LockVersion, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID
+	err = s.q.QueryRow(ctx, `INSERT INTO lesson_revisions (lesson_id,version,source_draft_version,title,summary,body_markdown,sort_key,published_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,published_at`, in.LessonID, version, d.LockVersion, d.Title, d.Summary, d.BodyMarkdown, d.SortKey, in.ActorID).Scan(&revision.ID, &revision.PublishedAt)
 	if err != nil {
 		return Revision{}, mapTeachingError(err)
 	}

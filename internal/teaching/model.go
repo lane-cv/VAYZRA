@@ -69,17 +69,18 @@ type Draft struct {
 }
 
 type Revision struct {
-	ID             uuid.UUID
-	LessonID       uuid.UUID
-	Version        int64
-	Title          string
-	Summary        string
-	BodyMarkdown   string
-	SortKey        int64
-	Audience       Audience
-	ExternalVideos []ExternalVideo
-	PublishedBy    uuid.UUID
-	PublishedAt    time.Time
+	ID                 uuid.UUID
+	LessonID           uuid.UUID
+	Version            int64
+	SourceDraftVersion int64
+	Title              string
+	Summary            string
+	BodyMarkdown       string
+	SortKey            int64
+	Audience           Audience
+	ExternalVideos     []ExternalVideo
+	PublishedBy        uuid.UUID
+	PublishedAt        time.Time
 }
 
 type Lesson struct {

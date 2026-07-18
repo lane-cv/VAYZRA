@@ -180,8 +180,8 @@ func publishFixtureRevision(t *testing.T, pool *pgxpool.Pool, lessonID, teacherI
 	ctx := context.Background()
 	var revisionID uuid.UUID
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO lesson_revisions (lesson_id, version, title, summary, body_markdown, sort_key, published_by)
-		VALUES ($1, 1, 'Lesson 1', '', 'Body', 1024, $2) RETURNING id`, lessonID, teacherID).Scan(&revisionID); err != nil {
+		INSERT INTO lesson_revisions (lesson_id, version, source_draft_version, title, summary, body_markdown, sort_key, published_by)
+		VALUES ($1, 1, 1, 'Lesson 1', '', 'Body', 1024, $2) RETURNING id`, lessonID, teacherID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'selected')`, revisionID); err != nil {
@@ -204,8 +204,8 @@ func publishRevisionForAudience(t *testing.T, pool *pgxpool.Pool, lessonID, teac
 	ctx := context.Background()
 	var revisionID uuid.UUID
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO lesson_revisions (lesson_id, version, title, summary, body_markdown, sort_key, published_by)
-		VALUES ($1, 1, $2, '', $3, 1024, $4) RETURNING id`, lessonID, title, body, teacherID).Scan(&revisionID); err != nil {
+		INSERT INTO lesson_revisions (lesson_id, version, source_draft_version, title, summary, body_markdown, sort_key, published_by)
+		VALUES ($1, 1, 1, $2, '', $3, 1024, $4) RETURNING id`, lessonID, title, body, teacherID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, $2)`, revisionID, mode); err != nil {
@@ -229,8 +229,8 @@ func publishRevisionVersion(t *testing.T, pool *pgxpool.Pool, lessonID, teacherI
 	ctx := context.Background()
 	var revisionID uuid.UUID
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO lesson_revisions (lesson_id, version, title, summary, body_markdown, sort_key, published_by)
-		VALUES ($1, $2, 'Replacement', '', 'replacement body', 1024, $3) RETURNING id`, lessonID, version, teacherID).Scan(&revisionID); err != nil {
+		INSERT INTO lesson_revisions (lesson_id, version, source_draft_version, title, summary, body_markdown, sort_key, published_by)
+		VALUES ($1, $2, $2, 'Replacement', '', 'replacement body', 1024, $3) RETURNING id`, lessonID, version, teacherID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, $2)`, revisionID, mode); err != nil {
@@ -320,7 +320,7 @@ func TestTeachingSchemaFinalizesRevisionChildren(t *testing.T) {
 	}
 }
 
-func TestTeachingSchemaRequiresActiveAudienceStudents(t *testing.T) {
+func TestTeachingSchemaValidatesNewAudienceMembersButPreservesHistory(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(ctx, pool); err != nil {
@@ -349,14 +349,15 @@ func TestTeachingSchemaRequiresActiveAudienceStudents(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_audience_users (lesson_id, user_id) VALUES ($1, $2)`, lessonID, activeStudent); err != nil {
 		t.Fatal(err)
 	}
-	for _, update := range []string{
-		`UPDATE users SET status = 'disabled' WHERE id = $1`,
-		`UPDATE users SET role = 'admin' WHERE id = $1`,
-		`UPDATE users SET deleted_at = now() WHERE id = $1`,
-	} {
-		if _, err := pool.Exec(ctx, update, activeStudent); err == nil {
-			t.Fatal("referenced audience student was allowed to become ineligible")
-		}
+	if _, err := pool.Exec(ctx, `UPDATE users SET status = 'disabled' WHERE id = $1`, activeStudent); err != nil {
+		t.Fatalf("disable referenced student: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET deleted_at = now() WHERE id = $1`, activeStudent); err != nil {
+		t.Fatalf("soft-delete referenced student: %v", err)
+	}
+	var historicalRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM lesson_draft_audience_users WHERE lesson_id=$1 AND user_id=$2`, lessonID, activeStudent).Scan(&historicalRows); err != nil || historicalRows != 1 {
+		t.Fatalf("historical audience rows=%d err=%v", historicalRows, err)
 	}
 }
 
@@ -364,8 +365,8 @@ func insertUnfinalizedRevision(t *testing.T, pool *pgxpool.Pool, lessonID, teach
 	t.Helper()
 	var revisionID uuid.UUID
 	if err := pool.QueryRow(context.Background(), `
-		INSERT INTO lesson_revisions (lesson_id, version, title, summary, body_markdown, sort_key, published_by)
-		VALUES ($1, 1, 'Lesson 1', '', 'Body', 1024, $2) RETURNING id`, lessonID, teacherID).Scan(&revisionID); err != nil {
+		INSERT INTO lesson_revisions (lesson_id, version, source_draft_version, title, summary, body_markdown, sort_key, published_by)
+		VALUES ($1, 1, 1, 'Lesson 1', '', 'Body', 1024, $2) RETURNING id`, lessonID, teacherID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
 	return revisionID
