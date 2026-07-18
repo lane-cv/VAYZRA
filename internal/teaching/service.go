@@ -187,16 +187,12 @@ func (s *Service) Publish(ctx context.Context, actor Principal, in PublishInput)
 			return ErrNotPublishable
 		}
 		if draft.Audience.Mode == AudienceSelected {
-			eligible, err := store.EligibleAudienceUsers(ctx, draft.Audience.UserIDs)
-			if err != nil {
+			if err := store.LockAudienceUsersForPublication(ctx, draft.Audience.UserIDs); err != nil {
 				return err
 			}
-			if eligible != len(draft.Audience.UserIDs) {
-				return ErrNotPublishable
-			}
 		}
-		if err := s.publication.Check(ctx, store, draft); err != nil {
-			return ErrNotPublishable
+		if err := s.checkPublication(ctx, store, draft); err != nil {
+			return err
 		}
 		revision, err = store.PublishSnapshot(ctx, in, draft)
 		if err != nil {
@@ -206,6 +202,13 @@ func (s *Service) Publish(ctx context.Context, actor Principal, in PublishInput)
 	})
 	return revision, err
 }
+
+func (s *Service) checkPublication(ctx context.Context, store PublicationReader, draft Draft) error {
+	reader := newPublicationReadScope(store)
+	defer reader.invalidate()
+	return s.publication.Check(ctx, reader, draft)
+}
+
 func (s *Service) ListAdminCatalog(ctx context.Context, actor Principal, in AdminCatalogInput) ([]AdminCatalogItem, AdminCatalogCursor, error) {
 	if err := authorize(actor); err != nil {
 		return nil, AdminCatalogCursor{}, err
@@ -303,6 +306,12 @@ func validCatalogCreate(in CatalogCreateInput) bool {
 func validText(v string, max int) bool {
 	return utf8.ValidString(v) && strings.TrimSpace(v) != "" && utf8.RuneCountInString(v) <= max
 }
+func validSingleLineText(v string, max int) bool {
+	return validText(v, max) && !containsDisallowedTextControl(v, false)
+}
+func validOptionalMultilineText(v string, max int) bool {
+	return utf8.ValidString(v) && utf8.RuneCountInString(v) <= max && !containsDisallowedTextControl(v, true)
+}
 func normalizedDraftInput(in SaveDraftInput, actorID uuid.UUID) SaveDraftInput {
 	in.ActorID, in.Title, in.Summary = actorID, strings.TrimSpace(in.Title), strings.TrimSpace(in.Summary)
 	for i := range in.ExternalVideos {
@@ -317,7 +326,7 @@ func normalizedDraftInput(in SaveDraftInput, actorID uuid.UUID) SaveDraftInput {
 	return in
 }
 func validDraft(in SaveDraftInput) bool {
-	if in.LessonID == uuid.Nil || in.ExpectedVersion < 1 || !validText(in.Title, 160) || !utf8.ValidString(in.Summary) || utf8.RuneCountInString(in.Summary) > 500 || !utf8.ValidString(in.BodyMarkdown) || utf8.RuneCountInString(in.BodyMarkdown) > 200000 {
+	if in.LessonID == uuid.Nil || in.ExpectedVersion < 1 || !validSingleLineText(in.Title, 160) || !validOptionalMultilineText(in.Summary, 500) || !utf8.ValidString(in.BodyMarkdown) || utf8.RuneCountInString(in.BodyMarkdown) > maxPublicationBodyRunes {
 		return false
 	}
 	if in.Audience.Mode != AudienceAll && in.Audience.Mode != AudienceSelected {
@@ -337,24 +346,21 @@ func validDraft(in SaveDraftInput) bool {
 		seen[id] = true
 	}
 	for _, video := range in.ExternalVideos {
-		if video.ID == uuid.Nil || !validText(video.Title, 160) || !utf8.ValidString(video.Description) || utf8.RuneCountInString(video.Description) > 500 || !validExternalURL(video.URL) {
+		if video.ID == uuid.Nil || !validSingleLineText(video.Title, 160) || !validOptionalMultilineText(video.Description, 500) || !validExternalURL(video.URL) {
 			return false
 		}
 	}
 	return true
 }
 func validPersistedDraft(in SaveDraftInput) bool {
-	if !validDraft(in) {
+	if !validDraft(in) || validatePublicationBody(in.BodyMarkdown) != nil {
 		return false
 	}
-	lower := strings.ToLower(in.BodyMarkdown)
-	for _, bad := range []string{"<script", "javascript:", "\\write18", "\\input{", "\\include{"} {
-		if strings.Contains(lower, bad) {
+	for _, video := range in.ExternalVideos {
+		normalized, err := normalizeExternalURL(video.URL)
+		if err != nil || normalized != video.URL {
 			return false
 		}
-	}
-	if strings.Count(in.BodyMarkdown, "```")%2 != 0 || strings.ContainsRune(in.BodyMarkdown, '\x00') {
-		return false
 	}
 	return true
 }

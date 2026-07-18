@@ -43,8 +43,8 @@ func TestStudentCatalogDoesNotEnumerateOtherStudentsLessons(t *testing.T) {
 	if _, err := svc.GetLesson(ctx, principalA, forA); err != nil {
 		t.Fatalf("read of A-only lesson: %v", err)
 	}
-	if nodes, err := svc.Browse(ctx, principalA, teaching.BrowseInput{}); err != nil || len(nodes) != 4 {
-		t.Fatalf("browse nodes=%d err=%v, want visible active path", len(nodes), err)
+	if nodes, _, err := svc.Browse(ctx, principalA, teaching.BrowseInput{}); err != nil || len(nodes) != 6 {
+		t.Fatalf("browse nodes=%d err=%v, want active path plus two authorized lessons", len(nodes), err)
 	}
 	results, _, err := svc.Search(ctx, principalA, teaching.SearchInput{Query: "alpha", Limit: 10})
 	if err != nil || len(results) != 1 || results[0].LessonID != forA {

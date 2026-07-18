@@ -29,6 +29,7 @@ type Dependencies struct {
 	TrustedProxyCIDRs []netip.Prefix
 	Limiter           redisx.Limiter
 	ProgressLimiter   redisx.ProgressWriteLimiter
+	SearchLimiter     redisx.SearchRateLimiter
 	Captchas          redisx.CaptchaService
 	StaticFiles       fs.FS
 }
@@ -73,7 +74,7 @@ func New(d Dependencies) http.Handler {
 					private.Mount("/admin", teaching.NewAdminHandlerWithConfig(d.Teaching, teaching.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.StudentTeaching != nil {
-					private.Mount("/student", teaching.NewStudentHandlerWithConfig(d.StudentTeaching, teaching.StudentHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProgressLimiter: d.ProgressLimiter}).Routes())
+					private.Mount("/student", teaching.NewStudentHandlerWithConfig(d.StudentTeaching, teaching.StudentHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProgressLimiter: d.ProgressLimiter, SearchLimiter: d.SearchLimiter}).Routes())
 				}
 			})
 		})

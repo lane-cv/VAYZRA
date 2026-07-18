@@ -23,10 +23,7 @@ type CatalogStore interface {
 	ListAdminRevisions(context.Context, uuid.UUID, int, RevisionCursor) ([]Revision, RevisionCursor, error)
 	LockDraftForPublication(context.Context, uuid.UUID) (Draft, error)
 	PublishSnapshot(context.Context, PublishInput, Draft) (Revision, error)
-	EligibleAudienceUsers(context.Context, []uuid.UUID) (int, error)
-	Browse(context.Context, BrowseInput) ([]CatalogNode, error)
-	Search(context.Context, SearchInput) ([]Revision, SearchCursor, error)
-	UpdateProgress(context.Context, uuid.UUID, ProgressInput) error
+	LockAudienceUsersForPublication(context.Context, []uuid.UUID) error
 }
 
 type TxStore interface {

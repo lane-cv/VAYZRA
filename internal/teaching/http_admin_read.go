@@ -20,7 +20,8 @@ type adminCatalogDTO struct {
 	Description string `json:"description"`
 	SortKey     int64  `json:"sortKey"`
 	Status      string `json:"status"`
-	Published   bool   `json:"published"`
+	// Published is retained for compatibility and means a current revision pointer exists.
+	Published bool `json:"published"`
 }
 type adminAudienceDTO struct {
 	Mode    AudienceMode `json:"mode"`
@@ -66,6 +67,19 @@ type adminLessonDTO struct {
 	PublishedRevisionID string            `json:"publishedRevisionId,omitempty"`
 	Draft               adminDraftDTO     `json:"draft"`
 	CurrentPublication  *adminRevisionDTO `json:"currentPublication"`
+}
+
+func adminLessonStatus(archived, published, hasRevisions bool) string {
+	switch {
+	case archived:
+		return "archived"
+	case published:
+		return "published"
+	case hasRevisions:
+		return "withdrawn"
+	default:
+		return "draft"
+	}
 }
 
 func adminAudienceView(a Audience) adminAudienceDTO {
@@ -150,7 +164,9 @@ func (h *AdminHandler) ListCatalog(w http.ResponseWriter, r *http.Request) {
 	views := make([]adminCatalogDTO, 0, len(items))
 	for _, item := range items {
 		status := "active"
-		if item.ArchivedAt != nil {
+		if item.Kind == "lesson" {
+			status = adminLessonStatus(item.ArchivedAt != nil, item.Published, item.HasRevisions)
+		} else if item.ArchivedAt != nil {
 			status = "archived"
 		}
 		parentID := ""
@@ -178,12 +194,7 @@ func (h *AdminHandler) GetLesson(w http.ResponseWriter, r *http.Request) {
 		adminError(w, r, err)
 		return
 	}
-	status := "draft"
-	if detail.Lesson.ArchivedAt != nil {
-		status = "archived"
-	} else if detail.Lesson.PublishedRevisionID != uuid.Nil {
-		status = "published"
-	}
+	status := adminLessonStatus(detail.Lesson.ArchivedAt != nil, detail.Lesson.PublishedRevisionID != uuid.Nil, detail.HasRevisions)
 	view := adminLessonDTO{ID: detail.Lesson.ID.String(), ChapterID: detail.Lesson.ChapterID.String(), Status: status, Draft: adminDraftView(detail.Draft)}
 	if detail.Lesson.PublishedRevisionID != uuid.Nil {
 		view.PublishedRevisionID = detail.Lesson.PublishedRevisionID.String()

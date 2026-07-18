@@ -55,10 +55,11 @@ func adminTeachingPrincipal() Principal {
 }
 
 type fakeCatalogStore struct {
-	draft      Draft
-	published  bool
-	finalized  bool
-	outboxKind string
+	draft       Draft
+	published   bool
+	finalized   bool
+	outboxKind  string
+	blockersErr error
 }
 
 func (s *fakeCatalogStore) CreateCatalog(context.Context, CatalogCreateInput) (CatalogNode, error) {

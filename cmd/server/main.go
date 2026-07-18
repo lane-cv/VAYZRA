@@ -80,6 +80,7 @@ type applicationDependencies struct {
 	openRedis          func(string) (*redis.Client, error)
 	newThrottle        func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
 	newProgressLimiter func(*redis.Client, config.Config) redisx.ProgressWriteLimiter
+	newSearchLimiter   func(*redis.Client, config.Config) redisx.SearchRateLimiter
 	closeRedis         func(*redis.Client)
 }
 
@@ -101,7 +102,10 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 			return redisx.NewLoginLimiter(client, policy), redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
 		},
 		newProgressLimiter: func(client *redis.Client, cfg config.Config) redisx.ProgressWriteLimiter {
-			return redisx.NewProgressWriteLimiter(client, redisx.ProgressLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxWrites: 60})
+			return redisx.NewProgressWriteLimiter(client, redisx.ProgressLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, SessionMaxWrites: 60, AccountMaxWrites: 120})
+		},
+		newSearchLimiter: func(client *redis.Client, cfg config.Config) redisx.SearchRateLimiter {
+			return redisx.NewSearchLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 30})
 		},
 		closeRedis: func(client *redis.Client) { _ = client.Close() },
 	})
@@ -142,6 +146,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	var limiter redisx.Limiter
 	var captchas redisx.CaptchaService
 	var progressLimiter redisx.ProgressWriteLimiter
+	var searchLimiter redisx.SearchRateLimiter
 	closeResources := closePool
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
@@ -157,6 +162,9 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		limiter, captchas = deps.newThrottle(client, cfg)
 		if deps.newProgressLimiter != nil {
 			progressLimiter = deps.newProgressLimiter(client, cfg)
+		}
+		if deps.newSearchLimiter != nil {
+			searchLimiter = deps.newSearchLimiter(client, cfg)
 		}
 		closeResources = func() {
 			deps.closeRedis(client)
@@ -174,6 +182,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Limiter:           limiter,
 		ProgressLimiter:   progressLimiter,
+		SearchLimiter:     searchLimiter,
 		Captchas:          captchas,
 		StaticFiles:       os.DirFS("web/dist"),
 	}), closeResources, nil

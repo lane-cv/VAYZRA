@@ -47,7 +47,7 @@ func TestPublicationCheckRunsUnderDraftLockAndFailureRollsBack(t *testing.T) {
 	svc := teaching.NewService(teaching.NewPostgresStore(pool), check, time.Now)
 	actor := teaching.Principal{User: auth.User{ID: adminID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "atomic-check", IP: net.ParseIP("192.0.2.60")}
 	_, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: 1})
-	if !errors.Is(err, teaching.ErrNotPublishable) || !check.locked {
+	if !errors.Is(err, errReadinessBlocked) || !check.locked {
 		t.Fatalf("err=%v locked=%t", err, check.locked)
 	}
 	var revisions, finalizations, outbox, audits int

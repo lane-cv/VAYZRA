@@ -13,7 +13,7 @@ import (
 
 func TestStudentLessonReadDoesNotRevealUnauthorizedLesson(t *testing.T) {
 	studentA, studentB, lessonID := uuid.New(), uuid.New(), uuid.New()
-	svc := NewStudentService(&fakeStudentStore{lesson: Revision{ID: uuid.New(), LessonID: lessonID}, getErr: ErrNotFound}, fixedTeachingClock)
+	svc := NewStudentService(&fakeStudentStore{lesson: StudentLesson{Revision: Revision{ID: uuid.New(), LessonID: lessonID}}, getErr: ErrNotFound}, fixedTeachingClock)
 
 	_, err := svc.GetLesson(context.Background(), studentTeachingPrincipal(studentA), lessonID)
 	if !errors.Is(err, ErrNotFound) {
@@ -29,7 +29,7 @@ func TestStudentServiceRejectsDisabledStudentAndInvalidProgress(t *testing.T) {
 	disabled := studentTeachingPrincipal(studentID)
 	disabled.User.Status = auth.StatusDisabled
 
-	if _, err := svc.Browse(context.Background(), disabled, BrowseInput{}); !errors.Is(err, ErrForbidden) {
+	if _, _, err := svc.Browse(context.Background(), disabled, BrowseInput{}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("browse error = %v, want forbidden", err)
 	}
 	err := svc.UpdateProgress(context.Background(), studentTeachingPrincipal(studentID), ProgressInput{
@@ -44,19 +44,25 @@ func TestStudentServiceRejectsDisabledStudentAndInvalidProgress(t *testing.T) {
 }
 
 type fakeStudentStore struct {
-	lesson         Revision
+	lesson         StudentLesson
 	getErr         error
 	progressCalled bool
 }
 
-func (s *fakeStudentStore) Browse(context.Context, BrowseInput) ([]CatalogNode, error) {
+func (s *fakeStudentStore) BrowseStudent(context.Context, BrowseInput) ([]StudentCatalogNode, CatalogCursor, error) {
+	return nil, CatalogCursor{}, nil
+}
+func (s *fakeStudentStore) Recent(context.Context, uuid.UUID, int) ([]RecentLesson, error) {
 	return nil, nil
 }
-func (s *fakeStudentStore) Search(context.Context, SearchInput) ([]Revision, SearchCursor, error) {
+func (s *fakeStudentStore) Search(context.Context, SearchInput) ([]SearchResult, SearchCursor, error) {
 	return nil, SearchCursor{}, nil
 }
-func (s *fakeStudentStore) GetLesson(context.Context, uuid.UUID, uuid.UUID) (Revision, error) {
+func (s *fakeStudentStore) GetLesson(context.Context, uuid.UUID, uuid.UUID) (StudentLesson, error) {
 	return s.lesson, s.getErr
+}
+func (s *fakeStudentStore) GetPosition(context.Context, uuid.UUID, uuid.UUID) (LessonProgress, error) {
+	return LessonProgress{}, s.getErr
 }
 func (s *fakeStudentStore) UpdateProgress(context.Context, uuid.UUID, ProgressInput) error {
 	s.progressCalled = true

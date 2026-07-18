@@ -65,7 +65,7 @@ func TestTeachingDisableRevokesSessionsAndPreservesRevisionAudience(t *testing.T
 	student.Status = auth.StatusDisabled
 	disabledActor := teaching.Principal{User: student, RequestID: "disabled-student", IP: net.ParseIP("192.0.2.62")}
 	studentService := teaching.NewStudentService(teaching.NewPostgresStore(pool), time.Now)
-	if _, err := studentService.Browse(ctx, disabledActor, teaching.BrowseInput{}); !errors.Is(err, teaching.ErrForbidden) {
+	if _, _, err := studentService.Browse(ctx, disabledActor, teaching.BrowseInput{}); !errors.Is(err, teaching.ErrForbidden) {
 		t.Fatalf("disabled browse error=%v, want forbidden", err)
 	}
 	if _, _, err := studentService.Search(ctx, disabledActor, teaching.SearchInput{}); !errors.Is(err, teaching.ErrForbidden) {

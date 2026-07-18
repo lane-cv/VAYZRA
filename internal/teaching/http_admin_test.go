@@ -76,6 +76,18 @@ func TestAdminPublishReturnsStableNotPublishable(t *testing.T) {
 	}
 }
 
+func TestAdminPublishInfrastructureFailureReturnsInternalError(t *testing.T) {
+	h := NewAdminHandler(&fakeAdminHTTPService{publishErr: errors.New("readiness database unavailable")}).Routes()
+	r := httptest.NewRequest(http.MethodPost, "/lessons/"+uuid.NewString()+"/publish", nil)
+	r.Header.Set("If-Match", "1")
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{Role: auth.RoleAdmin, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), `"code":"internal_error"`) {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 type fakeAdminHTTPService struct{ saveErr, publishErr error }
 
 func (*fakeAdminHTTPService) CreateCatalog(context.Context, Principal, CatalogCreateInput) (CatalogNode, error) {

@@ -2,10 +2,6 @@ package redisx
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -15,30 +11,29 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ProgressWriteLimiter limits progress mutations independently from login
-// throttling. A backend failure deliberately fails open: authorization and
-// monotonicity remain PostgreSQL-enforced.
+// ProgressWriteLimiter applies both a session budget and an account budget.
 type ProgressWriteLimiter interface {
-	AllowProgressWrite(context.Context, uuid.UUID) (ProgressDecision, error)
+	AllowProgressWrite(context.Context, uuid.UUID, uuid.UUID) (ProgressDecision, error)
 }
 
-type ProgressDecision struct {
-	Allowed    bool
-	RetryAfter time.Duration
-}
+type ProgressDecision = ResourceDecision
 
 type ProgressLimitPolicy struct {
-	Secret    []byte
-	Window    time.Duration
-	MaxWrites int64
+	Secret           []byte
+	Window           time.Duration
+	MaxWrites        int64 // retained as a compatibility alias for SessionMaxWrites
+	SessionMaxWrites int64
+	AccountMaxWrites int64
+	LocalMaxKeys     int
 }
 
 type ProgressLimiter struct {
-	rdb    *redis.Client
-	policy ProgressLimitPolicy
-
+	rdb          *redis.Client
+	policy       ProgressLimitPolicy
+	localMu      sync.Mutex
+	local        *boundedCounterLRU
 	degradations atomic.Uint64
-	mu           sync.Mutex
+	warnMu       sync.Mutex
 	warnAfter    time.Time
 }
 
@@ -46,65 +41,69 @@ func NewProgressWriteLimiter(rdb *redis.Client, policy ProgressLimitPolicy) *Pro
 	if policy.Window <= 0 {
 		policy.Window = time.Minute
 	}
-	if policy.MaxWrites <= 0 {
-		policy.MaxWrites = 60
+	if policy.SessionMaxWrites <= 0 {
+		policy.SessionMaxWrites = policy.MaxWrites
 	}
-	if len(policy.Secret) == 0 {
-		policy.Secret = make([]byte, 32)
-		if _, err := rand.Read(policy.Secret); err != nil {
-			panic("read progress limiter secret")
-		}
+	if policy.SessionMaxWrites <= 0 {
+		policy.SessionMaxWrites = 60
 	}
-	policy.Secret = append([]byte(nil), policy.Secret...)
-	return &ProgressLimiter{rdb: rdb, policy: policy}
+	if policy.AccountMaxWrites <= 0 {
+		policy.AccountMaxWrites = 120
+	}
+	if policy.LocalMaxKeys <= 0 || policy.LocalMaxKeys > resourceFallbackMaxKeys {
+		policy.LocalMaxKeys = resourceFallbackMaxKeys
+	}
+	policy.Secret = normalizedResourceSecret(policy.Secret)
+	return &ProgressLimiter{rdb: rdb, policy: policy, local: newBoundedCounterLRU(policy.LocalMaxKeys)}
 }
 
 var progressWriteScript = redis.NewScript(`
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
-local ttl = redis.call('PTTL', KEYS[1])
-if count > tonumber(ARGV[2]) then return {0, ttl} end
-return {1, ttl}
+local session = redis.call('INCR', KEYS[1])
+if session == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+local sessionTTL = redis.call('PTTL', KEYS[1])
+local account = redis.call('INCR', KEYS[2])
+if account == 1 then redis.call('PEXPIRE', KEYS[2], ARGV[1]) end
+local accountTTL = redis.call('PTTL', KEYS[2])
+local retry = sessionTTL
+if accountTTL > retry then retry = accountTTL end
+if session > tonumber(ARGV[2]) or account > tonumber(ARGV[3]) then return {0, retry} end
+return {1, retry}
 `)
 
-func (l *ProgressLimiter) AllowProgressWrite(ctx context.Context, sessionID uuid.UUID) (ProgressDecision, error) {
-	if sessionID == uuid.Nil {
+func (l *ProgressLimiter) AllowProgressWrite(ctx context.Context, sessionID, accountID uuid.UUID) (ProgressDecision, error) {
+	if sessionID == uuid.Nil || accountID == uuid.Nil {
 		return ProgressDecision{}, nil
 	}
-	if l.rdb == nil {
-		return ProgressDecision{Allowed: true}, nil
-	}
-	result, err := progressWriteScript.Run(ctx, l.rdb, []string{l.key(sessionID)}, l.policy.Window.Milliseconds(), l.policy.MaxWrites).Int64Slice()
-	if err != nil || len(result) != 2 || result[1] < 0 {
+	sessionKey := resourceKey(l.policy.Secret, "progress-session", sessionID)
+	accountKey := resourceKey(l.policy.Secret, "progress-account", accountID)
+	if l.rdb != nil {
+		result, err := progressWriteScript.Run(ctx, l.rdb, []string{sessionKey, accountKey}, l.policy.Window.Milliseconds(), l.policy.SessionMaxWrites, l.policy.AccountMaxWrites).Int64Slice()
+		if err == nil && len(result) == 2 && result[1] >= 0 {
+			return resourceResult(result), nil
+		}
 		l.degraded("allow")
-		return ProgressDecision{Allowed: true}, nil
 	}
-	if result[0] == 0 {
-		return ProgressDecision{RetryAfter: time.Duration(result[1]) * time.Millisecond}, nil
-	}
-	return ProgressDecision{Allowed: true}, nil
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	return l.local.allow([]string{sessionKey, accountKey}, []int64{l.policy.SessionMaxWrites, l.policy.AccountMaxWrites}, time.Now(), l.policy.Window), nil
 }
 
-func (l *ProgressLimiter) key(sessionID uuid.UUID) string {
-	h := hmac.New(sha256.New, l.policy.Secret)
-	_, _ = h.Write([]byte("progress-session"))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(sessionID.String()))
-	return "hl:progress:session:" + hex.EncodeToString(h.Sum(nil))
+func (l *ProgressLimiter) LocalKeyCount() int {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	return l.local.Len()
 }
-
+func (l *ProgressLimiter) DegradationCount() uint64 { return l.degradations.Load() }
 func (l *ProgressLimiter) degraded(operation string) {
 	l.degradations.Add(1)
 	now := time.Now()
-	l.mu.Lock()
+	l.warnMu.Lock()
 	warn := !l.warnAfter.After(now)
 	if warn {
 		l.warnAfter = now.Add(time.Minute)
 	}
-	l.mu.Unlock()
+	l.warnMu.Unlock()
 	if warn {
 		log.Printf("level=warn event=progress_limiter_redis_unavailable metric=progress_limiter_redis_errors_total operation=%s", operation)
 	}
 }
-
-func (l *ProgressLimiter) DegradationCount() uint64 { return l.degradations.Load() }

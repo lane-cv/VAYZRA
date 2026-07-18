@@ -163,13 +163,19 @@ func (*appStudentAuth) Authenticate(context.Context, string) (auth.Authenticatio
 
 type appStudentTeaching struct{}
 
-func (*appStudentTeaching) Browse(context.Context, teaching.Principal, teaching.BrowseInput) ([]teaching.CatalogNode, error) {
-	return []teaching.CatalogNode{}, nil
+func (*appStudentTeaching) Browse(context.Context, teaching.Principal, teaching.BrowseInput) ([]teaching.StudentCatalogNode, teaching.CatalogCursor, error) {
+	return []teaching.StudentCatalogNode{}, teaching.CatalogCursor{}, nil
 }
-func (*appStudentTeaching) GetLesson(context.Context, teaching.Principal, uuid.UUID) (teaching.Revision, error) {
-	return teaching.Revision{}, nil
+func (*appStudentTeaching) Recent(context.Context, teaching.Principal, int) ([]teaching.RecentLesson, error) {
+	return nil, nil
 }
-func (*appStudentTeaching) Search(context.Context, teaching.Principal, teaching.SearchInput) ([]teaching.Revision, teaching.SearchCursor, error) {
+func (*appStudentTeaching) GetLesson(context.Context, teaching.Principal, uuid.UUID) (teaching.StudentLesson, error) {
+	return teaching.StudentLesson{}, nil
+}
+func (*appStudentTeaching) GetPosition(context.Context, teaching.Principal, uuid.UUID) (teaching.LessonProgress, error) {
+	return teaching.LessonProgress{}, nil
+}
+func (*appStudentTeaching) Search(context.Context, teaching.Principal, teaching.SearchInput) ([]teaching.SearchResult, teaching.SearchCursor, error) {
 	return nil, teaching.SearchCursor{}, nil
 }
 func (*appStudentTeaching) UpdateProgress(context.Context, teaching.Principal, teaching.ProgressInput) error {

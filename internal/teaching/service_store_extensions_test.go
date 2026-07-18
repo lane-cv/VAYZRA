@@ -21,9 +21,9 @@ func (s *fakeCatalogStore) LockDraftForPublication(ctx context.Context, id uuid.
 func (s *fakeCatalogStore) PublishSnapshot(ctx context.Context, in PublishInput, _ Draft) (Revision, error) {
 	return s.Publish(ctx, in)
 }
-func (s *fakeCatalogStore) EligibleAudienceUsers(_ context.Context, ids []uuid.UUID) (int, error) {
-	return len(ids), nil
+func (s *fakeCatalogStore) LockAudienceUsersForPublication(context.Context, []uuid.UUID) error {
+	return nil
 }
 func (s *fakeCatalogStore) PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error) {
-	return nil, nil
+	return nil, s.blockersErr
 }

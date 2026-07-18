@@ -25,11 +25,12 @@ const (
 )
 
 var (
-	ErrNotFound       = errors.New("teaching resource not found")
-	ErrForbidden      = errors.New("teaching operation forbidden")
-	ErrInvalid        = errors.New("invalid teaching input")
-	ErrConflict       = errors.New("teaching draft conflict")
-	ErrNotPublishable = errors.New("lesson not publishable")
+	ErrNotFound                 = errors.New("teaching resource not found")
+	ErrForbidden                = errors.New("teaching operation forbidden")
+	ErrInvalid                  = errors.New("invalid teaching input")
+	ErrConflict                 = errors.New("teaching draft conflict")
+	ErrNotPublishable           = errors.New("lesson not publishable")
+	ErrPublicationReaderExpired = errors.New("publication reader expired")
 )
 
 type Audience struct {
@@ -98,7 +99,9 @@ type AdminCatalogItem struct {
 	Description string
 	SortKey     int64
 	ArchivedAt  *time.Time
-	Published   bool
+	// Published is a compatibility shorthand for a current revision pointer.
+	Published    bool
+	HasRevisions bool
 }
 type AdminCatalogCursor struct {
 	Rank    int
@@ -113,9 +116,10 @@ type AdminCatalogInput struct {
 	After           AdminCatalogCursor
 }
 type AdminLessonDetail struct {
-	Lesson    Lesson
-	Draft     Draft
-	Published *Revision
+	Lesson       Lesson
+	Draft        Draft
+	Published    *Revision
+	HasRevisions bool
 }
 type RevisionCursor struct {
 	Version int64
@@ -183,6 +187,9 @@ type BrowseInput struct {
 	TermID    uuid.UUID
 	SubjectID uuid.UUID
 	ChapterID uuid.UUID
+	Kind      CatalogKind
+	Limit     int
+	After     CatalogCursor
 }
 
 type SearchCursor struct {
@@ -191,10 +198,11 @@ type SearchCursor struct {
 }
 
 type SearchInput struct {
-	StudentID uuid.UUID
-	Query     string
-	Limit     int
-	After     SearchCursor
+	StudentID   uuid.UUID
+	Query       string
+	Limit       int
+	After       SearchCursor
+	IncludeBody bool
 }
 
 type ProgressInput struct {
@@ -208,6 +216,9 @@ type ProgressInput struct {
 type PublicationReader interface {
 	PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error)
 }
+
+// PublicationCheck returns ErrNotPublishable for a semantic readiness blocker.
+// Every other error is an infrastructure failure and is preserved by Publish.
 type PublicationCheck interface {
 	Check(context.Context, PublicationReader, Draft) error
 }

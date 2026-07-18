@@ -84,11 +84,15 @@ func TestTeachingPublicationFailureLeavesCurrentRevisionUntouched(t *testing.T) 
 	ids := insertCatalogPath(t, pool)
 	lessonID := insertLessonDraft(t, pool, ids.chapterID, adminID)
 	current := publishFixtureRevision(t, pool, lessonID, adminID, studentID)
-	svc := teaching.NewService(teaching.NewPostgresStore(pool), rejectPublication{}, time.Now)
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_audiences(lesson_id,mode) VALUES($1,'all')`, lessonID); err != nil {
+		t.Fatal(err)
+	}
+	checkerCalled := false
+	svc := teaching.NewService(teaching.NewPostgresStore(pool), rejectPublication{called: &checkerCalled}, time.Now)
 	actor := teaching.Principal{User: auth.User{ID: adminID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "reject-request", IP: net.ParseIP("192.0.2.41")}
 	_, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: 1})
-	if !errors.Is(err, teaching.ErrNotPublishable) {
-		t.Fatalf("publish error=%v", err)
+	if !errors.Is(err, teaching.ErrNotPublishable) || !checkerCalled {
+		t.Fatalf("publish error=%v checkerCalled=%t", err, checkerCalled)
 	}
 	var got uuid.UUID
 	if err := pool.QueryRow(ctx, `SELECT published_revision_id FROM lessons WHERE id=$1`, lessonID).Scan(&got); err != nil || got != current {
@@ -96,8 +100,9 @@ func TestTeachingPublicationFailureLeavesCurrentRevisionUntouched(t *testing.T) 
 	}
 }
 
-type rejectPublication struct{}
+type rejectPublication struct{ called *bool }
 
-func (rejectPublication) Check(context.Context, teaching.PublicationReader, teaching.Draft) error {
-	return errors.New("blocked")
+func (r rejectPublication) Check(context.Context, teaching.PublicationReader, teaching.Draft) error {
+	*r.called = true
+	return teaching.ErrNotPublishable
 }

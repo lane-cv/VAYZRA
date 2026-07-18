@@ -36,6 +36,27 @@ func TestStudentRoutesHideUnauthorizedLessonAndSetNoStore(t *testing.T) {
 	}
 }
 
+func TestStudentFilteredBrowseNotFoundIsStableAndNonEnumerating(t *testing.T) {
+	gradeID := uuid.New()
+	var bodies []string
+	for _, name := range []string{"missing", "unauthorized"} {
+		t.Run(name, func(t *testing.T) {
+			svc := &fakeStudentHTTPService{browseErr: ErrNotFound}
+			h := NewStudentHandler(svc).Routes()
+			r := httptest.NewRequest(http.MethodGet, "/catalog?gradeId="+gradeID.String(), nil)
+			r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"code":"not_found"`) || w.Header().Get("Cache-Control") != "no-store, private" {
+				t.Fatalf("status=%d cache=%q body=%s", w.Code, w.Header().Get("Cache-Control"), w.Body.String())
+			}
+			bodies = append(bodies, w.Body.String())
+		})
+	}
+	if len(bodies) != 2 || bodies[0] != bodies[1] {
+		t.Fatalf("filtered not-found responses are distinguishable: %#v", bodies)
+	}
+}
 func TestStudentProgressJSONIsStrictAndBounded(t *testing.T) {
 	svc := &fakeStudentHTTPService{}
 	h := NewStudentHandler(svc).Routes()
@@ -110,18 +131,25 @@ func TestStudentSearchCursorBoundsRejectBeforeServiceDispatch(t *testing.T) {
 }
 
 type fakeStudentHTTPService struct {
+	browseErr      error
 	getErr         error
 	progressCalled bool
 	searchCalled   bool
 }
 
-func (*fakeStudentHTTPService) Browse(context.Context, Principal, BrowseInput) ([]CatalogNode, error) {
+func (f *fakeStudentHTTPService) Browse(context.Context, Principal, BrowseInput) ([]StudentCatalogNode, CatalogCursor, error) {
+	return nil, CatalogCursor{}, f.browseErr
+}
+func (*fakeStudentHTTPService) Recent(context.Context, Principal, int) ([]RecentLesson, error) {
 	return nil, nil
 }
-func (f *fakeStudentHTTPService) GetLesson(context.Context, Principal, uuid.UUID) (Revision, error) {
-	return Revision{}, f.getErr
+func (f *fakeStudentHTTPService) GetLesson(context.Context, Principal, uuid.UUID) (StudentLesson, error) {
+	return StudentLesson{}, f.getErr
 }
-func (f *fakeStudentHTTPService) Search(context.Context, Principal, SearchInput) ([]Revision, SearchCursor, error) {
+func (f *fakeStudentHTTPService) GetPosition(context.Context, Principal, uuid.UUID) (LessonProgress, error) {
+	return LessonProgress{}, f.getErr
+}
+func (f *fakeStudentHTTPService) Search(context.Context, Principal, SearchInput) ([]SearchResult, SearchCursor, error) {
 	f.searchCalled = true
 	return nil, SearchCursor{}, nil
 }
@@ -138,18 +166,22 @@ type fakeProgressWriteLimiter struct {
 	calls    int
 }
 
-func (f *fakeProgressWriteLimiter) AllowProgressWrite(context.Context, uuid.UUID) (redisx.ProgressDecision, error) {
+func (f *fakeProgressWriteLimiter) AllowProgressWrite(context.Context, uuid.UUID, uuid.UUID) (redisx.ProgressDecision, error) {
 	f.calls++
 	return f.decision, nil
 }
 
-type studentSessionAuth struct{ sessionID uuid.UUID }
+type studentSessionAuth struct{ sessionID, userID uuid.UUID }
 
 func (*studentSessionAuth) Login(context.Context, auth.LoginInput) (auth.Authentication, string, error) {
 	return auth.Authentication{}, "", auth.ErrUnauthenticated
 }
 func (s *studentSessionAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
-	return auth.Authentication{User: auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}, Session: auth.Session{ID: s.sessionID}}, nil
+	userID := s.userID
+	if userID == uuid.Nil {
+		userID = uuid.New()
+	}
+	return auth.Authentication{User: auth.User{ID: userID, Role: auth.RoleStudent, Status: auth.StatusActive}, Session: auth.Session{ID: s.sessionID}}, nil
 }
 func (*studentSessionAuth) ChangePassword(context.Context, auth.ChangePasswordInput) (auth.Authentication, string, error) {
 	return auth.Authentication{}, "", auth.ErrUnauthenticated

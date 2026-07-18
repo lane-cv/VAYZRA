@@ -11,23 +11,47 @@ func (s *PostgresStore) PublicationBlockers(context.Context, uuid.UUID, int64) (
 	return nil, nil
 }
 
-func (s *PostgresStore) EligibleAudienceUsers(ctx context.Context, ids []uuid.UUID) (int, error) {
+func (s *PostgresStore) LockAudienceUsersForPublication(ctx context.Context, ids []uuid.UUID) error {
 	if len(ids) == 0 {
-		return 0, nil
+		return ErrNotPublishable
 	}
-	var count int
-	err := s.q.QueryRow(ctx, `SELECT count(*) FROM users WHERE id=ANY($1) AND role='student' AND status='active' AND deleted_at IS NULL`, ids).Scan(&count)
-	return count, mapTeachingError(err)
+	rows, err := s.q.Query(ctx, `SELECT id FROM users
+		WHERE id=ANY($1) AND role='student' AND status='active' AND deleted_at IS NULL
+		ORDER BY id FOR SHARE`, ids)
+	if err != nil {
+		return mapTeachingError(err)
+	}
+	defer rows.Close()
+	locked := make(map[uuid.UUID]struct{}, len(ids))
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return mapTeachingError(err)
+		}
+		locked[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return mapTeachingError(err)
+	}
+	if len(locked) != len(ids) {
+		return ErrNotPublishable
+	}
+	for _, id := range ids {
+		if _, ok := locked[id]; !ok {
+			return ErrNotPublishable
+		}
+	}
+	return nil
 }
 
 func (s *PostgresStore) ListAdminCatalog(ctx context.Context, in AdminCatalogInput) ([]AdminCatalogItem, AdminCatalogCursor, error) {
-	rows, err := s.q.Query(ctx, `WITH items(rank,id,parent_id,kind,name,description,sort_key,archived_at,published) AS (
-		SELECT 1,g.id,NULL::uuid,'grade',g.name,''::text,g.sort_key,g.archived_at,false FROM grades g
-		UNION ALL SELECT 2,t.id,t.grade_id,'term',t.name,'',t.sort_key,CASE WHEN g.archived_at IS NOT NULL THEN g.archived_at ELSE t.archived_at END,false FROM terms t JOIN grades g ON g.id=t.grade_id
-		UNION ALL SELECT 3,s.id,s.term_id,'subject',s.name,'',s.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at),false FROM subjects s JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
-		UNION ALL SELECT 4,c.id,c.subject_id,'chapter',c.name,c.description,c.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at,c.archived_at),false FROM chapters c JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
-		UNION ALL SELECT 5,l.id,l.chapter_id,'lesson',d.title,d.summary,d.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at,c.archived_at,l.archived_at),l.published_revision_id IS NOT NULL FROM lessons l JOIN lesson_drafts d ON d.lesson_id=l.id JOIN chapters c ON c.id=l.chapter_id JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
-	) SELECT rank,id,COALESCE(parent_id,'00000000-0000-0000-0000-000000000000'::uuid),kind,name,description,sort_key,archived_at,published FROM items
+	rows, err := s.q.Query(ctx, `WITH items(rank,id,parent_id,kind,name,description,sort_key,archived_at,published,has_revisions) AS (
+		SELECT 1,g.id,NULL::uuid,'grade',g.name,''::text,g.sort_key,g.archived_at,false,false FROM grades g
+		UNION ALL SELECT 2,t.id,t.grade_id,'term',t.name,'',t.sort_key,CASE WHEN g.archived_at IS NOT NULL THEN g.archived_at ELSE t.archived_at END,false,false FROM terms t JOIN grades g ON g.id=t.grade_id
+		UNION ALL SELECT 3,s.id,s.term_id,'subject',s.name,'',s.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at),false,false FROM subjects s JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
+		UNION ALL SELECT 4,c.id,c.subject_id,'chapter',c.name,c.description,c.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at,c.archived_at),false,false FROM chapters c JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
+		UNION ALL SELECT 5,l.id,l.chapter_id,'lesson',d.title,d.summary,d.sort_key,COALESCE(g.archived_at,t.archived_at,s.archived_at,c.archived_at,l.archived_at),l.published_revision_id IS NOT NULL,EXISTS(SELECT 1 FROM lesson_revisions r WHERE r.lesson_id=l.id) FROM lessons l JOIN lesson_drafts d ON d.lesson_id=l.id JOIN chapters c ON c.id=l.chapter_id JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id
+	) SELECT rank,id,COALESCE(parent_id,'00000000-0000-0000-0000-000000000000'::uuid),kind,name,description,sort_key,archived_at,published,has_revisions FROM items
 	WHERE ($1='' OR kind=$1) AND ($2::uuid='00000000-0000-0000-0000-000000000000' OR parent_id=$2) AND ($3 OR archived_at IS NULL)
 	AND (($4=0) OR (rank,sort_key,id)>($4,$5,$6)) ORDER BY rank,sort_key,id LIMIT $7`, in.Kind, in.ParentID, in.IncludeArchived, in.After.Rank, in.After.SortKey, in.After.ID, in.Limit)
 	if err != nil {
@@ -39,7 +63,7 @@ func (s *PostgresStore) ListAdminCatalog(ctx context.Context, in AdminCatalogInp
 	for rows.Next() {
 		var item AdminCatalogItem
 		var rank int
-		if err := rows.Scan(&rank, &item.ID, &item.ParentID, &item.Kind, &item.Name, &item.Description, &item.SortKey, &item.ArchivedAt, &item.Published); err != nil {
+		if err := rows.Scan(&rank, &item.ID, &item.ParentID, &item.Kind, &item.Name, &item.Description, &item.SortKey, &item.ArchivedAt, &item.Published, &item.HasRevisions); err != nil {
 			return nil, AdminCatalogCursor{}, mapTeachingError(err)
 		}
 		items = append(items, item)
@@ -56,7 +80,16 @@ func (s *PostgresStore) ListAdminCatalog(ctx context.Context, in AdminCatalogInp
 
 func (s *PostgresStore) GetAdminLesson(ctx context.Context, id uuid.UUID) (AdminLessonDetail, error) {
 	var out AdminLessonDetail
-	err := s.q.QueryRow(ctx, `SELECT id,chapter_id,COALESCE(published_revision_id,'00000000-0000-0000-0000-000000000000'::uuid),archived_at FROM lessons WHERE id=$1`, id).Scan(&out.Lesson.ID, &out.Lesson.ChapterID, &out.Lesson.PublishedRevisionID, &out.Lesson.ArchivedAt)
+	err := s.q.QueryRow(ctx, `SELECT l.id,l.chapter_id,
+		COALESCE(l.published_revision_id,'00000000-0000-0000-0000-000000000000'::uuid),
+		COALESCE(g.archived_at,t.archived_at,s.archived_at,c.archived_at,l.archived_at),
+		EXISTS(SELECT 1 FROM lesson_revisions r WHERE r.lesson_id=l.id)
+		FROM lessons l
+		JOIN chapters c ON c.id=l.chapter_id
+		JOIN subjects s ON s.id=c.subject_id
+		JOIN terms t ON t.id=s.term_id
+		JOIN grades g ON g.id=t.grade_id
+		WHERE l.id=$1`, id).Scan(&out.Lesson.ID, &out.Lesson.ChapterID, &out.Lesson.PublishedRevisionID, &out.Lesson.ArchivedAt, &out.HasRevisions)
 	if err != nil {
 		return AdminLessonDetail{}, mapTeachingError(err)
 	}
