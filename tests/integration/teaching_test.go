@@ -176,14 +176,17 @@ func TestTeachingSchemaFinalizesRevisionChildren(t *testing.T) {
 
 	secondLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
 	secondRevisionID := insertUnfinalizedRevision(t, pool, secondLessonID, teacher)
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'all')`, secondRevisionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, secondRevisionID); err != nil {
-		t.Fatalf("finalize revision without children: %v", err)
+		t.Fatalf("finalize revision: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE lessons SET published_revision_id = $2 WHERE id = $1`, secondLessonID, secondRevisionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'all')`, secondRevisionID); err == nil {
-		t.Fatal("finalized revision accepted an audience header")
+	if _, err := pool.Exec(ctx, `UPDATE lesson_revision_audiences SET mode = 'selected' WHERE revision_id = $1`, secondRevisionID); err == nil {
+		t.Fatal("finalized revision accepted an audience header mutation")
 	}
 }
 
@@ -247,4 +250,82 @@ func insertTeachingUserWithStatus(t *testing.T, pool *pgxpool.Pool, username, ro
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestTeachingSchemaPreventsFrozenChildMoves(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	teacher := insertTeachingUser(t, pool, "move_teacher", "admin")
+	student := insertTeachingUser(t, pool, "move_student", "student")
+	ids := insertCatalogPath(t, pool)
+	sourceLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	targetLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	sourceRevisionID := insertUnfinalizedRevision(t, pool, sourceLessonID, teacher)
+	targetRevisionID := insertUnfinalizedRevision(t, pool, targetLessonID, teacher)
+	for _, revisionID := range []uuid.UUID{sourceRevisionID, targetRevisionID} {
+		if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'selected')`, revisionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audience_users (revision_id, user_id) VALUES ($1, $2)`, sourceRevisionID, student); err != nil {
+		t.Fatal(err)
+	}
+	var videoID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO lesson_revision_external_videos (revision_id, url, title)
+		VALUES ($1, 'https://video.example.test', 'Video') RETURNING id`, sourceRevisionID).Scan(&videoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, sourceRevisionID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE lesson_revision_audience_users SET revision_id = $2 WHERE revision_id = $1 AND user_id = $3`, sourceRevisionID, targetRevisionID, student); err == nil {
+		t.Fatal("frozen audience member moved to an unfinalized revision")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE lesson_revision_external_videos SET revision_id = $2 WHERE id = $1`, videoID, targetRevisionID); err == nil {
+		t.Fatal("frozen external video moved to an unfinalized revision")
+	}
+}
+
+func TestTeachingSchemaRequiresAudienceHeaderBeforeFinalization(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	teacher := insertTeachingUser(t, pool, "header_teacher", "admin")
+	ids := insertCatalogPath(t, pool)
+	lessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	revisionID := insertUnfinalizedRevision(t, pool, lessonID, teacher)
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, revisionID); err == nil {
+		t.Fatal("revision without audience header finalized")
+	}
+}
+
+func TestTeachingSchemaRequiresSelectedAudienceMemberBeforeFinalization(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	teacher := insertTeachingUser(t, pool, "selected_teacher", "admin")
+	ids := insertCatalogPath(t, pool)
+	lessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	revisionID := insertUnfinalizedRevision(t, pool, lessonID, teacher)
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'selected')`, revisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, revisionID); err == nil {
+		t.Fatal("revision with empty selected audience finalized")
+	}
 }

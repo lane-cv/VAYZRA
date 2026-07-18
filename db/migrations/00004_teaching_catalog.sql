@@ -208,10 +208,20 @@ CREATE TRIGGER lesson_revisions_immutable
 CREATE OR REPLACE FUNCTION finalize_lesson_revision(p_revision_id uuid) RETURNS void AS $$
 DECLARE
   revision_lesson_id uuid;
+  audience_mode text;
 BEGIN
   SELECT lesson_id INTO revision_lesson_id FROM lesson_revisions WHERE id = p_revision_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'lesson revision does not exist' USING ERRCODE = '23503';
+  END IF;
+  SELECT mode INTO audience_mode FROM lesson_revision_audiences WHERE revision_id = p_revision_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'lesson revision requires an audience header' USING ERRCODE = '23514';
+  END IF;
+  IF audience_mode = 'selected' AND NOT EXISTS (
+    SELECT 1 FROM lesson_revision_audience_users WHERE revision_id = p_revision_id
+  ) THEN
+    RAISE EXCEPTION 'selected lesson revision audience requires a student' USING ERRCODE = '23514';
   END IF;
   INSERT INTO lesson_revision_finalizations (revision_id, lesson_id)
     VALUES (p_revision_id, revision_lesson_id);
@@ -224,19 +234,21 @@ CREATE TRIGGER lesson_revision_finalizations_immutable
 
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION reject_finalized_lesson_revision_child_mutation() RETURNS trigger AS $$
-DECLARE
-  target_revision_id uuid;
 BEGIN
-  IF TG_OP = 'DELETE' THEN
-    target_revision_id := OLD.revision_id;
-  ELSE
-    target_revision_id := NEW.revision_id;
-  END IF;
-  IF EXISTS (SELECT 1 FROM lesson_revision_finalizations WHERE revision_id = target_revision_id) THEN
-    RAISE EXCEPTION 'finalized lesson revision children are immutable' USING ERRCODE = '55000';
+  IF TG_OP = 'INSERT' THEN
+    IF EXISTS (SELECT 1 FROM lesson_revision_finalizations WHERE revision_id = NEW.revision_id) THEN
+      RAISE EXCEPTION 'finalized lesson revision children are immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
   END IF;
   IF TG_OP = 'DELETE' THEN
+    IF EXISTS (SELECT 1 FROM lesson_revision_finalizations WHERE revision_id = OLD.revision_id) THEN
+      RAISE EXCEPTION 'finalized lesson revision children are immutable' USING ERRCODE = '55000';
+    END IF;
     RETURN OLD;
+  END IF;
+  IF EXISTS (SELECT 1 FROM lesson_revision_finalizations WHERE revision_id IN (OLD.revision_id, NEW.revision_id)) THEN
+    RAISE EXCEPTION 'finalized lesson revision children are immutable' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
 END;
