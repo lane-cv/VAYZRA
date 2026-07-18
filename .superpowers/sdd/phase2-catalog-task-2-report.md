@@ -36,3 +36,11 @@ Completed teacher catalog, lesson draft, and publication APIs only. Student brow
 ## Concern
 
 The local PATH lacked Go, so the initial written RED test could not be executed before implementation. All subsequent focused, package, and disposable-PostgreSQL integration verification passed in the cached Go container.
+
+## Review-fix RED/GREEN (follow-up)
+
+- RED: `go test ./tests/integration -run "SnapshotsExternal|RejectsArchived" -count=1` failed: second publication returned `teaching draft conflict` from duplicate revision-video IDs; every archived hierarchy level published successfully.
+- GREEN: publication now generates new revision-video IDs and locks/validates the complete active grade→term→subject→chapter→lesson hierarchy. The same focused suite passed.
+- Added lesson archive service/store/HTTP behavior with atomic `lesson.archived` audit, bounded empty-body enforcement for publish/withdraw, and action-to-target audit validation.
+- Final suite: `go test ./internal/teaching ./internal/audit ./internal/app ./cmd/server ./tests/integration -run "Teaching|Publication|Admin|Audit|SaveDraft|Publish" -count=1` passed against disposable PostgreSQL on localhost:55433.
+- Self-review: second publication preserves draft-video IDs while every revision snapshot receives fresh IDs; archived lessons and archived ancestors cannot publish; cross-domain audit actions are rejected.

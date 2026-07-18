@@ -220,7 +220,9 @@ func (s *PostgresStore) SaveDraft(ctx context.Context, in SaveDraftInput) (Draft
 }
 func (s *PostgresStore) Publish(ctx context.Context, in PublishInput) (Revision, error) {
 	var locked uuid.UUID
-	if err := s.q.QueryRow(ctx, `SELECT lesson_id FROM lesson_drafts WHERE lesson_id=$1 FOR UPDATE`, in.LessonID).Scan(&locked); err != nil {
+	if err := s.q.QueryRow(ctx, `SELECT d.lesson_id FROM lesson_drafts d JOIN lessons l ON l.id=d.lesson_id JOIN chapters c ON c.id=l.chapter_id JOIN subjects s ON s.id=c.subject_id JOIN terms t ON t.id=s.term_id JOIN grades g ON g.id=t.grade_id WHERE d.lesson_id=$1 AND l.archived_at IS NULL AND c.archived_at IS NULL AND s.archived_at IS NULL AND t.archived_at IS NULL AND g.archived_at IS NULL FOR UPDATE OF d,l,c,s,t,g`, in.LessonID).Scan(&locked); errors.Is(err, pgx.ErrNoRows) {
+		return Revision{}, ErrNotPublishable
+	} else if err != nil {
 		return Revision{}, mapTeachingError(err)
 	}
 	d, err := s.GetDraft(ctx, in.LessonID)
@@ -251,8 +253,12 @@ func (s *PostgresStore) Publish(ctx context.Context, in PublishInput) (Revision,
 			return Revision{}, mapTeachingError(err)
 		}
 	}
+	revision.ExternalVideos = make([]ExternalVideo, 0, len(d.ExternalVideos))
 	for _, v := range d.ExternalVideos {
-		if _, err = s.q.Exec(ctx, `INSERT INTO lesson_revision_external_videos (id,revision_id,url,title,description,sort_key) VALUES ($1,$2,$3,$4,$5,$6)`, v.ID, revision.ID, v.URL, v.Title, v.Description, v.SortKey); err != nil {
+		snapshot := v
+		snapshot.ID = uuid.New()
+		revision.ExternalVideos = append(revision.ExternalVideos, snapshot)
+		if _, err = s.q.Exec(ctx, `INSERT INTO lesson_revision_external_videos (id,revision_id,url,title,description,sort_key) VALUES ($1,$2,$3,$4,$5,$6)`, snapshot.ID, revision.ID, snapshot.URL, snapshot.Title, snapshot.Description, snapshot.SortKey); err != nil {
 			return Revision{}, mapTeachingError(err)
 		}
 	}
@@ -278,6 +284,17 @@ func (s *PostgresStore) Withdraw(ctx context.Context, in WithdrawInput) error {
 	}
 	return nil
 }
+func (s *PostgresStore) ArchiveLesson(ctx context.Context, lessonID uuid.UUID) error {
+	tag, err := s.q.Exec(ctx, `UPDATE lessons SET archived_at=now(), updated_at=now() WHERE id=$1 AND archived_at IS NULL`, lessonID)
+	if err != nil {
+		return mapTeachingError(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *PostgresStore) Browse(context.Context, BrowseInput) ([]CatalogNode, error) {
 	return nil, errors.New("student browse is not implemented")
 }

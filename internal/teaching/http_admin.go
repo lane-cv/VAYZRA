@@ -42,6 +42,7 @@ func (h *AdminHandler) Routes() http.Handler {
 	r.Post("/lessons", h.CreateLesson)
 	r.Put("/lessons/{id}/draft", h.SaveDraft)
 	r.Post("/lessons/{id}/publish", h.Publish)
+	r.Post("/lessons/{id}/archive", h.ArchiveLesson)
 	r.Post("/lessons/{id}/withdraw", h.Withdraw)
 	return r
 }
@@ -197,7 +198,28 @@ func (h *AdminHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 		Data Draft `json:"data"`
 	}{draft})
 }
+func (h *AdminHandler) ArchiveLesson(w http.ResponseWriter, r *http.Request) {
+	if !requireEmptyBody(w, r) {
+		return
+	}
+	id, ok := routeUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	actor, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	if err := h.service.ArchiveLesson(r.Context(), actor, id); err != nil {
+		adminError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 func (h *AdminHandler) Publish(w http.ResponseWriter, r *http.Request) {
+	if !requireEmptyBody(w, r) {
+		return
+	}
 	id, ok := routeUUID(w, r, "id")
 	if !ok {
 		return
@@ -220,6 +242,9 @@ func (h *AdminHandler) Publish(w http.ResponseWriter, r *http.Request) {
 	}{revision})
 }
 func (h *AdminHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
+	if !requireEmptyBody(w, r) {
+		return
+	}
 	id, ok := routeUUID(w, r, "id")
 	if !ok {
 		return
@@ -269,6 +294,19 @@ func ifMatchVersion(w http.ResponseWriter, r *http.Request) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+func requireEmptyBody(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		adminDecodeError(w, r, err)
+		return false
+	}
+	if strings.TrimSpace(string(body)) != "" {
+		adminBad(w, r)
+		return false
+	}
+	return true
 }
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	types := r.Header.Values("Content-Type")

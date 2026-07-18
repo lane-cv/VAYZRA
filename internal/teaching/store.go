@@ -17,6 +17,7 @@ type CatalogStore interface {
 	SaveDraft(context.Context, SaveDraftInput) (Draft, error)
 	Publish(context.Context, PublishInput) (Revision, error)
 	Withdraw(context.Context, WithdrawInput) error
+	ArchiveLesson(context.Context, uuid.UUID) error
 	Browse(context.Context, BrowseInput) ([]CatalogNode, error)
 	Search(context.Context, SearchInput) ([]Revision, SearchCursor, error)
 	UpdateProgress(context.Context, uuid.UUID, ProgressInput) error

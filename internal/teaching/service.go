@@ -29,6 +29,7 @@ type AdminHTTPService interface {
 	SaveDraft(context.Context, Principal, SaveDraftInput) (Draft, error)
 	Publish(context.Context, Principal, PublishInput) (Revision, error)
 	Withdraw(context.Context, Principal, uuid.UUID) error
+	ArchiveLesson(context.Context, Principal, uuid.UUID) error
 }
 
 type Service struct {
@@ -183,6 +184,21 @@ func (s *Service) Publish(ctx context.Context, actor Principal, in PublishInput)
 	})
 	return revision, err
 }
+func (s *Service) ArchiveLesson(ctx context.Context, actor Principal, lessonID uuid.UUID) error {
+	if err := authorize(actor); err != nil {
+		return err
+	}
+	if lessonID == uuid.Nil {
+		return ErrInvalid
+	}
+	return s.withTx(ctx, func(store TxStore, writer audit.Writer) error {
+		if err := store.ArchiveLesson(ctx, lessonID); err != nil {
+			return err
+		}
+		return writer.Write(ctx, teachingEvent(actor, "lesson.archived", "lesson", lessonID, map[string]any{}))
+	})
+}
+
 func (s *Service) Withdraw(ctx context.Context, actor Principal, lessonID uuid.UUID) error {
 	if err := authorize(actor); err != nil {
 		return err

@@ -102,3 +102,18 @@ func (f *fakeAdminHTTPService) Publish(context.Context, Principal, PublishInput)
 func (*fakeAdminHTTPService) Withdraw(context.Context, Principal, uuid.UUID) error { return nil }
 
 var _ = errors.Is
+
+func (*fakeAdminHTTPService) ArchiveLesson(context.Context, Principal, uuid.UUID) error { return nil }
+
+func TestAdminPublishAndWithdrawRejectBodies(t *testing.T) {
+	h := NewAdminHandler(&fakeAdminHTTPService{}).Routes()
+	for _, endpoint := range []string{"publish", "withdraw"} {
+		r := httptest.NewRequest(http.MethodPost, "/lessons/"+uuid.NewString()+"/"+endpoint, strings.NewReader(`{"unexpected":true}`))
+		r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{Role: auth.RoleAdmin, Status: auth.StatusActive}))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d", endpoint, w.Code)
+		}
+	}
+}

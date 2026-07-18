@@ -121,3 +121,5 @@ type fakeTeachingUOW struct {
 func (u *fakeTeachingUOW) WithinTx(ctx context.Context, fn func(TxStore, audit.Writer) error) error {
 	return fn(u.fakeCatalogStore, u.audit)
 }
+
+func (s *fakeCatalogStore) ArchiveLesson(context.Context, uuid.UUID) error { return nil }
