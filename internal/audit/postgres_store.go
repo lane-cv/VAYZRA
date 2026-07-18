@@ -76,7 +76,7 @@ func validateAndMarshal(event Event) ([]byte, error) {
 		return nil, ErrInvalidEvent
 	}
 	allowed, ok := allowedMetadata[event.Action]
-	if !ok || event.TargetType != "student" {
+	if !ok || !validTargetType(event.TargetType) {
 		return nil, ErrInvalidEvent
 	}
 	for key, value := range event.Metadata {
@@ -90,4 +90,12 @@ func validateAndMarshal(event Event) ([]byte, error) {
 	return json.Marshal(event.Metadata)
 }
 
-var allowedMetadata = map[string]map[string]bool{"student.created": {"username": true, "display_name": true}, "student.disabled": {"status": true}, "student.enabled": {"status": true}, "student.password_reset": {}}
+var allowedMetadata = map[string]map[string]bool{
+	"student.created": {"username": true, "display_name": true}, "student.disabled": {"status": true}, "student.enabled": {"status": true}, "student.password_reset": {},
+	"catalog.created": {"kind": true}, "catalog.renamed": {"kind": true}, "catalog.reordered": {"kind": true}, "catalog.archived": {"kind": true}, "catalog.restored": {"kind": true},
+	"lesson.draft_saved": {}, "lesson.published": {"revision_id": true}, "lesson.withdrawn": {}, "lesson.archived": {},
+}
+
+func validTargetType(target string) bool {
+	return target == "student" || target == "catalog" || target == "lesson"
+}

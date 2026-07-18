@@ -1,0 +1,38 @@
+# Phase 2 catalog — Task 2 report
+
+## Status
+
+Completed teacher catalog, lesson draft, and publication APIs only. Student browse/search/progress behavior remains unimplemented for Task 3.
+
+## Implementation
+
+- Added `teaching.Service` with active-admin/request-ID/canonical-IP authorization, catalog and draft validation, HTTPS external-video validation, publication gating, optimistic locking, and transactional audit events.
+- Added `PostgresStore` and transaction boundary. Publication locks the draft, snapshots draft/audience/videos, finalizes the revision, switches the deferred published pointer, and writes an outbox row atomically.
+- Added authenticated, no-store admin routes for catalog mutation, lesson creation, draft save, publication, and withdrawal. JSON is strict and bounded; stable `draft_conflict` and `lesson_not_publishable` errors are returned.
+- Mounted the new admin routes in `internal/app` and production wiring.
+- Extended audit validation to permit the Task 2-required `catalog.*` and `lesson.*` events; this is required so the audit row can be written in the same publication transaction instead of forcing a rollback.
+
+## Files
+
+- New: `internal/teaching/service.go`, `postgres_store.go`, `http_admin.go` and their unit tests.
+- New: `tests/integration/teaching_admin_test.go`.
+- Updated: `internal/app/app.go`, `cmd/server/main.go`, `internal/audit/postgres_store.go`.
+
+## RED/GREEN evidence
+
+- RED: added `service_test.go` before service/store production files. The prescribed local command initially failed because `go` was absent from PATH (`The term 'go' is not recognized`); this environment issue prevented observing the intended compile-red result.
+- GREEN focused: cached `golang:1.26.5-bookworm` container ran `go test ./internal/teaching -run 'SaveDraft|Publish|Catalog' -count=1` successfully.
+- GREEN package suite: `go test ./internal/teaching ./internal/app ./cmd/server -count=1` passed.
+- GREEN isolated integration: disposable PostgreSQL 18 container on localhost:55432 ran `go test ./tests/integration -run 'TeachingAdmin|Publication' -count=1` successfully. It verifies finalization/pointer/audit/outbox and a publication-gate failure retaining the prior published revision.
+- A final rerun caught and corrected the integration assertion to scope outbox rows by lesson payload; final package and integration suites both passed after that correction.
+
+## Self-review
+
+- Confirmed the exact optimistic draft `UPDATE ... lock_version=lock_version+1` is used.
+- Confirmed publication performs `FOR UPDATE`, writes all revision children before finalization, and sets the deferred published pointer in the same transaction.
+- Confirmed route-level role enforcement, strict JSON, UUID and `If-Match` checks, body limits, stable 409/422 response codes, and no-store headers.
+- Confirmed the temporary PostgreSQL container was removed after testing; no deployed database or user data was accessed.
+
+## Concern
+
+The local PATH lacked Go, so the initial written RED test could not be executed before implementation. All subsequent focused, package, and disposable-PostgreSQL integration verification passed in the cached Go container.

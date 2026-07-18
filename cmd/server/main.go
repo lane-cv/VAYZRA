@@ -18,6 +18,7 @@ import (
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/redisx"
 	"happylearn.local/app/internal/students"
+	"happylearn.local/app/internal/teaching"
 )
 
 func main() {
@@ -72,6 +73,7 @@ type applicationDependencies struct {
 	migrate     func(context.Context, *pgxpool.Pool) error
 	newAuth     func(*pgxpool.Pool) (auth.HTTPService, error)
 	newStudents func(*pgxpool.Pool) students.HTTPService
+	newTeaching func(*pgxpool.Pool) teaching.AdminHTTPService
 	ready       func(*pgxpool.Pool) func(context.Context) error
 	close       func(*pgxpool.Pool)
 	openRedis   func(string) (*redis.Client, error)
@@ -85,6 +87,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		migrate:     database.Migrate,
 		newAuth:     newProductionAuthService,
 		newStudents: newProductionStudentService,
+		newTeaching: newProductionTeachingService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -117,6 +120,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newStudents != nil {
 		studentService = deps.newStudents(pool)
 	}
+	var teachingService teaching.AdminHTTPService
+	if deps.newTeaching != nil {
+		teachingService = deps.newTeaching(pool)
+	}
 	ready := deps.ready(pool)
 	if ready == nil {
 		closePool()
@@ -146,6 +153,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Ready:             ready,
 		Auth:              service,
 		Students:          studentService,
+		Teaching:          teachingService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
@@ -168,6 +176,10 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 		return nil, errors.New("initialize authentication service")
 	}
 	return service, nil
+}
+
+func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService {
+	return teaching.NewService(teaching.NewPostgresStore(pool), nil, time.Now)
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {

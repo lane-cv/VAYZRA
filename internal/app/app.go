@@ -11,6 +11,7 @@ import (
 
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/students"
+	"happylearn.local/app/internal/teaching"
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
@@ -21,6 +22,7 @@ type Dependencies struct {
 	Ready             func(context.Context) error
 	Auth              auth.HTTPService
 	Students          students.HTTPService
+	Teaching          teaching.AdminHTTPService
 	PublicOrigin      string
 	CookieSecure      bool
 	TrustedProxyCIDRs []netip.Prefix
@@ -64,6 +66,9 @@ func New(d Dependencies) http.Handler {
 				private.Post("/auth/logout-others", authHTTP.LogoutOthers)
 				if d.Students != nil {
 					private.Mount("/admin/students", students.NewHandlerWithConfig(d.Students, students.HTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.Teaching != nil {
+					private.Mount("/admin", teaching.NewAdminHandlerWithConfig(d.Teaching, teaching.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 			})
 		})
