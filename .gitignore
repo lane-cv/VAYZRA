@@ -5,6 +5,8 @@
 backups/
 data/
 *.log
+*.license
+secrets/
 
 .pnpm-store/
 .tmp-go-build-cache/

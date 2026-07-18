@@ -6,7 +6,7 @@
 
 **Architecture:** PostgreSQL owns upload/file state; MinIO owns bytes. Browser traffic always passes through authenticated Go endpoints, which stream one upload part or response range without buffering a complete object. Teaching publication calls a narrow file-readiness checker before switching revisions.
 
-**Tech Stack:** Go 1.26.5, pgx v5, `github.com/minio/minio-go/v7` v7.2.1, PostgreSQL 18.4, MinIO `RELEASE.2025-10-15T17-29-55Z` built from official source commit `9e49d5e`, chi HTTP streaming.
+**Tech Stack:** Go 1.26.5, pgx v5, `github.com/minio/minio-go/v7` v7.2.1, PostgreSQL 18.4, MinIO AIStor Free `quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120`, chi HTTP streaming.
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - Default upload part size is 8 MiB; allow at most two in-flight parts for one upload.
 - Upload sessions expire after 24 hours; cleanup uses a grace window and never deletes referenced objects.
 - File bytes never enter PostgreSQL or logs; MinIO object keys are random and never reach the browser.
-- MinIO is private and has no public host-port mapping.
+- Development S3 and console host ports bind only to loopback. Production deployment must omit S3 and console host-port mappings.
 - Every file access rechecks session, active user, current published revision, audience, and file policy.
 - “Preview only” blocks the download endpoint but is not represented as DRM.
 - Preserve no-store, CSRF/origin for mutations, request IDs, trusted client IP, and audit behavior.
@@ -27,7 +27,6 @@
 - `db/migrations/00005_secure_files.sql`: files, versions, previews, bindings, upload sessions/parts, and access logs.
 - `internal/platform/objectstore/store.go`: object-store interface and multipart/range value types.
 - `internal/platform/objectstore/minio.go`: MinIO implementation and bucket bootstrap.
-- `Dockerfile.minio`: reproducible build of the last official MinIO security release from source.
 - `internal/files/model.go`, `store.go`: domain and persistence contracts.
 - `internal/files/postgres_store.go`: durable upload/file state and access-log implementation.
 - `internal/files/upload_service.go`, `http_upload.go`: resumable upload domain and teacher HTTP API.
@@ -48,7 +47,6 @@
 - Modify: `.env.example`
 - Modify: `deploy/compose.dev.yml`
 - Modify: `go.mod`, `go.sum`
-- Create: `Dockerfile.minio`
 - Test: `tests/integration/files_test.go`
 
 **Interfaces:**
@@ -82,7 +80,9 @@ Expected: FAIL because the object-store package and schema do not exist.
 
 Add `HAPPYLEARN_MINIO_ENDPOINT`, `HAPPYLEARN_MINIO_ACCESS_KEY`, `HAPPYLEARN_MINIO_SECRET_KEY`, `HAPPYLEARN_MINIO_USE_TLS`, `HAPPYLEARN_MINIO_ORIGINALS_BUCKET`, and `HAPPYLEARN_MINIO_PREVIEWS_BUCKET`. Secrets must not be printed by config errors.
 
-`Dockerfile.minio` must build `github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z` (commit `9e49d5e`) with `golang:1.26.5-bookworm`, copy only the binary and CA certificates into a pinned Debian 12.12 slim runtime, and run as non-root. Compose tags that local image `happylearn-minio:RELEASE.2025-10-15T17-29-55Z`, attaches it only to `happylearn`, uses a named volume, healthchecks `/minio/health/live`, and binds both S3 and console ports to `127.0.0.1` only in the development Compose file. Production deployment omits both host mappings. Add an idempotent Go bootstrap that creates only the configured private buckets. Because the official MinIO repository was archived on 2026-04-25, final image/CVE review is a blocking gate; any unremediated reachable High/Critical server vulnerability requires explicit user approval to replace the `objectstore.Store` backend before production.
+Compose must use the official MinIO AIStor Free single-node image `quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120`, where the digest is the Quay Linux/amd64 image manifest. Keep data in a named volume. A no-network root initializer may set that volume to UID 1000, while the long-running server must be non-root and use the exact `/minio/health/live` endpoint. Bind S3 and console ports to `127.0.0.1` only in development. Production deployment must omit S3 and console host-port mappings. Add an idempotent Go bootstrap that creates only the configured private buckets.
+
+AIStor Free requires a separately provisioned single-node license. The operator must download it outside Git, set `HAPPYLEARN_AISTOR_LICENSE_FILE` to that file, and ensure it exists before service startup. Compose mounts the file read-only as the `aistor_license` secret at `/minio.license`; license content must never appear in environment values, source control, logs, or tests. Each upgrade must resolve and pin the target-platform Quay manifest digest, update the deployment contract and docs atomically, fetch the official CycloneDX or SPDX SBOM and available release checksum metadata, and scan for reachable High/Critical vulnerabilities before rollout. An unresolved image, license, or vulnerability gate blocks deployment.
 
 - [ ] **Step 4: Add file/upload tables with hard constraints**
 
@@ -115,7 +115,7 @@ Expected: PASS; a range request returns the exact requested bytes and aborted up
 - [ ] **Step 6: Commit object storage foundation**
 
 ```bash
-git add db/migrations/00005_secure_files.sql internal/platform/objectstore internal/platform/config .env.example deploy/compose.dev.yml Dockerfile.minio go.mod go.sum tests/integration/files_test.go
+git add db/migrations/00005_secure_files.sql internal/platform/objectstore internal/platform/config .env.example .gitignore deploy/compose.dev.yml docs/superpowers/specs/2026-07-18-phase2-teaching-design.md docs/superpowers/plans/2026-07-18-phase2-secure-files.md go.mod go.sum tests/integration/files_test.go
 git commit -m "feat: add private object storage"
 ```
 
