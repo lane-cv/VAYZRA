@@ -3,6 +3,7 @@ package teaching
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -80,9 +81,38 @@ func TestStudentProgressRateLimitDoesNotDispatch(t *testing.T) {
 	}
 }
 
+func TestStudentSearchCursorBoundsRejectBeforeServiceDispatch(t *testing.T) {
+	svc := &fakeStudentHTTPService{}
+	h := NewStudentHandler(svc).Routes()
+	student := auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}
+	maxCursor := encodeStudentCursor(SearchCursor{SortKey: math.MinInt64, ID: uuid.New()})
+	if len(maxCursor) != maxStudentCursorEncodedLength {
+		t.Fatalf("max cursor length=%d want=%d", len(maxCursor), maxStudentCursorEncodedLength)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/search?q=lesson&limit=1&cursor="+maxCursor, nil)
+	r = r.WithContext(auth.ContextWithUser(r.Context(), student))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !svc.searchCalled {
+		t.Fatalf("max valid cursor status=%d dispatched=%t body=%s", w.Code, svc.searchCalled, w.Body.String())
+	}
+
+	for _, cursor := range []string{strings.Repeat("A", maxStudentCursorEncodedLength+1), strings.Repeat("A", 32*1024)} {
+		svc.searchCalled = false
+		r = httptest.NewRequest(http.MethodGet, "/search?q=lesson&cursor="+cursor, nil)
+		r = r.WithContext(auth.ContextWithUser(r.Context(), student))
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest || svc.searchCalled || !strings.Contains(w.Body.String(), `"code":"invalid_request"`) {
+			t.Fatalf("cursor length=%d status=%d dispatched=%t body=%s", len(cursor), w.Code, svc.searchCalled, w.Body.String())
+		}
+	}
+}
+
 type fakeStudentHTTPService struct {
 	getErr         error
 	progressCalled bool
+	searchCalled   bool
 }
 
 func (*fakeStudentHTTPService) Browse(context.Context, Principal, BrowseInput) ([]CatalogNode, error) {
@@ -91,7 +121,8 @@ func (*fakeStudentHTTPService) Browse(context.Context, Principal, BrowseInput) (
 func (f *fakeStudentHTTPService) GetLesson(context.Context, Principal, uuid.UUID) (Revision, error) {
 	return Revision{}, f.getErr
 }
-func (*fakeStudentHTTPService) Search(context.Context, Principal, SearchInput) ([]Revision, SearchCursor, error) {
+func (f *fakeStudentHTTPService) Search(context.Context, Principal, SearchInput) ([]Revision, SearchCursor, error) {
+	f.searchCalled = true
 	return nil, SearchCursor{}, nil
 }
 func (f *fakeStudentHTTPService) UpdateProgress(context.Context, Principal, ProgressInput) error {

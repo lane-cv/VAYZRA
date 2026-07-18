@@ -20,7 +20,13 @@ import (
 	"happylearn.local/app/internal/platform/redisx"
 )
 
-const maxStudentRequestBody = 16 * 1024
+const (
+	maxStudentRequestBody = 16 * 1024
+	// A cursor is "<int64>:<canonical UUID>": at most 57 decoded bytes,
+	// which is exactly 76 bytes in unpadded URL-safe base64.
+	maxStudentCursorDecodedLength = 57
+	maxStudentCursorEncodedLength = 76
+)
 
 type StudentHTTPConfig struct {
 	TrustedProxyCIDRs []netip.Prefix
@@ -216,13 +222,17 @@ func decodeStudentCursor(w http.ResponseWriter, r *http.Request, raw string) (Se
 	if raw == "" {
 		return SearchCursor{}, true
 	}
+	if len(raw) > maxStudentCursorEncodedLength || base64.RawURLEncoding.DecodedLen(len(raw)) > maxStudentCursorDecodedLength {
+		studentBad(w, r)
+		return SearchCursor{}, false
+	}
 	decoded, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
+	if err != nil || len(decoded) > maxStudentCursorDecodedLength {
 		studentBad(w, r)
 		return SearchCursor{}, false
 	}
 	sortRaw, idRaw, ok := strings.Cut(string(decoded), ":")
-	if !ok {
+	if !ok || len(sortRaw) > 20 || len(idRaw) != 36 {
 		studentBad(w, r)
 		return SearchCursor{}, false
 	}
