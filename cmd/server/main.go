@@ -14,8 +14,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"happylearn.local/app/internal/app"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/internal/platform/redisx"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
@@ -74,6 +76,8 @@ type applicationDependencies struct {
 	newAuth            func(*pgxpool.Pool) (auth.HTTPService, error)
 	newStudents        func(*pgxpool.Pool) students.HTTPService
 	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
+	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	ready              func(*pgxpool.Pool) func(context.Context) error
 	close              func(*pgxpool.Pool)
@@ -91,6 +95,8 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newAuth:            newProductionAuthService,
 		newStudents:        newProductionStudentService,
 		newTeaching:        newProductionTeachingService,
+		newUploads:         newProductionUploadService,
+		startUploadCleanup: files.StartCleanupRunner,
 		newStudentTeaching: newProductionStudentTeachingService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
@@ -134,6 +140,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newTeaching != nil {
 		teachingService = deps.newTeaching(pool)
 	}
+	var uploadService files.UploadHTTPService
+	if deps.newUploads != nil {
+		uploadService, err = deps.newUploads(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize upload service")
+		}
+	}
 	var studentTeachingService teaching.StudentHTTPService
 	if deps.newStudentTeaching != nil {
 		studentTeachingService = deps.newStudentTeaching(pool)
@@ -171,11 +185,20 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closePool()
 		}
 	}
+	if cleaner, ok := uploadService.(files.ExpiredUploadCleaner); ok && deps.startUploadCleanup != nil {
+		stopCleanup := deps.startUploadCleanup(cleaner)
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopCleanup()
+			closeOtherResources()
+		}
+	}
 	return app.New(app.Dependencies{
 		Ready:             ready,
 		Auth:              service,
 		Students:          studentService,
 		Teaching:          teachingService,
+		Uploads:           uploadService,
 		StudentTeaching:   studentTeachingService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
@@ -205,6 +228,17 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 
 func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService {
 	return teaching.NewService(teaching.NewPostgresStore(pool), nil, time.Now)
+}
+
+func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, time.Now), nil
 }
 
 func newProductionStudentTeachingService(pool *pgxpool.Pool) teaching.StudentHTTPService {

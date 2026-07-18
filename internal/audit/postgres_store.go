@@ -94,10 +94,12 @@ var allowedMetadata = map[string]map[string]bool{
 	"student.created": {"username": true, "display_name": true}, "student.disabled": {"status": true}, "student.enabled": {"status": true}, "student.password_reset": {},
 	"catalog.created": {"kind": true}, "catalog.renamed": {"kind": true}, "catalog.reordered": {"kind": true}, "catalog.archived": {"kind": true}, "catalog.restored": {"kind": true},
 	"lesson.draft_saved": {}, "lesson.published": {"revision_id": true}, "lesson.withdrawn": {}, "lesson.archived": {},
+	"file.uploaded": {},
 }
 
 var allowedTargetTypes = map[string]string{
 	"student.created": "student", "student.disabled": "student", "student.enabled": "student", "student.password_reset": "student",
 	"catalog.created": "catalog", "catalog.renamed": "catalog", "catalog.reordered": "catalog", "catalog.archived": "catalog", "catalog.restored": "catalog",
 	"lesson.draft_saved": "lesson", "lesson.published": "lesson", "lesson.withdrawn": "lesson", "lesson.archived": "lesson",
+	"file.uploaded": "file_version",
 }

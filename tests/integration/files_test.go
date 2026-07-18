@@ -3,9 +3,12 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"happylearn.local/app/internal/auth"
+	securefiles "happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/tests/integration"
@@ -35,7 +40,10 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 	}
 
 	actorID := insertFileSchemaUser(t, pool, "file_schema_actor")
+	suffix := uuid.NewString()
 	insertUpload := func(size int64, state, objectKey, uploadID string) error {
+		objectKey += "/" + suffix
+		uploadID += "-" + suffix
 		_, err := pool.Exec(ctx, `INSERT INTO upload_sessions (actor_user_id,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at) VALUES ($1,$2,$3,'notes.pdf','application/pdf',$4,$5,$6,now()+interval '1 hour')`, actorID, objectKey, uploadID, size, fmt.Sprintf("%064x", 1), state)
 		return err
 	}
@@ -52,7 +60,7 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sessionID uuid.UUID
-	if err := pool.QueryRow(ctx, `SELECT id FROM upload_sessions WHERE object_key='schema/valid'`).Scan(&sessionID); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id FROM upload_sessions WHERE object_key=$1`, "schema/valid/"+suffix).Scan(&sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO upload_parts (upload_session_id,part_number,size_bytes,sha256,etag) VALUES ($1,1,1,$2,'etag-one'),($1,1,1,$2,'etag-two')`, sessionID, fmt.Sprintf("%064x", 2)); err == nil {
@@ -198,4 +206,87 @@ func envOr(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+func TestUploadServiceResumesPersistedPartsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actorID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users (id,username,display_name,role,status,password_hash) VALUES ($1,$2,'Upload integration admin','student','active','hash')`, actorID, "upload_integration_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("restart-persisted-upload")
+	sum := sha256.Sum256(payload)
+	hash := hex.EncodeToString(sum[:])
+	objects := newIntegrationUploadObjects()
+	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "upload-integration-request", IP: net.ParseIP("192.0.2.90")}
+	first := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, time.Now)
+	created, err := first.Create(ctx, actor, securefiles.CreateUploadInput{DisplayName: "restart.pdf", DeclaredMIME: "application/pdf", ExpectedSize: int64(len(payload)), ExpectedSHA256: hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.PutPart(ctx, actor, securefiles.PutPartInput{SessionID: created.ID, Number: 1, Size: int64(len(payload)), SHA256: hash, Body: bytes.NewReader(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	restarted := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, time.Now)
+	status, err := restarted.Status(ctx, actor, created.ID)
+	if err != nil || len(status.Parts) != 1 || status.Parts[0].SHA256 != hash {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	completed, err := restarted.Complete(ctx, actor, created.ID)
+	if err != nil || completed.FileVersionID == uuid.Nil || completed.ProcessingState != "pending_scan" {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	duplicate, err := restarted.Complete(ctx, actor, created.ID)
+	if err != nil || duplicate.FileVersionID != completed.FileVersionID {
+		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
+	}
+}
+
+type integrationUploadObjects struct {
+	parts map[string][]byte
+	data  map[string][]byte
+}
+
+func newIntegrationUploadObjects() *integrationUploadObjects {
+	return &integrationUploadObjects{parts: make(map[string][]byte), data: make(map[string][]byte)}
+}
+func (*integrationUploadObjects) CreateMultipart(context.Context, string, objectstore.ObjectMeta) (string, error) {
+	return uuid.NewString(), nil
+}
+func (s *integrationUploadObjects) PutPart(_ context.Context, key, _ string, number int, reader io.Reader, size int64, _ string) (objectstore.Part, error) {
+	var buffer bytes.Buffer
+	if _, err := io.CopyN(&buffer, reader, size); err != nil {
+		return objectstore.Part{}, err
+	}
+	s.parts[key] = buffer.Bytes()
+	return objectstore.Part{Number: number, ETag: "bounded-etag", Size: size}, nil
+}
+func (s *integrationUploadObjects) CompleteMultipart(_ context.Context, key, _ string, _ []objectstore.Part) (objectstore.ObjectInfo, error) {
+	s.data[key] = append([]byte(nil), s.parts[key]...)
+	return objectstore.ObjectInfo{Size: int64(len(s.data[key]))}, nil
+}
+func (*integrationUploadObjects) AbortMultipart(context.Context, string, string) error { return nil }
+func (s *integrationUploadObjects) Stat(_ context.Context, key string) (objectstore.ObjectInfo, error) {
+	data, ok := s.data[key]
+	if !ok {
+		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
+	}
+	return objectstore.ObjectInfo{Size: int64(len(data))}, nil
+}
+func (s *integrationUploadObjects) Get(_ context.Context, key string, _ *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
+	data, ok := s.data[key]
+	if !ok {
+		return nil, objectstore.ObjectInfo{}, objectstore.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), objectstore.ObjectInfo{Size: int64(len(data))}, nil
+}
+func (*integrationUploadObjects) Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error) {
+	return objectstore.ObjectInfo{}, errors.New("not implemented")
+}
+func (s *integrationUploadObjects) Delete(_ context.Context, key string) error {
+	delete(s.data, key)
+	return nil
 }

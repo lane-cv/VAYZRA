@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
 
@@ -23,6 +24,7 @@ type Dependencies struct {
 	Auth              auth.HTTPService
 	Students          students.HTTPService
 	Teaching          teaching.AdminHTTPService
+	Uploads           files.UploadHTTPService
 	StudentTeaching   teaching.StudentHTTPService
 	PublicOrigin      string
 	CookieSecure      bool
@@ -72,6 +74,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.Teaching != nil {
 					private.Mount("/admin", teaching.NewAdminHandlerWithConfig(d.Teaching, teaching.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.Uploads != nil {
+					private.Mount("/admin/uploads", files.NewUploadHandlerWithConfig(d.Uploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.StudentTeaching != nil {
 					private.Mount("/student", teaching.NewStudentHandlerWithConfig(d.StudentTeaching, teaching.StudentHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProgressLimiter: d.ProgressLimiter, SearchLimiter: d.SearchLimiter}).Routes())

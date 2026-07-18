@@ -12,6 +12,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/lifecycle"
 )
 
 const defaultOperationTimeout = 30 * time.Second
@@ -98,21 +99,106 @@ func (s *MinIOStores) bootstrap(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("bootstrap object store: %w", mapMinIOError(err))
 		}
-		if exists {
-			continue
+		if !exists {
+			opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
+			err = s.core.MakeBucket(opCtx, bucket, minio.MakeBucketOptions{})
+			cancel()
+			if err != nil {
+				response := minio.ToErrorResponse(err)
+				if response.Code != "BucketAlreadyOwnedByYou" && response.Code != "BucketAlreadyExists" {
+					return fmt.Errorf("bootstrap object store: %w", mapMinIOError(err))
+				}
+			}
 		}
 		opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
-		err = s.core.MakeBucket(opCtx, bucket, minio.MakeBucketOptions{})
+		err = ensureIncompleteMultipartLifecycle(opCtx, s.core.Client, bucket)
 		cancel()
 		if err != nil {
-			response := minio.ToErrorResponse(err)
-			if response.Code == "BucketAlreadyOwnedByYou" || response.Code == "BucketAlreadyExists" {
-				continue
-			}
-			return fmt.Errorf("bootstrap object store: %w", mapMinIOError(err))
+			return fmt.Errorf("bootstrap object store: %w", err)
 		}
 	}
 	return nil
+}
+
+type lifecycleClient interface {
+	GetBucketLifecycle(context.Context, string) (*lifecycle.Configuration, error)
+	SetBucketLifecycle(context.Context, string, *lifecycle.Configuration) error
+}
+
+const incompleteMultipartLifecycleRuleID = "happylearn-abort-incomplete-multipart"
+
+func ensureIncompleteMultipartLifecycle(ctx context.Context, client lifecycleClient, bucket string) error {
+	config, err := client.GetBucketLifecycle(ctx, bucket)
+	if err != nil {
+		response := minio.ToErrorResponse(err)
+		if response.Code != "NoSuchLifecycleConfiguration" && response.Code != "NoSuchLifecycle" {
+			return ErrUnavailable
+		}
+		config = &lifecycle.Configuration{}
+	}
+	if config == nil {
+		config = &lifecycle.Configuration{}
+	}
+	if hasIncompleteMultipartLifecycle(config, 2) {
+		return nil
+	}
+	rules := make([]lifecycle.Rule, 0, len(config.Rules)+1)
+	for _, rule := range config.Rules {
+		if rule.ID != incompleteMultipartLifecycleRuleID {
+			rules = append(rules, rule)
+		}
+	}
+	config.Rules = append(rules, canonicalIncompleteMultipartLifecycleRule())
+	if err := client.SetBucketLifecycle(ctx, bucket, config); err != nil {
+		return ErrUnavailable
+	}
+	verified, err := client.GetBucketLifecycle(ctx, bucket)
+	if err != nil || !hasIncompleteMultipartLifecycle(verified, 2) {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func canonicalIncompleteMultipartLifecycleRule() lifecycle.Rule {
+	return lifecycle.Rule{
+		ID:                             incompleteMultipartLifecycleRuleID,
+		Status:                         "Enabled",
+		AbortIncompleteMultipartUpload: lifecycle.AbortIncompleteMultipartUpload{DaysAfterInitiation: lifecycle.ExpirationDays(2)},
+	}
+}
+
+func hasIncompleteMultipartLifecycle(config *lifecycle.Configuration, days lifecycle.ExpirationDays) bool {
+	if config == nil {
+		return false
+	}
+	reserved := 0
+	for _, rule := range config.Rules {
+		if rule.ID != incompleteMultipartLifecycleRuleID {
+			continue
+		}
+		reserved++
+		if !canonicalIncompleteMultipartLifecycle(rule, days) {
+			return false
+		}
+	}
+	return reserved == 1
+}
+
+func canonicalIncompleteMultipartLifecycle(rule lifecycle.Rule, days lifecycle.ExpirationDays) bool {
+	return rule.ID == incompleteMultipartLifecycleRuleID &&
+		rule.Status == "Enabled" &&
+		rule.Prefix == "" &&
+		rule.RuleFilter.IsNull() &&
+		rule.AbortIncompleteMultipartUpload.DaysAfterInitiation == days &&
+		rule.Expiration.IsNull() &&
+		rule.DelMarkerExpiration.IsNull() &&
+		rule.AllVersionsExpiration.IsNull() &&
+		rule.NoncurrentVersionExpiration.NoncurrentDays == 0 &&
+		rule.NoncurrentVersionExpiration.NewerNoncurrentVersions == 0 &&
+		rule.NoncurrentVersionTransition.StorageClass == "" &&
+		rule.NoncurrentVersionTransition.NoncurrentDays == 0 &&
+		rule.NoncurrentVersionTransition.NewerNoncurrentVersions == 0 &&
+		rule.Transition.IsNull()
 }
 
 func (s *MinIOStores) Ready(ctx context.Context) error {
