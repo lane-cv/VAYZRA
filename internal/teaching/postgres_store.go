@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -295,14 +296,192 @@ func (s *PostgresStore) ArchiveLesson(ctx context.Context, lessonID uuid.UUID) e
 	return nil
 }
 
-func (s *PostgresStore) Browse(context.Context, BrowseInput) ([]CatalogNode, error) {
-	return nil, errors.New("student browse is not implemented")
+func (s *PostgresStore) Browse(ctx context.Context, in BrowseInput) ([]CatalogNode, error) {
+	rows, err := s.q.Query(ctx, `
+WITH authorized_lessons AS (
+  SELECT l.chapter_id
+  FROM users u
+  JOIN lessons l ON l.archived_at IS NULL
+  JOIN lesson_revisions r ON r.id = l.published_revision_id
+  JOIN lesson_revision_finalizations rf ON rf.revision_id = r.id AND rf.lesson_id = l.id
+  JOIN lesson_revision_audiences ra ON ra.revision_id = r.id
+  JOIN chapters c ON c.id = l.chapter_id AND c.archived_at IS NULL
+  JOIN subjects s ON s.id = c.subject_id AND s.archived_at IS NULL
+  JOIN terms t ON t.id = s.term_id AND t.archived_at IS NULL
+  JOIN grades g ON g.id = t.grade_id AND g.archived_at IS NULL
+  WHERE u.id = $1 AND u.role = 'student' AND u.status = 'active' AND u.deleted_at IS NULL
+    AND (ra.mode = 'all' OR EXISTS (
+      SELECT 1 FROM lesson_revision_audience_users rau
+      WHERE rau.revision_id = r.id AND rau.user_id = $1
+    ))
+)
+SELECT g.id, NULL::uuid, 'grade', g.name, '', g.sort_key, g.archived_at
+FROM grades g
+WHERE g.archived_at IS NULL AND ($2::uuid IS NULL OR g.id = $2)
+  AND EXISTS (SELECT 1 FROM terms t JOIN subjects s ON s.term_id=t.id JOIN chapters c ON c.subject_id=s.id JOIN authorized_lessons al ON al.chapter_id=c.id WHERE t.grade_id=g.id)
+UNION ALL
+SELECT t.id, t.grade_id, 'term', t.name, '', t.sort_key, t.archived_at
+FROM terms t
+WHERE t.archived_at IS NULL AND ($2::uuid IS NULL OR t.grade_id = $2) AND ($3::uuid IS NULL OR t.id = $3)
+  AND EXISTS (SELECT 1 FROM subjects s JOIN chapters c ON c.subject_id=s.id JOIN authorized_lessons al ON al.chapter_id=c.id WHERE s.term_id=t.id)
+UNION ALL
+SELECT s.id, s.term_id, 'subject', s.name, '', s.sort_key, s.archived_at
+FROM subjects s
+WHERE s.archived_at IS NULL AND ($3::uuid IS NULL OR s.term_id = $3) AND ($4::uuid IS NULL OR s.id = $4)
+  AND EXISTS (SELECT 1 FROM chapters c JOIN authorized_lessons al ON al.chapter_id=c.id WHERE c.subject_id=s.id)
+UNION ALL
+SELECT c.id, c.subject_id, 'chapter', c.name, c.description, c.sort_key, c.archived_at
+FROM chapters c
+WHERE c.archived_at IS NULL AND ($4::uuid IS NULL OR c.subject_id = $4) AND ($5::uuid IS NULL OR c.id = $5)
+  AND EXISTS (SELECT 1 FROM authorized_lessons al WHERE al.chapter_id=c.id)
+ORDER BY 6, 1`, in.StudentID, nullUUID(in.GradeID), nullUUID(in.TermID), nullUUID(in.SubjectID), nullUUID(in.ChapterID))
+	if err != nil {
+		return nil, mapTeachingError(err)
+	}
+	defer rows.Close()
+	nodes := make([]CatalogNode, 0)
+	for rows.Next() {
+		var node CatalogNode
+		var parent *uuid.UUID
+		if err := rows.Scan(&node.ID, &parent, &node.Kind, &node.Name, &node.Description, &node.SortKey, &node.ArchivedAt); err != nil {
+			return nil, mapTeachingError(err)
+		}
+		if parent != nil {
+			node.ParentID = *parent
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, mapTeachingError(rows.Err())
 }
-func (s *PostgresStore) Search(context.Context, SearchInput) ([]Revision, SearchCursor, error) {
-	return nil, SearchCursor{}, errors.New("student search is not implemented")
+
+const authorizedRevisionJoins = `
+FROM users u
+JOIN lessons l ON l.id = $2 AND l.archived_at IS NULL
+JOIN lesson_revisions r ON r.id = l.published_revision_id
+JOIN lesson_revision_finalizations rf ON rf.revision_id = r.id AND rf.lesson_id = l.id
+JOIN lesson_revision_audiences ra ON ra.revision_id = r.id
+JOIN chapters c ON c.id = l.chapter_id AND c.archived_at IS NULL
+JOIN subjects s ON s.id = c.subject_id AND s.archived_at IS NULL
+JOIN terms t ON t.id = s.term_id AND t.archived_at IS NULL
+JOIN grades g ON g.id = t.grade_id AND g.archived_at IS NULL`
+
+const authorizedRevisionWhere = `
+WHERE u.id = $1 AND u.role = 'student' AND u.status = 'active' AND u.deleted_at IS NULL
+  AND (ra.mode = 'all' OR EXISTS (
+    SELECT 1 FROM lesson_revision_audience_users rau WHERE rau.revision_id = r.id AND rau.user_id = $1
+  ))`
+
+func (s *PostgresStore) GetLesson(ctx context.Context, studentID, lessonID uuid.UUID) (Revision, error) {
+	var revision Revision
+	err := s.q.QueryRow(ctx, `SELECT r.id,r.lesson_id,r.version,r.title,r.summary,r.body_markdown,r.sort_key,r.published_by,r.published_at `+authorizedRevisionJoins+authorizedRevisionWhere, studentID, lessonID).Scan(
+		&revision.ID, &revision.LessonID, &revision.Version, &revision.Title, &revision.Summary, &revision.BodyMarkdown, &revision.SortKey, &revision.PublishedBy, &revision.PublishedAt,
+	)
+	if err != nil {
+		return Revision{}, mapTeachingError(err)
+	}
+	revision.PublishedAt = revision.PublishedAt.UTC()
+	rows, err := s.q.Query(ctx, `SELECT v.id,v.url,v.title,v.description,v.sort_key `+authorizedRevisionJoins+` JOIN lesson_revision_external_videos v ON v.revision_id=r.id `+authorizedRevisionWhere+` ORDER BY v.sort_key,v.id`, studentID, lessonID)
+	if err != nil {
+		return Revision{}, mapTeachingError(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var video ExternalVideo
+		if err := rows.Scan(&video.ID, &video.URL, &video.Title, &video.Description, &video.SortKey); err != nil {
+			return Revision{}, mapTeachingError(err)
+		}
+		revision.ExternalVideos = append(revision.ExternalVideos, video)
+	}
+	return revision, mapTeachingError(rows.Err())
 }
-func (s *PostgresStore) UpdateProgress(context.Context, uuid.UUID, ProgressInput) error {
-	return errors.New("student progress is not implemented")
+
+func (s *PostgresStore) Search(ctx context.Context, in SearchInput) ([]Revision, SearchCursor, error) {
+	rows, err := s.q.Query(ctx, `
+SELECT r.id,r.lesson_id,r.version,r.title,r.summary,r.body_markdown,r.sort_key,r.published_by,r.published_at
+FROM users u
+JOIN lessons l ON l.archived_at IS NULL
+JOIN lesson_revisions r ON r.id = l.published_revision_id
+JOIN lesson_revision_finalizations rf ON rf.revision_id = r.id AND rf.lesson_id = l.id
+JOIN lesson_revision_audiences ra ON ra.revision_id = r.id
+JOIN chapters c ON c.id = l.chapter_id AND c.archived_at IS NULL
+JOIN subjects s ON s.id = c.subject_id AND s.archived_at IS NULL
+JOIN terms t ON t.id = s.term_id AND t.archived_at IS NULL
+JOIN grades g ON g.id = t.grade_id AND g.archived_at IS NULL
+WHERE u.id = $1 AND u.role = 'student' AND u.status = 'active' AND u.deleted_at IS NULL
+  AND (ra.mode = 'all' OR EXISTS (SELECT 1 FROM lesson_revision_audience_users rau WHERE rau.revision_id = r.id AND rau.user_id = $1))
+  AND (r.title ILIKE $2 ESCAPE E'\\' OR r.body_markdown ILIKE $2 ESCAPE E'\\')
+  AND (NOT $3 OR (r.sort_key, r.id) > ($4, $5))
+ORDER BY r.sort_key,r.id LIMIT $6`, in.StudentID, "%"+escapeLike(in.Query)+"%", in.After.ID != uuid.Nil, in.After.SortKey, in.After.ID, in.Limit+1)
+	if err != nil {
+		return nil, SearchCursor{}, mapTeachingError(err)
+	}
+	defer rows.Close()
+	revisions := make([]Revision, 0, in.Limit)
+	for rows.Next() {
+		var revision Revision
+		if err := rows.Scan(&revision.ID, &revision.LessonID, &revision.Version, &revision.Title, &revision.Summary, &revision.BodyMarkdown, &revision.SortKey, &revision.PublishedBy, &revision.PublishedAt); err != nil {
+			return nil, SearchCursor{}, mapTeachingError(err)
+		}
+		revision.PublishedAt = revision.PublishedAt.UTC()
+		revisions = append(revisions, revision)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, SearchCursor{}, mapTeachingError(err)
+	}
+	var next SearchCursor
+	if len(revisions) > in.Limit {
+		revisions = revisions[:in.Limit]
+		last := revisions[len(revisions)-1]
+		next = SearchCursor{SortKey: last.SortKey, ID: last.ID}
+	}
+	return revisions, next, nil
+}
+
+func (s *PostgresStore) UpdateProgress(ctx context.Context, studentID uuid.UUID, in ProgressInput) error {
+	var authorized, updated bool
+	err := s.q.QueryRow(ctx, `
+WITH authorized AS (
+  SELECT r.id FROM users u
+  JOIN lessons l ON l.archived_at IS NULL
+  JOIN lesson_revisions r ON r.id = l.published_revision_id AND r.id = $2
+  JOIN lesson_revision_finalizations rf ON rf.revision_id = r.id AND rf.lesson_id = l.id
+  JOIN lesson_revision_audiences ra ON ra.revision_id = r.id
+  JOIN chapters c ON c.id = l.chapter_id AND c.archived_at IS NULL
+  JOIN subjects s ON s.id = c.subject_id AND s.archived_at IS NULL
+  JOIN terms t ON t.id = s.term_id AND t.archived_at IS NULL
+  JOIN grades g ON g.id = t.grade_id AND g.archived_at IS NULL
+  WHERE u.id = $1 AND u.role = 'student' AND u.status = 'active' AND u.deleted_at IS NULL
+    AND (ra.mode = 'all' OR EXISTS (SELECT 1 FROM lesson_revision_audience_users rau WHERE rau.revision_id = r.id AND rau.user_id = $1))
+), upsert AS (
+  INSERT INTO lesson_progress (user_id,revision_id,viewed,anchor,scroll_ratio,observed_at)
+  SELECT $1,id,$3,$4,$5,$6 FROM authorized
+  ON CONFLICT (user_id,revision_id) DO UPDATE SET
+    viewed = lesson_progress.viewed OR EXCLUDED.viewed,
+    anchor = EXCLUDED.anchor, scroll_ratio = EXCLUDED.scroll_ratio,
+    observed_at = EXCLUDED.observed_at, last_viewed_at = now()
+  WHERE lesson_progress.observed_at <= EXCLUDED.observed_at
+  RETURNING 1
+)
+SELECT EXISTS (SELECT 1 FROM authorized), EXISTS (SELECT 1 FROM upsert)`, studentID, in.RevisionID, in.Viewed, in.Anchor, in.ScrollRatio, in.ObservedAt).Scan(&authorized, &updated)
+	if err != nil {
+		return mapTeachingError(err)
+	}
+	if !authorized {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func escapeLike(v string) string {
+	v = strings.ReplaceAll(v, "\\", "\\\\")
+	v = strings.ReplaceAll(v, "%", "\\%")
+	return strings.ReplaceAll(v, "_", "\\_")
+}
+func nullUUID(id uuid.UUID) any {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
 }
 
 func mapTeachingError(err error) error {

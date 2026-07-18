@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
 )
@@ -56,6 +58,7 @@ type UserView struct {
 
 type userContextKey struct{}
 type sessionTokenContextKey struct{}
+type sessionIDContextKey struct{}
 
 func NewHTTPHandler(service HTTPService, cfg HTTPConfig) *Handler {
 	return &Handler{
@@ -207,6 +210,7 @@ func (h *Handler) Authenticate(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), userContextKey{}, authentication.User)
 		ctx = context.WithValue(ctx, sessionTokenContextKey{}, rawToken)
+		ctx = context.WithValue(ctx, sessionIDContextKey{}, authentication.Session.ID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -317,6 +321,13 @@ func ContextWithUser(ctx context.Context, user User) context.Context {
 	return context.WithValue(ctx, userContextKey{}, user)
 }
 
+// SessionIDFromContext returns an ID only when authentication middleware
+// verified the session for this request. ContextWithUser intentionally does
+// not populate it so tests and in-process callers cannot fabricate sessions.
+func SessionIDFromContext(ctx context.Context) (uuid.UUID, bool) {
+	id, ok := ctx.Value(sessionIDContextKey{}).(uuid.UUID)
+	return id, ok && id != uuid.Nil
+}
 func RequireRole(role Role) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

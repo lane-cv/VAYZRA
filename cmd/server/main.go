@@ -69,25 +69,28 @@ func newServer(address string, handler http.Handler) *http.Server {
 }
 
 type applicationDependencies struct {
-	open        func(context.Context, string) (*pgxpool.Pool, error)
-	migrate     func(context.Context, *pgxpool.Pool) error
-	newAuth     func(*pgxpool.Pool) (auth.HTTPService, error)
-	newStudents func(*pgxpool.Pool) students.HTTPService
-	newTeaching func(*pgxpool.Pool) teaching.AdminHTTPService
-	ready       func(*pgxpool.Pool) func(context.Context) error
-	close       func(*pgxpool.Pool)
-	openRedis   func(string) (*redis.Client, error)
-	newThrottle func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
-	closeRedis  func(*redis.Client)
+	open               func(context.Context, string) (*pgxpool.Pool, error)
+	migrate            func(context.Context, *pgxpool.Pool) error
+	newAuth            func(*pgxpool.Pool) (auth.HTTPService, error)
+	newStudents        func(*pgxpool.Pool) students.HTTPService
+	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
+	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
+	ready              func(*pgxpool.Pool) func(context.Context) error
+	close              func(*pgxpool.Pool)
+	openRedis          func(string) (*redis.Client, error)
+	newThrottle        func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
+	newProgressLimiter func(*redis.Client, config.Config) redisx.ProgressWriteLimiter
+	closeRedis         func(*redis.Client)
 }
 
 func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
 	return buildApplication(ctx, cfg, applicationDependencies{
-		open:        database.Open,
-		migrate:     database.Migrate,
-		newAuth:     newProductionAuthService,
-		newStudents: newProductionStudentService,
-		newTeaching: newProductionTeachingService,
+		open:               database.Open,
+		migrate:            database.Migrate,
+		newAuth:            newProductionAuthService,
+		newStudents:        newProductionStudentService,
+		newTeaching:        newProductionTeachingService,
+		newStudentTeaching: newProductionStudentTeachingService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -96,6 +99,9 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newThrottle: func(client *redis.Client, cfg config.Config) (redisx.Limiter, redisx.CaptchaService) {
 			policy := redisx.Policy{Secret: []byte(cfg.LoginThrottleSecret), Window: 15 * time.Minute, AccountFailures: 5, IPFailures: 20, Lockout: 15 * time.Minute}
 			return redisx.NewLoginLimiter(client, policy), redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
+		},
+		newProgressLimiter: func(client *redis.Client, cfg config.Config) redisx.ProgressWriteLimiter {
+			return redisx.NewProgressWriteLimiter(client, redisx.ProgressLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxWrites: 60})
 		},
 		closeRedis: func(client *redis.Client) { _ = client.Close() },
 	})
@@ -124,6 +130,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newTeaching != nil {
 		teachingService = deps.newTeaching(pool)
 	}
+	var studentTeachingService teaching.StudentHTTPService
+	if deps.newStudentTeaching != nil {
+		studentTeachingService = deps.newStudentTeaching(pool)
+	}
 	ready := deps.ready(pool)
 	if ready == nil {
 		closePool()
@@ -131,6 +141,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	}
 	var limiter redisx.Limiter
 	var captchas redisx.CaptchaService
+	var progressLimiter redisx.ProgressWriteLimiter
 	closeResources := closePool
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
@@ -144,6 +155,9 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			return nil, nil, errors.New("initialize login throttling")
 		}
 		limiter, captchas = deps.newThrottle(client, cfg)
+		if deps.newProgressLimiter != nil {
+			progressLimiter = deps.newProgressLimiter(client, cfg)
+		}
 		closeResources = func() {
 			deps.closeRedis(client)
 			closePool()
@@ -154,10 +168,12 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Auth:              service,
 		Students:          studentService,
 		Teaching:          teachingService,
+		StudentTeaching:   studentTeachingService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Limiter:           limiter,
+		ProgressLimiter:   progressLimiter,
 		Captchas:          captchas,
 		StaticFiles:       os.DirFS("web/dist"),
 	}), closeResources, nil
@@ -180,6 +196,10 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 
 func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService {
 	return teaching.NewService(teaching.NewPostgresStore(pool), nil, time.Now)
+}
+
+func newProductionStudentTeachingService(pool *pgxpool.Pool) teaching.StudentHTTPService {
+	return teaching.NewStudentService(teaching.NewPostgresStore(pool), time.Now)
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {

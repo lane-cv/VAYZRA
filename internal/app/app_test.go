@@ -12,8 +12,19 @@ import (
 	"github.com/google/uuid"
 
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/teaching"
 )
 
+func TestApplicationMountsStudentTeachingRoutes(t *testing.T) {
+	h := New(Dependencies{Auth: &appStudentAuth{}, StudentTeaching: &appStudentTeaching{}})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/student/catalog", nil)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"data"`) {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
 func TestLivenessIncludesRequestID(t *testing.T) {
 	h := New(Dependencies{Ready: func(context.Context) error { return nil }})
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/health/live", nil)
@@ -143,3 +154,24 @@ func (*appFakeAuth) ChangePassword(context.Context, auth.ChangePasswordInput) (a
 }
 func (*appFakeAuth) Logout(context.Context, string) error       { return nil }
 func (*appFakeAuth) LogoutOthers(context.Context, string) error { return nil }
+
+type appStudentAuth struct{ appFakeAuth }
+
+func (*appStudentAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
+	return auth.Authentication{User: auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}}, nil
+}
+
+type appStudentTeaching struct{}
+
+func (*appStudentTeaching) Browse(context.Context, teaching.Principal, teaching.BrowseInput) ([]teaching.CatalogNode, error) {
+	return []teaching.CatalogNode{}, nil
+}
+func (*appStudentTeaching) GetLesson(context.Context, teaching.Principal, uuid.UUID) (teaching.Revision, error) {
+	return teaching.Revision{}, nil
+}
+func (*appStudentTeaching) Search(context.Context, teaching.Principal, teaching.SearchInput) ([]teaching.Revision, teaching.SearchCursor, error) {
+	return nil, teaching.SearchCursor{}, nil
+}
+func (*appStudentTeaching) UpdateProgress(context.Context, teaching.Principal, teaching.ProgressInput) error {
+	return nil
+}

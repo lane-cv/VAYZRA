@@ -292,6 +292,27 @@ func TestAuthenticateRejectsUnauthenticatedMe(t *testing.T) {
 	}
 }
 
+func TestAuthenticateStoresVerifiedSessionIDOnly(t *testing.T) {
+	sessionID := uuid.New()
+	authentication := activeAuthentication(false)
+	authentication.Session.ID = sessionID
+	h := NewHTTPHandler(&fakeHTTPService{authenticateAuth: authentication}, HTTPConfig{})
+	next := h.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, ok := SessionIDFromContext(r.Context())
+		if !ok || got != sessionID {
+			t.Fatalf("session id=%s ok=%t", got, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	w := httptest.NewRecorder()
+	next.ServeHTTP(w, authenticatedRequest(http.MethodGet, "/private", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if _, ok := SessionIDFromContext(ContextWithUser(context.Background(), authentication.User)); ok {
+		t.Fatal("trusted user-only test context fabricated a session id")
+	}
+}
 func TestForcedPasswordChangeRestrictsOtherMutations(t *testing.T) {
 	svc := &fakeHTTPService{authenticateAuth: activeAuthentication(true)}
 	h := newHTTPTestHandler(svc)
