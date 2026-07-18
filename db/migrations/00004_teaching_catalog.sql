@@ -79,11 +79,20 @@ CREATE TABLE lesson_revisions (
   sort_key bigint NOT NULL DEFAULT 1024,
   published_by uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   published_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (lesson_id, version)
+  UNIQUE (lesson_id, version),
+  UNIQUE (id, lesson_id)
+);
+
+CREATE TABLE lesson_revision_finalizations (
+  revision_id uuid PRIMARY KEY,
+  lesson_id uuid NOT NULL,
+  finalized_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (revision_id, lesson_id),
+  FOREIGN KEY (revision_id, lesson_id) REFERENCES lesson_revisions(id, lesson_id) ON DELETE RESTRICT
 );
 
 ALTER TABLE lessons ADD CONSTRAINT lessons_published_revision_id_fkey
-  FOREIGN KEY (published_revision_id) REFERENCES lesson_revisions(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+  FOREIGN KEY (published_revision_id, id) REFERENCES lesson_revision_finalizations(revision_id, lesson_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
 
 CREATE TABLE lesson_draft_audiences (
   lesson_id uuid PRIMARY KEY REFERENCES lesson_drafts(lesson_id) ON DELETE CASCADE,
@@ -148,7 +157,10 @@ CREATE TABLE lesson_progress (
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION require_student_audience_member() RETURNS trigger AS $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM users WHERE id = NEW.user_id AND role = 'student') THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = NEW.user_id AND role = 'student' AND status = 'active' AND deleted_at IS NULL
+  ) THEN
     RAISE EXCEPTION 'lesson audience users must be students' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -164,6 +176,23 @@ CREATE TRIGGER lesson_revision_audience_users_student_only
   FOR EACH ROW EXECUTE FUNCTION require_student_audience_member();
 
 -- +goose StatementBegin
+CREATE OR REPLACE FUNCTION reject_ineligible_referenced_audience_user() RETURNS trigger AS $$
+BEGIN
+  IF (NEW.role <> 'student' OR NEW.status <> 'active' OR NEW.deleted_at IS NOT NULL) AND (
+    EXISTS (SELECT 1 FROM lesson_draft_audience_users WHERE user_id = NEW.id) OR
+    EXISTS (SELECT 1 FROM lesson_revision_audience_users WHERE user_id = NEW.id)
+  ) THEN
+    RAISE EXCEPTION 'referenced lesson audience users must remain active students' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+CREATE TRIGGER users_referenced_audience_students_only
+  BEFORE UPDATE OF role, status, deleted_at ON users
+  FOR EACH ROW EXECUTE FUNCTION reject_ineligible_referenced_audience_user();
+
+-- +goose StatementBegin
 CREATE OR REPLACE FUNCTION reject_lesson_revision_mutation() RETURNS trigger AS $$
 BEGIN
   RAISE EXCEPTION 'lesson revisions are immutable' USING ERRCODE = '55000';
@@ -174,15 +203,54 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER lesson_revisions_immutable
   BEFORE UPDATE OR DELETE ON lesson_revisions
   FOR EACH ROW EXECUTE FUNCTION reject_lesson_revision_mutation();
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION finalize_lesson_revision(p_revision_id uuid) RETURNS void AS $$
+DECLARE
+  revision_lesson_id uuid;
+BEGIN
+  SELECT lesson_id INTO revision_lesson_id FROM lesson_revisions WHERE id = p_revision_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'lesson revision does not exist' USING ERRCODE = '23503';
+  END IF;
+  INSERT INTO lesson_revision_finalizations (revision_id, lesson_id)
+    VALUES (p_revision_id, revision_lesson_id);
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+CREATE TRIGGER lesson_revision_finalizations_immutable
+  BEFORE UPDATE OR DELETE ON lesson_revision_finalizations
+  FOR EACH ROW EXECUTE FUNCTION reject_lesson_revision_mutation();
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION reject_finalized_lesson_revision_child_mutation() RETURNS trigger AS $$
+DECLARE
+  target_revision_id uuid;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    target_revision_id := OLD.revision_id;
+  ELSE
+    target_revision_id := NEW.revision_id;
+  END IF;
+  IF EXISTS (SELECT 1 FROM lesson_revision_finalizations WHERE revision_id = target_revision_id) THEN
+    RAISE EXCEPTION 'finalized lesson revision children are immutable' USING ERRCODE = '55000';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
 CREATE TRIGGER lesson_revision_audiences_immutable
-  BEFORE UPDATE OR DELETE ON lesson_revision_audiences
-  FOR EACH ROW EXECUTE FUNCTION reject_lesson_revision_mutation();
+  BEFORE INSERT OR UPDATE OR DELETE ON lesson_revision_audiences
+  FOR EACH ROW EXECUTE FUNCTION reject_finalized_lesson_revision_child_mutation();
 CREATE TRIGGER lesson_revision_audience_users_immutable
-  BEFORE UPDATE OR DELETE ON lesson_revision_audience_users
-  FOR EACH ROW EXECUTE FUNCTION reject_lesson_revision_mutation();
+  BEFORE INSERT OR UPDATE OR DELETE ON lesson_revision_audience_users
+  FOR EACH ROW EXECUTE FUNCTION reject_finalized_lesson_revision_child_mutation();
 CREATE TRIGGER lesson_revision_external_videos_immutable
-  BEFORE UPDATE OR DELETE ON lesson_revision_external_videos
-  FOR EACH ROW EXECUTE FUNCTION reject_lesson_revision_mutation();
+  BEFORE INSERT OR UPDATE OR DELETE ON lesson_revision_external_videos
+  FOR EACH ROW EXECUTE FUNCTION reject_finalized_lesson_revision_child_mutation();
 
 CREATE INDEX grades_active_sort_idx ON grades (sort_key, id) WHERE archived_at IS NULL;
 CREATE INDEX terms_active_tree_idx ON terms (grade_id, sort_key, id) WHERE archived_at IS NULL;
@@ -209,8 +277,13 @@ DROP INDEX grades_active_sort_idx;
 DROP TRIGGER lesson_revision_external_videos_immutable ON lesson_revision_external_videos;
 DROP TRIGGER lesson_revision_audience_users_immutable ON lesson_revision_audience_users;
 DROP TRIGGER lesson_revision_audiences_immutable ON lesson_revision_audiences;
+DROP FUNCTION reject_finalized_lesson_revision_child_mutation();
+DROP TRIGGER lesson_revision_finalizations_immutable ON lesson_revision_finalizations;
+DROP FUNCTION finalize_lesson_revision(uuid);
 DROP TRIGGER lesson_revisions_immutable ON lesson_revisions;
 DROP FUNCTION reject_lesson_revision_mutation();
+DROP TRIGGER users_referenced_audience_students_only ON users;
+DROP FUNCTION reject_ineligible_referenced_audience_user();
 DROP TRIGGER lesson_revision_audience_users_student_only ON lesson_revision_audience_users;
 DROP TRIGGER lesson_draft_audience_users_student_only ON lesson_draft_audience_users;
 DROP FUNCTION require_student_audience_member();
@@ -221,6 +294,7 @@ DROP TABLE lesson_revision_external_videos;
 DROP TABLE lesson_draft_external_videos;
 DROP TABLE lesson_revision_audience_users;
 DROP TABLE lesson_revision_audiences;
+DROP TABLE lesson_revision_finalizations;
 DROP TABLE lesson_draft_audience_users;
 DROP TABLE lesson_draft_audiences;
 DROP TABLE lesson_revisions;

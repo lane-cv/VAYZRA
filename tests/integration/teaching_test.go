@@ -105,6 +105,9 @@ func publishFixtureRevision(t *testing.T, pool *pgxpool.Pool, lessonID, teacherI
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audience_users (revision_id, user_id) VALUES ($1, $2)`, revisionID, studentID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, revisionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE lessons SET published_revision_id = $2 WHERE id = $1`, lessonID, revisionID); err != nil {
 		t.Fatal(err)
 	}
@@ -127,4 +130,121 @@ func resetTeachingTables(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(context.Background(), `TRUNCATE TABLE grades, users CASCADE`); err != nil {
 		t.Fatalf("reset teaching tables: %v", err)
 	}
+}
+
+func TestTeachingSchemaRejectsCrossLessonPublishedRevision(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	teacher := insertTeachingUser(t, pool, "cross_teacher", "admin")
+	student := insertTeachingUser(t, pool, "cross_student", "student")
+	ids := insertCatalogPath(t, pool)
+	firstLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	secondLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	revisionID := publishFixtureRevision(t, pool, firstLessonID, teacher, student)
+
+	if _, err := pool.Exec(ctx, `UPDATE lessons SET published_revision_id = $2 WHERE id = $1`, secondLessonID, revisionID); err == nil {
+		t.Fatal("lesson accepted a published revision owned by another lesson")
+	}
+}
+
+func TestTeachingSchemaFinalizesRevisionChildren(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	teacher := insertTeachingUser(t, pool, "freeze_teacher", "admin")
+	student := insertTeachingUser(t, pool, "freeze_student", "student")
+	secondStudent := insertTeachingUser(t, pool, "freeze_student_2", "student")
+	ids := insertCatalogPath(t, pool)
+	lessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	revisionID := publishFixtureRevision(t, pool, lessonID, teacher, student)
+
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audience_users (revision_id, user_id) VALUES ($1, $2)`, revisionID, secondStudent); err == nil {
+		t.Fatal("finalized revision accepted a new audience member")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_external_videos (revision_id, url, title) VALUES ($1, 'https://video.example.test', 'Video')`, revisionID); err == nil {
+		t.Fatal("finalized revision accepted a new external video")
+	}
+
+	secondLessonID := insertLessonDraft(t, pool, ids.chapterID, teacher)
+	secondRevisionID := insertUnfinalizedRevision(t, pool, secondLessonID, teacher)
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, secondRevisionID); err != nil {
+		t.Fatalf("finalize revision without children: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE lessons SET published_revision_id = $2 WHERE id = $1`, secondLessonID, secondRevisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences (revision_id, mode) VALUES ($1, 'all')`, secondRevisionID); err == nil {
+		t.Fatal("finalized revision accepted an audience header")
+	}
+}
+
+func TestTeachingSchemaRequiresActiveAudienceStudents(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetTeachingTables(t, pool)
+
+	editor := insertTeachingUser(t, pool, "audience_editor", "student")
+	inactiveStudent := insertTeachingUserWithStatus(t, pool, "inactive_student", "student", "disabled")
+	deletedStudent := insertTeachingUser(t, pool, "deleted_student", "student")
+	if _, err := pool.Exec(ctx, `UPDATE users SET deleted_at = now() WHERE id = $1`, deletedStudent); err != nil {
+		t.Fatal(err)
+	}
+	activeStudent := insertTeachingUser(t, pool, "active_student", "student")
+	ids := insertCatalogPath(t, pool)
+	lessonID := insertLessonDraft(t, pool, ids.chapterID, editor)
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_audiences (lesson_id, mode) VALUES ($1, 'selected')`, lessonID); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, studentID := range []uuid.UUID{inactiveStudent, deletedStudent} {
+		if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_audience_users (lesson_id, user_id) VALUES ($1, $2)`, lessonID, studentID); err == nil {
+			t.Fatal("selected audience accepted an inactive or deleted student")
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_audience_users (lesson_id, user_id) VALUES ($1, $2)`, lessonID, activeStudent); err != nil {
+		t.Fatal(err)
+	}
+	for _, update := range []string{
+		`UPDATE users SET status = 'disabled' WHERE id = $1`,
+		`UPDATE users SET role = 'admin' WHERE id = $1`,
+		`UPDATE users SET deleted_at = now() WHERE id = $1`,
+	} {
+		if _, err := pool.Exec(ctx, update, activeStudent); err == nil {
+			t.Fatal("referenced audience student was allowed to become ineligible")
+		}
+	}
+}
+
+func insertUnfinalizedRevision(t *testing.T, pool *pgxpool.Pool, lessonID, teacherID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var revisionID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO lesson_revisions (lesson_id, version, title, summary, body_markdown, sort_key, published_by)
+		VALUES ($1, 1, 'Lesson 1', '', 'Body', 1024, $2) RETURNING id`, lessonID, teacherID).Scan(&revisionID); err != nil {
+		t.Fatal(err)
+	}
+	return revisionID
+}
+
+func insertTeachingUserWithStatus(t *testing.T, pool *pgxpool.Pool, username, role, status string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO users (username, display_name, role, status, password_hash)
+		VALUES ($1, $1, $2, $3, 'hash') RETURNING id`, username, role, status).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
