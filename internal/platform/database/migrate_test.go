@@ -61,3 +61,29 @@ func TestAuthMigrationHasUserUniquenessIndexes(t *testing.T) {
 		t.Fatalf("user uniqueness index count=%d err=%v", count, err)
 	}
 }
+
+func TestTeachingMigrationCreatesCatalogSchema(t *testing.T) {
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(context.Background(), pool); err != nil {
+		t.Fatal(err)
+	}
+
+	var version int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 4 {
+		t.Fatalf("migration version=%d err=%v", version, err)
+	}
+
+	var count int
+	err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name IN
+		('grades', 'terms', 'subjects', 'chapters', 'lessons', 'lesson_drafts',
+		 'lesson_revisions', 'lesson_draft_audiences', 'lesson_draft_audience_users',
+		 'lesson_revision_audiences', 'lesson_revision_audience_users',
+		 'lesson_draft_external_videos', 'lesson_revision_external_videos',
+		 'outbox_events', 'lesson_progress')`).Scan(&count)
+	if err != nil || count != 15 {
+		t.Fatalf("teaching table count=%d err=%v", count, err)
+	}
+}
