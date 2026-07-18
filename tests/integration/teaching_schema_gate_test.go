@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net"
-	"reflect"
 	"testing"
 	"time"
 
@@ -63,9 +62,24 @@ func TestTeachingDisableRevokesSessionsAndPreservesRevisionAudience(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM lesson_revision_audience_users WHERE revision_id=$1 AND user_id=$2`, revisionID, student.ID).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("historical revision audience rows=%d err=%v", rows, err)
 	}
+	student.Status = auth.StatusDisabled
+	disabledActor := teaching.Principal{User: student, RequestID: "disabled-student", IP: net.ParseIP("192.0.2.62")}
+	studentService := teaching.NewStudentService(teaching.NewPostgresStore(pool), time.Now)
+	if _, err := studentService.Browse(ctx, disabledActor, teaching.BrowseInput{}); !errors.Is(err, teaching.ErrForbidden) {
+		t.Fatalf("disabled browse error=%v, want forbidden", err)
+	}
+	if _, _, err := studentService.Search(ctx, disabledActor, teaching.SearchInput{}); !errors.Is(err, teaching.ErrForbidden) {
+		t.Fatalf("disabled search error=%v, want forbidden", err)
+	}
+	if _, err := studentService.GetLesson(ctx, disabledActor, lessonID); !errors.Is(err, teaching.ErrForbidden) {
+		t.Fatalf("disabled get error=%v, want forbidden", err)
+	}
+	if err := studentService.UpdateProgress(ctx, disabledActor, teaching.ProgressInput{}); !errors.Is(err, teaching.ErrForbidden) {
+		t.Fatalf("disabled progress error=%v, want forbidden", err)
+	}
 }
 
-func TestTeachingPublicationRecordsSourceDraftVersionAndRejectsReplay(t *testing.T) {
+func TestTeachingPublicationRecordsSourceDraftVersionAcrossRepublish(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(ctx, pool); err != nil {
@@ -82,23 +96,27 @@ func TestTeachingPublicationRecordsSourceDraftVersionAndRejectsReplay(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	revision, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: draft.LockVersion})
+	first, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: draft.LockVersion})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sourceVersion int64
-	if err := pool.QueryRow(ctx, `SELECT source_draft_version FROM lesson_revisions WHERE id=$1`, revision.ID).Scan(&sourceVersion); err != nil || sourceVersion != draft.LockVersion {
-		t.Fatalf("source draft version=%d want=%d err=%v", sourceVersion, draft.LockVersion, err)
+	if err := svc.Withdraw(ctx, actor, lessonID); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: draft.LockVersion}); !errors.Is(err, teaching.ErrConflict) {
-		t.Fatalf("duplicate publish error=%v, want conflict", err)
+	second, err := svc.Publish(ctx, actor, teaching.PublishInput{LessonID: lessonID, ExpectedVersion: draft.LockVersion})
+	if err != nil {
+		t.Fatalf("republish unchanged source draft: %v", err)
 	}
-	var revisions int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM lesson_revisions WHERE lesson_id=$1`, lessonID).Scan(&revisions); err != nil || revisions != 1 {
-		t.Fatalf("revision count=%d err=%v", revisions, err)
+	if first.SourceDraftVersion != draft.LockVersion || second.SourceDraftVersion != draft.LockVersion || second.Version != first.Version+1 || second.ID == first.ID {
+		t.Fatalf("first=%+v second=%+v source draft version=%d", first, second, draft.LockVersion)
 	}
-	if _, ok := reflect.TypeOf(teaching.Revision{}).FieldByName("SourceDraftVersion"); !ok {
-		t.Fatal("Revision contract lacks SourceDraftVersion")
+	var revisions, finalized int
+	var minSource, maxSource int64
+	if err := pool.QueryRow(ctx, `SELECT count(*),count(f.revision_id),min(r.source_draft_version),max(r.source_draft_version) FROM lesson_revisions r LEFT JOIN lesson_revision_finalizations f ON f.revision_id=r.id WHERE r.lesson_id=$1`, lessonID).Scan(&revisions, &finalized, &minSource, &maxSource); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 2 || finalized != 2 || minSource != draft.LockVersion || maxSource != draft.LockVersion {
+		t.Fatalf("revisions=%d finalized=%d source range=%d..%d want two finalized at %d", revisions, finalized, minSource, maxSource, draft.LockVersion)
 	}
 }
 

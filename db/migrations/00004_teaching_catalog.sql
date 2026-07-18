@@ -81,7 +81,6 @@ CREATE TABLE lesson_revisions (
   published_by uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   published_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (lesson_id, version),
-  UNIQUE (lesson_id, source_draft_version),
   UNIQUE (id, lesson_id)
 );
 
