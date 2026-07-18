@@ -6,6 +6,86 @@ import (
 	"time"
 )
 
+func productionConfigEnv() map[string]string {
+	return map[string]string{
+		"HAPPYLEARN_ENV":                    "production",
+		"HAPPYLEARN_DATABASE_URL":           "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":              "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":  "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":          "https://learn.example.com",
+		"HAPPYLEARN_MINIO_ENDPOINT":         "minio.internal:9000",
+		"HAPPYLEARN_MINIO_ACCESS_KEY":       "test-access-key",
+		"HAPPYLEARN_MINIO_SECRET_KEY":       "test-secret-key",
+		"HAPPYLEARN_MINIO_USE_TLS":          "true",
+		"HAPPYLEARN_MINIO_ORIGINALS_BUCKET": "happylearn-originals",
+		"HAPPYLEARN_MINIO_PREVIEWS_BUCKET":  "happylearn-previews",
+	}
+}
+
+func TestLoadRejectsMissingMinIOValuesInProduction(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"HAPPYLEARN_MINIO_ENDPOINT", "HAPPYLEARN_MINIO_ENDPOINT is required in production"},
+		{"HAPPYLEARN_MINIO_ACCESS_KEY", "HAPPYLEARN_MINIO_ACCESS_KEY is required in production"},
+		{"HAPPYLEARN_MINIO_SECRET_KEY", "HAPPYLEARN_MINIO_SECRET_KEY is required in production"},
+		{"HAPPYLEARN_MINIO_ORIGINALS_BUCKET", "HAPPYLEARN_MINIO_ORIGINALS_BUCKET is required in production"},
+		{"HAPPYLEARN_MINIO_PREVIEWS_BUCKET", "HAPPYLEARN_MINIO_PREVIEWS_BUCKET is required in production"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := productionConfigEnv()
+			delete(env, tc.name)
+			_, err := Load(func(k string) string { return env[k] })
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeMinIOEndpointsWithoutLeakingCredentials(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://minio.internal:9000/private",
+		"https://access:secret@minio.internal:9000",
+	} {
+		env := productionConfigEnv()
+		env["HAPPYLEARN_MINIO_ENDPOINT"] = endpoint
+		_, err := Load(func(k string) string { return env[k] })
+		if err == nil || err.Error() != "HAPPYLEARN_MINIO_ENDPOINT must be a host and optional port without scheme, credentials, path, query, or fragment" {
+			t.Fatalf("endpoint=%q error=%v", endpoint, err)
+		}
+		if strings.Contains(err.Error(), "access") || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), endpoint) {
+			t.Fatalf("endpoint credentials leaked in error: %v", err)
+		}
+	}
+}
+
+func TestLoadRejectsInvalidMinIOBucketNames(t *testing.T) {
+	for _, variable := range []string{"HAPPYLEARN_MINIO_ORIGINALS_BUCKET", "HAPPYLEARN_MINIO_PREVIEWS_BUCKET"} {
+		for _, bucket := range []string{"ab", "HappyLearn", "bad_bucket", "192.0.2.1", "bad..bucket", "-bad-bucket"} {
+			env := productionConfigEnv()
+			env[variable] = bucket
+			_, err := Load(func(k string) string { return env[k] })
+			want := variable + " must be a valid S3 bucket name"
+			if err == nil || err.Error() != want {
+				t.Fatalf("variable=%s bucket=%q error=%v, want %q", variable, bucket, err, want)
+			}
+		}
+	}
+}
+
+func TestLoadParsesMinIOConfiguration(t *testing.T) {
+	env := productionConfigEnv()
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MinIOEndpoint != "minio.internal:9000" || cfg.MinIOAccessKey != "test-access-key" || cfg.MinIOSecretKey != "test-secret-key" || !cfg.MinIOUseTLS || cfg.MinIOOriginalsBucket != "happylearn-originals" || cfg.MinIOPreviewsBucket != "happylearn-previews" {
+		t.Fatalf("unexpected MinIO config: %#v", cfg)
+	}
+}
 func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 	_, err := Load(func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_DATABASE_URL") {
@@ -104,12 +184,7 @@ func TestLoadValidatesAndNormalizesPublicOrigin(t *testing.T) {
 }
 
 func TestLoadRequiresHTTPSPublicOriginInProduction(t *testing.T) {
-	base := map[string]string{
-		"HAPPYLEARN_ENV":                   "production",
-		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
-		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
-		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
-	}
+	base := productionConfigEnv()
 
 	base["HAPPYLEARN_PUBLIC_ORIGIN"] = "http://learn.example.com"
 	if _, err := Load(func(k string) string { return base[k] }); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_PUBLIC_ORIGIN") {

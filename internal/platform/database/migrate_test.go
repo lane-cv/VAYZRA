@@ -68,10 +68,10 @@ func TestTeachingMigrationCreatesCatalogSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var version int
+	var teachingMigrationApplied bool
 	if err := pool.QueryRow(context.Background(), `
-		SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 4 {
-		t.Fatalf("migration version=%d err=%v", version, err)
+		SELECT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id=4 AND is_applied)`).Scan(&teachingMigrationApplied); err != nil || !teachingMigrationApplied {
+		t.Fatalf("teaching migration applied=%t err=%v", teachingMigrationApplied, err)
 	}
 
 	var count int

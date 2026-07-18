@@ -5,21 +5,29 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	Environment         string
-	ListenAddress       string
-	DatabaseURL         string
-	RedisURL            string
-	LoginThrottleSecret string
-	TrustedProxyCIDRs   []netip.Prefix
-	PublicOrigin        string
-	SessionIdleTTL      time.Duration
-	SessionAbsoluteTTL  time.Duration
-	CookieSecure        bool
+	Environment          string
+	ListenAddress        string
+	DatabaseURL          string
+	RedisURL             string
+	LoginThrottleSecret  string
+	TrustedProxyCIDRs    []netip.Prefix
+	PublicOrigin         string
+	SessionIdleTTL       time.Duration
+	SessionAbsoluteTTL   time.Duration
+	CookieSecure         bool
+	MinIOEndpoint        string
+	MinIOAccessKey       string
+	MinIOSecretKey       string
+	MinIOUseTLS          bool
+	MinIOOriginalsBucket string
+	MinIOPreviewsBucket  string
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -63,7 +71,64 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 	}
 	c.CookieSecure = c.Environment == "production"
-
+	c.MinIOEndpoint = getenv("HAPPYLEARN_MINIO_ENDPOINT")
+	c.MinIOAccessKey = getenv("HAPPYLEARN_MINIO_ACCESS_KEY")
+	c.MinIOSecretKey = getenv("HAPPYLEARN_MINIO_SECRET_KEY")
+	c.MinIOOriginalsBucket = getenv("HAPPYLEARN_MINIO_ORIGINALS_BUCKET")
+	c.MinIOPreviewsBucket = getenv("HAPPYLEARN_MINIO_PREVIEWS_BUCKET")
+	if c.Environment == "development" {
+		if c.MinIOEndpoint == "" {
+			c.MinIOEndpoint = "127.0.0.1:59000"
+		}
+		if c.MinIOAccessKey == "" {
+			c.MinIOAccessKey = "happylearn_dev"
+		}
+		if c.MinIOSecretKey == "" {
+			c.MinIOSecretKey = "happylearn_minio_dev_secret"
+		}
+		if c.MinIOOriginalsBucket == "" {
+			c.MinIOOriginalsBucket = "happylearn-originals"
+		}
+		if c.MinIOPreviewsBucket == "" {
+			c.MinIOPreviewsBucket = "happylearn-previews"
+		}
+	}
+	if raw := getenv("HAPPYLEARN_MINIO_USE_TLS"); raw != "" {
+		useTLS, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_USE_TLS must be true or false")
+		}
+		c.MinIOUseTLS = useTLS
+	}
+	if c.MinIOEndpoint == "" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_ENDPOINT is required in production")
+	}
+	if c.MinIOAccessKey == "" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_ACCESS_KEY is required in production")
+	}
+	if c.MinIOSecretKey == "" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_SECRET_KEY is required in production")
+	}
+	if c.MinIOOriginalsBucket == "" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_ORIGINALS_BUCKET is required in production")
+	}
+	if c.MinIOPreviewsBucket == "" {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_PREVIEWS_BUCKET is required in production")
+	}
+	if !validMinIOEndpoint(c.MinIOEndpoint) {
+		return Config{}, fmt.Errorf("HAPPYLEARN_MINIO_ENDPOINT must be a host and optional port without scheme, credentials, path, query, or fragment")
+	}
+	for _, bucket := range []struct {
+		name  string
+		value string
+	}{
+		{"HAPPYLEARN_MINIO_ORIGINALS_BUCKET", c.MinIOOriginalsBucket},
+		{"HAPPYLEARN_MINIO_PREVIEWS_BUCKET", c.MinIOPreviewsBucket},
+	} {
+		if !validS3BucketName(bucket.value) {
+			return Config{}, fmt.Errorf("%s must be a valid S3 bucket name", bucket.name)
+		}
+	}
 	for _, required := range []struct {
 		name  string
 		value string
@@ -103,4 +168,40 @@ func normalizePublicOrigin(raw string) (string, error) {
 		host = "[" + host + "]"
 	}
 	return u.Scheme + "://" + host, nil
+}
+
+var s3BucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+
+func validMinIOEndpoint(raw string) bool {
+	if raw == "" || strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "/?#,") {
+		return false
+	}
+	u, err := url.Parse("http://" + raw)
+	if err != nil || u.Scheme != "http" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validS3BucketName(name string) bool {
+	if !s3BucketName.MatchString(name) || strings.Contains(name, "..") || strings.Contains(name, ".-") || strings.Contains(name, "-.") || net.ParseIP(name) != nil {
+		return false
+	}
+	for _, prefix := range []string{"xn--", "sthree-", "amzn-s3-demo-"} {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	for _, suffix := range []string{"-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"} {
+		if strings.HasSuffix(name, suffix) {
+			return false
+		}
+	}
+	return true
 }

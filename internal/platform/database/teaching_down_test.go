@@ -30,12 +30,12 @@ func TestTeachingMigrationDownRemovesTaskOneObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := provider.Down(ctx)
+	results, err := provider.DownTo(ctx, 3)
 	if err != nil {
 		t.Fatalf("rollback teaching migration: %v", err)
 	}
-	if result.Source.Version != 4 {
-		t.Fatalf("rolled back version=%d, want 4", result.Source.Version)
+	if len(results) != 2 || results[len(results)-1].Source.Version != 4 {
+		t.Fatalf("rolled back migrations=%v, want versions 5 then 4", results)
 	}
 	var tables, routines int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('grades','terms','subjects','chapters','lessons','lesson_drafts','lesson_revisions','lesson_revision_finalizations','lesson_draft_audiences','lesson_draft_audience_users','lesson_revision_audiences','lesson_revision_audience_users','lesson_draft_external_videos','lesson_revision_external_videos','outbox_events','lesson_progress')`).Scan(&tables); err != nil {
