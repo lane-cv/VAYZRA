@@ -20,16 +20,16 @@ func (s *PostgresStore) ListFiles(ctx context.Context, filter FileFilter, cursor
 WITH latest AS (
  SELECT DISTINCT ON (file_id) id,file_id,version,display_name,declared_mime,COALESCE(detected_mime,'') AS detected_mime,size_bytes,processing_state,
   COALESCE(failure_category,'') AS failure_category,browser_playable,created_at,retention_until
- FROM file_versions ORDER BY file_id,version DESC,id DESC
+ FROM file_versions WHERE purpose='teaching' ORDER BY file_id,version DESC,id DESC
 )
 SELECT f.id,f.created_at,f.deleted_at,
  v.id,v.file_id,v.version,v.display_name,v.declared_mime,v.detected_mime,v.size_bytes,v.processing_state,v.failure_category,
  COALESCE((SELECT processing_state FROM file_previews WHERE file_version_id=v.id ORDER BY created_at DESC,id DESC LIMIT 1),''),
  v.browser_playable,v.created_at,v.retention_until,
  (SELECT count(*) FROM (
-   SELECT lesson_id FROM lesson_draft_files WHERE file_version_id IN (SELECT id FROM file_versions WHERE file_id=f.id)
+   SELECT lesson_id FROM lesson_draft_files WHERE file_version_id IN (SELECT id FROM file_versions WHERE file_id=f.id AND purpose='teaching')
    UNION ALL
-   SELECT revision_id FROM lesson_revision_files WHERE file_version_id IN (SELECT id FROM file_versions WHERE file_id=f.id)
+   SELECT revision_id FROM lesson_revision_files WHERE file_version_id IN (SELECT id FROM file_versions WHERE file_id=f.id AND purpose='teaching')
   ) refs)
 FROM files f JOIN latest v ON v.file_id=f.id
 WHERE f.deleted_at IS NULL
@@ -43,10 +43,10 @@ WHERE f.deleted_at IS NULL
    ELSE false END)
  AND ($3='' OR v.processing_state=$3)
  AND ($4='' OR
-   ($4='referenced' AND (EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id) OR EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id))) OR
-   ($4='unreferenced' AND NOT EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id) AND NOT EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id)) OR
-   ($4='draft' AND EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id)) OR
-   ($4='published' AND EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=f.id)))
+   ($4='referenced' AND (EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id) OR EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id))) OR
+   ($4='unreferenced' AND NOT EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id) AND NOT EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id)) OR
+   ($4='draft' AND EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id)) OR
+   ($4='published' AND EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id AND x.purpose='teaching' WHERE x.file_id=f.id)))
  AND ($5::timestamptz IS NULL OR f.created_at >= $5)
  AND ($6::timestamptz IS NULL OR f.created_at <= $6)
  AND ($7::timestamptz IS NULL OR (f.created_at,f.id) < ($7,$8))
@@ -80,10 +80,10 @@ ORDER BY f.created_at DESC,f.id DESC LIMIT $9`, filter.Name, filter.Type, filter
 
 func (s *PostgresStore) FileDetail(ctx context.Context, fileID uuid.UUID) (FileDetail, error) {
 	var detail FileDetail
-	if err := s.pool.QueryRow(ctx, `SELECT id,created_at,deleted_at FROM files WHERE id=$1 AND deleted_at IS NULL`, fileID).Scan(&detail.ID, &detail.CreatedAt, &detail.DeletedAt); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT f.id,f.created_at,f.deleted_at FROM files f WHERE f.id=$1 AND f.deleted_at IS NULL AND EXISTS(SELECT 1 FROM file_versions fv WHERE fv.file_id=f.id AND fv.purpose='teaching')`, fileID).Scan(&detail.ID, &detail.CreatedAt, &detail.DeletedAt); err != nil {
 		return FileDetail{}, mapStoreError(err)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT fv.id,fv.file_id,fv.version,fv.display_name,fv.declared_mime,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,COALESCE(fv.failure_category,''),COALESCE((SELECT processing_state FROM file_previews WHERE file_version_id=fv.id ORDER BY created_at DESC,id DESC LIMIT 1),''),fv.browser_playable,fv.created_at,fv.retention_until FROM file_versions fv WHERE fv.file_id=$1 ORDER BY fv.version DESC,fv.id DESC`, fileID)
+	rows, err := s.pool.Query(ctx, `SELECT fv.id,fv.file_id,fv.version,fv.display_name,fv.declared_mime,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,COALESCE(fv.failure_category,''),COALESCE((SELECT processing_state FROM file_previews WHERE file_version_id=fv.id ORDER BY created_at DESC,id DESC LIMIT 1),''),fv.browser_playable,fv.created_at,fv.retention_until FROM file_versions fv WHERE fv.file_id=$1 AND fv.purpose='teaching' ORDER BY fv.version DESC,fv.id DESC`, fileID)
 	if err != nil {
 		return FileDetail{}, err
 	}
@@ -101,9 +101,9 @@ func (s *PostgresStore) FileDetail(ctx context.Context, fileID uuid.UUID) (FileD
 	}
 	rows.Close()
 	refs, err := s.pool.Query(ctx, `
-SELECT DISTINCT 'draft',d.lesson_id,d.title,NULL::uuid FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN lesson_drafts d ON d.lesson_id=b.lesson_id WHERE fv.file_id=$1
+SELECT DISTINCT 'draft',d.lesson_id,d.title,NULL::uuid FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' JOIN lesson_drafts d ON d.lesson_id=b.lesson_id WHERE fv.file_id=$1
 UNION
-SELECT DISTINCT 'published',r.lesson_id,r.title,r.id FROM lesson_revision_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN lesson_revisions r ON r.id=b.revision_id WHERE fv.file_id=$1
+SELECT DISTINCT 'published',r.lesson_id,r.title,r.id FROM lesson_revision_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' JOIN lesson_revisions r ON r.id=b.revision_id WHERE fv.file_id=$1
 ORDER BY 1,3,2`, fileID)
 	if err != nil {
 		return FileDetail{}, err
@@ -125,7 +125,7 @@ ORDER BY 1,3,2`, fileID)
 
 func (s *PostgresStore) FileVersion(ctx context.Context, id uuid.UUID) (FileVersionDetail, error) {
 	var version FileVersionDetail
-	err := scanFileVersion(s.pool.QueryRow(ctx, `SELECT fv.id,fv.file_id,fv.version,fv.display_name,fv.declared_mime,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,COALESCE(fv.failure_category,''),COALESCE((SELECT processing_state FROM file_previews WHERE file_version_id=fv.id ORDER BY created_at DESC,id DESC LIMIT 1),''),fv.browser_playable,fv.created_at,fv.retention_until FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=$1 AND f.deleted_at IS NULL`, id), &version)
+	err := scanFileVersion(s.pool.QueryRow(ctx, `SELECT fv.id,fv.file_id,fv.version,fv.display_name,fv.declared_mime,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,COALESCE(fv.failure_category,''),COALESCE((SELECT processing_state FROM file_previews WHERE file_version_id=fv.id ORDER BY created_at DESC,id DESC LIMIT 1),''),fv.browser_playable,fv.created_at,fv.retention_until FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=$1 AND fv.purpose='teaching' AND f.deleted_at IS NULL`, id), &version)
 	return version, mapStoreError(err)
 }
 
@@ -136,7 +136,7 @@ func (s *PostgresStore) RetryFile(ctx context.Context, actor Principal, versionI
 	}
 	defer tx.Rollback(context.Background())
 	var state, category string
-	if err := tx.QueryRow(ctx, `SELECT processing_state,COALESCE(failure_category,'') FROM file_versions WHERE id=$1 FOR UPDATE`, versionID).Scan(&state, &category); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT processing_state,COALESCE(failure_category,'') FROM file_versions WHERE id=$1 AND purpose='teaching' FOR UPDATE`, versionID).Scan(&state, &category); err != nil {
 		return mapStoreError(err)
 	}
 	if state != "failed" || !retryableFailure(category) {
@@ -145,7 +145,7 @@ func (s *PostgresStore) RetryFile(ctx context.Context, actor Principal, versionI
 	if _, err := tx.Exec(ctx, `INSERT INTO file_processing_jobs(file_version_id,kind) VALUES($1,'process_file')`, versionID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE file_versions SET processing_state='pending_scan',failure_category=NULL WHERE id=$1`, versionID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE file_versions SET processing_state='pending_scan',failure_category=NULL WHERE id=$1 AND purpose='teaching'`, versionID); err != nil {
 		return err
 	}
 	if err := writeFileAudit(ctx, tx, actor, "file.processing_retried", "file_version", versionID); err != nil {
@@ -161,7 +161,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	}
 	defer tx.Rollback(context.Background())
 	var sourceFileID uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT file_id FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&sourceFileID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT file_id FROM file_versions WHERE id=$1 AND purpose='teaching'`, uploadedVersionID).Scan(&sourceFileID); err != nil {
 		return mapStoreError(err)
 	}
 	if sourceFileID == fileID {
@@ -170,7 +170,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	if err := lockDraftBindingsForFile(ctx, tx, fileID); err != nil {
 		return err
 	}
-	fileLocks, err := tx.Query(ctx, `SELECT id FROM files WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id FOR UPDATE`, []uuid.UUID{fileID, sourceFileID})
+	fileLocks, err := tx.Query(ctx, `SELECT f.id FROM files f WHERE f.id=ANY($1) AND f.deleted_at IS NULL AND EXISTS(SELECT 1 FROM file_versions fv WHERE fv.file_id=f.id AND fv.purpose='teaching') ORDER BY f.id FOR UPDATE`, []uuid.UUID{fileID, sourceFileID})
 	if err != nil {
 		return err
 	}
@@ -191,7 +191,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	if lockedFiles != 2 {
 		return ErrNotFound
 	}
-	versionLocks, err := tx.Query(ctx, `SELECT id FROM file_versions WHERE file_id=ANY($1) ORDER BY id FOR UPDATE`, []uuid.UUID{fileID, sourceFileID})
+	versionLocks, err := tx.Query(ctx, `SELECT id FROM file_versions WHERE file_id=ANY($1) AND purpose='teaching' ORDER BY id FOR UPDATE`, []uuid.UUID{fileID, sourceFileID})
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	var browserPlayable, previewReady bool
 	if err := tx.QueryRow(ctx, `SELECT file_id,version,processing_state,COALESCE(NULLIF(detected_mime,''),declared_mime),browser_playable,
  EXISTS(SELECT 1 FROM file_previews WHERE file_version_id=$1 AND processing_state='ready')
- FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&lockedSourceFileID, &sourceVersion, &processingState, &detectedMIME, &browserPlayable, &previewReady); err != nil {
+ FROM file_versions WHERE id=$1 AND purpose='teaching'`, uploadedVersionID).Scan(&lockedSourceFileID, &sourceVersion, &processingState, &detectedMIME, &browserPlayable, &previewReady); err != nil {
 		return mapStoreError(err)
 	}
 	if lockedSourceFileID != sourceFileID || sourceVersion != 1 {
@@ -224,7 +224,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	}
 	var sourceVersions int
 	var referenced bool
-	if err := tx.QueryRow(ctx, `SELECT count(*),EXISTS(SELECT 1 FROM lesson_draft_files WHERE file_version_id=$1) OR EXISTS(SELECT 1 FROM lesson_revision_files WHERE file_version_id=$1) FROM file_versions WHERE file_id=$2`, uploadedVersionID, sourceFileID).Scan(&sourceVersions, &referenced); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*),EXISTS(SELECT 1 FROM lesson_draft_files WHERE file_version_id=$1) OR EXISTS(SELECT 1 FROM lesson_revision_files WHERE file_version_id=$1) FROM file_versions WHERE file_id=$2 AND purpose='teaching'`, uploadedVersionID, sourceFileID).Scan(&sourceVersions, &referenced); err != nil {
 		return err
 	}
 	if sourceVersions != 1 || referenced {
@@ -232,7 +232,7 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	}
 	var previousVersionID uuid.UUID
 	var previousVersion int64
-	if err := tx.QueryRow(ctx, `SELECT id,version FROM file_versions WHERE file_id=$1 ORDER BY version DESC,id DESC LIMIT 1 FOR UPDATE`, fileID).Scan(&previousVersionID, &previousVersion); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT id,version FROM file_versions WHERE file_id=$1 AND purpose='teaching' ORDER BY version DESC,id DESC LIMIT 1 FOR UPDATE`, fileID).Scan(&previousVersionID, &previousVersion); err != nil {
 		return err
 	}
 	policies, err := tx.Query(ctx, `SELECT DISTINCT access_policy FROM lesson_draft_files WHERE file_version_id=$1 ORDER BY access_policy`, previousVersionID)
@@ -256,10 +256,10 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	}
 	policies.Close()
 	nextVersion := previousVersion + 1
-	if _, err := tx.Exec(ctx, `UPDATE file_versions SET retention_until=$2 WHERE id=$1`, previousVersionID, retentionUntil); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE file_versions SET retention_until=$2 WHERE id=$1 AND purpose='teaching'`, previousVersionID, retentionUntil); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE file_versions SET file_id=$2,version=$3,retention_until=NULL WHERE id=$1`, uploadedVersionID, fileID, nextVersion); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE file_versions SET file_id=$2,version=$3,retention_until=NULL WHERE id=$1 AND purpose='teaching'`, uploadedVersionID, fileID, nextVersion); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `WITH affected AS (
@@ -285,11 +285,11 @@ func (s *PostgresStore) RollbackFile(ctx context.Context, actor Principal, fileI
 	}
 	defer tx.Rollback(context.Background())
 	var bindingID, currentVersionID uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT b.id,b.file_version_id FROM lesson_drafts d JOIN lesson_draft_files b ON b.lesson_id=d.lesson_id JOIN file_versions fv ON fv.id=b.file_version_id WHERE d.lesson_id=$1 AND fv.file_id=$2 FOR UPDATE OF d,b`, lessonID, fileID).Scan(&bindingID, &currentVersionID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT b.id,b.file_version_id FROM lesson_drafts d JOIN lesson_draft_files b ON b.lesson_id=d.lesson_id JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' WHERE d.lesson_id=$1 AND fv.file_id=$2 FOR UPDATE OF d,b`, lessonID, fileID).Scan(&bindingID, &currentVersionID); err != nil {
 		return mapStoreError(err)
 	}
 	var fileLock uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT id FROM files WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, fileID).Scan(&fileLock); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT f.id FROM files f WHERE f.id=$1 AND f.deleted_at IS NULL AND EXISTS(SELECT 1 FROM file_versions fv WHERE fv.file_id=f.id AND fv.purpose='teaching') FOR UPDATE`, fileID).Scan(&fileLock); err != nil {
 		return mapStoreError(err)
 	}
 	if err := lockFileVersions(ctx, tx, fileID); err != nil {
@@ -297,7 +297,7 @@ func (s *PostgresStore) RollbackFile(ctx context.Context, actor Principal, fileI
 	}
 	var retention *time.Time
 	var state string
-	if err := tx.QueryRow(ctx, `SELECT retention_until,processing_state FROM file_versions WHERE id=$1 AND file_id=$2`, versionID, fileID).Scan(&retention, &state); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT retention_until,processing_state FROM file_versions WHERE id=$1 AND file_id=$2 AND purpose='teaching'`, versionID, fileID).Scan(&retention, &state); err != nil {
 		return mapStoreError(err)
 	}
 	if retention != nil && !retention.After(time.Now()) {
@@ -321,7 +321,7 @@ func (s *PostgresStore) RollbackFile(ctx context.Context, actor Principal, fileI
 }
 
 func lockDraftBindingsForFile(ctx context.Context, tx pgx.Tx, fileID uuid.UUID) error {
-	rows, err := tx.Query(ctx, `SELECT d.lesson_id,b.id FROM lesson_drafts d JOIN lesson_draft_files b ON b.lesson_id=d.lesson_id JOIN file_versions fv ON fv.id=b.file_version_id WHERE fv.file_id=$1 ORDER BY d.lesson_id,b.id FOR UPDATE OF d,b`, fileID)
+	rows, err := tx.Query(ctx, `SELECT d.lesson_id,b.id FROM lesson_drafts d JOIN lesson_draft_files b ON b.lesson_id=d.lesson_id JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' WHERE fv.file_id=$1 ORDER BY d.lesson_id,b.id FOR UPDATE OF d,b`, fileID)
 	if err != nil {
 		return err
 	}
@@ -342,10 +342,10 @@ func (s *PostgresStore) DeleteFile(ctx context.Context, actor Principal, fileID 
 	}
 	defer tx.Rollback(context.Background())
 	var deletedAt *time.Time
-	if err := tx.QueryRow(ctx, `SELECT deleted_at FROM files WHERE id=$1 FOR UPDATE`, fileID).Scan(&deletedAt); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT f.deleted_at FROM files f WHERE f.id=$1 AND EXISTS(SELECT 1 FROM file_versions fv WHERE fv.file_id=f.id AND fv.purpose='teaching') FOR UPDATE`, fileID).Scan(&deletedAt); err != nil {
 		return mapStoreError(err)
 	}
-	locked, err := tx.Query(ctx, `SELECT id FROM file_versions WHERE file_id=$1 ORDER BY id FOR UPDATE`, fileID)
+	locked, err := tx.Query(ctx, `SELECT id FROM file_versions WHERE file_id=$1 AND purpose='teaching' ORDER BY id FOR UPDATE`, fileID)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ func (s *PostgresStore) DeleteFile(ctx context.Context, actor Principal, fileID 
 	}
 	locked.Close()
 	var referenced bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id WHERE fv.file_id=$1) OR EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions fv ON fv.id=b.file_version_id WHERE fv.file_id=$1)`, fileID).Scan(&referenced); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' WHERE fv.file_id=$1) OR EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' WHERE fv.file_id=$1)`, fileID).Scan(&referenced); err != nil {
 		return err
 	}
 	if referenced {
@@ -373,7 +373,7 @@ func (s *PostgresStore) DeleteFile(ctx context.Context, actor Principal, fileID 
 		if _, err := tx.Exec(ctx, `UPDATE files SET deleted_at=$2 WHERE id=$1`, fileID, deleted); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE file_versions SET retention_until=$2,cleanup_state=CASE WHEN purged_at IS NULL THEN 'pending' ELSE cleanup_state END,cleanup_lease_owner=NULL,cleanup_lease_until=NULL WHERE file_id=$1`, fileID, retentionUntil); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE file_versions SET retention_until=$2,cleanup_state=CASE WHEN purged_at IS NULL THEN 'pending' ELSE cleanup_state END,cleanup_lease_owner=NULL,cleanup_lease_until=NULL WHERE file_id=$1 AND purpose='teaching'`, fileID, retentionUntil); err != nil {
 			return err
 		}
 		if err := writeFileAudit(ctx, tx, actor, "file.delete_requested", "file", fileID); err != nil {

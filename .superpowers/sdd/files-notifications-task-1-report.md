@@ -27,3 +27,25 @@ GREEN verification:
 ## Environment Concern
 
 The complete integration package has one pre-existing environment-only failure: `TestMinIOObjectStoreMultipartRangeAndAbort` cannot bootstrap the unavailable MinIO/AIStor service (`object store unavailable`). All PostgreSQL and in-memory object-store upload tests pass; no object-store service or AIStor license was available for this task.
+
+## Independent Review Remediation
+
+The first independent review found that upload lifecycle purpose isolation was complete, but legacy teaching consumers did not consistently require `purpose='teaching'`. The remediation was implemented with a new PostgreSQL test that failed first because a ready `qa_attachment` appeared in the admin teaching file center.
+
+All teaching consumers now fail closed on purpose:
+
+- admin file-center list/detail/version/retry/delete;
+- lesson draft binding/listing;
+- replacement source and target, rollback current binding and target version;
+- student published-file delivery and teaching access resolution;
+- publication readiness, revision snapshotting, admin publication locks, student lesson file DTOs, and attachment-name search.
+
+The regression proves that a ready Q&A version is absent from the teaching file center, cannot bind to a draft, cannot be used as a replacement or rollback source/target, and cannot be delivered through a malicious legacy revision binding. Q&A and random UUID probes both return `ErrNotFound`; normal teaching listing, binding, replacement, rollback, and access regressions remain green.
+
+Post-remediation verification:
+
+- focused purpose-isolation PostgreSQL test — PASS
+- affected `internal/files`, `internal/teaching`, and integration suites — PASS
+- `go test -race ./internal/files ./internal/teaching -count=1` — PASS
+- affected `go vet` — PASS
+- `git diff --check` — PASS

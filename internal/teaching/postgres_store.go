@@ -277,8 +277,9 @@ func (s *PostgresStore) PublishSnapshot(ctx context.Context, in PublishInput, d 
 	}
 	if _, err = s.q.Exec(ctx, `INSERT INTO lesson_revision_files
 		(revision_id,file_version_id,access_policy,sort_position,display_name,description)
-		SELECT $1,file_version_id,access_policy,sort_position,display_name,description
-		FROM lesson_draft_files WHERE lesson_id=$2 ORDER BY sort_position,id`, revision.ID, in.LessonID); err != nil {
+		SELECT $1,b.file_version_id,b.access_policy,b.sort_position,b.display_name,b.description
+		FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching'
+		WHERE b.lesson_id=$2 ORDER BY b.sort_position,b.id`, revision.ID, in.LessonID); err != nil {
 		return Revision{}, mapTeachingError(err)
 	}
 	if _, err = s.q.Exec(ctx, `SELECT finalize_lesson_revision($1)`, revision.ID); err != nil {
@@ -484,7 +485,7 @@ SELECT b.file_version_id,b.access_policy,b.display_name,b.description,b.sort_pos
        COALESCE(fv.detected_mime,''),fv.browser_playable,
        (fv.browser_playable OR EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready'))
 FROM lesson_revision_files b
-JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready'
+JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready' AND fv.purpose='teaching'
 JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
 WHERE b.revision_id=$1
 ORDER BY b.sort_position,b.file_version_id`, lesson.Revision.ID)
@@ -596,7 +597,7 @@ JOIN terms t ON t.id=s.term_id AND t.archived_at IS NULL
 JOIN grades g ON g.id=t.grade_id AND g.archived_at IS NULL
 WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
  AND (ra.mode='all' OR EXISTS(SELECT 1 FROM lesson_revision_audience_users rau WHERE rau.revision_id=r.id AND rau.user_id=$1))
- AND (r.title ILIKE $2 ESCAPE E'\\' OR ($3 AND r.body_markdown ILIKE $2 ESCAPE E'\\') OR EXISTS(SELECT 1 FROM lesson_revision_files lrf WHERE lrf.revision_id=r.id AND lrf.display_name ILIKE $2 ESCAPE E'\\'))
+ AND (r.title ILIKE $2 ESCAPE E'\\' OR ($3 AND r.body_markdown ILIKE $2 ESCAPE E'\\') OR EXISTS(SELECT 1 FROM lesson_revision_files lrf JOIN file_versions fv ON fv.id=lrf.file_version_id AND fv.purpose='teaching' WHERE lrf.revision_id=r.id AND lrf.display_name ILIKE $2 ESCAPE E'\\'))
  AND (NOT $4 OR (r.sort_key,r.id)>($5,$6))
 ORDER BY r.sort_key,r.id LIMIT $7`, in.StudentID, "%"+escapeLike(in.Query)+"%", in.IncludeBody, in.After.ID != uuid.Nil, in.After.SortKey, nullUUID(in.After.ID), in.Limit+1)
 	if err != nil {

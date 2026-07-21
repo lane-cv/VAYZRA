@@ -383,7 +383,7 @@ JOIN lesson_revisions r ON r.id=l.published_revision_id
 JOIN lesson_revision_finalizations rf ON rf.revision_id=r.id AND rf.lesson_id=l.id
 JOIN lesson_revision_audiences ra ON ra.revision_id=r.id
 JOIN lesson_revision_files b ON b.revision_id=r.id AND b.file_version_id=$2
-JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready'
+JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready' AND fv.purpose='teaching'
 JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
 LEFT JOIN LATERAL (
  SELECT object_key,content_type,size_bytes FROM file_previews
@@ -442,7 +442,7 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 		locked, lockErr := tx.Query(ctx, `SELECT fv.id,fv.processing_state,COALESCE(NULLIF(fv.detected_mime,''),fv.declared_mime),fv.browser_playable,
  EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready')
  FROM file_versions fv JOIN files f ON f.id=fv.file_id
- WHERE fv.id=ANY($1) AND f.deleted_at IS NULL ORDER BY f.id,fv.id FOR SHARE OF f,fv`, versionIDs)
+ WHERE fv.id=ANY($1) AND fv.purpose='teaching' AND f.deleted_at IS NULL ORDER BY f.id,fv.id FOR SHARE OF f,fv`, versionIDs)
 		if lockErr != nil {
 			return nil, lockErr
 		}
@@ -499,7 +499,7 @@ func (s *PostgresStore) ListDraftBindings(ctx context.Context, lessonID uuid.UUI
 	if !exists {
 		return nil, ErrNotFound
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,lesson_id,file_version_id,access_policy,display_name,description,sort_position FROM lesson_draft_files WHERE lesson_id=$1 ORDER BY sort_position,id`, lessonID)
+	rows, err := s.pool.Query(ctx, `SELECT b.id,b.lesson_id,b.file_version_id,b.access_policy,b.display_name,b.description,b.sort_position FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id AND fv.purpose='teaching' WHERE b.lesson_id=$1 ORDER BY b.sort_position,b.id`, lessonID)
 	if err != nil {
 		return nil, err
 	}

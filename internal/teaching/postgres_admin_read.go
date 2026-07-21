@@ -13,9 +13,9 @@ func (s *PostgresStore) PublicationBlockers(ctx context.Context, lessonID uuid.U
 	// lesson_draft_files -> files -> file_versions -> file_previews.
 	lockQueries := []string{
 		"SELECT b.id FROM lesson_draft_files b WHERE b.lesson_id=$1 ORDER BY b.id FOR SHARE OF b",
-		"SELECT f.id FROM files f JOIN file_versions fv ON fv.file_id=f.id JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 ORDER BY f.id FOR SHARE OF f",
-		"SELECT fv.id FROM file_versions fv JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 ORDER BY fv.id FOR SHARE OF fv",
-		"SELECT fp.file_version_id FROM file_previews fp JOIN lesson_draft_files b ON b.file_version_id=fp.file_version_id WHERE b.lesson_id=$1 ORDER BY fp.file_version_id,fp.preview_kind FOR SHARE OF fp",
+		"SELECT f.id FROM files f JOIN file_versions fv ON fv.file_id=f.id AND fv.purpose='teaching' JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 ORDER BY f.id FOR SHARE OF f",
+		"SELECT fv.id FROM file_versions fv JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 AND fv.purpose='teaching' ORDER BY fv.id FOR SHARE OF fv",
+		"SELECT fp.file_version_id FROM file_previews fp JOIN file_versions fv ON fv.id=fp.file_version_id AND fv.purpose='teaching' JOIN lesson_draft_files b ON b.file_version_id=fp.file_version_id WHERE b.lesson_id=$1 ORDER BY fp.file_version_id,fp.preview_kind FOR SHARE OF fp",
 	}
 	for _, query := range lockQueries {
 		rows, err := s.q.Query(ctx, query, lessonID)
@@ -40,6 +40,7 @@ SELECT DISTINCT blocker FROM (
  SELECT 'draft_changed' blocker WHERE NOT EXISTS(SELECT 1 FROM lesson_drafts WHERE lesson_id=$1 AND lock_version=$2)
  UNION ALL
  SELECT CASE
+  WHEN fv.purpose<>'teaching' THEN 'file_not_ready'
   WHEN f.deleted_at IS NOT NULL THEN 'file_deleted'
   WHEN fv.processing_state='pending_scan' OR (fv.processing_state='processing' AND fv.scan_result IS NULL) THEN 'scan_pending'
   WHEN fv.processing_state='rejected' THEN 'scan_rejected'
@@ -47,9 +48,9 @@ SELECT DISTINCT blocker FROM (
   WHEN fv.processing_state='failed' THEN 'conversion_failed'
   ELSE 'file_not_ready' END
  FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN files f ON f.id=fv.file_id
- WHERE b.lesson_id=$1 AND (fv.processing_state<>'ready' OR f.deleted_at IS NOT NULL)
+ WHERE b.lesson_id=$1 AND (fv.purpose<>'teaching' OR fv.processing_state<>'ready' OR f.deleted_at IS NOT NULL)
  UNION ALL
- SELECT 'preview_missing' FROM lesson_draft_files b WHERE b.lesson_id=$1 AND b.access_policy='preview' AND NOT EXISTS(
+ SELECT 'preview_missing' FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id WHERE b.lesson_id=$1 AND fv.purpose='teaching' AND b.access_policy='preview' AND NOT EXISTS(
   SELECT 1 FROM file_previews fp WHERE fp.file_version_id=b.file_version_id AND fp.processing_state='ready')
 ) blockers ORDER BY blocker`, lessonID, sourceVersion)
 	if err != nil {

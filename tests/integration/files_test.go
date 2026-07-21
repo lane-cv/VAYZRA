@@ -306,6 +306,104 @@ func TestReplaceFileRejectsUndeliverableUpload(t *testing.T) {
 	}
 }
 
+func TestTeachingFileConsumersFailClosedForQAAttachmentPurpose(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actorID := insertFileSchemaUser(t, pool, "purpose_isolation_actor")
+	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "purpose-isolation", IP: net.ParseIP("192.0.2.84")}
+	store := securefiles.NewPostgresStore(pool)
+	seedVersion := func(purpose, name string, state string) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		var fileID, versionID uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&fileID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,$3,$4,'application/pdf','application/pdf',4,$5,$6,$7) RETURNING id`, fileID, purpose, "purpose-isolation/"+uuid.NewString(), name, fmt.Sprintf("%064x", uuid.New().ID()), state, actorID).Scan(&versionID); err != nil {
+			t.Fatal(err)
+		}
+		return fileID, versionID
+	}
+	teachingFile, teachingVersion := seedVersion("teaching", "teaching.pdf", "ready")
+	qaFile, qaVersion := seedVersion("qa_attachment", "private-answer.pdf", "ready")
+
+	page, err := store.ListFiles(ctx, securefiles.FileFilter{}, securefiles.Cursor{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenTeaching, seenQA := false, false
+	for _, item := range page.Items {
+		seenTeaching = seenTeaching || item.ID == teachingFile
+		seenQA = seenQA || item.ID == qaFile
+	}
+	if !seenTeaching || seenQA {
+		t.Fatalf("file center teaching=%t qa=%t items=%+v", seenTeaching, seenQA, page.Items)
+	}
+	for label, check := range map[string]func() error{
+		"qa detail":     func() error { _, err := store.FileDetail(ctx, qaFile); return err },
+		"qa version":    func() error { _, err := store.FileVersion(ctx, qaVersion); return err },
+		"random detail": func() error { _, err := store.FileDetail(ctx, uuid.New()); return err },
+		"qa retry":      func() error { return store.RetryFile(ctx, actor, qaVersion) },
+		"qa delete":     func() error { return store.DeleteFile(ctx, actor, qaFile, time.Now().Add(30*24*time.Hour)) },
+	} {
+		if err := check(); !errors.Is(err, securefiles.ErrNotFound) {
+			t.Fatalf("%s err=%v", label, err)
+		}
+	}
+
+	revisionID := insertFileSchemaRevision(t, pool, actorID)
+	var lessonID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT lesson_id FROM lesson_revisions WHERE id=$1`, revisionID).Scan(&lessonID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_drafts(lesson_id,title,body_markdown,lock_version,updated_by) VALUES($1,'Purpose isolation','body',1,$2)`, lessonID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	qaBinding := securefiles.DraftBindingInput{FileVersionID: qaVersion, Policy: securefiles.PolicyDownload, DisplayName: "private-answer.pdf", SortPosition: 0}
+	if _, err := store.ReplaceDraftBindings(ctx, actor, lessonID, 1, []securefiles.DraftBindingInput{qaBinding}); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("bind QA err=%v", err)
+	}
+	teachingBinding := securefiles.DraftBindingInput{FileVersionID: teachingVersion, Policy: securefiles.PolicyDownload, DisplayName: "teaching.pdf", SortPosition: 0}
+	if _, err := store.ReplaceDraftBindings(ctx, actor, lessonID, 1, []securefiles.DraftBindingInput{teachingBinding}); err != nil {
+		t.Fatalf("bind teaching: %v", err)
+	}
+	if err := store.ReplaceFile(ctx, actor, teachingFile, qaVersion, time.Now().Add(30*24*time.Hour)); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("replace from QA err=%v", err)
+	}
+	if err := store.ReplaceFile(ctx, actor, qaFile, teachingVersion, time.Now().Add(30*24*time.Hour)); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("replace into QA file err=%v", err)
+	}
+
+	var mixedQAVersion uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,2,'qa_attachment',$2,'mixed-private.pdf','application/pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, teachingFile, "purpose-isolation/"+uuid.NewString(), fmt.Sprintf("%064x", 12345), actorID).Scan(&mixedQAVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackFile(ctx, actor, teachingFile, lessonID, mixedQAVersion); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("rollback to QA err=%v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_audiences(revision_id,mode) VALUES($1,'all')`, revisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_revision_files(revision_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,'download',0,'private-answer.pdf','')`, revisionID, qaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT finalize_lesson_revision($1)`, revisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE lessons SET published_revision_id=$1 WHERE id=$2`, revisionID, lessonID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveAccess(ctx, actorID, qaVersion, securefiles.ActionDownload); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("teaching delivery exposed QA err=%v", err)
+	}
+	if _, err := store.ResolveAccess(ctx, actorID, uuid.New(), securefiles.ActionDownload); !errors.Is(err, securefiles.ErrNotFound) {
+		t.Fatalf("random delivery err=%v", err)
+	}
+}
+
 func envOr(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
