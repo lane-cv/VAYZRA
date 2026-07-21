@@ -23,7 +23,7 @@
 ### Task 1: Add Purpose-Bound Upload Policies Without Duplicating Multipart Logic
 
 **Files:**
-- Create: `db/migrations/00010_qa_file_purpose.sql`
+- Create: `db/migrations/00011_qa_file_purpose.sql`
 - Modify: `internal/files/model.go`
 - Modify: `internal/files/upload_service.go`
 - Modify: `internal/files/upload_service_test.go`
@@ -113,7 +113,7 @@ Expected: PASS. Existing teaching upload tests remain unchanged in outcome; deni
 - [ ] **Step 7: Commit purpose-bound uploads**
 
 ```bash
-git add db/migrations/00010_qa_file_purpose.sql internal/files cmd/server internal/app
+git add db/migrations/00011_qa_file_purpose.sql internal/files cmd/server internal/app
 git commit -m "feat: add purpose-bound qa uploads"
 ```
 
@@ -191,7 +191,7 @@ git commit -m "feat: secure teacher qa attachments"
 ### Task 3: Add Durable Notification Storage and Recipient-Scoped APIs
 
 **Files:**
-- Create: `db/migrations/00011_notifications_outbox.sql`
+- Create: `db/migrations/00012_notifications_outbox.sql`
 - Create: `internal/notifications/model.go`
 - Create: `internal/notifications/store.go`
 - Create: `internal/notifications/service.go`
@@ -279,7 +279,7 @@ Expected: PASS with no cross-user counts or mutations and no duplicate Q&A notif
 - [ ] **Step 8: Commit notification storage and APIs**
 
 ```bash
-git add db/migrations/00011_notifications_outbox.sql internal/notifications internal/qanda internal/app cmd/server
+git add db/migrations/00012_notifications_outbox.sql internal/notifications internal/qanda internal/app cmd/server
 git commit -m "feat: add private in-app notifications"
 ```
 

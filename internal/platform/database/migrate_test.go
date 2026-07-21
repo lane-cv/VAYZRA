@@ -94,7 +94,7 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), `
 		SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid
 		WHERE r.relname='qa_messages' AND c.contype='c'
-		  AND pg_get_constraintdef(c.oid) LIKE '%message_kind%initial%student_follow_up%admin_reply%'`).Scan(&messageKindChecks); err != nil {
+		  AND c.conname IN ('qa_messages_message_kind_check','qa_messages_message_kind_role_check')`).Scan(&messageKindChecks); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(context.Background(), `
@@ -108,7 +108,7 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 		]`).Scan(&idempotencyKeys); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 4 || triggers != 3 || indexes != 4 || idempotencyKeys != 1 || messageKindColumns != 1 || messageKindChecks != 1 {
+	if tables != 4 || triggers != 3 || indexes != 4 || idempotencyKeys != 1 || messageKindColumns != 1 || messageKindChecks != 2 {
 		t.Fatalf("tables=%d triggers=%d indexes=%d idempotency_keys=%d message_kind_columns=%d message_kind_checks=%d", tables, triggers, indexes, idempotencyKeys, messageKindColumns, messageKindChecks)
 	}
 }

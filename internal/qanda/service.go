@@ -163,7 +163,12 @@ func (s *Service) AddStudentMessage(ctx context.Context, actor Principal, in Add
 		if nextErr != nil {
 			return nextErr
 		}
-		thread, message, err = store.AppendStudentMessage(ctx, thread, actor.User.ID, in, next, s.now().UTC())
+		activityAt := s.now().UTC()
+		minimumActivityAt := thread.LastMessageAt.UTC().Add(time.Microsecond)
+		if activityAt.Before(minimumActivityAt) {
+			activityAt = minimumActivityAt
+		}
+		thread, message, err = store.AppendStudentMessage(ctx, thread, actor.User.ID, in, next, activityAt)
 		if err != nil {
 			return err
 		}

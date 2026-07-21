@@ -243,6 +243,62 @@ func TestPostgresConcurrentStudentFollowUpsAppendOnce(t *testing.T) {
 	}
 }
 
+func TestPostgresStudentFollowUpUsesMonotonicActivityTime(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	activeQAAdmin(t, pool)
+	student := insertQAStudent(t, pool)
+	base := time.Date(2026, 7, 22, 11, 0, 0, 123456000, time.UTC)
+	clock := base
+	service := NewService(
+		NewPostgresStore(pool),
+		NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return &capturingNotifications{} }),
+		func() time.Time { return clock },
+	)
+	thread, initial, err := service.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Clock", Body: "Initial", IdempotencyKey: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='waiting_student',version=2 WHERE id=$1`, thread.ID); err != nil {
+		t.Fatal(err)
+	}
+	equalThread, equalMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, Body: "Equal", IdempotencyKey: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalMessage.CreatedAt.Equal(base.Add(time.Microsecond)) || !equalThread.LastMessageAt.Equal(equalMessage.CreatedAt) || !equalThread.UpdatedAt.Equal(equalMessage.CreatedAt) {
+		t.Fatalf("equal clock message=%s last=%s updated=%s", equalMessage.CreatedAt, equalThread.LastMessageAt, equalThread.UpdatedAt)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='waiting_student' WHERE id=$1`, thread.ID); err != nil {
+		t.Fatal(err)
+	}
+	clock = base.Add(-time.Hour)
+	backwardThread, backwardMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, Body: "Backward", IdempotencyKey: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backwardMessage.CreatedAt.Equal(base.Add(2*time.Microsecond)) || !backwardThread.LastMessageAt.Equal(backwardMessage.CreatedAt) || !backwardThread.UpdatedAt.Equal(backwardMessage.CreatedAt) {
+		t.Fatalf("backward clock message=%s last=%s updated=%s", backwardMessage.CreatedAt, backwardThread.LastMessageAt, backwardThread.UpdatedAt)
+	}
+
+	store := NewPostgresStore(pool)
+	cursor := MessageCursor{Limit: 1}
+	var got []Message
+	for range 3 {
+		page, next, err := store.ListStudentMessages(ctx, student, thread.ID, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) != 1 {
+			t.Fatalf("page=%#v cursor=%#v", page, cursor)
+		}
+		got = append(got, page[0])
+		cursor = next
+	}
+	if got[0].ID != initial.ID || got[1].ID != equalMessage.ID || got[2].ID != backwardMessage.ID || !got[0].CreatedAt.Before(got[1].CreatedAt) || !got[1].CreatedAt.Before(got[2].CreatedAt) {
+		t.Fatalf("forward history=%#v", got)
+	}
+}
+
 func postgresFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
