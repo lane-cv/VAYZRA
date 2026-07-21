@@ -32,7 +32,12 @@ describe('ConsoleLayout drawer', () => {
   it('links teachers to student management', () => {
     const { wrapper } = mountLayout('admin')
     expect(wrapper.get('a[href="/admin/students"]').text()).toContain('学生管理')
+    expect(wrapper.get('a[href="/admin/teaching"]').text()).toContain('教学管理')
     expect(wrapper.text()).not.toContain('即将开放')
+  })
+  it('never renders teaching administration for students', () => {
+    const { wrapper } = mountLayout('student')
+    expect(wrapper.find('a[href="/admin/teaching"]').exists()).toBe(false)
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
     const { wrapper, route } = mountLayout(); const trigger = wrapper.get('button[aria-label="打开导航"]')
