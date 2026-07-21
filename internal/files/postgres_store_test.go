@@ -53,18 +53,21 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	if err != nil || duplicate == nil || duplicate.FileVersionID != completed.FileVersionID {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
-	var filesCount, versionsCount, auditCount int
+	var filesCount, versionsCount, jobsCount, auditCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM files WHERE id=$1`, completed.FileID).Scan(&filesCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_versions WHERE id=$1 AND processing_state='pending_scan'`, completed.FileVersionID).Scan(&versionsCount); err != nil {
 		t.Fatal(err)
 	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_processing_jobs WHERE file_version_id=$1 AND kind='process_file' AND state='queued' AND attempts=0`, completed.FileVersionID).Scan(&jobsCount); err != nil {
+		t.Fatal(err)
+	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='file.uploaded' AND target_type='file_version' AND target_id=$1 AND request_id='postgres-upload-request' AND metadata='{}'::jsonb`, completed.FileVersionID.String()).Scan(&auditCount); err != nil {
 		t.Fatal(err)
 	}
-	if filesCount != 1 || versionsCount != 1 || auditCount != 1 {
-		t.Fatalf("files=%d versions=%d audits=%d", filesCount, versionsCount, auditCount)
+	if filesCount != 1 || versionsCount != 1 || jobsCount != 1 || auditCount != 1 {
+		t.Fatalf("files=%d versions=%d jobs=%d audits=%d", filesCount, versionsCount, jobsCount, auditCount)
 	}
 }
 

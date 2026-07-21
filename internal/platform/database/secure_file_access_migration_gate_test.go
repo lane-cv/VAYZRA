@@ -22,14 +22,13 @@ func TestSecureFileAccessMigrationUpHandlesExistingV5Logs(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
-	defer closeProvider()
+	registerMigrationProviderCleanup(t, provider, closeProvider)
 	if _, err := pool.Exec(ctx, `TRUNCATE file_access_logs`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(ctx, 5); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = provider.UpTo(context.Background(), 6) }()
 
 	var logID string
 	if err := pool.QueryRow(ctx, migrationLogFixtureSQL(false)).Scan(&logID); err != nil {
@@ -67,7 +66,10 @@ func TestSecureFileAccessMigrationDownRejectsUnrepresentableLogsAtomically(t *te
 		t.Fatal(err)
 	}
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
-	defer closeProvider()
+	registerMigrationProviderCleanup(t, provider, closeProvider)
+	if _, err := provider.DownTo(ctx, 6); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `TRUNCATE file_access_logs`); err != nil {
 		t.Fatal(err)
 	}
@@ -99,6 +101,12 @@ func TestSecureFileAccessMigrationDownLocksBeforeCheckingConcurrentLogs(t *testi
 	if err := database.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
+	const applicationName = "happylearn-down-lock-gate"
+	provider, closeProvider := namedMigrationProvider(t, pool.Config().ConnString(), applicationName)
+	registerMigrationProviderCleanup(t, provider, closeProvider)
+	if _, err := provider.DownTo(ctx, 6); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `TRUNCATE file_access_logs`); err != nil {
 		t.Fatal(err)
 	}
@@ -113,17 +121,17 @@ func TestSecureFileAccessMigrationDownLocksBeforeCheckingConcurrentLogs(t *testi
 		t.Fatal(err)
 	}
 
-	const applicationName = "happylearn-down-lock-gate"
-	provider, closeProvider := namedMigrationProvider(t, pool.Config().ConnString(), applicationName)
-	defer closeProvider()
+	downCtx, cancelDown := context.WithCancel(context.Background())
+	defer cancelDown()
 	downResult := make(chan error, 1)
 	go func() {
-		_, err := provider.DownTo(context.Background(), 5)
+		_, err := provider.DownTo(downCtx, 5)
 		downResult <- err
 	}()
 
 	deadline := time.Now().Add(5 * time.Second)
 	waiting := false
+	var pollErr error
 	for time.Now().Before(deadline) {
 		if err := pool.QueryRow(ctx, `
 			SELECT EXISTS (
@@ -137,17 +145,34 @@ func TestSecureFileAccessMigrationDownLocksBeforeCheckingConcurrentLogs(t *testi
 				  AND NOT l.granted
 				  AND a.wait_event_type='Lock'
 			)`, applicationName).Scan(&waiting); err != nil {
-			t.Fatal(err)
+			pollErr = err
+			break
 		}
 		if waiting {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !waiting {
+	if pollErr != nil || !waiting {
+		cancelDown()
+		_ = insertTx.Rollback(ctx)
+		select {
+		case <-downResult:
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancelled downgrade goroutine did not finish")
+		}
+		if pollErr != nil {
+			t.Fatalf("inspect migration lock: %v", pollErr)
+		}
 		t.Fatal("downgrade did not wait for an ACCESS EXCLUSIVE lock on file_access_logs")
 	}
 	if err := insertTx.Commit(ctx); err != nil {
+		cancelDown()
+		select {
+		case <-downResult:
+		case <-time.After(5 * time.Second):
+			t.Fatal("downgrade goroutine did not finish after commit failure cancellation")
+		}
 		t.Fatal(err)
 	}
 	select {
@@ -156,6 +181,12 @@ func TestSecureFileAccessMigrationDownLocksBeforeCheckingConcurrentLogs(t *testi
 			t.Fatalf("downgrade err=%v, want representability SQLSTATE 55000", err)
 		}
 	case <-time.After(5 * time.Second):
+		cancelDown()
+		select {
+		case <-downResult:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed-out downgrade goroutine did not finish after cancellation")
+		}
 		t.Fatal("downgrade did not finish after concurrent insert committed")
 	}
 
@@ -184,14 +215,16 @@ func TestSecureFileAccessMigrationDownSucceedsWithoutLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
-	defer closeProvider()
+	registerMigrationProviderCleanup(t, provider, closeProvider)
+	if _, err := provider.DownTo(ctx, 6); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `TRUNCATE file_access_logs`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(ctx, 5); err != nil {
 		t.Fatalf("clean downgrade: %v", err)
 	}
-	defer func() { _, _ = provider.UpTo(context.Background(), 6) }()
 	var columnPresent, triggerPresent bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='file_access_logs' AND column_name='result')`).Scan(&columnPresent); err != nil {
 		t.Fatal(err)
@@ -204,6 +237,15 @@ func TestSecureFileAccessMigrationDownSucceedsWithoutLogs(t *testing.T) {
 	}
 }
 
+func registerMigrationProviderCleanup(t *testing.T, provider *goose.Provider, closeProvider func()) {
+	t.Helper()
+	t.Cleanup(closeProvider)
+	t.Cleanup(func() {
+		if _, err := provider.UpTo(context.Background(), 7); err != nil {
+			t.Errorf("restore latest migration: %v", err)
+		}
+	})
+}
 func migrationProvider(t *testing.T, connectionString string) (*goose.Provider, func()) {
 	t.Helper()
 	db, err := sql.Open("pgx", connectionString)

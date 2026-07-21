@@ -179,6 +179,9 @@ func (s *PostgresStore) FinishCompletion(ctx context.Context, u UploadSession, a
 		completed.FileID, locked.ObjectKey, locked.DisplayName, locked.DeclaredMIME, locked.ExpectedSize, locked.ExpectedSHA256, locked.ActorUserID).Scan(&completed.FileVersionID, &completed.ProcessingState); err != nil {
 		return CompletedUpload{}, err
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO file_processing_jobs (file_version_id,kind) VALUES ($1,'process_file')`, completed.FileVersionID); err != nil {
+		return CompletedUpload{}, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE upload_sessions SET state='completed' WHERE id=$1`, locked.ID); err != nil {
 		return CompletedUpload{}, err
 	}

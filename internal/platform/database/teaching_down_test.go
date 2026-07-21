@@ -25,17 +25,22 @@ func TestTeachingMigrationDownRemovesTaskOneObjects(t *testing.T) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if _, err := provider.UpTo(context.Background(), 7); err != nil {
+			t.Errorf("restore latest migration: %v", err)
+		}
+	})
 	results, err := provider.DownTo(ctx, 3)
 	if err != nil {
 		t.Fatalf("rollback teaching migration: %v", err)
 	}
-	if len(results) != 3 || results[len(results)-1].Source.Version != 4 {
-		t.Fatalf("rolled back migrations=%v, want versions 6, 5 then 4", results)
+	if len(results) != 4 || results[len(results)-1].Source.Version != 4 {
+		t.Fatalf("rolled back migrations=%v, want versions 7, 6, 5 then 4", results)
 	}
 	var tables, routines int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('grades','terms','subjects','chapters','lessons','lesson_drafts','lesson_revisions','lesson_revision_finalizations','lesson_draft_audiences','lesson_draft_audience_users','lesson_revision_audiences','lesson_revision_audience_users','lesson_draft_external_videos','lesson_revision_external_videos','outbox_events','lesson_progress')`).Scan(&tables); err != nil {
