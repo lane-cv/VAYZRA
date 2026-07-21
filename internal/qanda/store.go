@@ -35,6 +35,14 @@ type NotificationWriter interface {
 	Notify(context.Context, NotificationIntent) error
 }
 
+type QAAttachmentValidator interface {
+	ValidateForMessage(context.Context, Principal, []AttachmentInput) ([]Attachment, error)
+}
+
+type QAAttachmentBinder interface {
+	BindMessageAttachments(context.Context, uuid.UUID, []Attachment) error
+}
+
 type UnitOfWork interface {
 	WithinTx(context.Context, func(TxStore, audit.Writer, NotificationWriter) error) error
 }

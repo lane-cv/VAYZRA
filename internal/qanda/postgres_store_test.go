@@ -199,6 +199,82 @@ func TestPostgresIdempotencyScopeAndNotificationRollback(t *testing.T) {
 	}
 }
 
+func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin := activeQAAdmin(t, pool)
+	student, other := insertQAStudent(t, pool), insertQAStudent(t, pool)
+	valid := insertReadyQAAttachment(t, pool, student, "  answer.pdf  ", "application/pdf", 1024)
+	foreign := insertReadyQAAttachment(t, pool, other, "secret.pdf", "application/pdf", 1024)
+	teaching := insertQATestFileVersion(t, pool, student, "lesson.pdf")
+	svc := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return &capturingNotifications{} }), time.Now)
+	_, message, err := svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "With file", Body: "Please review", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: valid, SortPosition: 0}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].DisplayName != "answer.pdf" {
+		t.Fatalf("attachments=%+v", message.Attachments)
+	}
+	var bound int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM qa_message_files WHERE message_id=$1 AND file_version_id=$2`, message.ID, valid).Scan(&bound); err != nil || bound != 1 {
+		t.Fatalf("bound=%d err=%v", bound, err)
+	}
+
+	badKey := uuid.NewString()
+	_, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Bad", Body: "bad", IdempotencyKey: badKey, Attachments: []AttachmentInput{{FileVersionID: foreign, SortPosition: 0}}})
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("foreign err=%v", err)
+	}
+	var messages int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1 AND idempotency_key=$2`, student, badKey).Scan(&messages); err != nil || messages != 0 {
+		t.Fatalf("messages=%d err=%v", messages, err)
+	}
+	if _, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Teaching", Body: "bad", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: teaching, SortPosition: 0}}}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("teaching purpose err=%v", err)
+	}
+
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='failed' WHERE id=$1`, valid); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Not ready", Body: "not ready", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: valid, SortPosition: 0}}})
+	if !errors.Is(err, ErrAttachmentNotReady) {
+		t.Fatalf("not ready err=%v", err)
+	}
+	_ = admin
+}
+
+func TestQAAttachmentValidationEnforcesTypeCountAndSizeLimits(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	owner := insertQAStudent(t, pool)
+	store := NewPostgresStore(pool)
+	actor := postgresPrincipal(owner)
+	inputs := func(ids []uuid.UUID) []AttachmentInput {
+		out := make([]AttachmentInput, len(ids))
+		for i, id := range ids {
+			out[i] = AttachmentInput{FileVersionID: id, SortPosition: i}
+		}
+		return out
+	}
+	images := make([]uuid.UUID, 11)
+	for i := range images {
+		images[i] = insertReadyQAAttachment(t, pool, owner, fmt.Sprintf("image-%d.png", i), "image/png", 1)
+	}
+	if _, err := store.ValidateForMessage(ctx, actor, inputs(images)); !errors.Is(err, ErrAttachmentLimit) {
+		t.Fatalf("11 images err=%v", err)
+	}
+	tooLarge := insertReadyQAAttachment(t, pool, owner, "large.png", "image/png", (20<<20)+1)
+	if _, err := store.ValidateForMessage(ctx, actor, inputs([]uuid.UUID{tooLarge})); !errors.Is(err, ErrAttachmentLimit) {
+		t.Fatalf("large image err=%v", err)
+	}
+	big := []uuid.UUID{insertReadyQAAttachment(t, pool, owner, "a.pdf", "application/pdf", 40<<20), insertReadyQAAttachment(t, pool, owner, "b.pdf", "application/pdf", 40<<20), insertReadyQAAttachment(t, pool, owner, "c.pdf", "application/pdf", 40<<20)}
+	if _, err := store.ValidateForMessage(ctx, actor, inputs(big)); !errors.Is(err, ErrAttachmentLimit) {
+		t.Fatalf("aggregate err=%v", err)
+	}
+	unsupported := insertReadyQAAttachment(t, pool, owner, "archive.zip", "application/zip", 1)
+	if _, err := store.ValidateForMessage(ctx, actor, inputs([]uuid.UUID{unsupported})); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unsupported err=%v", err)
+	}
+}
+
 func TestPostgresConcurrentStudentFollowUpsAppendOnce(t *testing.T) {
 	ctx, pool := postgresFixture(t)
 	activeQAAdmin(t, pool)
@@ -493,6 +569,19 @@ func insertQATestFileVersion(t *testing.T, pool *pgxpool.Pool, creator uuid.UUID
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,$3,'application/pdf',1,$4,'ready',$5) RETURNING id`, fileID, "qa-test/"+uuid.NewString(), displayName, strings.Repeat("a", 64), creator).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	return versionID
+}
+
+func insertReadyQAAttachment(t *testing.T, pool *pgxpool.Pool, creator uuid.UUID, name, mime string, size int64) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	var fileID, versionID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, creator).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'qa_attachment',$2,$3,$4,$4,$5,$6,'ready',$7) RETURNING id`, fileID, "qa-ready/"+uuid.NewString(), name, mime, size, strings.Repeat("b", 64), creator).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	return versionID

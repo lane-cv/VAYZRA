@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -312,10 +316,6 @@ func (s *PostgresStore) CreateThreadWithFirstMessage(ctx context.Context, studen
 	if err != nil {
 		return Thread{}, Message{}, false, err
 	}
-	message.Attachments, err = s.bindStudentAttachments(ctx, studentID, message.ID, in.Attachments)
-	if err != nil {
-		return Thread{}, Message{}, false, err
-	}
 	return thread, message, true, nil
 }
 
@@ -332,10 +332,6 @@ func (s *PostgresStore) AppendStudentMessage(ctx context.Context, thread Thread,
 		INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at)
 		VALUES($1,$2,$3,'student','student_follow_up',$4,$5,$6)
 		RETURNING id,thread_id,sender_user_id,sender_role,message_kind,body_text,created_at`, uuid.New(), thread.ID, studentID, in.Body, in.IdempotencyKey, now))
-	if err != nil {
-		return Thread{}, Message{}, err
-	}
-	message.Attachments, err = s.bindStudentAttachments(ctx, studentID, message.ID, in.Attachments)
 	if err != nil {
 		return Thread{}, Message{}, err
 	}
@@ -384,10 +380,6 @@ func (s *PostgresStore) AppendAdminMessage(ctx context.Context, thread Thread, a
 	if err != nil {
 		return Thread{}, Message{}, err
 	}
-	message.Attachments, err = s.bindAdminAttachments(ctx, adminID, message.ID, in.Attachments)
-	if err != nil {
-		return Thread{}, Message{}, err
-	}
 	updated, err := scanThread(s.q.QueryRow(ctx, `UPDATE qa_threads SET status=$3,version=version+1,last_message_at=$4,updated_at=$4,completed_at=NULL WHERE id=$1 AND version=$2 RETURNING id,student_id,title,status,version,last_message_at,created_at,updated_at,completed_at`, thread.ID, thread.Version, next, now))
 	if errors.Is(err, ErrNotFound) {
 		return Thread{}, Message{}, ErrThreadConflict
@@ -429,17 +421,141 @@ func nullableTime(value time.Time) any {
 	return value.UTC()
 }
 
-func (s *PostgresStore) bindAdminAttachments(ctx context.Context, adminID, messageID uuid.UUID, inputs []AttachmentInput) ([]Attachment, error) {
-	attachments := make([]Attachment, 0, len(inputs))
-	for _, input := range inputs {
-		var a Attachment
-		err := s.q.QueryRow(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) SELECT $1,fv.id,$3,fv.display_name FROM file_versions fv JOIN files f ON f.id=fv.file_id AND f.created_by=$4 AND f.deleted_at IS NULL WHERE fv.id=$2 AND fv.processing_state='ready' RETURNING file_version_id,sort_position,display_name`, messageID, input.FileVersionID, input.SortPosition, adminID).Scan(&a.FileVersionID, &a.SortPosition, &a.DisplayName)
-		if err != nil {
+type lockedQAAttachment struct {
+	id, owner                  uuid.UUID
+	purpose, state, mime, name string
+	size                       int64
+}
+
+var qaAttachmentLimits = map[string]int64{
+	"image/jpeg": 20 << 20, "image/png": 20 << 20, "image/webp": 20 << 20, "image/gif": 20 << 20,
+	"application/pdf": 50 << 20,
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   30 << 20,
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         30 << 20,
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": 30 << 20,
+	"text/plain": 10 << 20, "text/markdown": 10 << 20,
+}
+
+// ValidateForMessage runs on the caller's pgx transaction. The one locked
+// query obtains every security-relevant fact from PostgreSQL and holds all
+// matching versions until the message/binding transaction commits.
+func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal, inputs []AttachmentInput) ([]Attachment, error) {
+	if len(inputs) == 0 {
+		return []Attachment{}, nil
+	}
+	if len(inputs) > 20 || actor.User.ID == uuid.Nil || actor.User.Status != "active" || (actor.User.Role != "student" && actor.User.Role != "admin") {
+		return nil, ErrAttachmentLimit
+	}
+	ids := make([]uuid.UUID, len(inputs))
+	requested := make(map[uuid.UUID]AttachmentInput, len(inputs))
+	positions := make(map[int]struct{}, len(inputs))
+	for i, in := range inputs {
+		if in.FileVersionID == uuid.Nil || in.SortPosition < 0 || in.SortPosition > 19 {
+			return nil, ErrInvalidInput
+		}
+		if _, ok := requested[in.FileVersionID]; ok {
+			return nil, ErrInvalidInput
+		}
+		if _, ok := positions[in.SortPosition]; ok {
+			return nil, ErrInvalidInput
+		}
+		ids[i] = in.FileVersionID
+		requested[in.FileVersionID] = in
+		positions[in.SortPosition] = struct{}{}
+	}
+	rows, err := s.q.Query(ctx, `SELECT fv.id,f.created_by,fv.purpose,fv.processing_state,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.display_name
+	 FROM file_versions fv JOIN files f ON f.id=fv.file_id
+	 WHERE fv.id=ANY($1) ORDER BY fv.id FOR UPDATE OF fv,f`, ids)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	locked := make(map[uuid.UUID]lockedQAAttachment, len(ids))
+	for rows.Next() {
+		var a lockedQAAttachment
+		if err = rows.Scan(&a.id, &a.owner, &a.purpose, &a.state, &a.mime, &a.size, &a.name); err != nil {
 			return nil, mapPostgresError(err)
 		}
-		attachments = append(attachments, a)
+		locked[a.id] = a
 	}
-	return attachments, nil
+	if err = rows.Err(); err != nil {
+		return nil, mapPostgresError(err)
+	}
+	if len(locked) != len(requested) {
+		return nil, ErrForbidden
+	}
+	out := make([]Attachment, 0, len(inputs))
+	images := 0
+	var total int64
+	for id, in := range requested {
+		a := locked[id]
+		if a.owner != actor.User.ID || a.purpose != "qa_attachment" {
+			return nil, ErrForbidden
+		}
+		if a.state != "ready" {
+			return nil, ErrAttachmentNotReady
+		}
+		mime := strings.ToLower(a.mime)
+		limit, ok := qaAttachmentLimits[mime]
+		if !ok {
+			return nil, ErrInvalidInput
+		}
+		if a.size < 1 || a.size > limit {
+			return nil, ErrAttachmentLimit
+		}
+		total += a.size
+		if total > 100<<20 {
+			return nil, ErrAttachmentLimit
+		}
+		if strings.HasPrefix(mime, "image/") {
+			images++
+			if images > 10 {
+				return nil, ErrAttachmentLimit
+			}
+		}
+		name := strings.TrimSpace(a.name)
+		if !validQAAttachmentName(name) {
+			return nil, ErrInvalidInput
+		}
+		out = append(out, Attachment{FileVersionID: id, SortPosition: in.SortPosition, DisplayName: name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SortPosition < out[j].SortPosition })
+	return out, nil
+}
+
+func validQAAttachmentName(name string) bool {
+	if name == "" || !utf8.ValidString(name) || utf8.RuneCountInString(name) > 255 || name == "." || name == ".." || strings.TrimSpace(name) != name || strings.ContainsAny(name, "/\\\x00\r\n") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return filepath.Ext(name) != ""
+}
+
+func (s *PostgresStore) BindMessageAttachments(ctx context.Context, messageID uuid.UUID, attachments []Attachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, len(attachments))
+	positions := make([]int16, len(attachments))
+	names := make([]string, len(attachments))
+	for i, a := range attachments {
+		ids[i] = a.FileVersionID
+		positions[i] = int16(a.SortPosition)
+		names[i] = a.DisplayName
+	}
+	tag, err := s.q.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name)
+	 SELECT $1,x.id,x.pos,x.name FROM unnest($2::uuid[],$3::smallint[],$4::text[]) AS x(id,pos,name)`, messageID, ids, positions, names)
+	if err != nil {
+		return mapPostgresError(err)
+	}
+	if tag.RowsAffected() != int64(len(attachments)) {
+		return ErrInvalidInput
+	}
+	return nil
 }
 
 func (s *PostgresStore) listAdminMessageAttachments(ctx context.Context, messageID uuid.UUID) ([]Attachment, error) {
@@ -463,25 +579,6 @@ func (s *PostgresStore) requireActiveStudent(ctx context.Context, studentID uuid
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT true FROM users WHERE id=$1 AND role='student' AND status='active' AND deleted_at IS NULL`, studentID).Scan(&ok)
 	return mapPostgresError(err)
-}
-
-func (s *PostgresStore) bindStudentAttachments(ctx context.Context, studentID, messageID uuid.UUID, inputs []AttachmentInput) ([]Attachment, error) {
-	attachments := make([]Attachment, 0, len(inputs))
-	for _, input := range inputs {
-		var attachment Attachment
-		err := s.q.QueryRow(ctx, `
-			INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name)
-			SELECT $1,fv.id,$3,fv.display_name FROM file_versions fv
-			JOIN files f ON f.id=fv.file_id AND f.created_by=$4 AND f.deleted_at IS NULL
-			WHERE fv.id=$2 AND fv.processing_state='ready'
-			RETURNING file_version_id,sort_position,display_name`, messageID, input.FileVersionID, input.SortPosition, studentID).
-			Scan(&attachment.FileVersionID, &attachment.SortPosition, &attachment.DisplayName)
-		if err != nil {
-			return nil, mapPostgresError(err)
-		}
-		attachments = append(attachments, attachment)
-	}
-	return attachments, nil
 }
 
 func (s *PostgresStore) listStudentMessageAttachments(ctx context.Context, studentID, messageID uuid.UUID) ([]Attachment, error) {

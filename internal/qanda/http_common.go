@@ -209,6 +209,10 @@ func qandaError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusConflict, "invalid_status_transition", "状态变更无效")
 	case errors.Is(err, ErrThreadConflict):
 		httpx.Error(w, r, http.StatusConflict, "thread_conflict", "问题已被更新，请刷新后重试")
+	case errors.Is(err, ErrAttachmentNotReady):
+		httpx.Error(w, r, http.StatusConflict, "attachment_not_ready", "附件尚未处理完成")
+	case errors.Is(err, ErrAttachmentLimit):
+		httpx.Error(w, r, http.StatusBadRequest, "attachment_limit_exceeded", "附件超过限制")
 	default:
 		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
 	}

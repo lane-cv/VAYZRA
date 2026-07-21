@@ -50,11 +50,19 @@ func (s *Service) CreateThread(ctx context.Context, actor Principal, in CreateTh
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
+		attachments, validateErr := validateMessageAttachments(ctx, store, actor, in.Attachments)
+		if validateErr != nil {
+			return validateErr
+		}
 		var created bool
 		thread, message, created, err = store.CreateThreadWithFirstMessage(ctx, actor.User.ID, in, s.now().UTC())
 		if err != nil || !created {
 			return err
 		}
+		if err = bindMessageAttachments(ctx, store, message.ID, attachments); err != nil {
+			return err
+		}
+		message.Attachments = attachments
 		if err = audits.Write(ctx, auditEvent(actor, "qa.thread_created", thread.ID, map[string]any{
 			"messageCount": "1", "attachmentCount": strconv.Itoa(len(in.Attachments)),
 		})); err != nil {
@@ -163,6 +171,10 @@ func (s *Service) AddStudentMessage(ctx context.Context, actor Principal, in Add
 		if nextErr != nil {
 			return nextErr
 		}
+		attachments, validateErr := validateMessageAttachments(ctx, store, actor, in.Attachments)
+		if validateErr != nil {
+			return validateErr
+		}
 		activityAt := s.now().UTC()
 		minimumActivityAt := thread.LastMessageAt.UTC().Add(time.Microsecond)
 		if activityAt.Before(minimumActivityAt) {
@@ -172,6 +184,10 @@ func (s *Service) AddStudentMessage(ctx context.Context, actor Principal, in Add
 		if err != nil {
 			return err
 		}
+		if err = bindMessageAttachments(ctx, store, message.ID, attachments); err != nil {
+			return err
+		}
+		message.Attachments = attachments
 		if err = audits.Write(ctx, auditEvent(actor, "qa.student_followed_up", thread.ID, map[string]any{
 			"messageCount": "1", "attachmentCount": strconv.Itoa(len(in.Attachments)),
 		})); err != nil {
@@ -271,12 +287,20 @@ func (s *Service) AddAdminMessage(ctx context.Context, actor Principal, in AddAd
 		if nextErr != nil {
 			return nextErr
 		}
+		attachments, validateErr := validateMessageAttachments(ctx, store, actor, in.Attachments)
+		if validateErr != nil {
+			return validateErr
+		}
 		activityAt := monotonicActivity(s.now().UTC(), thread.LastMessageAt)
 		old := thread.Status
 		thread, message, err = store.AppendAdminMessage(ctx, thread, actor.User.ID, in, next, activityAt)
 		if err != nil {
 			return err
 		}
+		if err = bindMessageAttachments(ctx, store, message.ID, attachments); err != nil {
+			return err
+		}
+		message.Attachments = attachments
 		if err = audits.Write(ctx, auditEvent(actor, "qa.admin_replied", thread.ID, map[string]any{"messageCount": "1", "attachmentCount": strconv.Itoa(len(in.Attachments)), "oldStatus": string(old), "newStatus": string(next)})); err != nil {
 			return err
 		}
@@ -286,6 +310,28 @@ func (s *Service) AddAdminMessage(ctx context.Context, actor Principal, in AddAd
 		return Thread{}, Message{}, err
 	}
 	return thread, message, nil
+}
+
+func validateMessageAttachments(ctx context.Context, store TxStore, actor Principal, inputs []AttachmentInput) ([]Attachment, error) {
+	if len(inputs) == 0 {
+		return []Attachment{}, nil
+	}
+	validator, ok := store.(QAAttachmentValidator)
+	if !ok {
+		return nil, ErrInvalidInput
+	}
+	return validator.ValidateForMessage(ctx, actor, inputs)
+}
+
+func bindMessageAttachments(ctx context.Context, store TxStore, messageID uuid.UUID, attachments []Attachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	binder, ok := store.(QAAttachmentBinder)
+	if !ok {
+		return ErrInvalidInput
+	}
+	return binder.BindMessageAttachments(ctx, messageID, attachments)
 }
 
 func (s *Service) ChangeStatus(ctx context.Context, actor Principal, in ChangeStatusInput) (Thread, error) {

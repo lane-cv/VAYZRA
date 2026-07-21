@@ -402,18 +402,84 @@ WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NUL
 }
 
 func (s *PostgresStore) WriteAccessLog(ctx context.Context, l AccessLog) error {
-	var resolved, revision any
+	var resolved, revision, qaMessage any
 	if l.VersionID != uuid.Nil {
 		resolved = l.VersionID
 	}
 	if l.RevisionID != uuid.Nil {
 		revision = l.RevisionID
 	}
+	if l.QAMessageID != uuid.Nil {
+		qaMessage = l.QAMessageID
+	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO file_access_logs
- (actor_user_id,file_version_id,lesson_revision_id,access_policy,request_id,range_start,range_end,requested_file_version_id,result,reason_code,ip,playback_session_hash)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
-		l.ActorUserID, resolved, revision, l.Action, l.RequestID, l.RangeStart, l.RangeEnd, l.RequestedVersionID, l.Result, l.Reason, l.IP, l.PlaybackSessionHash)
+	 (actor_user_id,file_version_id,lesson_revision_id,qa_message_id,access_policy,request_id,range_start,range_end,requested_file_version_id,result,reason_code,ip,playback_session_hash)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`,
+		l.ActorUserID, resolved, revision, qaMessage, l.Action, l.RequestID, l.RangeStart, l.RangeEnd, l.RequestedVersionID, l.Result, l.Reason, l.IP, l.PlaybackSessionHash)
 	return err
+}
+
+func (s *PostgresStore) ResolveQAStatus(ctx context.Context, actor Principal, requestedID uuid.UUID) (QAFileStatus, error) {
+	var out QAFileStatus
+	err := s.pool.QueryRow(ctx, `
+SELECT fv.id,fv.processing_state,COALESCE(fv.failure_category,''),COALESCE(fv.detected_mime,''),fv.size_bytes,
+ EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready')
+FROM file_versions fv
+JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
+JOIN users actor ON actor.id=$1 AND actor.role=$2 AND actor.status='active' AND actor.deleted_at IS NULL
+WHERE fv.id=$3 AND fv.purpose='qa_attachment' AND (
+ (NOT EXISTS(SELECT 1 FROM qa_message_files x WHERE x.file_version_id=fv.id) AND f.created_by=$1)
+ OR EXISTS(
+   SELECT 1 FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id
+   JOIN qa_threads q ON q.id=m.thread_id
+   JOIN users student ON student.id=q.student_id AND student.role='student' AND student.deleted_at IS NULL
+   WHERE mf.file_version_id=fv.id AND f.created_by=m.sender_user_id
+    AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up'))
+      OR (m.sender_role='admin' AND m.message_kind='admin_reply' AND EXISTS(SELECT 1 FROM users sender WHERE sender.id=m.sender_user_id AND sender.role='admin' AND sender.status='active' AND sender.deleted_at IS NULL)))
+    AND ($2='admin' OR ($2='student' AND q.student_id=$1 AND student.status='active'))
+ ))`, actor.User.ID, actor.User.Role, requestedID).Scan(&out.FileVersionID, &out.ProcessingState, &out.FailureCategory, &out.DetectedMIME, &out.Size, &out.PreviewAvailable)
+	if err != nil {
+		return QAFileStatus{}, mapStoreError(err)
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) ResolveQAAccess(ctx context.Context, actor Principal, requestedID uuid.UUID, action AccessAction) (QADelivery, error) {
+	var out QADelivery
+	err := s.pool.QueryRow(ctx, `
+SELECT fv.id,m.id,
+ CASE WHEN $4='preview' AND fp.object_key IS NOT NULL THEN fp.object_key ELSE fv.object_key END,
+ mf.display_name,
+ CASE WHEN $4='download' THEN 'application/octet-stream' WHEN fp.object_key IS NOT NULL THEN fp.content_type ELSE fv.detected_mime END,
+ CASE WHEN $4='preview' AND fp.object_key IS NOT NULL THEN fp.size_bytes ELSE fv.size_bytes END,
+ ($4='preview' AND fp.object_key IS NOT NULL),fv.browser_playable
+FROM users actor
+JOIN qa_message_files mf ON mf.file_version_id=$3
+JOIN qa_messages m ON m.id=mf.message_id
+JOIN qa_threads q ON q.id=m.thread_id
+JOIN users student ON student.id=q.student_id AND student.role='student' AND student.deleted_at IS NULL
+JOIN file_versions fv ON fv.id=mf.file_version_id AND fv.processing_state='ready' AND fv.purpose='qa_attachment'
+JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
+LEFT JOIN LATERAL (
+ SELECT object_key,content_type,size_bytes FROM file_previews
+ WHERE file_version_id=fv.id AND processing_state='ready'
+ ORDER BY CASE preview_kind WHEN 'pdf' THEN 1 WHEN 'page' THEN 2 WHEN 'poster' THEN 3 ELSE 4 END,id LIMIT 1
+) fp ON true
+WHERE actor.id=$1 AND actor.role=$2 AND actor.status='active' AND actor.deleted_at IS NULL
+ AND f.created_by=m.sender_user_id
+ AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up'))
+   OR (m.sender_role='admin' AND m.message_kind='admin_reply' AND EXISTS(SELECT 1 FROM users sender WHERE sender.id=m.sender_user_id AND sender.role='admin' AND sender.status='active' AND sender.deleted_at IS NULL)))
+ AND ($2='admin' OR ($2='student' AND q.student_id=$1 AND student.status='active'))
+ AND ($4='download' OR fp.object_key IS NOT NULL OR fv.detected_mime IN ('image/jpeg','image/png','image/webp','image/gif','text/plain','text/markdown'))
+ORDER BY m.created_at,m.id LIMIT 1`, actor.User.ID, actor.User.Role, requestedID, action).Scan(
+		&out.VersionID, &out.MessageID, &out.ObjectKey, &out.DisplayName, &out.ContentType, &out.Size, &out.Preview, &out.Playable)
+	if err != nil {
+		return QADelivery{}, mapStoreError(err)
+	}
+	if action == ActionDownload {
+		out.Playable = false
+	}
+	return out, nil
 }
 
 func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principal, lessonID uuid.UUID, expected int64, inputs []DraftBindingInput) ([]DraftBinding, error) {

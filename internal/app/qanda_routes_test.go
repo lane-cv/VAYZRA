@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/qanda"
 )
 
@@ -60,6 +61,30 @@ func TestQARoutesRemainOptional(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+type appQAFileAccess struct{ statuses int }
+
+func (s *appQAFileAccess) Status(context.Context, files.Principal, uuid.UUID) (files.QAFileStatus, error) {
+	s.statuses++
+	return files.QAFileStatus{}, nil
+}
+func (*appQAFileAccess) Open(context.Context, files.Principal, files.QAOpenInput) (files.OpenedFile, error) {
+	return files.OpenedFile{}, files.ErrNotFound
+}
+
+func TestQuestionFileRoutesAreAuthenticatedAndMounted(t *testing.T) {
+	svc := &appQAFileAccess{}
+	h := New(Dependencies{Auth: &appStudentAuth{}, QAFileAccess: svc})
+	id := uuid.New()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/question-files/"+id.String()+"/status", nil)
+	r.RemoteAddr = "192.0.2.2:1234"
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 || svc.statuses != 1 || w.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, svc.statuses, w.Body.String())
 	}
 }
 

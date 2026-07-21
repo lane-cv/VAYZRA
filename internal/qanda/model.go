@@ -18,6 +18,8 @@ var (
 	ErrInvalidStatusTransition = errors.New("invalid qanda status transition")
 	ErrIdempotencyConflict     = errors.New("qanda idempotency conflict")
 	ErrThreadConflict          = errors.New("qanda thread conflict")
+	ErrAttachmentNotReady      = errors.New("qanda attachment not ready")
+	ErrAttachmentLimit         = errors.New("qanda attachment limit exceeded")
 )
 
 type Status string

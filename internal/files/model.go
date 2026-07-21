@@ -178,6 +178,7 @@ type AccessLog struct {
 	RequestedVersionID  uuid.UUID
 	VersionID           uuid.UUID
 	RevisionID          uuid.UUID
+	QAMessageID         uuid.UUID
 	Action              AccessAction
 	Result              AccessResult
 	Reason              string
@@ -186,6 +187,28 @@ type AccessLog struct {
 	RangeStart          *int64
 	RangeEnd            *int64
 	PlaybackSessionHash string
+}
+
+type QAOpenInput struct {
+	VersionID uuid.UUID
+	Action    AccessAction
+	Range     string
+}
+
+// QAFileStatus is deliberately capability-safe: it contains neither storage
+// coordinates nor file ownership/provenance identifiers.
+type QAFileStatus struct {
+	FileVersionID    uuid.UUID `json:"fileVersionId"`
+	ProcessingState  string    `json:"processingState"`
+	FailureCategory  string    `json:"failureCategory,omitempty"`
+	DetectedMIME     string    `json:"detectedMime,omitempty"`
+	Size             int64     `json:"size"`
+	PreviewAvailable bool      `json:"previewAvailable"`
+}
+
+type QADelivery struct {
+	Delivery
+	MessageID uuid.UUID
 }
 
 type OpenInput struct {

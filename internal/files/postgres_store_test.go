@@ -71,6 +71,88 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	}
 }
 
+func TestPostgresQAAccessAuthorizationIsDerivedFromBoundThread(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	insertUser := func(role auth.Role) uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO users(username,display_name,role,status,password_hash) VALUES($1,'QA access',$2,'active','hash') RETURNING id`, "qa_access_"+uuid.NewString(), role).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	owner, other := insertUser(auth.RoleStudent), insertUser(auth.RoleStudent)
+	var admin uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE role='admin' AND status='active' AND deleted_at IS NULL LIMIT 1`).Scan(&admin); err != nil {
+		admin = insertUser(auth.RoleAdmin)
+	}
+	thread, message := uuid.New(), uuid.New()
+	now := time.Now().UTC()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,last_message_at,created_at,updated_at) VALUES($1,$2,'Private','pending',$3,$3,$3)`, thread, owner, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','initial','body',$4,$5)`, message, thread, owner, uuid.NewString(), now); err != nil {
+		t.Fatal(err)
+	}
+	makeVersion := func(purpose, state string, bound bool) uuid.UUID {
+		t.Helper()
+		var fileID, versionID uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, owner).Scan(&fileID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,$3,'answer.txt','text/plain','text/plain',4,$4,$5,$6) RETURNING id`, fileID, purpose, "qa-access/"+uuid.NewString(), digestOf([]byte("data")), state, owner).Scan(&versionID); err != nil {
+			t.Fatal(err)
+		}
+		if bound {
+			if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,0,'answer.txt')`, message, versionID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return versionID
+	}
+	bound := makeVersion("qa_attachment", "ready", true)
+	unbound := makeVersion("qa_attachment", "ready", false)
+	teaching := makeVersion("teaching", "ready", false)
+	store := NewPostgresStore(pool)
+	principal := func(id uuid.UUID, role auth.Role) Principal {
+		return Principal{User: auth.User{ID: id, Role: role, Status: auth.StatusActive}, RequestID: "qa-access-request", IP: net.ParseIP("192.0.2.8")}
+	}
+	if d, err := store.ResolveQAAccess(ctx, principal(owner, auth.RoleStudent), bound, ActionDownload); err != nil || d.MessageID != message {
+		t.Fatalf("owner delivery=%+v err=%v", d, err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(other, auth.RoleStudent), bound, ActionDownload); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross student err=%v", err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(admin, auth.RoleAdmin), bound, ActionDownload); err != nil {
+		t.Fatalf("admin err=%v", err)
+	}
+	if _, err := store.ResolveQAStatus(ctx, principal(owner, auth.RoleStudent), unbound); err != nil {
+		t.Fatalf("owner unbound status=%v", err)
+	}
+	if _, err := store.ResolveQAStatus(ctx, principal(other, auth.RoleStudent), unbound); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign unbound err=%v", err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(owner, auth.RoleStudent), unbound, ActionDownload); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unbound delivery err=%v", err)
+	}
+	if _, err := store.ResolveQAStatus(ctx, principal(owner, auth.RoleStudent), teaching); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("teaching status err=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(owner, auth.RoleStudent), bound, ActionDownload); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled owner err=%v", err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(admin, auth.RoleAdmin), bound, ActionDownload); err != nil {
+		t.Fatalf("admin should retain thread access after student disable: %v", err)
+	}
+}
+
 func TestPostgresUploadCleanupClaimsGraceRecoveryStatesAndSkipsReferences(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

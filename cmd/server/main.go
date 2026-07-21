@@ -81,6 +81,7 @@ type applicationDependencies struct {
 	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newQAUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
+	newQAFileAccess    func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
 	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
 	newFileCenter      func(*pgxpool.Pool) files.FileCenterHTTPService
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
@@ -107,6 +108,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newUploads:         newProductionUploadService,
 		newQAUploads:       newProductionQAUploadService,
 		newFileAccess:      newProductionFileAccessService,
+		newQAFileAccess:    newProductionQAFileAccessService,
 		newFileBindings:    newProductionFileBindingService,
 		newFileCenter:      newProductionFileCenterService,
 		startUploadCleanup: files.StartCleanupRunner,
@@ -187,6 +189,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			return nil, nil, errors.New("initialize file access service")
 		}
 	}
+	var qaFileAccessService files.QAAccessHTTPService
+	if deps.newQAFileAccess != nil {
+		qaFileAccessService, err = deps.newQAFileAccess(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize question file access service")
+		}
+	}
 	var fileBindingService files.BindingHTTPService
 	if deps.newFileBindings != nil {
 		fileBindingService = deps.newFileBindings(pool)
@@ -253,6 +263,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Uploads:           uploadService,
 		QAUploads:         qaUploadService,
 		FileAccess:        fileAccessService,
+		QAFileAccess:      qaFileAccessService,
 		FileBindings:      fileBindingService,
 		FileCenter:        fileCenterService,
 		StudentTeaching:   studentTeachingService,
@@ -361,6 +372,18 @@ func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg
 	}
 	store := files.NewPostgresStore(pool)
 	return files.NewAccessService(store, stores.Originals, stores.Previews), nil
+}
+
+func newProductionQAFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.QAAccessHTTPService, error) {
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files.NewQAAccessService(files.NewPostgresStore(pool), stores.Originals, stores.Previews), nil
 }
 
 func newProductionFileBindingService(pool *pgxpool.Pool) files.BindingHTTPService {

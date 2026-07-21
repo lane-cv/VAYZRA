@@ -28,6 +28,7 @@ type Dependencies struct {
 	Uploads           files.UploadHTTPService
 	QAUploads         files.UploadHTTPService
 	FileAccess        files.AccessHTTPService
+	QAFileAccess      files.QAAccessHTTPService
 	FileBindings      files.BindingHTTPService
 	FileCenter        files.FileCenterHTTPService
 	StudentTeaching   teaching.StudentHTTPService
@@ -108,6 +109,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.FileAccess != nil {
 					private.Mount("/files", files.NewAccessHandler(d.FileAccess, d.TrustedProxyCIDRs).Routes())
+				}
+				if d.QAFileAccess != nil {
+					private.Mount("/question-files", files.NewQAAccessHandler(d.QAFileAccess, d.TrustedProxyCIDRs).Routes())
 				}
 			})
 		})
