@@ -62,3 +62,34 @@ func TestQARoutesRemainOptional(t *testing.T) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
+
+type appAdminQuestions struct{ lists int }
+
+func (s *appAdminQuestions) ListAdminThreads(context.Context, qanda.Principal, qanda.AdminThreadFilter, qanda.ThreadCursor) ([]qanda.Thread, qanda.ThreadCursor, error) {
+	s.lists++
+	return []qanda.Thread{}, qanda.ThreadCursor{}, nil
+}
+func (*appAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID) (qanda.AdminThreadDetail, error) {
+	return qanda.AdminThreadDetail{}, nil
+}
+func (*appAdminQuestions) AddAdminMessage(context.Context, qanda.Principal, qanda.AddAdminMessageInput) (qanda.Thread, qanda.Message, error) {
+	return qanda.Thread{}, qanda.Message{}, nil
+}
+func (*appAdminQuestions) ChangeStatus(context.Context, qanda.Principal, qanda.ChangeStatusInput) (qanda.Thread, error) {
+	return qanda.Thread{}, nil
+}
+func (*appAdminQuestions) AddTeacherNote(context.Context, qanda.Principal, qanda.AddTeacherNoteInput) (qanda.TeacherNote, error) {
+	return qanda.TeacherNote{}, nil
+}
+
+func TestQARoutesMountAdminQuestionsOnlyForAuthenticatedAdmin(t *testing.T) {
+	svc := &appAdminQuestions{}
+	h := New(Dependencies{Auth: &appAdminAuth{}, AdminQuestions: svc})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/questions", nil)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || svc.lists != 1 {
+		t.Fatalf("status=%d lists=%d body=%s", w.Code, svc.lists, w.Body.String())
+	}
+}

@@ -110,6 +110,47 @@ func TestBuildApplicationWiresStudentQuestionRoutes(t *testing.T) {
 	}
 }
 
+func TestBuildApplicationWiresAdminQuestionRoutes(t *testing.T) {
+	questions := &serverAdminQuestions{}
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{open: func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil }, migrate: func(context.Context, *pgxpool.Pool) error { return nil }, newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverAdminAuth{}, nil }, newQuestions: func(*pgxpool.Pool) qanda.HTTPServices { return qanda.HTTPServices{Admin: questions} }, ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } }, close: func(*pgxpool.Pool) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeResources)
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/questions", nil)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || questions.lists != 1 {
+		t.Fatalf("status=%d lists=%d body=%s", w.Code, questions.lists, w.Body.String())
+	}
+}
+
+type serverAdminAuth struct{ serverFakeAuth }
+
+func (serverAdminAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
+	return auth.Authentication{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}, nil
+}
+
+type serverAdminQuestions struct{ lists int }
+
+func (s *serverAdminQuestions) ListAdminThreads(context.Context, qanda.Principal, qanda.AdminThreadFilter, qanda.ThreadCursor) ([]qanda.Thread, qanda.ThreadCursor, error) {
+	s.lists++
+	return []qanda.Thread{}, qanda.ThreadCursor{}, nil
+}
+func (*serverAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID) (qanda.AdminThreadDetail, error) {
+	return qanda.AdminThreadDetail{}, nil
+}
+func (*serverAdminQuestions) AddAdminMessage(context.Context, qanda.Principal, qanda.AddAdminMessageInput) (qanda.Thread, qanda.Message, error) {
+	return qanda.Thread{}, qanda.Message{}, nil
+}
+func (*serverAdminQuestions) ChangeStatus(context.Context, qanda.Principal, qanda.ChangeStatusInput) (qanda.Thread, error) {
+	return qanda.Thread{}, nil
+}
+func (*serverAdminQuestions) AddTeacherNote(context.Context, qanda.Principal, qanda.AddTeacherNoteInput) (qanda.TeacherNote, error) {
+	return qanda.TeacherNote{}, nil
+}
+
 type serverStudentAuth struct{ serverFakeAuth }
 
 func (serverStudentAuth) Authenticate(context.Context, string) (auth.Authentication, error) {

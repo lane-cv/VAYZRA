@@ -246,6 +246,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		FileCenter:        fileCenterService,
 		StudentTeaching:   studentTeachingService,
 		StudentQuestions:  questionServices.Student,
+		AdminQuestions:    questionServices.Admin,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,

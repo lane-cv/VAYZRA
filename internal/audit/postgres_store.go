@@ -96,7 +96,39 @@ func validateAndMarshal(event Event) ([]byte, error) {
 			return nil, ErrInvalidEvent
 		}
 	}
+	if event.Action == "qa.admin_replied" {
+		messageCount, messageOK := event.Metadata["messageCount"].(string)
+		attachmentCount, attachmentOK := event.Metadata["attachmentCount"].(string)
+		oldStatus, oldOK := event.Metadata["oldStatus"].(string)
+		newStatus, newOK := event.Metadata["newStatus"].(string)
+		attachments, countErr := strconv.Atoi(attachmentCount)
+		if len(event.Metadata) != 4 || !messageOK || messageCount != "1" || !attachmentOK || countErr != nil || attachments < 0 || attachments > 20 || !oldOK || !safeQAStatus(oldStatus) || !newOK || !safeQAStatus(newStatus) {
+			return nil, ErrInvalidEvent
+		}
+	}
+	if event.Action == "qa.status_changed" {
+		oldStatus, oldOK := event.Metadata["oldStatus"].(string)
+		newStatus, newOK := event.Metadata["newStatus"].(string)
+		if len(event.Metadata) != 2 || !oldOK || !safeQAStatus(oldStatus) || !newOK || !safeQAStatus(newStatus) {
+			return nil, ErrInvalidEvent
+		}
+	}
+	if event.Action == "qa.teacher_note_added" {
+		noteCount, ok := event.Metadata["noteCount"].(string)
+		if len(event.Metadata) != 1 || !ok || noteCount != "1" {
+			return nil, ErrInvalidEvent
+		}
+	}
 	return json.Marshal(event.Metadata)
+}
+
+func safeQAStatus(status string) bool {
+	switch status {
+	case "pending", "in_progress", "waiting_student", "completed":
+		return true
+	default:
+		return false
+	}
 }
 
 var allowedMetadata = map[string]map[string]bool{
@@ -106,6 +138,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"file.uploaded": {}, "file.policy_changed": {}, "file.processing_retried": {}, "file.replaced": {}, "file.draft_rolled_back": {}, "file.delete_requested": {},
 	"file.cleanup_scheduled": {"previewCount": true}, "file.cleanup_completed": {},
 	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
+	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -114,5 +147,5 @@ var allowedTargetTypes = map[string]string{
 	"lesson.draft_saved": "lesson", "lesson.published": "lesson", "lesson.withdrawn": "lesson", "lesson.archived": "lesson",
 	"file.uploaded": "file_version", "file.policy_changed": "lesson", "file.processing_retried": "file_version", "file.replaced": "file", "file.draft_rolled_back": "file_version", "file.delete_requested": "file",
 	"file.cleanup_scheduled": "file_version", "file.cleanup_completed": "file_version",
-	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread",
+	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
 }

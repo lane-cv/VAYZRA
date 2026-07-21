@@ -27,7 +27,13 @@ type StudentHTTPService interface {
 // AdminHTTPService is intentionally narrow until the teacher workflow lands.
 // Keeping a distinct interface prevents student handlers from gaining teacher
 // methods merely because both roles share one concrete PostgreSQL service.
-type AdminHTTPService interface{}
+type AdminHTTPService interface {
+	ListAdminThreads(context.Context, Principal, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error)
+	GetAdminThread(context.Context, Principal, uuid.UUID) (AdminThreadDetail, error)
+	AddAdminMessage(context.Context, Principal, AddAdminMessageInput) (Thread, Message, error)
+	ChangeStatus(context.Context, Principal, ChangeStatusInput) (Thread, error)
+	AddTeacherNote(context.Context, Principal, AddTeacherNoteInput) (TeacherNote, error)
+}
 
 type HTTPServices struct {
 	Student StudentHTTPService
@@ -201,6 +207,8 @@ func qandaError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusConflict, "idempotency_conflict", "幂等键与已有请求冲突")
 	case errors.Is(err, ErrInvalidStatusTransition):
 		httpx.Error(w, r, http.StatusConflict, "invalid_status_transition", "状态变更无效")
+	case errors.Is(err, ErrThreadConflict):
+		httpx.Error(w, r, http.StatusConflict, "thread_conflict", "问题已被更新，请刷新后重试")
 	default:
 		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
 	}

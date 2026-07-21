@@ -75,3 +75,19 @@ func TestQandaStudentAuditEventsAcceptOnlySafeCounts(t *testing.T) {
 		})
 	}
 }
+
+func TestQandaTeacherAuditEventsRejectPrivateText(t *testing.T) {
+	base := Event{ActorUserID: uuid.New(), TargetType: "qa_thread", TargetID: uuid.NewString(), RequestID: "request-admin", IP: net.ParseIP("192.0.2.6")}
+	for action, metadata := range map[string]map[string]any{"qa.admin_replied": {"messageCount": "1", "attachmentCount": "0", "oldStatus": "pending", "newStatus": "waiting_student"}, "qa.status_changed": {"oldStatus": "pending", "newStatus": "completed"}, "qa.teacher_note_added": {"noteCount": "1"}} {
+		event := base
+		event.Action = action
+		event.Metadata = metadata
+		if _, err := validateAndMarshal(event); err != nil {
+			t.Fatalf("approved %s rejected: %v", action, err)
+		}
+		event.Metadata = map[string]any{"body": "private"}
+		if _, err := validateAndMarshal(event); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("private %s accepted", action)
+		}
+	}
+}

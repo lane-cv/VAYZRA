@@ -299,6 +299,141 @@ func TestPostgresStudentFollowUpUsesMonotonicActivityTime(t *testing.T) {
 	}
 }
 
+func TestPostgresAdminQueueFiltersStableCursorAndWorkflow(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin := activeQAAdmin(t, pool)
+	first, second := insertQAStudent(t, pool), insertQAStudent(t, pool)
+	stamp := time.Date(2026, 7, 22, 13, 0, 0, 0, time.UTC)
+	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() > ids[j].String() })
+	for i, id := range ids {
+		student := first
+		if i == 2 {
+			student = second
+		}
+		status := "pending"
+		if i == 1 {
+			status = "in_progress"
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,version,last_message_at,created_at,updated_at) VALUES($1,$2,$3,$4,1,$5,$6,$6)`, id, student, fmt.Sprintf("admin-%d", i), status, stamp, stamp.Add(time.Duration(i)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewPostgresStore(pool)
+	page, next, err := store.ListAdminThreads(ctx, AdminThreadFilter{StudentID: first, From: stamp.Add(-time.Minute), To: stamp.Add(2 * time.Hour)}, ThreadCursor{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].ID != ids[0] || next.ID != ids[0] {
+		t.Fatalf("page=%#v next=%#v", page, next)
+	}
+	rest, _, err := store.ListAdminThreads(ctx, AdminThreadFilter{StudentID: first}, next)
+	if err != nil || len(rest) != 1 || rest[0].ID != ids[1] {
+		t.Fatalf("rest=%#v err=%v", rest, err)
+	}
+	pending, _, err := store.ListAdminThreads(ctx, AdminThreadFilter{Status: StatusPending, StudentID: first, From: stamp.Add(-time.Minute)}, ThreadCursor{Limit: 10})
+	if err != nil || len(pending) != 1 || pending[0].ID != ids[0] {
+		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+	notifications := &capturingNotifications{}
+	svc := NewService(store, NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return notifications }), func() time.Time { return stamp.Add(4 * time.Hour) })
+	reply, _, err := svc.AddAdminMessage(ctx, adminPrincipal(admin), AddAdminMessageInput{ThreadID: ids[0], ExpectedVersion: 1, Body: "answer", IdempotencyKey: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Status != StatusWaitingStudent || reply.Version != 2 {
+		t.Fatalf("reply=%#v", reply)
+	}
+	if _, _, err := svc.AddAdminMessage(ctx, adminPrincipal(admin), AddAdminMessageInput{ThreadID: ids[0], ExpectedVersion: 1, Body: "stale", IdempotencyKey: uuid.NewString()}); !errors.Is(err, ErrThreadConflict) {
+		t.Fatalf("stale reply error=%v", err)
+	}
+	note, err := svc.AddTeacherNote(ctx, adminPrincipal(admin), AddTeacherNoteInput{ThreadID: ids[0], Body: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := svc.GetAdminThread(ctx, adminPrincipal(admin), ids[0])
+	if err != nil || len(detail.Notes) != 1 || detail.Notes[0].ID != note.ID {
+		t.Fatalf("detail=%#v err=%v", detail, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE teacher_notes SET body_text='changed' WHERE id=$1`, note.ID); err == nil {
+		t.Fatal("teacher note update unexpectedly succeeded")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM teacher_notes WHERE id=$1`, note.ID); err == nil {
+		t.Fatal("teacher note delete unexpectedly succeeded")
+	}
+	studentDetail, err := svc.GetStudentThread(ctx, postgresPrincipal(first), ids[0])
+	if err != nil || len(studentDetail.Messages) != 1 {
+		t.Fatalf("student detail=%#v err=%v", studentDetail, err)
+	}
+}
+
+func TestPostgresAdminNotificationFailureRollsBack(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin := activeQAAdmin(t, pool)
+	student := insertQAStudent(t, pool)
+	stamp := time.Date(2026, 7, 22, 14, 0, 0, 0, time.UTC)
+	thread := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,version,last_message_at,created_at,updated_at) VALUES($1,$2,'rollback','pending',1,$3,$3,$3)`, thread, student, stamp); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(tx pgx.Tx) NotificationWriter { return failingTxNotification{tx: tx} }), func() time.Time { return stamp.Add(time.Hour) })
+	if _, _, err := svc.AddAdminMessage(ctx, adminPrincipal(admin), AddAdminMessageInput{ThreadID: thread, ExpectedVersion: 1, Body: "secret reply", IdempotencyKey: uuid.NewString()}); err == nil {
+		t.Fatal("reply unexpectedly committed")
+	}
+	var messages, audits int
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE thread_id=$1`, thread).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE target_id=$1 AND action='qa.admin_replied'`, thread.String()).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT version FROM qa_threads WHERE id=$1`, thread).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 || audits != 0 || version != 1 {
+		t.Fatalf("messages=%d audits=%d version=%d", messages, audits, version)
+	}
+}
+
+func TestPostgresConcurrentAdminRepliesAppendOnce(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin, student := activeQAAdmin(t, pool), insertQAStudent(t, pool)
+	stamp := time.Date(2026, 7, 22, 16, 0, 0, 0, time.UTC)
+	threadID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,version,last_message_at,created_at,updated_at) VALUES($1,$2,'concurrent admin','pending',1,$3,$3,$3)`, threadID, student, stamp); err != nil {
+		t.Fatal(err)
+	}
+	notifications := &capturingNotifications{}
+	svc := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return notifications }), func() time.Time { return stamp.Add(time.Hour) })
+	in := AddAdminMessageInput{ThreadID: threadID, ExpectedVersion: 1, Body: "one answer", IdempotencyKey: uuid.NewString()}
+	start, results := make(chan struct{}), make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, _, err := svc.AddAdminMessage(context.Background(), adminPrincipal(admin), in)
+			results <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var messages int
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1 AND idempotency_key=$2`, admin, in.IdempotencyKey).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT version FROM qa_threads WHERE id=$1`, threadID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 1 || version != 2 || notifications.count() != 1 {
+		t.Fatalf("messages=%d version=%d notifications=%d", messages, version, notifications.count())
+	}
+}
+
 func postgresFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()

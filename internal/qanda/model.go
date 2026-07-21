@@ -17,6 +17,7 @@ var (
 	ErrNotFound                = errors.New("qanda thread not found")
 	ErrInvalidStatusTransition = errors.New("invalid qanda status transition")
 	ErrIdempotencyConflict     = errors.New("qanda idempotency conflict")
+	ErrThreadConflict          = errors.New("qanda thread conflict")
 )
 
 type Status string
@@ -91,6 +92,30 @@ type AddMessageInput struct {
 	Attachments          []AttachmentInput
 }
 
+type AddAdminMessageInput struct {
+	ThreadID             uuid.UUID
+	ExpectedVersion      int64
+	Body, IdempotencyKey string
+	Attachments          []AttachmentInput
+}
+
+type ChangeStatusInput struct {
+	ThreadID        uuid.UUID
+	ExpectedVersion int64
+	Status          Status
+}
+
+type AddTeacherNoteInput struct {
+	ThreadID uuid.UUID
+	Body     string
+}
+
+type AdminThreadFilter struct {
+	Status    Status
+	StudentID uuid.UUID
+	From, To  time.Time
+}
+
 type ThreadCursor struct {
 	LastMessageAt time.Time
 	ID            uuid.UUID
@@ -133,6 +158,19 @@ type ThreadDetail struct {
 	NextMessageCursor MessageCursor
 }
 
+type TeacherNote struct {
+	ID, ThreadID, AuthorUserID uuid.UUID
+	Body                       string
+	CreatedAt                  time.Time
+}
+
+type AdminThreadDetail struct {
+	Thread            Thread
+	Messages          []Message
+	Notes             []TeacherNote
+	NextMessageCursor MessageCursor
+}
+
 type NotificationIntent struct {
 	RecipientUserID                                         uuid.UUID
 	Kind, Title, Summary, TargetType, TargetPath, DedupeKey string
@@ -155,6 +193,23 @@ func normalizeAddMessageInput(in AddMessageInput) (AddMessageInput, error) {
 		return AddMessageInput{}, ErrInvalidInput
 	}
 	in.Attachments = append([]AttachmentInput(nil), in.Attachments...)
+	return in, nil
+}
+
+func normalizeAddAdminMessageInput(in AddAdminMessageInput) (AddAdminMessageInput, error) {
+	in.Body = strings.TrimSpace(in.Body)
+	if in.ThreadID == uuid.Nil || in.ExpectedVersion < 1 || !validText(in.Body, 1, 20000) || !validIdempotencyKey(in.IdempotencyKey) || !validAttachments(in.Attachments) {
+		return AddAdminMessageInput{}, ErrInvalidInput
+	}
+	in.Attachments = append([]AttachmentInput(nil), in.Attachments...)
+	return in, nil
+}
+
+func normalizeTeacherNoteInput(in AddTeacherNoteInput) (AddTeacherNoteInput, error) {
+	in.Body = strings.TrimSpace(in.Body)
+	if in.ThreadID == uuid.Nil || !validText(in.Body, 1, 20000) {
+		return AddTeacherNoteInput{}, ErrInvalidInput
+	}
 	return in, nil
 }
 

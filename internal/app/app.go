@@ -31,6 +31,7 @@ type Dependencies struct {
 	FileCenter        files.FileCenterHTTPService
 	StudentTeaching   teaching.StudentHTTPService
 	StudentQuestions  qanda.StudentHTTPService
+	AdminQuestions    qanda.AdminHTTPService
 	PublicOrigin      string
 	CookieSecure      bool
 	TrustedProxyCIDRs []netip.Prefix
@@ -96,6 +97,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.StudentQuestions != nil {
 					private.Mount("/student/questions", qanda.NewStudentHandlerWithConfig(d.StudentQuestions, qanda.StudentHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.AdminQuestions != nil {
+					private.Mount("/admin/questions", qanda.NewAdminHandlerWithConfig(d.AdminQuestions, qanda.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.FileAccess != nil {
 					private.Mount("/files", files.NewAccessHandler(d.FileAccess, d.TrustedProxyCIDRs).Routes())

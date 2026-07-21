@@ -228,6 +228,18 @@ func (s *detailCursorStore) ListStudentMessages(_ context.Context, studentID, th
 	}
 	return page, next, nil
 }
+func (*detailCursorStore) ListAdminThreads(context.Context, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error) {
+	return nil, ThreadCursor{}, nil
+}
+func (*detailCursorStore) GetAdminThread(context.Context, uuid.UUID) (Thread, error) {
+	return Thread{}, ErrNotFound
+}
+func (*detailCursorStore) ListAdminMessages(context.Context, uuid.UUID, MessageCursor) ([]Message, MessageCursor, error) {
+	return nil, MessageCursor{}, ErrNotFound
+}
+func (*detailCursorStore) ListTeacherNotes(context.Context, uuid.UUID) ([]TeacherNote, error) {
+	return nil, ErrNotFound
+}
 
 func withCreateTitle(in CreateThreadInput, value string) CreateThreadInput {
 	in.Title = value
@@ -373,10 +385,11 @@ type fakeState struct {
 	threads     map[uuid.UUID]Thread
 	messages    map[uuid.UUID]Message
 	idempotency map[string]uuid.UUID
+	notes       map[uuid.UUID]TeacherNote
 }
 
 func newFakeState() *fakeState {
-	return &fakeState{threads: map[uuid.UUID]Thread{}, messages: map[uuid.UUID]Message{}, idempotency: map[string]uuid.UUID{}}
+	return &fakeState{threads: map[uuid.UUID]Thread{}, messages: map[uuid.UUID]Message{}, idempotency: map[string]uuid.UUID{}, notes: map[uuid.UUID]TeacherNote{}}
 }
 
 func (s *fakeState) clone() *fakeState {
@@ -389,6 +402,9 @@ func (s *fakeState) clone() *fakeState {
 	}
 	for key, id := range s.idempotency {
 		copy.idempotency[key] = id
+	}
+	for id, note := range s.notes {
+		copy.notes[id] = note
 	}
 	return copy
 }
@@ -460,6 +476,34 @@ func (s *fakeStore) GetStudentThread(_ context.Context, studentID, threadID uuid
 func (s *fakeStore) ListStudentMessages(context.Context, uuid.UUID, uuid.UUID, MessageCursor) ([]Message, MessageCursor, error) {
 	return nil, MessageCursor{}, nil
 }
+func (s *fakeStore) ListAdminThreads(context.Context, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error) {
+	return nil, ThreadCursor{}, nil
+}
+func (s *fakeStore) GetAdminThread(_ context.Context, threadID uuid.UUID) (Thread, error) {
+	thread, ok := s.state.threads[threadID]
+	if !ok {
+		return Thread{}, ErrNotFound
+	}
+	return thread, nil
+}
+func (s *fakeStore) ListAdminMessages(_ context.Context, threadID uuid.UUID, _ MessageCursor) ([]Message, MessageCursor, error) {
+	var out []Message
+	for _, m := range s.state.messages {
+		if m.ThreadID == threadID {
+			out = append(out, m)
+		}
+	}
+	return out, MessageCursor{}, nil
+}
+func (s *fakeStore) ListTeacherNotes(_ context.Context, threadID uuid.UUID) ([]TeacherNote, error) {
+	var out []TeacherNote
+	for _, n := range s.state.notes {
+		if n.ThreadID == threadID {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
 func (s *fakeStore) FindMessageByIdempotency(_ context.Context, senderID uuid.UUID, key string) (Thread, Message, error) {
 	messageID, ok := s.state.idempotency[senderID.String()+"/"+key]
 	if !ok {
@@ -492,6 +536,42 @@ func (s *fakeStore) AppendStudentMessage(_ context.Context, thread Thread, stude
 	return thread, message, nil
 }
 func (s *fakeStore) ActiveAdminID(context.Context) (uuid.UUID, error) { return s.adminID, nil }
+func (s *fakeStore) FindAdminMessageByIdempotency(_ context.Context, adminID uuid.UUID, key string) (Thread, Message, error) {
+	return s.FindMessageByIdempotency(context.Background(), adminID, key)
+}
+func (s *fakeStore) LockAdminThread(_ context.Context, threadID uuid.UUID) (Thread, error) {
+	return s.GetAdminThread(context.Background(), threadID)
+}
+func (s *fakeStore) AppendAdminMessage(_ context.Context, thread Thread, adminID uuid.UUID, in AddAdminMessageInput, next Status, now time.Time) (Thread, Message, error) {
+	thread.Status = next
+	thread.Version++
+	thread.LastMessageAt = now
+	thread.UpdatedAt = now
+	thread.CompletedAt = nil
+	message := Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: adminID, SenderRole: auth.RoleAdmin, Kind: MessageKindAdminReply, Body: in.Body, CreatedAt: now}
+	s.state.threads[thread.ID] = thread
+	s.state.messages[message.ID] = message
+	s.state.idempotency[adminID.String()+"/"+in.IdempotencyKey] = message.ID
+	return thread, message, nil
+}
+func (s *fakeStore) UpdateAdminThreadStatus(_ context.Context, thread Thread, next Status, now time.Time) (Thread, error) {
+	thread.Status = next
+	thread.Version++
+	thread.UpdatedAt = now
+	if next == StatusCompleted {
+		completed := now
+		thread.CompletedAt = &completed
+	} else {
+		thread.CompletedAt = nil
+	}
+	s.state.threads[thread.ID] = thread
+	return thread, nil
+}
+func (s *fakeStore) InsertTeacherNote(_ context.Context, threadID, adminID uuid.UUID, body string, now time.Time) (TeacherNote, error) {
+	note := TeacherNote{ID: uuid.New(), ThreadID: threadID, AuthorUserID: adminID, Body: body, CreatedAt: now}
+	s.state.notes[note.ID] = note
+	return note, nil
+}
 
 func studentPrincipal(id uuid.UUID) Principal {
 	return Principal{User: auth.User{ID: id, Role: auth.RoleStudent, Status: auth.StatusActive}, RequestID: "req-1", IP: net.ParseIP("127.0.0.1")}

@@ -89,6 +89,114 @@ func (s *PostgresStore) ListStudentThreads(ctx context.Context, studentID uuid.U
 	return threads, next, nil
 }
 
+func (s *PostgresStore) ListAdminThreads(ctx context.Context, filter AdminThreadFilter, cursor ThreadCursor) ([]Thread, ThreadCursor, error) {
+	lastMessageAt, id := cursor.LastMessageAt, cursor.ID
+	if lastMessageAt.IsZero() {
+		lastMessageAt = time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)
+		id = uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	}
+	rows, err := s.q.Query(ctx, `
+		SELECT q.id,q.student_id,q.title,q.status,q.version,q.last_message_at,q.created_at,q.updated_at,q.completed_at
+		FROM qa_threads q JOIN users u ON u.id=q.student_id AND u.role='student' AND u.deleted_at IS NULL
+		WHERE ($1='' OR q.status=$1) AND ($2::uuid IS NULL OR q.student_id=$2)
+		  AND ($3::timestamptz IS NULL OR q.created_at >= $3) AND ($4::timestamptz IS NULL OR q.created_at <= $4)
+		  AND (q.last_message_at,q.id)<($5,$6)
+		ORDER BY q.last_message_at DESC,q.id DESC LIMIT $7`, filter.Status, nullableUUID(filter.StudentID), nullableTime(filter.From), nullableTime(filter.To), lastMessageAt, id, cursor.Limit)
+	if err != nil {
+		return nil, ThreadCursor{}, mapPostgresError(err)
+	}
+	defer rows.Close()
+	threads := make([]Thread, 0, cursor.Limit)
+	for rows.Next() {
+		thread, scanErr := scanThread(rows)
+		if scanErr != nil {
+			return nil, ThreadCursor{}, scanErr
+		}
+		threads = append(threads, thread)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, ThreadCursor{}, mapPostgresError(err)
+	}
+	var next ThreadCursor
+	if len(threads) == cursor.Limit {
+		last := threads[len(threads)-1]
+		next = ThreadCursor{LastMessageAt: last.LastMessageAt, ID: last.ID, Limit: cursor.Limit}
+	}
+	return threads, next, nil
+}
+
+func (s *PostgresStore) GetAdminThread(ctx context.Context, threadID uuid.UUID) (Thread, error) {
+	return scanThread(s.q.QueryRow(ctx, `SELECT q.id,q.student_id,q.title,q.status,q.version,q.last_message_at,q.created_at,q.updated_at,q.completed_at FROM qa_threads q JOIN users u ON u.id=q.student_id AND u.role='student' AND u.deleted_at IS NULL WHERE q.id=$1`, threadID))
+}
+
+func (s *PostgresStore) ListAdminMessages(ctx context.Context, threadID uuid.UUID, cursor MessageCursor) ([]Message, MessageCursor, error) {
+	createdAt, id := cursor.CreatedAt, cursor.ID
+	if createdAt.IsZero() {
+		createdAt = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+		id = uuid.Nil
+	}
+	rows, err := s.q.Query(ctx, `SELECT m.id,m.thread_id,m.sender_user_id,m.sender_role,m.message_kind,m.body_text,m.created_at FROM qa_messages m JOIN qa_threads q ON q.id=m.thread_id LEFT JOIN users sender ON sender.id=m.sender_user_id AND sender.status='active' AND sender.deleted_at IS NULL WHERE m.thread_id=$1 AND (m.created_at,m.id)>($2,$3) AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up')) OR (m.sender_role='admin' AND sender.role='admin' AND m.message_kind='admin_reply')) ORDER BY m.created_at,m.id LIMIT $4`, threadID, createdAt, id, cursor.Limit)
+	if err != nil {
+		return nil, MessageCursor{}, mapPostgresError(err)
+	}
+	defer rows.Close()
+	messages := make([]Message, 0, cursor.Limit)
+	for rows.Next() {
+		m, e := scanMessage(rows)
+		if e != nil {
+			return nil, MessageCursor{}, e
+		}
+		messages = append(messages, m)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, MessageCursor{}, mapPostgresError(err)
+	}
+	if len(messages) == 0 {
+		if _, err = s.GetAdminThread(ctx, threadID); err != nil {
+			return nil, MessageCursor{}, err
+		}
+	}
+	for i := range messages {
+		attachments, e := s.listAdminMessageAttachments(ctx, messages[i].ID)
+		if e != nil {
+			return nil, MessageCursor{}, e
+		}
+		messages[i].Attachments = attachments
+	}
+	var next MessageCursor
+	if len(messages) == cursor.Limit {
+		last := messages[len(messages)-1]
+		next = MessageCursor{CreatedAt: last.CreatedAt, ID: last.ID, Limit: cursor.Limit}
+	}
+	return messages, next, nil
+}
+
+func (s *PostgresStore) ListTeacherNotes(ctx context.Context, threadID uuid.UUID) ([]TeacherNote, error) {
+	rows, err := s.q.Query(ctx, `SELECT n.id,n.thread_id,n.author_user_id,n.body_text,n.created_at FROM teacher_notes n JOIN qa_threads q ON q.id=n.thread_id JOIN users a ON a.id=n.author_user_id AND a.role='admin' WHERE n.thread_id=$1 ORDER BY n.created_at,n.id`, threadID)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	notes := make([]TeacherNote, 0)
+	for rows.Next() {
+		var n TeacherNote
+		if err := rows.Scan(&n.ID, &n.ThreadID, &n.AuthorUserID, &n.Body, &n.CreatedAt); err != nil {
+			return nil, mapPostgresError(err)
+		}
+		n.CreatedAt = n.CreatedAt.UTC()
+		notes = append(notes, n)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, mapPostgresError(err)
+	}
+	if len(notes) == 0 {
+		if _, err = s.GetAdminThread(ctx, threadID); err != nil {
+			return nil, err
+		}
+	}
+	return notes, nil
+}
+
 func (s *PostgresStore) GetStudentThread(ctx context.Context, studentID, threadID uuid.UUID) (Thread, error) {
 	return scanThread(s.q.QueryRow(ctx, `
 		SELECT q.id,q.student_id,q.title,q.status,q.version,q.last_message_at,q.created_at,q.updated_at,q.completed_at
@@ -246,6 +354,109 @@ func (s *PostgresStore) ActiveAdminID(ctx context.Context) (uuid.UUID, error) {
 	var id uuid.UUID
 	err := s.q.QueryRow(ctx, `SELECT id FROM users WHERE role='admin' AND status='active' AND deleted_at IS NULL LIMIT 1`).Scan(&id)
 	return id, mapPostgresError(err)
+}
+
+func (s *PostgresStore) FindAdminMessageByIdempotency(ctx context.Context, adminID uuid.UUID, key string) (Thread, Message, error) {
+	row := s.q.QueryRow(ctx, `SELECT q.id,q.student_id,q.title,q.status,q.version,q.last_message_at,q.created_at,q.updated_at,q.completed_at,m.id,m.thread_id,m.sender_user_id,m.sender_role,m.message_kind,m.body_text,m.created_at FROM qa_messages m JOIN qa_threads q ON q.id=m.thread_id JOIN users u ON u.id=m.sender_user_id AND u.role='admin' AND u.status='active' AND u.deleted_at IS NULL WHERE m.sender_user_id=$1 AND m.sender_role='admin' AND m.message_kind='admin_reply' AND m.idempotency_key=$2`, adminID, key)
+	var thread Thread
+	var message Message
+	var completed *time.Time
+	if err := row.Scan(&thread.ID, &thread.StudentID, &thread.Title, &thread.Status, &thread.Version, &thread.LastMessageAt, &thread.CreatedAt, &thread.UpdatedAt, &completed, &message.ID, &message.ThreadID, &message.SenderUserID, &message.SenderRole, &message.Kind, &message.Body, &message.CreatedAt); err != nil {
+		return Thread{}, Message{}, mapPostgresError(err)
+	}
+	thread.CompletedAt = utcPointer(completed)
+	normalizeThreadTimes(&thread)
+	message.CreatedAt = message.CreatedAt.UTC()
+	attachments, err := s.listAdminMessageAttachments(ctx, message.ID)
+	if err != nil {
+		return Thread{}, Message{}, err
+	}
+	message.Attachments = attachments
+	return thread, message, nil
+}
+
+func (s *PostgresStore) LockAdminThread(ctx context.Context, threadID uuid.UUID) (Thread, error) {
+	return scanThread(s.q.QueryRow(ctx, `SELECT q.id,q.student_id,q.title,q.status,q.version,q.last_message_at,q.created_at,q.updated_at,q.completed_at FROM qa_threads q JOIN users u ON u.id=q.student_id AND u.role='student' AND u.deleted_at IS NULL WHERE q.id=$1 FOR UPDATE OF q`, threadID))
+}
+
+func (s *PostgresStore) AppendAdminMessage(ctx context.Context, thread Thread, adminID uuid.UUID, in AddAdminMessageInput, next Status, now time.Time) (Thread, Message, error) {
+	message, err := scanMessage(s.q.QueryRow(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) SELECT $1,$2,u.id,'admin','admin_reply',$4,$5,$6 FROM users u WHERE u.id=$3 AND u.role='admin' AND u.status='active' AND u.deleted_at IS NULL RETURNING id,thread_id,sender_user_id,sender_role,message_kind,body_text,created_at`, uuid.New(), thread.ID, adminID, in.Body, in.IdempotencyKey, now))
+	if err != nil {
+		return Thread{}, Message{}, err
+	}
+	message.Attachments, err = s.bindAdminAttachments(ctx, adminID, message.ID, in.Attachments)
+	if err != nil {
+		return Thread{}, Message{}, err
+	}
+	updated, err := scanThread(s.q.QueryRow(ctx, `UPDATE qa_threads SET status=$3,version=version+1,last_message_at=$4,updated_at=$4,completed_at=NULL WHERE id=$1 AND version=$2 RETURNING id,student_id,title,status,version,last_message_at,created_at,updated_at,completed_at`, thread.ID, thread.Version, next, now))
+	if errors.Is(err, ErrNotFound) {
+		return Thread{}, Message{}, ErrThreadConflict
+	}
+	if err != nil {
+		return Thread{}, Message{}, err
+	}
+	return updated, message, nil
+}
+
+func (s *PostgresStore) UpdateAdminThreadStatus(ctx context.Context, thread Thread, next Status, now time.Time) (Thread, error) {
+	updated, err := scanThread(s.q.QueryRow(ctx, `UPDATE qa_threads SET status=$3,version=version+1,updated_at=$4,completed_at=CASE WHEN $3='completed' THEN $4::timestamptz ELSE NULL END WHERE id=$1 AND version=$2 RETURNING id,student_id,title,status,version,last_message_at,created_at,updated_at,completed_at`, thread.ID, thread.Version, next, now))
+	if errors.Is(err, ErrNotFound) {
+		return Thread{}, ErrThreadConflict
+	}
+	return updated, err
+}
+
+func (s *PostgresStore) InsertTeacherNote(ctx context.Context, threadID, adminID uuid.UUID, body string, now time.Time) (TeacherNote, error) {
+	var n TeacherNote
+	err := s.q.QueryRow(ctx, `INSERT INTO teacher_notes(id,thread_id,author_user_id,body_text,created_at) SELECT $1,q.id,a.id,$4,$5 FROM qa_threads q JOIN users a ON a.id=$3 AND a.role='admin' AND a.status='active' AND a.deleted_at IS NULL WHERE q.id=$2 RETURNING id,thread_id,author_user_id,body_text,created_at`, uuid.New(), threadID, adminID, body, now).Scan(&n.ID, &n.ThreadID, &n.AuthorUserID, &n.Body, &n.CreatedAt)
+	if err != nil {
+		return TeacherNote{}, mapPostgresError(err)
+	}
+	n.CreatedAt = n.CreatedAt.UTC()
+	return n, nil
+}
+
+func nullableUUID(id uuid.UUID) any {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
+}
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC()
+}
+
+func (s *PostgresStore) bindAdminAttachments(ctx context.Context, adminID, messageID uuid.UUID, inputs []AttachmentInput) ([]Attachment, error) {
+	attachments := make([]Attachment, 0, len(inputs))
+	for _, input := range inputs {
+		var a Attachment
+		err := s.q.QueryRow(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) SELECT $1,fv.id,$3,fv.display_name FROM file_versions fv JOIN files f ON f.id=fv.file_id AND f.created_by=$4 AND f.deleted_at IS NULL WHERE fv.id=$2 AND fv.processing_state='ready' RETURNING file_version_id,sort_position,display_name`, messageID, input.FileVersionID, input.SortPosition, adminID).Scan(&a.FileVersionID, &a.SortPosition, &a.DisplayName)
+		if err != nil {
+			return nil, mapPostgresError(err)
+		}
+		attachments = append(attachments, a)
+	}
+	return attachments, nil
+}
+
+func (s *PostgresStore) listAdminMessageAttachments(ctx context.Context, messageID uuid.UUID) ([]Attachment, error) {
+	rows, err := s.q.Query(ctx, `SELECT mf.file_version_id,mf.sort_position,mf.display_name FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id JOIN files f ON f.id=(SELECT file_id FROM file_versions WHERE id=mf.file_version_id) AND f.created_by=m.sender_user_id AND f.deleted_at IS NULL WHERE mf.message_id=$1 ORDER BY mf.sort_position,mf.file_version_id`, messageID)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	out := make([]Attachment, 0)
+	for rows.Next() {
+		var a Attachment
+		if err := rows.Scan(&a.FileVersionID, &a.SortPosition, &a.DisplayName); err != nil {
+			return nil, mapPostgresError(err)
+		}
+		out = append(out, a)
+	}
+	return out, mapPostgresError(rows.Err())
 }
 
 func (s *PostgresStore) requireActiveStudent(ctx context.Context, studentID uuid.UUID) error {
