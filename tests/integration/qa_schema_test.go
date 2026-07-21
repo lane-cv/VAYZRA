@@ -39,8 +39,8 @@ func TestQAHistoryIsImmutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,body_text,idempotency_key)
-		VALUES($1,$2,$3,'student','Question', $4)`, messageID, threadID, student, "qa-message-key-0001"); err != nil {
+		INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key)
+		VALUES($1,$2,$3,'student','initial','Question', $4)`, messageID, threadID, student, "qa-message-key-0001"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -101,11 +101,17 @@ func TestQAStatusAndMessageIdempotencyConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := "qa-message-key-0002"
-	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,body_text,idempotency_key) VALUES($1,$2,$3,'student','One',$4)`, uuid.New(), threadID, student, key); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','initial','One',$4)`, uuid.New(), threadID, student, key); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,body_text,idempotency_key) VALUES($1,$2,$3,'student','Two',$4)`, uuid.New(), threadID, student, key); err == nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','student_follow_up','Two',$4)`, uuid.New(), threadID, student, key); err == nil {
 		t.Fatal("duplicate sender idempotency key succeeded")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','initial','Another initial',$4)`, uuid.New(), threadID, student, "qa-message-key-0003"); err == nil {
+		t.Fatal("second initial message succeeded")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','invalid','Invalid kind',$4)`, uuid.New(), threadID, student, "qa-message-key-0004"); err == nil {
+		t.Fatal("invalid message kind succeeded")
 	}
 }
 

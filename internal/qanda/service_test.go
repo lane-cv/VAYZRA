@@ -163,6 +163,72 @@ func TestValidateStudentPrincipalAndCursors(t *testing.T) {
 	}
 }
 
+func TestGetStudentThreadReturnsMessageContinuationCursor(t *testing.T) {
+	studentID := uuid.New()
+	thread := Thread{ID: uuid.New(), StudentID: studentID, Status: StatusPending}
+	messages := make([]Message, 101)
+	base := time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC)
+	for i := range messages {
+		messages[i] = Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: studentID, SenderRole: auth.RoleStudent, CreatedAt: base.Add(time.Duration(i) * time.Second)}
+	}
+	store := &detailCursorStore{thread: thread, messages: messages}
+	svc := NewService(store, nil, time.Now)
+	detail, err := svc.GetStudentThread(context.Background(), studentPrincipal(studentID), thread.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Messages) != 100 || detail.NextMessageCursor.ID != messages[99].ID || !detail.NextMessageCursor.CreatedAt.Equal(messages[99].CreatedAt) {
+		t.Fatalf("messages=%d next=%#v", len(detail.Messages), detail.NextMessageCursor)
+	}
+	rest, _, err := svc.ListStudentMessages(context.Background(), studentPrincipal(studentID), thread.ID, detail.NextMessageCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 1 || rest[0].ID != messages[100].ID {
+		t.Fatalf("rest=%#v", rest)
+	}
+}
+
+type detailCursorStore struct {
+	thread   Thread
+	messages []Message
+}
+
+func (s *detailCursorStore) ListStudentThreads(context.Context, uuid.UUID, Status, ThreadCursor) ([]Thread, ThreadCursor, error) {
+	return nil, ThreadCursor{}, nil
+}
+func (s *detailCursorStore) GetStudentThread(_ context.Context, studentID, threadID uuid.UUID) (Thread, error) {
+	if s.thread.StudentID != studentID || s.thread.ID != threadID {
+		return Thread{}, ErrNotFound
+	}
+	return s.thread, nil
+}
+func (s *detailCursorStore) ListStudentMessages(_ context.Context, studentID, threadID uuid.UUID, cursor MessageCursor) ([]Message, MessageCursor, error) {
+	if s.thread.StudentID != studentID || s.thread.ID != threadID {
+		return nil, MessageCursor{}, ErrNotFound
+	}
+	start := 0
+	if cursor.ID != uuid.Nil {
+		for i := range s.messages {
+			if s.messages[i].ID == cursor.ID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + cursor.Limit
+	if end > len(s.messages) {
+		end = len(s.messages)
+	}
+	page := append([]Message(nil), s.messages[start:end]...)
+	var next MessageCursor
+	if end < len(s.messages) {
+		last := page[len(page)-1]
+		next = MessageCursor{CreatedAt: last.CreatedAt, ID: last.ID, Limit: cursor.Limit}
+	}
+	return page, next, nil
+}
+
 func withCreateTitle(in CreateThreadInput, value string) CreateThreadInput {
 	in.Title = value
 	return in
@@ -307,11 +373,10 @@ type fakeState struct {
 	threads     map[uuid.UUID]Thread
 	messages    map[uuid.UUID]Message
 	idempotency map[string]uuid.UUID
-	first       map[uuid.UUID]uuid.UUID
 }
 
 func newFakeState() *fakeState {
-	return &fakeState{threads: map[uuid.UUID]Thread{}, messages: map[uuid.UUID]Message{}, idempotency: map[string]uuid.UUID{}, first: map[uuid.UUID]uuid.UUID{}}
+	return &fakeState{threads: map[uuid.UUID]Thread{}, messages: map[uuid.UUID]Message{}, idempotency: map[string]uuid.UUID{}}
 }
 
 func (s *fakeState) clone() *fakeState {
@@ -324,9 +389,6 @@ func (s *fakeState) clone() *fakeState {
 	}
 	for key, id := range s.idempotency {
 		copy.idempotency[key] = id
-	}
-	for threadID, messageID := range s.first {
-		copy.first[threadID] = messageID
 	}
 	return copy
 }
@@ -398,37 +460,33 @@ func (s *fakeStore) GetStudentThread(_ context.Context, studentID, threadID uuid
 func (s *fakeStore) ListStudentMessages(context.Context, uuid.UUID, uuid.UUID, MessageCursor) ([]Message, MessageCursor, error) {
 	return nil, MessageCursor{}, nil
 }
-func (s *fakeStore) FindMessageByIdempotency(_ context.Context, senderID uuid.UUID, key string) (Thread, Message, bool, error) {
+func (s *fakeStore) FindMessageByIdempotency(_ context.Context, senderID uuid.UUID, key string) (Thread, Message, error) {
 	messageID, ok := s.state.idempotency[senderID.String()+"/"+key]
 	if !ok {
-		return Thread{}, Message{}, false, ErrNotFound
+		return Thread{}, Message{}, ErrNotFound
 	}
 	message := s.state.messages[messageID]
-	return s.state.threads[message.ThreadID], message, s.state.first[message.ThreadID] == message.ID, nil
+	return s.state.threads[message.ThreadID], message, nil
 }
 func (s *fakeStore) CreateThreadWithFirstMessage(_ context.Context, studentID uuid.UUID, in CreateThreadInput, now time.Time) (Thread, Message, bool, error) {
-	if thread, message, first, err := s.FindMessageByIdempotency(context.Background(), studentID, in.IdempotencyKey); err == nil {
-		if !first {
+	if thread, message, err := s.FindMessageByIdempotency(context.Background(), studentID, in.IdempotencyKey); err == nil {
+		if message.Kind != MessageKindInitial {
 			return Thread{}, Message{}, false, ErrIdempotencyConflict
 		}
 		return thread, message, false, nil
 	}
 	thread := Thread{ID: uuid.New(), StudentID: studentID, Title: in.Title, Status: StatusPending, Version: 1, LastMessageAt: now, CreatedAt: now, UpdatedAt: now}
-	message := Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: studentID, SenderRole: auth.RoleStudent, Body: in.Body, CreatedAt: now}
+	message := Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: studentID, SenderRole: auth.RoleStudent, Kind: MessageKindInitial, Body: in.Body, CreatedAt: now}
 	s.state.threads[thread.ID], s.state.messages[message.ID] = thread, message
 	s.state.idempotency[studentID.String()+"/"+in.IdempotencyKey] = message.ID
-	s.state.first[thread.ID] = message.ID
 	return thread, message, true, nil
 }
 func (s *fakeStore) LockStudentThread(_ context.Context, studentID, threadID uuid.UUID) (Thread, error) {
 	return s.GetStudentThread(context.Background(), studentID, threadID)
 }
 func (s *fakeStore) AppendStudentMessage(_ context.Context, thread Thread, studentID uuid.UUID, in AddMessageInput, next Status, now time.Time) (Thread, Message, error) {
-	if !now.After(thread.LastMessageAt) {
-		now = thread.LastMessageAt.Add(time.Microsecond)
-	}
 	thread.Status, thread.Version, thread.LastMessageAt, thread.UpdatedAt, thread.CompletedAt = next, thread.Version+1, now, now, nil
-	message := Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: studentID, SenderRole: auth.RoleStudent, Body: in.Body, CreatedAt: now}
+	message := Message{ID: uuid.New(), ThreadID: thread.ID, SenderUserID: studentID, SenderRole: auth.RoleStudent, Kind: MessageKindStudentFollowUp, Body: in.Body, CreatedAt: now}
 	s.state.threads[thread.ID], s.state.messages[message.ID] = thread, message
 	s.state.idempotency[studentID.String()+"/"+in.IdempotencyKey] = message.ID
 	return thread, message, nil

@@ -17,6 +17,7 @@ CREATE TABLE qa_messages (
   thread_id uuid NOT NULL REFERENCES qa_threads(id),
   sender_user_id uuid NOT NULL REFERENCES users(id),
   sender_role text NOT NULL CHECK (sender_role IN ('admin','student')),
+  message_kind text NOT NULL CHECK (message_kind IN ('initial','student_follow_up','admin_reply')),
   body_text text NOT NULL CHECK (char_length(btrim(body_text)) BETWEEN 1 AND 20000),
   idempotency_key text NOT NULL CHECK (char_length(idempotency_key) BETWEEN 16 AND 128),
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -43,6 +44,7 @@ CREATE TABLE teacher_notes (
 CREATE INDEX qa_threads_student_activity_idx ON qa_threads(student_id,last_message_at DESC,id DESC);
 CREATE INDEX qa_threads_teacher_queue_idx ON qa_threads(status,last_message_at DESC,id DESC);
 CREATE INDEX qa_messages_thread_time_idx ON qa_messages(thread_id,created_at,id);
+CREATE UNIQUE INDEX qa_messages_one_initial_per_thread_idx ON qa_messages(thread_id) WHERE message_kind='initial';
 
 -- +goose StatementBegin
 CREATE FUNCTION reject_qa_history_mutation() RETURNS trigger AS $$
@@ -66,6 +68,7 @@ CREATE TRIGGER teacher_notes_immutable
 
 -- +goose Down
 DROP INDEX qa_messages_thread_time_idx;
+DROP INDEX IF EXISTS qa_messages_one_initial_per_thread_idx;
 DROP INDEX qa_threads_teacher_queue_idx;
 DROP INDEX qa_threads_student_activity_idx;
 DROP TRIGGER teacher_notes_immutable ON teacher_notes;

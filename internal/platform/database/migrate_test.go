@@ -67,7 +67,7 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 	if err := database.Migrate(context.Background(), pool); err != nil {
 		t.Fatal(err)
 	}
-	var tables, triggers, indexes, idempotencyKeys int
+	var tables, triggers, indexes, idempotencyKeys, messageKindColumns, messageKindChecks int
 	if err := pool.QueryRow(context.Background(), `
 		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema='public' AND table_name IN
@@ -83,7 +83,18 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), `
 		SELECT count(*) FROM pg_indexes
 		WHERE schemaname='public' AND indexname IN
-		('qa_threads_student_activity_idx','qa_threads_teacher_queue_idx','qa_messages_thread_time_idx')`).Scan(&indexes); err != nil {
+		('qa_threads_student_activity_idx','qa_threads_teacher_queue_idx','qa_messages_thread_time_idx','qa_messages_one_initial_per_thread_idx')`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='qa_messages' AND column_name='message_kind' AND is_nullable='NO'`).Scan(&messageKindColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid
+		WHERE r.relname='qa_messages' AND c.contype='c'
+		  AND pg_get_constraintdef(c.oid) LIKE '%message_kind%initial%student_follow_up%admin_reply%'`).Scan(&messageKindChecks); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(context.Background(), `
@@ -97,8 +108,8 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 		]`).Scan(&idempotencyKeys); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 4 || triggers != 3 || indexes != 3 || idempotencyKeys != 1 {
-		t.Fatalf("tables=%d triggers=%d indexes=%d idempotency_keys=%d", tables, triggers, indexes, idempotencyKeys)
+	if tables != 4 || triggers != 3 || indexes != 4 || idempotencyKeys != 1 || messageKindColumns != 1 || messageKindChecks != 1 {
+		t.Fatalf("tables=%d triggers=%d indexes=%d idempotency_keys=%d message_kind_columns=%d message_kind_checks=%d", tables, triggers, indexes, idempotencyKeys, messageKindColumns, messageKindChecks)
 	}
 }
 

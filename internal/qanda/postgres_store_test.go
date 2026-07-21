@@ -66,10 +66,10 @@ func TestPostgresStudentIsolationDisabledDenialAndStableCursor(t *testing.T) {
 		t.Fatalf("reverse cross-student get error=%v", err)
 	}
 	malformedKey := strings.Repeat("m", 16)
-	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','must remain private',$4,$5)`, uuid.New(), otherThread, first, malformedKey, stamp); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','student_follow_up','must remain private',$4,$5)`, uuid.New(), otherThread, first, malformedKey, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := store.FindMessageByIdempotency(ctx, first, malformedKey); !errors.Is(err, ErrNotFound) {
+	if _, _, err := store.FindMessageByIdempotency(ctx, first, malformedKey); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-owner idempotency lookup error=%v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, first); err != nil {
@@ -80,6 +80,66 @@ func TestPostgresStudentIsolationDisabledDenialAndStableCursor(t *testing.T) {
 	}
 	if threads, _, err := store.ListStudentThreads(ctx, first, "", ThreadCursor{Limit: 10}); !errors.Is(err, ErrNotFound) || threads != nil {
 		t.Fatalf("disabled list=%#v error=%v", threads, err)
+	}
+}
+
+func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	owner, other, admin := insertQAStudent(t, pool), insertQAStudent(t, pool), activeQAAdmin(t, pool)
+	threadID := uuid.New()
+	stamp := time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,last_message_at,created_at,updated_at) VALUES($1,$2,'History','waiting_student',$3,$3,$3)`, threadID, owner, stamp); err != nil {
+		t.Fatal(err)
+	}
+	studentMessage, adminMessage := uuid.New(), uuid.New()
+	malformedStudent, malformedAdmin := uuid.New(), uuid.New()
+	for _, row := range []struct {
+		id, sender            uuid.UUID
+		role, kind, body, key string
+		at                    time.Time
+	}{
+		{studentMessage, owner, "student", "initial", "visible student", uuid.NewString(), stamp},
+		{malformedStudent, other, "student", "student_follow_up", "cross student secret", uuid.NewString(), stamp.Add(time.Second)},
+		{adminMessage, admin, "admin", "admin_reply", "visible admin", uuid.NewString(), stamp.Add(2 * time.Second)},
+		{malformedAdmin, other, "admin", "admin_reply", "non-admin sender secret", uuid.NewString(), stamp.Add(3 * time.Second)},
+	} {
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, row.id, threadID, row.sender, row.role, row.kind, row.body, row.key, row.at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownerFile := insertQATestFileVersion(t, pool, owner, "visible-student.pdf")
+	otherFile := insertQATestFileVersion(t, pool, other, "cross-student-secret.pdf")
+	adminFile := insertQATestFileVersion(t, pool, admin, "visible-admin.pdf")
+	studentOwnedFile := insertQATestFileVersion(t, pool, owner, "admin-foreign-secret.pdf")
+	for _, binding := range []struct {
+		message, version uuid.UUID
+		position         int
+		name             string
+	}{
+		{studentMessage, ownerFile, 0, "visible-student.pdf"},
+		{studentMessage, otherFile, 1, "cross-student-secret.pdf"},
+		{adminMessage, adminFile, 0, "visible-admin.pdf"},
+		{adminMessage, studentOwnedFile, 1, "admin-foreign-secret.pdf"},
+	} {
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,$3,$4)`, binding.message, binding.version, binding.position, binding.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, _, err := NewPostgresStore(pool).ListStudentMessages(ctx, owner, threadID, MessageCursor{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].ID != studentMessage || messages[1].ID != adminMessage {
+		t.Fatalf("messages=%#v", messages)
+	}
+	if len(messages[0].Attachments) != 1 || messages[0].Attachments[0].FileVersionID != ownerFile || len(messages[1].Attachments) != 1 || messages[1].Attachments[0].FileVersionID != adminFile {
+		t.Fatalf("attachments=%#v/%#v", messages[0].Attachments, messages[1].Attachments)
+	}
+	dump := fmt.Sprintf("%#v", messages)
+	for _, secret := range []string{"cross student secret", "non-admin sender secret", "cross-student-secret.pdf", "admin-foreign-secret.pdf", otherFile.String(), studentOwnedFile.String()} {
+		if strings.Contains(dump, secret) {
+			t.Fatalf("history leaked %q in %s", secret, dump)
+		}
 	}
 }
 
@@ -200,6 +260,19 @@ func insertQAStudent(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func insertQATestFileVersion(t *testing.T, pool *pgxpool.Pool, creator uuid.UUID, displayName string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	var fileID, versionID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, creator).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,$3,'application/pdf',1,$4,'ready',$5) RETURNING id`, fileID, "qa-test/"+uuid.NewString(), displayName, strings.Repeat("a", 64), creator).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	return versionID
 }
 
 func activeQAAdmin(t *testing.T, pool *pgxpool.Pool) uuid.UUID {

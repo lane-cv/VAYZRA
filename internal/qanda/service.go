@@ -40,10 +40,9 @@ func (s *Service) CreateThread(ctx context.Context, actor Principal, in CreateTh
 	var thread Thread
 	var message Message
 	err = s.uow.WithinTx(ctx, func(store TxStore, audits audit.Writer, notifications NotificationWriter) error {
-		var firstMessage bool
-		thread, message, firstMessage, err = store.FindMessageByIdempotency(ctx, actor.User.ID, in.IdempotencyKey)
+		thread, message, err = store.FindMessageByIdempotency(ctx, actor.User.ID, in.IdempotencyKey)
 		if err == nil {
-			if !firstMessage {
+			if message.Kind != MessageKindInitial {
 				return ErrIdempotencyConflict
 			}
 			return nil
@@ -108,11 +107,11 @@ func (s *Service) GetStudentThread(ctx context.Context, actor Principal, threadI
 	if err != nil {
 		return ThreadDetail{}, err
 	}
-	messages, _, err := s.store.ListStudentMessages(ctx, actor.User.ID, threadID, MessageCursor{Limit: 100})
+	messages, next, err := s.store.ListStudentMessages(ctx, actor.User.ID, threadID, MessageCursor{Limit: 100})
 	if err != nil {
 		return ThreadDetail{}, err
 	}
-	return ThreadDetail{Thread: thread, Messages: messages}, nil
+	return ThreadDetail{Thread: thread, Messages: messages, NextMessageCursor: next}, nil
 }
 
 func (s *Service) ListStudentMessages(ctx context.Context, actor Principal, threadID uuid.UUID, cursor MessageCursor) ([]Message, MessageCursor, error) {
@@ -149,9 +148,9 @@ func (s *Service) AddStudentMessage(ctx context.Context, actor Principal, in Add
 		if err != nil {
 			return err
 		}
-		existingThread, existingMessage, firstMessage, findErr := store.FindMessageByIdempotency(ctx, actor.User.ID, in.IdempotencyKey)
+		existingThread, existingMessage, findErr := store.FindMessageByIdempotency(ctx, actor.User.ID, in.IdempotencyKey)
 		if findErr == nil {
-			if firstMessage || existingThread.ID != in.ThreadID {
+			if existingMessage.Kind != MessageKindStudentFollowUp || existingThread.ID != in.ThreadID {
 				return ErrIdempotencyConflict
 			}
 			thread, message = existingThread, existingMessage

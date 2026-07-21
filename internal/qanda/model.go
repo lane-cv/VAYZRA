@@ -28,6 +28,14 @@ const (
 	StatusCompleted      Status = "completed"
 )
 
+type MessageKind string
+
+const (
+	MessageKindInitial         MessageKind = "initial"
+	MessageKindStudentFollowUp MessageKind = "student_follow_up"
+	MessageKindAdminReply      MessageKind = "admin_reply"
+)
+
 type Action string
 
 const (
@@ -113,14 +121,16 @@ type Attachment struct {
 type Message struct {
 	ID, ThreadID, SenderUserID uuid.UUID
 	SenderRole                 auth.Role
+	Kind                       MessageKind
 	Body                       string
 	CreatedAt                  time.Time
 	Attachments                []Attachment
 }
 
 type ThreadDetail struct {
-	Thread   Thread
-	Messages []Message
+	Thread            Thread
+	Messages          []Message
+	NextMessageCursor MessageCursor
 }
 
 type NotificationIntent struct {

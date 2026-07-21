@@ -15,7 +15,7 @@ type Store interface {
 }
 
 type TxStore interface {
-	FindMessageByIdempotency(context.Context, uuid.UUID, string) (Thread, Message, bool, error)
+	FindMessageByIdempotency(context.Context, uuid.UUID, string) (Thread, Message, error)
 	CreateThreadWithFirstMessage(context.Context, uuid.UUID, CreateThreadInput, time.Time) (Thread, Message, bool, error)
 	LockStudentThread(context.Context, uuid.UUID, uuid.UUID) (Thread, error)
 	AppendStudentMessage(context.Context, Thread, uuid.UUID, AddMessageInput, Status, time.Time) (Thread, Message, error)
