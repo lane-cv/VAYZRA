@@ -138,7 +138,7 @@ func (s *serverAdminQuestions) ListAdminThreads(context.Context, qanda.Principal
 	s.lists++
 	return []qanda.Thread{}, qanda.ThreadCursor{}, nil
 }
-func (*serverAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID) (qanda.AdminThreadDetail, error) {
+func (*serverAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID, qanda.MessageCursor) (qanda.AdminThreadDetail, error) {
 	return qanda.AdminThreadDetail{}, nil
 }
 func (*serverAdminQuestions) AddAdminMessage(context.Context, qanda.Principal, qanda.AddAdminMessageInput) (qanda.Thread, qanda.Message, error) {

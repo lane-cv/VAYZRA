@@ -69,7 +69,7 @@ func (s *appAdminQuestions) ListAdminThreads(context.Context, qanda.Principal, q
 	s.lists++
 	return []qanda.Thread{}, qanda.ThreadCursor{}, nil
 }
-func (*appAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID) (qanda.AdminThreadDetail, error) {
+func (*appAdminQuestions) GetAdminThread(context.Context, qanda.Principal, uuid.UUID, qanda.MessageCursor) (qanda.AdminThreadDetail, error) {
 	return qanda.AdminThreadDetail{}, nil
 }
 func (*appAdminQuestions) AddAdminMessage(context.Context, qanda.Principal, qanda.AddAdminMessageInput) (qanda.Thread, qanda.Message, error) {

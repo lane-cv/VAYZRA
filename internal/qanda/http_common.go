@@ -29,7 +29,7 @@ type StudentHTTPService interface {
 // methods merely because both roles share one concrete PostgreSQL service.
 type AdminHTTPService interface {
 	ListAdminThreads(context.Context, Principal, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error)
-	GetAdminThread(context.Context, Principal, uuid.UUID) (AdminThreadDetail, error)
+	GetAdminThread(context.Context, Principal, uuid.UUID, MessageCursor) (AdminThreadDetail, error)
 	AddAdminMessage(context.Context, Principal, AddAdminMessageInput) (Thread, Message, error)
 	ChangeStatus(context.Context, Principal, ChangeStatusInput) (Thread, error)
 	AddTeacherNote(context.Context, Principal, AddTeacherNoteInput) (TeacherNote, error)

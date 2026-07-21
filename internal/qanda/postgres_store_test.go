@@ -351,7 +351,7 @@ func TestPostgresAdminQueueFiltersStableCursorAndWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	detail, err := svc.GetAdminThread(ctx, adminPrincipal(admin), ids[0])
+	detail, err := svc.GetAdminThread(ctx, adminPrincipal(admin), ids[0], MessageCursor{})
 	if err != nil || len(detail.Notes) != 1 || detail.Notes[0].ID != note.ID {
 		t.Fatalf("detail=%#v err=%v", detail, err)
 	}
@@ -431,6 +431,38 @@ func TestPostgresConcurrentAdminRepliesAppendOnce(t *testing.T) {
 	}
 	if messages != 1 || version != 2 || notifications.count() != 1 {
 		t.Fatalf("messages=%d version=%d notifications=%d", messages, version, notifications.count())
+	}
+}
+
+func TestPostgresAdminDetailContinuesAfterOneHundredMessages(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin, student := activeQAAdmin(t, pool), insertQAStudent(t, pool)
+	base := time.Date(2026, 7, 22, 18, 0, 0, 0, time.UTC)
+	threadID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,version,last_message_at,created_at,updated_at) VALUES($1,$2,'long history','waiting_student',102,$3,$4,$3)`, threadID, student, base.Add(100*time.Second), base); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]uuid.UUID, 101)
+	for i := range want {
+		want[i] = uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'admin','admin_reply',$4,$5,$6)`, want[i], threadID, admin, "answer", uuid.NewString(), base.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := NewService(NewPostgresStore(pool), nil, time.Now)
+	first, err := svc.GetAdminThread(ctx, adminPrincipal(admin), threadID, MessageCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Messages) != 100 || first.Messages[0].ID != want[0] || first.Messages[99].ID != want[99] || first.NextMessageCursor.ID != want[99] {
+		t.Fatalf("first len=%d next=%#v", len(first.Messages), first.NextMessageCursor)
+	}
+	second, err := svc.GetAdminThread(ctx, adminPrincipal(admin), threadID, first.NextMessageCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Messages) != 1 || second.Messages[0].ID != want[100] || second.NextMessageCursor.ID != uuid.Nil {
+		t.Fatalf("second=%#v", second)
 	}
 }
 

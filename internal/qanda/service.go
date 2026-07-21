@@ -210,18 +210,21 @@ func (s *Service) ListAdminThreads(ctx context.Context, actor Principal, filter 
 	return s.store.ListAdminThreads(ctx, filter, cursor)
 }
 
-func (s *Service) GetAdminThread(ctx context.Context, actor Principal, threadID uuid.UUID) (AdminThreadDetail, error) {
+func (s *Service) GetAdminThread(ctx context.Context, actor Principal, threadID uuid.UUID, cursor MessageCursor) (AdminThreadDetail, error) {
 	if err := authorizeAdmin(actor); err != nil {
 		return AdminThreadDetail{}, err
 	}
-	if threadID == uuid.Nil || s.store == nil {
+	if cursor.Limit == 0 {
+		cursor.Limit = 100
+	}
+	if threadID == uuid.Nil || cursor.Limit < 1 || cursor.Limit > 100 || !validMessageCursor(cursor) || s.store == nil {
 		return AdminThreadDetail{}, ErrInvalidInput
 	}
 	thread, err := s.store.GetAdminThread(ctx, threadID)
 	if err != nil {
 		return AdminThreadDetail{}, err
 	}
-	messages, next, err := s.store.ListAdminMessages(ctx, threadID, MessageCursor{Limit: 100})
+	messages, next, err := s.store.ListAdminMessages(ctx, threadID, cursor)
 	if err != nil {
 		return AdminThreadDetail{}, err
 	}

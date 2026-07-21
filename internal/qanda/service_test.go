@@ -189,6 +189,32 @@ func TestGetStudentThreadReturnsMessageContinuationCursor(t *testing.T) {
 	}
 }
 
+func TestGetAdminThreadUsesRequestedMessagePage(t *testing.T) {
+	adminID, studentID := uuid.New(), uuid.New()
+	thread := Thread{ID: uuid.New(), StudentID: studentID, Status: StatusPending}
+	messages := make([]Message, 101)
+	base := time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC)
+	for i := range messages {
+		messages[i] = Message{ID: uuid.New(), ThreadID: thread.ID, CreatedAt: base.Add(time.Duration(i) * time.Second)}
+	}
+	store := &detailCursorStore{thread: thread, messages: messages}
+	svc := NewService(store, nil, time.Now)
+	first, err := svc.GetAdminThread(context.Background(), adminPrincipal(adminID), thread.ID, MessageCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Messages) != 100 || first.NextMessageCursor.ID != messages[99].ID {
+		t.Fatalf("first=%d next=%#v", len(first.Messages), first.NextMessageCursor)
+	}
+	second, err := svc.GetAdminThread(context.Background(), adminPrincipal(adminID), thread.ID, first.NextMessageCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Messages) != 1 || second.Messages[0].ID != messages[100].ID || second.NextMessageCursor.ID != uuid.Nil {
+		t.Fatalf("second=%#v", second)
+	}
+}
+
 type detailCursorStore struct {
 	thread   Thread
 	messages []Message
@@ -231,14 +257,20 @@ func (s *detailCursorStore) ListStudentMessages(_ context.Context, studentID, th
 func (*detailCursorStore) ListAdminThreads(context.Context, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error) {
 	return nil, ThreadCursor{}, nil
 }
-func (*detailCursorStore) GetAdminThread(context.Context, uuid.UUID) (Thread, error) {
-	return Thread{}, ErrNotFound
+func (s *detailCursorStore) GetAdminThread(_ context.Context, id uuid.UUID) (Thread, error) {
+	if s.thread.ID != id {
+		return Thread{}, ErrNotFound
+	}
+	return s.thread, nil
 }
-func (*detailCursorStore) ListAdminMessages(context.Context, uuid.UUID, MessageCursor) ([]Message, MessageCursor, error) {
-	return nil, MessageCursor{}, ErrNotFound
+func (s *detailCursorStore) ListAdminMessages(_ context.Context, id uuid.UUID, cursor MessageCursor) ([]Message, MessageCursor, error) {
+	return s.ListStudentMessages(context.Background(), s.thread.StudentID, id, cursor)
 }
-func (*detailCursorStore) ListTeacherNotes(context.Context, uuid.UUID) ([]TeacherNote, error) {
-	return nil, ErrNotFound
+func (s *detailCursorStore) ListTeacherNotes(_ context.Context, id uuid.UUID) ([]TeacherNote, error) {
+	if s.thread.ID != id {
+		return nil, ErrNotFound
+	}
+	return []TeacherNote{}, nil
 }
 
 func withCreateTitle(in CreateThreadInput, value string) CreateThreadInput {

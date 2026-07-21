@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -133,11 +134,29 @@ func (h *AdminHandler) Get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	query, ok := qandaQuery(w, r, "cursor", "limit")
+	if !ok {
+		return
+	}
+	limit, ok := qandaAdminMessageLimit(w, r, query)
+	if !ok {
+		return
+	}
+	cursorRaw, _, ok := qandaSingleQuery(w, r, query, "cursor")
+	if !ok {
+		return
+	}
+	cursor, err := decodeMessageCursor(cursorRaw, h.now())
+	if err != nil {
+		qandaBad(w, r)
+		return
+	}
+	cursor.Limit = limit
 	actor, ok := h.actor(w, r)
 	if !ok {
 		return
 	}
-	d, err := h.service.GetAdminThread(r.Context(), actor, id)
+	d, err := h.service.GetAdminThread(r.Context(), actor, id, cursor)
 	if err != nil {
 		qandaError(w, r, err)
 		return
@@ -166,6 +185,9 @@ func (h *AdminHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) AddMessage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := qandaQuery(w, r); !ok {
+		return
+	}
 	id, ok := qandaRouteID(w, r)
 	if !ok {
 		return
@@ -178,7 +200,7 @@ func (h *AdminHandler) AddMessage(w http.ResponseWriter, r *http.Request) {
 	if !decodeQANDAJSON(w, r, &body) {
 		return
 	}
-	key, ok := qandaIdempotencyKey(w, r)
+	key, ok := qandaAdminIdempotencyKey(w, r)
 	if !ok {
 		return
 	}
@@ -207,6 +229,9 @@ func (h *AdminHandler) AddMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) ChangeStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := qandaQuery(w, r); !ok {
+		return
+	}
 	id, ok := qandaRouteID(w, r)
 	if !ok {
 		return
@@ -232,6 +257,9 @@ func (h *AdminHandler) ChangeStatus(w http.ResponseWriter, r *http.Request) {
 	}{adminThreadView(thread)})
 }
 func (h *AdminHandler) AddNote(w http.ResponseWriter, r *http.Request) {
+	if _, ok := qandaQuery(w, r); !ok {
+		return
+	}
 	id, ok := qandaRouteID(w, r)
 	if !ok {
 		return
@@ -280,4 +308,33 @@ func adminDateQuery(w http.ResponseWriter, r *http.Request, q map[string][]strin
 		return time.Time{}, false
 	}
 	return at.UTC(), true
+}
+
+func qandaAdminMessageLimit(w http.ResponseWriter, r *http.Request, query map[string][]string) (int, bool) {
+	raw, present, ok := qandaSingleQuery(w, r, query, "limit")
+	if !ok {
+		return 0, false
+	}
+	if !present {
+		return 100, true
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 || limit > 100 {
+		qandaBad(w, r)
+		return 0, false
+	}
+	return limit, true
+}
+
+func qandaAdminIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	values := r.Header.Values("Idempotency-Key")
+	if len(values) == 0 {
+		httpx.Error(w, r, http.StatusBadRequest, "idempotency_key_required", "缺少幂等键")
+		return "", false
+	}
+	if len(values) != 1 || !validIdempotencyKey(values[0]) {
+		httpx.Error(w, r, http.StatusBadRequest, "invalid_idempotency_key", "幂等键无效")
+		return "", false
+	}
+	return values[0], true
 }
