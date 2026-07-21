@@ -15,6 +15,7 @@ import (
 
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/config"
+	"happylearn.local/app/internal/qanda"
 )
 
 func TestBuildApplicationWiresAuthRoutesAndConfiguredSecurity(t *testing.T) {
@@ -84,6 +85,56 @@ func TestBuildApplicationForwardsTrustedProxyCIDRs(t *testing.T) {
 	if w.Code != http.StatusOK || svc.loginInput.IP == nil || svc.loginInput.IP.String() != "198.51.100.4" {
 		t.Fatalf("status=%d input=%#v body=%s", w.Code, svc.loginInput, w.Body.String())
 	}
+}
+
+func TestBuildApplicationWiresStudentQuestionRoutes(t *testing.T) {
+	questions := &serverStudentQuestions{}
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:         func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate:      func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth:      func(*pgxpool.Pool) (auth.HTTPService, error) { return serverStudentAuth{}, nil },
+		newQuestions: func(*pgxpool.Pool) qanda.HTTPServices { return qanda.HTTPServices{Student: questions} },
+		ready:        func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		close:        func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeResources)
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/student/questions", nil)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || questions.lists != 1 {
+		t.Fatalf("status=%d lists=%d body=%s", w.Code, questions.lists, w.Body.String())
+	}
+}
+
+type serverStudentAuth struct{ serverFakeAuth }
+
+func (serverStudentAuth) Authenticate(context.Context, string) (auth.Authentication, error) {
+	return auth.Authentication{User: auth.User{ID: studentHTTPServerUser, Role: auth.RoleStudent, Status: auth.StatusActive}}, nil
+}
+
+var studentHTTPServerUser = uuid.MustParse("50000000-0000-4000-8000-000000000005")
+
+type serverStudentQuestions struct{ lists int }
+
+func (*serverStudentQuestions) CreateThread(context.Context, qanda.Principal, qanda.CreateThreadInput) (qanda.Thread, qanda.Message, error) {
+	return qanda.Thread{}, qanda.Message{}, nil
+}
+func (s *serverStudentQuestions) ListStudentThreads(context.Context, qanda.Principal, qanda.Status, qanda.ThreadCursor) ([]qanda.Thread, qanda.ThreadCursor, error) {
+	s.lists++
+	return []qanda.Thread{}, qanda.ThreadCursor{}, nil
+}
+func (*serverStudentQuestions) GetStudentThread(context.Context, qanda.Principal, uuid.UUID) (qanda.ThreadDetail, error) {
+	return qanda.ThreadDetail{}, nil
+}
+func (*serverStudentQuestions) ListStudentMessages(context.Context, qanda.Principal, uuid.UUID, qanda.MessageCursor) ([]qanda.Message, qanda.MessageCursor, error) {
+	return nil, qanda.MessageCursor{}, nil
+}
+func (*serverStudentQuestions) AddStudentMessage(context.Context, qanda.Principal, qanda.AddMessageInput) (qanda.Thread, qanda.Message, error) {
+	return qanda.Thread{}, qanda.Message{}, nil
 }
 
 func TestBuildApplicationClosesPoolAndHidesMigrationFailure(t *testing.T) {
