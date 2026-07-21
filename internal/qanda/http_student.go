@@ -47,6 +47,12 @@ func (h *StudentHandler) Routes() http.Handler {
 	r.Get("/{id}", h.Get)
 	r.Get("/{id}/messages", h.ListMessages)
 	r.Post("/{id}/messages", h.AddMessage)
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不被允许")
+	})
 	return r
 }
 
@@ -55,7 +61,7 @@ func (h *StudentHandler) List(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	statusRaw, ok := qandaSingleQuery(w, r, query, "status")
+	statusRaw, _, ok := qandaSingleQuery(w, r, query, "status")
 	if !ok || !validStatusFilter(Status(statusRaw)) {
 		if ok {
 			qandaBad(w, r)
@@ -66,7 +72,7 @@ func (h *StudentHandler) List(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	cursorRaw, ok := qandaSingleQuery(w, r, query, "cursor")
+	cursorRaw, _, ok := qandaSingleQuery(w, r, query, "cursor")
 	if !ok {
 		return
 	}
@@ -168,7 +174,7 @@ func (h *StudentHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	cursorRaw, ok := qandaSingleQuery(w, r, query, "cursor")
+	cursorRaw, _, ok := qandaSingleQuery(w, r, query, "cursor")
 	if !ok {
 		return
 	}
@@ -288,19 +294,23 @@ func decodeQANDAJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			httpx.Error(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "请求内容过大")
-		} else {
-			qandaBad(w, r)
-		}
+		qandaJSONDecodeError(w, r, err)
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		qandaBad(w, r)
+		qandaJSONDecodeError(w, r, err)
 		return false
 	}
 	return true
+}
+
+func qandaJSONDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		httpx.Error(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "请求内容过大")
+		return
+	}
+	qandaBad(w, r)
 }
 
 func qandaIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -341,24 +351,24 @@ func qandaQuery(w http.ResponseWriter, r *http.Request, allowed ...string) (url.
 	return query, true
 }
 
-func qandaSingleQuery(w http.ResponseWriter, r *http.Request, query url.Values, key string) (string, bool) {
-	values := query[key]
-	if len(values) == 0 {
-		return "", true
+func qandaSingleQuery(w http.ResponseWriter, r *http.Request, query url.Values, key string) (string, bool, bool) {
+	values, present := query[key]
+	if !present {
+		return "", false, true
 	}
-	if len(values) != 1 {
+	if len(values) != 1 || values[0] == "" {
 		qandaBad(w, r)
-		return "", false
+		return "", true, false
 	}
-	return values[0], true
+	return values[0], true, true
 }
 
 func qandaLimit(w http.ResponseWriter, r *http.Request, query url.Values) (int, bool) {
-	raw, ok := qandaSingleQuery(w, r, query, "limit")
+	raw, present, ok := qandaSingleQuery(w, r, query, "limit")
 	if !ok {
 		return 0, false
 	}
-	if raw == "" {
+	if !present {
 		return 0, true
 	}
 	limit, err := strconv.Atoi(raw)

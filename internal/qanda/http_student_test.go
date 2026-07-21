@@ -80,6 +80,7 @@ func TestStudentHTTPCreateStrictJSONAndIdempotencyContract(t *testing.T) {
 		{name: "unknown field", body: `{"title":"Question","body":"Please help","unknown":true}`, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "two objects", body: validBody + `{}`, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "body cap", body: `{"title":"Question","body":"` + strings.Repeat("x", 64*1024) + `"}`, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "request_too_large"},
+		{name: "body cap after valid object", body: validBody + strings.Repeat(" ", 64*1024), contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "request_too_large"},
 		{name: "missing idempotency", body: validBody, contentType: []string{"application/json"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "duplicate idempotency", body: validBody, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef", "fedcba0987654321"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "valid", body: validBody, contentType: []string{"application/json; charset=utf-8"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusCreated},
@@ -128,6 +129,9 @@ func TestStudentHTTPListValidatesFiltersLimitsAndCanonicalCursor(t *testing.T) {
 		{"valid", "?status=waiting_student&limit=50&cursor=" + validCursor, http.StatusOK},
 		{"invalid status", "?status=unknown", http.StatusBadRequest},
 		{"duplicate status", "?status=pending&status=completed", http.StatusBadRequest},
+		{"empty status", "?status=", http.StatusBadRequest},
+		{"empty cursor", "?cursor=", http.StatusBadRequest},
+		{"empty limit", "?limit=", http.StatusBadRequest},
 		{"zero limit", "?limit=0", http.StatusBadRequest},
 		{"high limit", "?limit=51", http.StatusBadRequest},
 		{"unknown query", "?studentId=" + studentHTTPUserID.String(), http.StatusBadRequest},
@@ -183,6 +187,8 @@ func TestStudentHTTPMessagesAndPathValidation(t *testing.T) {
 		{"malformed thread", "/not-a-uuid/messages", http.StatusBadRequest},
 		{"zero thread", "/00000000-0000-0000-0000-000000000000/messages", http.StatusBadRequest},
 		{"high limit", "/" + studentHTTPThread.String() + "/messages?limit=51", http.StatusBadRequest},
+		{"empty cursor", "/" + studentHTTPThread.String() + "/messages?cursor=", http.StatusBadRequest},
+		{"empty limit", "/" + studentHTTPThread.String() + "/messages?limit=", http.StatusBadRequest},
 		{"duplicate cursor", "/" + studentHTTPThread.String() + "/messages?cursor=" + validCursor + "&cursor=" + validCursor, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -194,6 +200,27 @@ func TestStudentHTTPMessagesAndPathValidation(t *testing.T) {
 			}
 			if tc.wantStatus == http.StatusOK && (svc.messageAfter.ID != studentHTTPMessage || svc.messageAfter.Limit != 50) {
 				t.Fatalf("cursor=%#v", svc.messageAfter)
+			}
+		})
+	}
+}
+
+func TestStudentHTTPRouterErrorsUseStableJSONContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, code string
+		status                   int
+	}{
+		{"unknown path", http.MethodGet, "/unknown/path", "not_found", http.StatusNotFound},
+		{"unsupported method", http.MethodPut, "/" + studentHTTPThread.String(), "method_not_allowed", http.StatusMethodNotAllowed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			studentHTTPHandler(&fakeStudentHTTPService{}).ServeHTTP(w, studentHTTPRequest(tc.method, tc.path, "", auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive}))
+			if w.Code != tc.status || !strings.Contains(w.Body.String(), `"code":"`+tc.code+`"`) || !strings.Contains(w.Body.String(), `"requestId":"request-test-1"`) {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if w.Header().Get("Cache-Control") != "no-store, private" || w.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+				t.Fatalf("cache=%q content-type=%q", w.Header().Get("Cache-Control"), w.Header().Get("Content-Type"))
 			}
 		})
 	}
