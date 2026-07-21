@@ -20,3 +20,11 @@ type UploadStore interface {
 	ConfirmCleanup(context.Context, uuid.UUID) (UploadSession, error)
 	FinishCleanup(context.Context, uuid.UUID) error
 }
+type AccessStore interface {
+	ResolveAccess(context.Context, uuid.UUID, uuid.UUID, AccessAction) (Delivery, error)
+	WriteAccessLog(context.Context, AccessLog) error
+}
+
+type BindingStore interface {
+	ReplaceDraftBindings(context.Context, Principal, uuid.UUID, int64, []DraftBindingInput) ([]DraftBinding, error)
+}

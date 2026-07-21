@@ -7,8 +7,30 @@ import (
 	"github.com/google/uuid"
 )
 
-func (s *PostgresStore) PublicationBlockers(context.Context, uuid.UUID, int64) ([]string, error) {
-	return nil, nil
+func (s *PostgresStore) PublicationBlockers(ctx context.Context, lessonID uuid.UUID, sourceVersion int64) ([]string, error) {
+	rows, err := s.q.Query(ctx, `
+SELECT blocker FROM (
+ SELECT 'draft_changed' blocker WHERE NOT EXISTS(SELECT 1 FROM lesson_drafts WHERE lesson_id=$1 AND lock_version=$2)
+ UNION ALL
+ SELECT 'file_not_ready' FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN files f ON f.id=fv.file_id
+ WHERE b.lesson_id=$1 AND (fv.processing_state<>'ready' OR f.deleted_at IS NOT NULL)
+ UNION ALL
+ SELECT 'preview_not_ready' FROM lesson_draft_files b WHERE b.lesson_id=$1 AND b.access_policy='preview' AND NOT EXISTS(
+  SELECT 1 FROM file_previews fp WHERE fp.file_version_id=b.file_version_id AND fp.processing_state='ready')
+) blockers ORDER BY blocker`, lessonID, sourceVersion)
+	if err != nil {
+		return nil, mapTeachingError(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, mapTeachingError(err)
+		}
+		out = append(out, v)
+	}
+	return out, mapTeachingError(rows.Err())
 }
 
 func (s *PostgresStore) LockAudienceUsersForPublication(ctx context.Context, ids []uuid.UUID) error {

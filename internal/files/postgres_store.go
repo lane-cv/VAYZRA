@@ -352,3 +352,105 @@ func mapStoreError(err error) error {
 }
 
 var _ UploadStore = (*PostgresStore)(nil)
+
+func (s *PostgresStore) ResolveAccess(ctx context.Context, actorID, requestedID uuid.UUID, action AccessAction) (Delivery, error) {
+	var d Delivery
+	err := s.pool.QueryRow(ctx, `
+SELECT fv.id,r.id,
+ CASE WHEN $3='preview' THEN fp.object_key ELSE fv.object_key END,
+ b.display_name,
+ CASE WHEN $3='preview' THEN fp.content_type ELSE 'application/octet-stream' END,
+ CASE WHEN $3='preview' THEN fp.size_bytes ELSE fv.size_bytes END,
+ b.access_policy,
+ ($3='preview')
+FROM users u
+JOIN lessons l ON l.archived_at IS NULL
+JOIN chapters c ON c.id=l.chapter_id AND c.archived_at IS NULL
+JOIN subjects sub ON sub.id=c.subject_id AND sub.archived_at IS NULL
+JOIN terms term ON term.id=sub.term_id AND term.archived_at IS NULL
+JOIN grades grade ON grade.id=term.grade_id AND grade.archived_at IS NULL
+JOIN lesson_revisions r ON r.id=l.published_revision_id
+JOIN lesson_revision_finalizations rf ON rf.revision_id=r.id AND rf.lesson_id=l.id
+JOIN lesson_revision_audiences ra ON ra.revision_id=r.id
+JOIN lesson_revision_files b ON b.revision_id=r.id AND b.file_version_id=$2
+JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready'
+JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
+LEFT JOIN LATERAL (
+ SELECT object_key,content_type,size_bytes FROM file_previews
+ WHERE file_version_id=fv.id AND processing_state='ready'
+ ORDER BY CASE preview_kind WHEN 'pdf' THEN 1 WHEN 'page' THEN 2 WHEN 'poster' THEN 3 ELSE 4 END,id LIMIT 1
+) fp ON true
+WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
+ AND (ra.mode='all' OR EXISTS(SELECT 1 FROM lesson_revision_audience_users x WHERE x.revision_id=r.id AND x.user_id=$1))
+ AND ($3<>'download' OR b.access_policy='download')
+ AND ($3<>'preview' OR fp.object_key IS NOT NULL)`, actorID, requestedID, action).Scan(
+		&d.VersionID, &d.RevisionID, &d.ObjectKey, &d.DisplayName, &d.ContentType, &d.Size, &d.Policy, &d.Preview)
+	if err != nil {
+		return Delivery{}, mapStoreError(err)
+	}
+	// Processing Task will set a trusted browser-playable field. Never infer it from declared MIME.
+	d.Playable = false
+	return d, nil
+}
+
+func (s *PostgresStore) WriteAccessLog(ctx context.Context, l AccessLog) error {
+	var resolved, revision any
+	if l.VersionID != uuid.Nil {
+		resolved = l.VersionID
+	}
+	if l.RevisionID != uuid.Nil {
+		revision = l.RevisionID
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO file_access_logs
+ (actor_user_id,file_version_id,lesson_revision_id,access_policy,request_id,range_start,range_end,requested_file_version_id,result,reason_code,ip,playback_session_hash)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
+		l.ActorUserID, resolved, revision, l.Action, l.RequestID, l.RangeStart, l.RangeEnd, l.RequestedVersionID, l.Result, l.Reason, l.IP, l.PlaybackSessionHash)
+	return err
+}
+
+func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principal, lessonID uuid.UUID, expected int64, inputs []DraftBindingInput) ([]DraftBinding, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.Background())
+	var version int64
+	if err = tx.QueryRow(ctx, `SELECT lock_version FROM lesson_drafts WHERE lesson_id=$1 FOR UPDATE`, lessonID).Scan(&version); err != nil {
+		return nil, mapStoreError(err)
+	}
+	if version != expected {
+		return nil, ErrUploadConflict
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM lesson_draft_files WHERE lesson_id=$1`, lessonID); err != nil {
+		return nil, err
+	}
+	out := make([]DraftBinding, 0, len(inputs))
+	for _, in := range inputs {
+		var exists bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=$1 AND f.deleted_at IS NULL)`, in.FileVersionID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrNotFound
+		}
+		b := DraftBinding{ID: uuid.New(), LessonID: lessonID, DraftBindingInput: in}
+		_, err = tx.Exec(ctx, `INSERT INTO lesson_draft_files(id,lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,$3,$4,$5,$6,$7)`, b.ID, lessonID, in.FileVersionID, in.Policy, in.SortPosition, in.DisplayName, in.Description)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE lesson_drafts SET lock_version=lock_version+1,updated_at=now() WHERE lesson_id=$1`, lessonID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,metadata,request_id,ip) VALUES($1,'file.policy_changed','lesson',$2,'{}'::jsonb,$3,$4)`, actor.User.ID, lessonID.String(), actor.RequestID, actor.IP); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+var _ AccessStore = (*PostgresStore)(nil)
+var _ BindingStore = (*PostgresStore)(nil)

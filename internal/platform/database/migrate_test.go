@@ -87,3 +87,25 @@ func TestTeachingMigrationCreatesCatalogSchema(t *testing.T) {
 		t.Fatalf("teaching table count=%d err=%v", count, err)
 	}
 }
+func TestSecureFileAccessMigration(t *testing.T) {
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(context.Background(), pool); err != nil {
+		t.Fatal(err)
+	}
+	var applied bool
+	if err := pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=6 AND is_applied)`).Scan(&applied); err != nil || !applied {
+		t.Fatalf("migration applied=%t err=%v", applied, err)
+	}
+	var columns int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND ((table_name='lesson_draft_files' AND column_name IN ('display_name','description')) OR (table_name='lesson_revision_files' AND column_name IN ('display_name','description')) OR (table_name='file_access_logs' AND column_name IN ('requested_file_version_id','result','reason_code','ip','playback_session_hash')))`).Scan(&columns); err != nil || columns != 9 {
+		t.Fatalf("columns=%d err=%v", columns, err)
+	}
+	var triggerFunction string
+	if err := pool.QueryRow(context.Background(), `SELECT p.proname FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid WHERE t.tgname='lesson_revision_files_insert_immutable' AND NOT t.tgisinternal`).Scan(&triggerFunction); err != nil || triggerFunction != "reject_finalized_lesson_revision_child_mutation" {
+		t.Fatalf("trigger function=%q err=%v", triggerFunction, err)
+	}
+	var sampleIndex bool
+	if err := pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='file_access_logs_playback_sample_key')`).Scan(&sampleIndex); err != nil || !sampleIndex {
+		t.Fatalf("sample index=%t err=%v", sampleIndex, err)
+	}
+}

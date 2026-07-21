@@ -17,6 +17,13 @@ import (
 
 const defaultOperationTimeout = 30 * time.Second
 
+const (
+	minDownloadBytesPerSecond    int64 = 64 * 1024
+	minimumObjectTransferTimeout       = 5 * time.Minute
+	maximumObjectTransferTimeout       = 3 * time.Hour
+	objectTransferOverhead             = 2 * time.Minute
+)
+
 type MinIOConfig struct {
 	Endpoint         string
 	AccessKey        string
@@ -291,25 +298,97 @@ func (s *MinIOStore) Get(ctx context.Context, key string, byteRange *ByteRange) 
 	if byteRange != nil && (byteRange.Offset < 0 || byteRange.Length <= 0 || byteRange.Offset > int64(^uint64(0)>>1)-byteRange.Length+1) {
 		return nil, ObjectInfo{}, fmt.Errorf("get object: %w", ErrConflict)
 	}
-	opCtx, cancel := context.WithTimeout(ctx, s.operationTimeout)
-	stat, err := s.core.StatObject(opCtx, s.bucket, key, minio.StatObjectOptions{})
+	statCtx, statCancel := context.WithTimeout(ctx, s.operationTimeout)
+	stat, err := s.core.StatObject(statCtx, s.bucket, key, minio.StatObjectOptions{})
+	statCancel()
 	if err != nil {
-		cancel()
 		return nil, ObjectInfo{}, fmt.Errorf("get object: %w", mapMinIOError(err))
 	}
 	opts := minio.GetObjectOptions{}
+	transferSize := stat.Size
 	if byteRange != nil {
 		if err := opts.SetRange(byteRange.Offset, byteRange.Offset+byteRange.Length-1); err != nil {
-			cancel()
 			return nil, ObjectInfo{}, fmt.Errorf("get object: %w", ErrConflict)
 		}
+		transferSize = byteRange.Length
 	}
-	reader, _, _, err := s.core.GetObject(opCtx, s.bucket, key, opts)
+	transferCtx, transferCancel := newObjectTransferContext(ctx, transferSize)
+	reader, err := establishObjectReader(transferCtx, s.operationTimeout, func(getCtx context.Context) (io.ReadCloser, error) {
+		reader, _, _, err := s.core.GetObject(getCtx, s.bucket, key, opts)
+		return reader, err
+	})
 	if err != nil {
-		cancel()
+		transferCancel()
 		return nil, ObjectInfo{}, fmt.Errorf("get object: %w", mapMinIOError(err))
 	}
-	return &cancelReadCloser{ReadCloser: reader, cancel: cancel}, objectInfo(stat), nil
+	return &cancelReadCloser{ReadCloser: reader, cancel: transferCancel}, objectInfo(stat), nil
+}
+
+func establishObjectReader(ctx context.Context, timeout time.Duration, get func(context.Context) (io.ReadCloser, error)) (io.ReadCloser, error) {
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	type getResult struct {
+		reader io.ReadCloser
+		err    error
+	}
+	result := make(chan getResult)
+	go func() {
+		reader, err := get(attemptCtx)
+		got := getResult{reader: reader, err: err}
+		select {
+		case result <- got:
+		case <-attemptCtx.Done():
+			if reader != nil {
+				_ = reader.Close()
+			}
+		}
+	}()
+	establishment := time.NewTimer(timeout)
+	defer establishment.Stop()
+	select {
+	case got := <-result:
+		if got.err != nil || ctx.Err() != nil || got.reader == nil {
+			attemptCancel()
+			if got.reader != nil {
+				_ = got.reader.Close()
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if got.err != nil {
+				return nil, got.err
+			}
+			return nil, ErrUnavailable
+		}
+		return &cancelReadCloser{ReadCloser: got.reader, cancel: attemptCancel}, nil
+	case <-establishment.C:
+		attemptCancel()
+		return nil, ErrUnavailable
+	case <-ctx.Done():
+		attemptCancel()
+		return nil, ctx.Err()
+	}
+}
+
+func objectTransferTimeout(size int64) time.Duration {
+	if size < 1 {
+		return minimumObjectTransferTimeout
+	}
+	seconds := size / minDownloadBytesPerSecond
+	if size%minDownloadBytesPerSecond != 0 {
+		seconds++
+	}
+	timeout := time.Duration(seconds)*time.Second + objectTransferOverhead
+	if timeout < minimumObjectTransferTimeout {
+		return minimumObjectTransferTimeout
+	}
+	if timeout > maximumObjectTransferTimeout {
+		return maximumObjectTransferTimeout
+	}
+	return timeout
+}
+
+func newObjectTransferContext(parent context.Context, size int64) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, objectTransferTimeout(size))
 }
 
 func (s *MinIOStore) Put(ctx context.Context, key string, reader io.Reader, size int64, meta ObjectMeta) (ObjectInfo, error) {

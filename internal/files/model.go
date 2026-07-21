@@ -1,6 +1,7 @@
 package files
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ var (
 	ErrUploadIncomplete    = errors.New("upload incomplete")
 	ErrPartHashMismatch    = errors.New("upload part hash mismatch")
 	ErrFinalHashMismatch   = errors.New("upload final hash mismatch")
+	ErrRangeNotSatisfiable = errors.New("range not satisfiable")
 )
 
 type UploadState string
@@ -104,4 +106,92 @@ type CompletedUpload struct {
 	FileID          uuid.UUID `json:"fileId"`
 	FileVersionID   uuid.UUID `json:"fileVersionId"`
 	ProcessingState string    `json:"processingState"`
+}
+type AccessPolicy string
+
+const (
+	PolicyPreview  AccessPolicy = "preview"
+	PolicyDownload AccessPolicy = "download"
+)
+
+type AccessAction string
+
+const (
+	ActionPreview  AccessAction = "preview"
+	ActionDownload AccessAction = "download"
+)
+
+type AccessResult string
+
+const (
+	AccessAllowed   AccessResult = "allow"
+	AccessDenied    AccessResult = "deny"
+	AccessMalformed AccessResult = "malformed"
+	AccessFailed    AccessResult = "fail"
+)
+
+type DraftBindingInput struct {
+	FileVersionID uuid.UUID    `json:"fileVersionId"`
+	Policy        AccessPolicy `json:"policy"`
+	DisplayName   string       `json:"displayName"`
+	Description   string       `json:"description"`
+	SortPosition  int64        `json:"sortPosition"`
+}
+
+type DraftBinding struct {
+	ID       uuid.UUID `json:"id"`
+	LessonID uuid.UUID `json:"lessonId"`
+	DraftBindingInput
+}
+
+type Delivery struct {
+	VersionID   uuid.UUID
+	RevisionID  uuid.UUID
+	ObjectKey   string
+	DisplayName string
+	ContentType string
+	Size        int64
+	Policy      AccessPolicy
+	Playable    bool
+	Preview     bool
+}
+
+type AccessLog struct {
+	ActorUserID         uuid.UUID
+	RequestedVersionID  uuid.UUID
+	VersionID           uuid.UUID
+	RevisionID          uuid.UUID
+	Action              AccessAction
+	Result              AccessResult
+	Reason              string
+	RequestID           string
+	IP                  net.IP
+	RangeStart          *int64
+	RangeEnd            *int64
+	PlaybackSessionHash string
+}
+
+type OpenInput struct {
+	VersionID       uuid.UUID
+	Action          AccessAction
+	Range           string
+	PlaybackSession string
+}
+
+type RangeError struct{ Size int64 }
+
+func (e *RangeError) Error() string { return ErrRangeNotSatisfiable.Error() }
+func (e *RangeError) Unwrap() error { return ErrRangeNotSatisfiable }
+
+type ResponseRange struct{ Start, End, Total int64 }
+
+type OpenedFile struct {
+	Body          io.ReadCloser
+	DisplayName   string
+	ContentType   string
+	Size          int64
+	Partial       bool
+	Range         ResponseRange
+	Playable      bool
+	ReportFailure func(context.Context, string) error
 }

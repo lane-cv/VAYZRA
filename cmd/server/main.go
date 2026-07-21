@@ -77,6 +77,8 @@ type applicationDependencies struct {
 	newStudents        func(*pgxpool.Pool) students.HTTPService
 	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
 	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
+	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	ready              func(*pgxpool.Pool) func(context.Context) error
@@ -96,6 +98,8 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newStudents:        newProductionStudentService,
 		newTeaching:        newProductionTeachingService,
 		newUploads:         newProductionUploadService,
+		newFileAccess:      newProductionFileAccessService,
+		newFileBindings:    newProductionFileBindingService,
 		startUploadCleanup: files.StartCleanupRunner,
 		newStudentTeaching: newProductionStudentTeachingService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
@@ -152,6 +156,18 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newStudentTeaching != nil {
 		studentTeachingService = deps.newStudentTeaching(pool)
 	}
+	var fileAccessService files.AccessHTTPService
+	if deps.newFileAccess != nil {
+		fileAccessService, err = deps.newFileAccess(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize file access service")
+		}
+	}
+	var fileBindingService files.BindingHTTPService
+	if deps.newFileBindings != nil {
+		fileBindingService = deps.newFileBindings(pool)
+	}
 	ready := deps.ready(pool)
 	if ready == nil {
 		closePool()
@@ -199,6 +215,8 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Students:          studentService,
 		Teaching:          teachingService,
 		Uploads:           uploadService,
+		FileAccess:        fileAccessService,
+		FileBindings:      fileBindingService,
 		StudentTeaching:   studentTeachingService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
@@ -227,7 +245,7 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 }
 
 func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService {
-	return teaching.NewService(teaching.NewPostgresStore(pool), nil, time.Now)
+	return teaching.NewService(teaching.NewPostgresStore(pool), files.NewReadinessChecker(), time.Now)
 }
 
 func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
@@ -241,6 +259,21 @@ func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg con
 	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, time.Now), nil
 }
 
+func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.AccessHTTPService, error) {
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+	})
+	if err != nil {
+		return nil, err
+	}
+	store := files.NewPostgresStore(pool)
+	return files.NewAccessService(store, stores.Originals, stores.Previews), nil
+}
+
+func newProductionFileBindingService(pool *pgxpool.Pool) files.BindingHTTPService {
+	return files.NewBindingService(files.NewPostgresStore(pool))
+}
 func newProductionStudentTeachingService(pool *pgxpool.Pool) teaching.StudentHTTPService {
 	return teaching.NewStudentService(teaching.NewPostgresStore(pool), time.Now)
 }
