@@ -19,14 +19,14 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore { return &PostgresStore
 
 func (s *PostgresStore) CreateSession(ctx context.Context, u UploadSession) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO upload_sessions
-        (id,actor_user_id,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		u.ID, u.ActorUserID, u.ObjectKey, u.MinIOUploadID, u.DisplayName, u.DeclaredMIME, u.ExpectedSize, u.ExpectedSHA256, u.State, u.ExpiresAt, u.CreatedAt)
+		(id,actor_user_id,purpose,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at,created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		u.ID, u.ActorUserID, u.Purpose, u.ObjectKey, u.MinIOUploadID, u.DisplayName, u.DeclaredMIME, u.ExpectedSize, u.ExpectedSHA256, u.State, u.ExpiresAt, u.CreatedAt)
 	return err
 }
 
-func (s *PostgresStore) GetSession(ctx context.Context, id, actor uuid.UUID) (UploadSession, []UploadPart, error) {
-	u, err := scanSession(s.pool.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2`, id, actor))
+func (s *PostgresStore) GetSession(ctx context.Context, id, actor uuid.UUID, purpose UploadPurpose) (UploadSession, []UploadPart, error) {
+	u, err := scanSession(s.pool.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 AND purpose=$3`, id, actor, purpose))
 	if err != nil {
 		return UploadSession{}, nil, mapStoreError(err)
 	}
@@ -34,13 +34,13 @@ func (s *PostgresStore) GetSession(ctx context.Context, id, actor uuid.UUID) (Up
 	return u, parts, err
 }
 
-func (s *PostgresStore) AdmitPart(ctx context.Context, id, actor uuid.UUID, number int, size int64, hash string, now time.Time) (UploadSession, *UploadPart, error) {
+func (s *PostgresStore) AdmitPart(ctx context.Context, id, actor uuid.UUID, purpose UploadPurpose, number int, size int64, hash string, now time.Time) (UploadSession, *UploadPart, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return UploadSession{}, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 FOR UPDATE`, id, actor))
+	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 AND purpose=$3 FOR UPDATE`, id, actor, purpose))
 	if err != nil {
 		return UploadSession{}, nil, mapStoreError(err)
 	}
@@ -100,13 +100,13 @@ func (s *PostgresStore) RecordPart(ctx context.Context, id uuid.UUID, p UploadPa
 	return stored, nil
 }
 
-func (s *PostgresStore) BeginCompletion(ctx context.Context, id, actor uuid.UUID, now time.Time) (UploadSession, []UploadPart, *CompletedUpload, error) {
+func (s *PostgresStore) BeginCompletion(ctx context.Context, id, actor uuid.UUID, purpose UploadPurpose, now time.Time) (UploadSession, []UploadPart, *CompletedUpload, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return UploadSession{}, nil, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 FOR UPDATE`, id, actor))
+	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 AND purpose=$3 FOR UPDATE`, id, actor, purpose))
 	if err != nil {
 		return UploadSession{}, nil, nil, mapStoreError(err)
 	}
@@ -174,10 +174,13 @@ func (s *PostgresStore) FinishCompletion(ctx context.Context, u UploadSession, a
 	if err := tx.QueryRow(ctx, `INSERT INTO files (created_by) VALUES ($1) RETURNING id`, locked.ActorUserID).Scan(&completed.FileID); err != nil {
 		return CompletedUpload{}, err
 	}
+	if locked.Purpose != u.Purpose {
+		return CompletedUpload{}, ErrNotFound
+	}
 	if err := tx.QueryRow(ctx, `INSERT INTO file_versions
-        (file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by)
-        VALUES ($1,1,$2,$3,$4,$5,$6,'pending_scan',$7) RETURNING id,processing_state`,
-		completed.FileID, locked.ObjectKey, locked.DisplayName, locked.DeclaredMIME, locked.ExpectedSize, locked.ExpectedSHA256, locked.ActorUserID).Scan(&completed.FileVersionID, &completed.ProcessingState); err != nil {
+		(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by)
+		VALUES ($1,1,$2,$3,$4,$5,$6,$7,'pending_scan',$8) RETURNING id,processing_state`,
+		completed.FileID, locked.Purpose, locked.ObjectKey, locked.DisplayName, locked.DeclaredMIME, locked.ExpectedSize, locked.ExpectedSHA256, locked.ActorUserID).Scan(&completed.FileVersionID, &completed.ProcessingState); err != nil {
 		return CompletedUpload{}, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO file_processing_jobs (file_version_id,kind) VALUES ($1,'process_file')`, completed.FileVersionID); err != nil {
@@ -195,7 +198,7 @@ func (s *PostgresStore) FinishCompletion(ctx context.Context, u UploadSession, a
 	return completed, nil
 }
 
-func (s *PostgresStore) CancelSession(ctx context.Context, id, actor uuid.UUID, state UploadState) (UploadSession, error) {
+func (s *PostgresStore) CancelSession(ctx context.Context, id, actor uuid.UUID, purpose UploadPurpose, state UploadState) (UploadSession, error) {
 	if state != UploadCancelled {
 		return UploadSession{}, ErrInvalid
 	}
@@ -204,7 +207,7 @@ func (s *PostgresStore) CancelSession(ctx context.Context, id, actor uuid.UUID, 
 		return UploadSession{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 FOR UPDATE`, id, actor))
+	u, err := scanSession(tx.QueryRow(ctx, sessionSelect+` WHERE id=$1 AND actor_user_id=$2 AND purpose=$3 FOR UPDATE`, id, actor, purpose))
 	if err != nil {
 		return UploadSession{}, mapStoreError(err)
 	}
@@ -310,12 +313,12 @@ type queryer interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
-const sessionSelect = `SELECT id,actor_user_id,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at,created_at FROM upload_sessions`
+const sessionSelect = `SELECT id,actor_user_id,purpose,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at,created_at FROM upload_sessions`
 const partSelect = `SELECT upload_session_id,part_number,size_bytes,sha256,etag,created_at FROM upload_parts`
 
 func scanSession(row rowScanner) (UploadSession, error) {
 	var u UploadSession
-	err := row.Scan(&u.ID, &u.ActorUserID, &u.ObjectKey, &u.MinIOUploadID, &u.DisplayName, &u.DeclaredMIME, &u.ExpectedSize, &u.ExpectedSHA256, &u.State, &u.ExpiresAt, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.ActorUserID, &u.Purpose, &u.ObjectKey, &u.MinIOUploadID, &u.DisplayName, &u.DeclaredMIME, &u.ExpectedSize, &u.ExpectedSHA256, &u.State, &u.ExpiresAt, &u.CreatedAt)
 	return u, err
 }
 

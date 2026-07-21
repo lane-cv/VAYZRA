@@ -60,24 +60,31 @@ func (g *sessionGate) acquirePart(number int) (*sync.Mutex, func()) {
 type UploadService struct {
 	store   UploadStore
 	objects objectstore.Store
+	policy  UploadPolicy
 	now     func() time.Time
 	gatesMu sync.Mutex
 	gates   map[uuid.UUID]*sessionGate
 }
 
-func NewUploadService(store UploadStore, objects objectstore.Store, now func() time.Time) *UploadService {
+func NewUploadService(store UploadStore, objects objectstore.Store, policy UploadPolicy, now func() time.Time) *UploadService {
 	if now == nil {
 		now = time.Now
 	}
-	return &UploadService{store: store, objects: objects, now: now, gates: make(map[uuid.UUID]*sessionGate)}
+	if policy == nil {
+		policy = TeachingUploadPolicy{}
+	}
+	return &UploadService{store: store, objects: objects, policy: policy, now: now, gates: make(map[uuid.UUID]*sessionGate)}
 }
 
 func (s *UploadService) Create(ctx context.Context, actor Principal, in CreateUploadInput) (UploadView, error) {
 	if err := validatePrincipal(actor); err != nil {
 		return UploadView{}, err
 	}
-	if !validCreateInput(in) {
-		return UploadView{}, ErrInvalid
+	if err := s.policy.Authorize(actor.User); err != nil {
+		return UploadView{}, err
+	}
+	if err := s.policy.Validate(in); err != nil {
+		return UploadView{}, err
 	}
 	key, err := randomObjectKey()
 	if err != nil {
@@ -88,7 +95,7 @@ func (s *UploadService) Create(ctx context.Context, actor Principal, in CreateUp
 		return UploadView{}, errors.New("create upload storage")
 	}
 	now := s.now().UTC()
-	session := UploadSession{ID: uuid.New(), ActorUserID: actor.User.ID, ObjectKey: key, MinIOUploadID: uploadID, DisplayName: in.DisplayName, DeclaredMIME: in.DeclaredMIME, ExpectedSize: in.ExpectedSize, ExpectedSHA256: in.ExpectedSHA256, State: UploadOpen, ExpiresAt: now.Add(uploadTTL), CreatedAt: now}
+	session := UploadSession{ID: uuid.New(), ActorUserID: actor.User.ID, Purpose: s.policy.Purpose(), ObjectKey: key, MinIOUploadID: uploadID, DisplayName: in.DisplayName, DeclaredMIME: in.DeclaredMIME, ExpectedSize: in.ExpectedSize, ExpectedSHA256: in.ExpectedSHA256, State: UploadOpen, ExpiresAt: now.Add(uploadTTL), CreatedAt: now}
 	if err := s.store.CreateSession(ctx, session); err != nil {
 		abortErr := s.objects.AbortMultipart(context.WithoutCancel(ctx), key, uploadID)
 		if abortErr != nil {
@@ -103,10 +110,13 @@ func (s *UploadService) Status(ctx context.Context, actor Principal, id uuid.UUI
 	if err := validatePrincipal(actor); err != nil {
 		return UploadView{}, err
 	}
+	if err := s.policy.Authorize(actor.User); err != nil {
+		return UploadView{}, err
+	}
 	if id == uuid.Nil {
 		return UploadView{}, ErrInvalid
 	}
-	session, parts, err := s.store.GetSession(ctx, id, actor.User.ID)
+	session, parts, err := s.store.GetSession(ctx, id, actor.User.ID, s.policy.Purpose())
 	if err != nil {
 		return UploadView{}, err
 	}
@@ -118,6 +128,9 @@ func (s *UploadService) Status(ctx context.Context, actor Principal, id uuid.UUI
 
 func (s *UploadService) PutPart(ctx context.Context, actor Principal, in PutPartInput) (PartView, error) {
 	if err := validatePrincipal(actor); err != nil {
+		return PartView{}, err
+	}
+	if err := s.policy.Authorize(actor.User); err != nil {
 		return PartView{}, err
 	}
 	if in.SessionID == uuid.Nil || in.Number < 1 || in.Number > 10000 || in.Size < 1 || !validHash(in.SHA256) || in.Body == nil {
@@ -137,7 +150,7 @@ func (s *UploadService) PutPart(ctx context.Context, actor Principal, in PutPart
 	defer releasePart()
 	partLock.Lock()
 	defer partLock.Unlock()
-	session, existing, err := s.store.AdmitPart(ctx, in.SessionID, actor.User.ID, in.Number, in.Size, in.SHA256, s.now())
+	session, existing, err := s.store.AdmitPart(ctx, in.SessionID, actor.User.ID, s.policy.Purpose(), in.Number, in.Size, in.SHA256, s.now())
 	if err != nil {
 		return PartView{}, err
 	}
@@ -178,6 +191,9 @@ func (s *UploadService) Complete(ctx context.Context, actor Principal, id uuid.U
 	if err := validatePrincipal(actor); err != nil {
 		return CompletedUpload{}, err
 	}
+	if err := s.policy.Authorize(actor.User); err != nil {
+		return CompletedUpload{}, err
+	}
 	if id == uuid.Nil {
 		return CompletedUpload{}, ErrInvalid
 	}
@@ -185,7 +201,7 @@ func (s *UploadService) Complete(ctx context.Context, actor Principal, id uuid.U
 	defer releaseGate()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	session, parts, completed, err := s.store.BeginCompletion(ctx, id, actor.User.ID, s.now())
+	session, parts, completed, err := s.store.BeginCompletion(ctx, id, actor.User.ID, s.policy.Purpose(), s.now())
 	if err != nil {
 		return CompletedUpload{}, err
 	}
@@ -230,7 +246,7 @@ func (s *UploadService) Complete(ctx context.Context, actor Principal, id uuid.U
 
 func (s *UploadService) rejectCompletedObject(ctx context.Context, actor Principal, session UploadSession) error {
 	compensationCtx := context.WithoutCancel(ctx)
-	if _, err := s.store.CancelSession(compensationCtx, session.ID, actor.User.ID, UploadCancelled); err != nil {
+	if _, err := s.store.CancelSession(compensationCtx, session.ID, actor.User.ID, s.policy.Purpose(), UploadCancelled); err != nil {
 		return errors.New("cancel invalid completed upload")
 	}
 	if err := s.objects.Delete(compensationCtx, session.ObjectKey); err != nil && !errors.Is(err, objectstore.ErrNotFound) {
@@ -243,6 +259,9 @@ func (s *UploadService) Cancel(ctx context.Context, actor Principal, id uuid.UUI
 	if err := validatePrincipal(actor); err != nil {
 		return err
 	}
+	if err := s.policy.Authorize(actor.User); err != nil {
+		return err
+	}
 	if id == uuid.Nil {
 		return ErrInvalid
 	}
@@ -250,7 +269,7 @@ func (s *UploadService) Cancel(ctx context.Context, actor Principal, id uuid.UUI
 	defer releaseGate()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	session, err := s.store.CancelSession(ctx, id, actor.User.ID, UploadCancelled)
+	session, err := s.store.CancelSession(ctx, id, actor.User.ID, s.policy.Purpose(), UploadCancelled)
 	if err != nil {
 		return err
 	}
@@ -326,7 +345,7 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 func validatePrincipal(actor Principal) error {
-	if actor.User.ID == uuid.Nil || actor.User.Role != auth.RoleAdmin || actor.User.Status != auth.StatusActive || strings.TrimSpace(actor.RequestID) == "" || actor.IP == nil {
+	if actor.User.ID == uuid.Nil || actor.User.Status != auth.StatusActive || strings.TrimSpace(actor.RequestID) == "" || actor.IP == nil {
 		return ErrForbidden
 	}
 	return nil

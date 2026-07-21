@@ -27,7 +27,7 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	session := UploadSession{ID: uuid.New(), ActorUserID: actor, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "restart.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 3, ExpectedSHA256: digestOf([]byte("pdf")), State: UploadOpen, ExpiresAt: now.Add(time.Hour), CreatedAt: now}
+	session := UploadSession{ID: uuid.New(), ActorUserID: actor, Purpose: UploadPurposeTeaching, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "restart.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 3, ExpectedSHA256: digestOf([]byte("pdf")), State: UploadOpen, ExpiresAt: now.Add(time.Hour), CreatedAt: now}
 	first := NewPostgresStore(pool)
 	if err := first.CreateSession(ctx, session); err != nil {
 		t.Fatal(err)
@@ -37,11 +37,11 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	}
 
 	restarted := NewPostgresStore(pool)
-	persisted, parts, err := restarted.GetSession(ctx, session.ID, actor)
+	persisted, parts, err := restarted.GetSession(ctx, session.ID, actor, UploadPurposeTeaching)
 	if err != nil || persisted.ID != session.ID || len(parts) != 1 || parts[0].SHA256 != digestOf([]byte("pdf")) {
 		t.Fatalf("session=%+v parts=%+v err=%v", persisted, parts, err)
 	}
-	completing, completionParts, existing, err := restarted.BeginCompletion(ctx, session.ID, actor, now)
+	completing, completionParts, existing, err := restarted.BeginCompletion(ctx, session.ID, actor, UploadPurposeTeaching, now)
 	if err != nil || existing != nil || completing.State != UploadCompleting || len(completionParts) != 1 {
 		t.Fatalf("session=%+v parts=%+v existing=%+v err=%v", completing, completionParts, existing, err)
 	}
@@ -49,7 +49,7 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	if err != nil || completed.FileVersionID == uuid.Nil || completed.ProcessingState != "pending_scan" {
 		t.Fatalf("completed=%+v err=%v", completed, err)
 	}
-	_, _, duplicate, err := restarted.BeginCompletion(ctx, session.ID, actor, now)
+	_, _, duplicate, err := restarted.BeginCompletion(ctx, session.ID, actor, UploadPurposeTeaching, now)
 	if err != nil || duplicate == nil || duplicate.FileVersionID != completed.FileVersionID {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
@@ -92,6 +92,7 @@ func TestPostgresUploadCleanupClaimsGraceRecoveryStatesAndSkipsReferences(t *tes
 		u := UploadSession{
 			ID:             uuid.New(),
 			ActorUserID:    actor,
+			Purpose:        UploadPurposeTeaching,
 			ObjectKey:      "originals/" + uuid.NewString(),
 			MinIOUploadID:  uuid.NewString(),
 			DisplayName:    "cleanup.pdf",
@@ -117,7 +118,7 @@ func TestPostgresUploadCleanupClaimsGraceRecoveryStatesAndSkipsReferences(t *tes
 	if err := pool.QueryRow(ctx, `INSERT INTO files (created_by) VALUES ($1) RETURNING id`, actor).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO file_versions (file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,$2,'referenced.pdf','application/pdf',1,$3,'ready',$4)`, fileID, referenced.ObjectKey, referenced.ExpectedSHA256, actor); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO file_versions (file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,'teaching',$2,'referenced.pdf','application/pdf',1,$3,'ready',$4)`, fileID, referenced.ObjectKey, referenced.ExpectedSHA256, actor); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,7 +182,7 @@ func TestPostgresUploadCleanupConfirmsReferenceBeforeObjectOperations(t *testing
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	base := NewPostgresStore(pool)
-	candidate := UploadSession{ID: uuid.New(), ActorUserID: actorID, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "race.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 1, ExpectedSHA256: digestOf([]byte("x")), State: UploadOpen, ExpiresAt: now.Add(-2 * cleanupGrace), CreatedAt: now.Add(-26 * time.Hour)}
+	candidate := UploadSession{ID: uuid.New(), ActorUserID: actorID, Purpose: UploadPurposeTeaching, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "race.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 1, ExpectedSHA256: digestOf([]byte("x")), State: UploadOpen, ExpiresAt: now.Add(-2 * cleanupGrace), CreatedAt: now.Add(-26 * time.Hour)}
 	if err := base.CreateSession(ctx, candidate); err != nil {
 		t.Fatal(err)
 	}
@@ -191,11 +192,11 @@ func TestPostgresUploadCleanupConfirmsReferenceBeforeObjectOperations(t *testing
 		if err := pool.QueryRow(ctx, `INSERT INTO files (created_by) VALUES ($1) RETURNING id`, actorID).Scan(&fileID); err != nil {
 			return err
 		}
-		_, err := pool.Exec(ctx, `INSERT INTO file_versions (file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,$2,'race.pdf','application/pdf',1,$3,'ready',$4)`, fileID, candidate.ObjectKey, candidate.ExpectedSHA256, actorID)
+		_, err := pool.Exec(ctx, `INSERT INTO file_versions (file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,'teaching',$2,'race.pdf','application/pdf',1,$3,'ready',$4)`, fileID, candidate.ObjectKey, candidate.ExpectedSHA256, actorID)
 		return err
 	}
 	objects := newFakeObjects()
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	if err := svc.CleanupExpired(ctx, 100); err == nil || err.Error() != "cleanup expired uploads" {
 		t.Fatalf("cleanup err=%v", err)
 	}
@@ -229,7 +230,7 @@ func TestPostgresUploadCleanupFreezeRejectsConcurrentCompletion(t *testing.T) {
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	base := NewPostgresStore(pool)
-	candidate := UploadSession{ID: uuid.New(), ActorUserID: actorID, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "freeze.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 1, ExpectedSHA256: digestOf([]byte("x")), State: UploadOpen, ExpiresAt: now.Add(-2 * cleanupGrace), CreatedAt: now.Add(-26 * time.Hour)}
+	candidate := UploadSession{ID: uuid.New(), ActorUserID: actorID, Purpose: UploadPurposeTeaching, ObjectKey: "originals/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "freeze.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 1, ExpectedSHA256: digestOf([]byte("x")), State: UploadOpen, ExpiresAt: now.Add(-2 * cleanupGrace), CreatedAt: now.Add(-26 * time.Hour)}
 	if err := base.CreateSession(ctx, candidate); err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +241,7 @@ func TestPostgresUploadCleanupFreezeRejectsConcurrentCompletion(t *testing.T) {
 		<-release
 	}}
 	cleanupObjects := newFakeObjects()
-	cleanupService := NewUploadService(cleanupStore, cleanupObjects, func() time.Time { return now })
+	cleanupService := NewUploadService(cleanupStore, cleanupObjects, TeachingUploadPolicy{}, func() time.Time { return now })
 	cleanupResult := make(chan error, 1)
 	go func() { cleanupResult <- cleanupService.CleanupExpired(ctx, 100) }()
 	select {
@@ -249,7 +250,7 @@ func TestPostgresUploadCleanupFreezeRejectsConcurrentCompletion(t *testing.T) {
 		t.Fatal("cleanup did not confirm and freeze candidate")
 	}
 	actor := Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "freeze-complete", IP: net.ParseIP("192.0.2.92")}
-	completionService := NewUploadService(base, newFakeObjects(), func() time.Time { return now })
+	completionService := NewUploadService(base, newFakeObjects(), TeachingUploadPolicy{}, func() time.Time { return now })
 	if _, err := completionService.Complete(ctx, actor, candidate.ID); !errors.Is(err, ErrUploadConflict) && !errors.Is(err, ErrUploadExpired) {
 		close(release)
 		t.Fatalf("completion after freeze err=%v", err)

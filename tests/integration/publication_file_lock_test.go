@@ -61,7 +61,7 @@ func TestPublicationReadinessLocksEveryFileDecisionRow(t *testing.T) {
 			if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, adminID).Scan(&fileID); err != nil {
 				t.Fatal(err)
 			}
-			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'x.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "lock/"+uuid.NewString(), fmt.Sprintf("%064x", 71), adminID).Scan(&versionID); err != nil {
+			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'x.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "lock/"+uuid.NewString(), fmt.Sprintf("%064x", 71), adminID).Scan(&versionID); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := pool.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,'pdf',$2,'application/pdf',4,$3,'ready')`, versionID, "preview/"+uuid.NewString(), fmt.Sprintf("%064x", 72)); err != nil {

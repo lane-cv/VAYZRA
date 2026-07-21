@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/qanda"
 )
@@ -123,6 +124,30 @@ func TestBuildApplicationWiresAdminQuestionRoutes(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusOK || questions.lists != 1 {
 		t.Fatalf("status=%d lists=%d body=%s", w.Code, questions.lists, w.Body.String())
+	}
+}
+
+func TestBuildApplicationWiresQuestionUploadFactory(t *testing.T) {
+	called := false
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open: func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil }, migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverStudentAuth{}, nil },
+		newQAUploads: func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error) {
+			called = true
+			return &serverUploadCleaner{}, nil
+		},
+		ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } }, close: func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeResources)
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/student/question-uploads/"+uuid.NewString(), nil)
+	r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if !called || w.Code != http.StatusOK {
+		t.Fatalf("called=%t status=%d body=%s", called, w.Code, w.Body.String())
 	}
 }
 

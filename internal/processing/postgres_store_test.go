@@ -57,7 +57,7 @@ func TestPostgresLeaseIsExclusiveReclaimsExpiredAndRejectsStaleOwner(t *testing.
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actor).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'lease.pdf','application/pdf',1,$3,'pending_scan',$4) RETURNING id`, fileID, "test-processing/lease/"+uuid.NewString(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", actor).Scan(&versionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'lease.pdf','application/pdf',1,$3,'pending_scan',$4) RETURNING id`, fileID, "test-processing/lease/"+uuid.NewString(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", actor).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO file_processing_jobs(file_version_id,kind,available_at) VALUES($1,'process_file','-infinity')`, versionID); err != nil {

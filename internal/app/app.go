@@ -26,6 +26,7 @@ type Dependencies struct {
 	Students          students.HTTPService
 	Teaching          teaching.AdminHTTPService
 	Uploads           files.UploadHTTPService
+	QAUploads         files.UploadHTTPService
 	FileAccess        files.AccessHTTPService
 	FileBindings      files.BindingHTTPService
 	FileCenter        files.FileCenterHTTPService
@@ -87,7 +88,11 @@ func New(d Dependencies) http.Handler {
 					private.Mount("/admin", teaching.NewAdminHandlerWithConfig(d.Teaching, teaching.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.Uploads != nil {
-					private.Mount("/admin/uploads", files.NewUploadHandlerWithConfig(d.Uploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+					private.Mount("/admin/uploads", files.NewUploadHandlerWithConfig(d.Uploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleAdmin}}).Routes())
+				}
+				if d.QAUploads != nil {
+					private.Mount("/student/question-uploads", files.NewUploadHandlerWithConfig(d.QAUploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleStudent}}).Routes())
+					private.Mount("/admin/question-uploads", files.NewUploadHandlerWithConfig(d.QAUploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleAdmin}}).Routes())
 				}
 				if d.FileCenter != nil {
 					private.Mount("/admin/files", files.NewFileCenterHandler(d.FileCenter, d.TrustedProxyCIDRs).Routes())

@@ -34,11 +34,20 @@ var (
 	ErrFileInUse           = errors.New("file is referenced")
 	ErrFileVersionExpired  = errors.New("file version expired")
 	ErrFileNotRetryable    = errors.New("file processing is not retryable")
+	ErrFileTooLarge        = errors.New("file too large")
+	ErrFileTypeRejected    = errors.New("file type rejected")
 )
 
 const FileRetentionPeriod = 30 * 24 * time.Hour
 
 type UploadState string
+
+type UploadPurpose string
+
+const (
+	UploadPurposeTeaching UploadPurpose = "teaching"
+	UploadPurposeQA       UploadPurpose = "qa_attachment"
+)
 
 const (
 	UploadOpen       UploadState = "open"
@@ -72,6 +81,7 @@ type PutPartInput struct {
 type UploadSession struct {
 	ID             uuid.UUID
 	ActorUserID    uuid.UUID
+	Purpose        UploadPurpose
 	ObjectKey      string
 	MinIOUploadID  string
 	DisplayName    string

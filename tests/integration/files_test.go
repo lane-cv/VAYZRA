@@ -33,7 +33,7 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 	}
 
 	var version int
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 10 {
+	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 11 {
 		t.Fatalf("migration version=%d err=%v", version, err)
 	}
 	var count int
@@ -46,7 +46,7 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 	insertUpload := func(size int64, state, objectKey, uploadID string) error {
 		objectKey += "/" + suffix
 		uploadID += "-" + suffix
-		_, err := pool.Exec(ctx, `INSERT INTO upload_sessions (actor_user_id,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at) VALUES ($1,$2,$3,'notes.pdf','application/pdf',$4,$5,$6,now()+interval '1 hour')`, actorID, objectKey, uploadID, size, fmt.Sprintf("%064x", 1), state)
+		_, err := pool.Exec(ctx, `INSERT INTO upload_sessions (actor_user_id,purpose,object_key,minio_upload_id,display_name,declared_mime,expected_size,expected_sha256,state,expires_at) VALUES ($1,'teaching',$2,$3,'notes.pdf','application/pdf',$4,$5,$6,now()+interval '1 hour')`, actorID, objectKey, uploadID, size, fmt.Sprintf("%064x", 1), state)
 		return err
 	}
 	if err := insertUpload(0, "open", "schema/zero", "upload-zero"); err == nil {
@@ -81,7 +81,7 @@ func TestFileSchemaRejectsInvalidPoliciesAndImmutableHistoryMutation(t *testing.
 	if err := pool.QueryRow(ctx, `INSERT INTO files (created_by) VALUES ($1) RETURNING id`, actorID).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions (file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,$2,'notes.pdf','application/pdf',4,$3,'pending_scan',$4) RETURNING id`, fileID, "history/"+uuid.NewString(), fmt.Sprintf("%064x", 3), actorID).Scan(&versionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions (file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES ($1,1,'teaching',$2,'notes.pdf','application/pdf',4,$3,'pending_scan',$4) RETURNING id`, fileID, "history/"+uuid.NewString(), fmt.Sprintf("%064x", 3), actorID).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	revisionID := insertFileSchemaRevision(t, pool, actorID)
@@ -222,7 +222,7 @@ func TestReplaceFileMovesReadyUploadIntoExistingFile(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&originalFileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'original.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 81), actorID).Scan(&originalVersionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'original.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 81), actorID).Scan(&originalVersionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_files(lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,'download',10,'original.docx','')`, lessonID, originalVersionID); err != nil {
@@ -231,7 +231,7 @@ func TestReplaceFileMovesReadyUploadIntoExistingFile(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&uploadedFileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'replacement.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 82), actorID).Scan(&uploadedVersionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'replacement.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 82), actorID).Scan(&uploadedVersionID); err != nil {
 		t.Fatal(err)
 	}
 	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "replace-request", IP: net.ParseIP("192.0.2.82")}
@@ -276,7 +276,7 @@ func TestReplaceFileRejectsUndeliverableUpload(t *testing.T) {
 			if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&originalFileID); err != nil {
 				t.Fatal(err)
 			}
-			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'original.pdf','application/pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 91), actorID).Scan(&originalVersionID); err != nil {
+			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'original.pdf','application/pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 91), actorID).Scan(&originalVersionID); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_files(lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,$3,10,'original.pdf','')`, lessonID, originalVersionID, tc.policy); err != nil {
@@ -285,7 +285,7 @@ func TestReplaceFileRejectsUndeliverableUpload(t *testing.T) {
 			if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&uploadedFileID); err != nil {
 				t.Fatal(err)
 			}
-			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'replacement.pdf','application/pdf','application/pdf',4,$3,$4,$5) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 92), tc.state, actorID).Scan(&uploadedVersionID); err != nil {
+			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'replacement.pdf','application/pdf','application/pdf',4,$3,$4,$5) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 92), tc.state, actorID).Scan(&uploadedVersionID); err != nil {
 				t.Fatal(err)
 			}
 
@@ -327,7 +327,7 @@ func TestUploadServiceResumesPersistedPartsAfterRestart(t *testing.T) {
 	hash := hex.EncodeToString(sum[:])
 	objects := newIntegrationUploadObjects()
 	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "upload-integration-request", IP: net.ParseIP("192.0.2.90")}
-	first := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, time.Now)
+	first := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, securefiles.TeachingUploadPolicy{}, time.Now)
 	created, err := first.Create(ctx, actor, securefiles.CreateUploadInput{DisplayName: "restart.pdf", DeclaredMIME: "application/pdf", ExpectedSize: int64(len(payload)), ExpectedSHA256: hash})
 	if err != nil {
 		t.Fatal(err)
@@ -335,7 +335,7 @@ func TestUploadServiceResumesPersistedPartsAfterRestart(t *testing.T) {
 	if _, err := first.PutPart(ctx, actor, securefiles.PutPartInput{SessionID: created.ID, Number: 1, Size: int64(len(payload)), SHA256: hash, Body: bytes.NewReader(payload)}); err != nil {
 		t.Fatal(err)
 	}
-	restarted := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, time.Now)
+	restarted := securefiles.NewUploadService(securefiles.NewPostgresStore(pool), objects, securefiles.TeachingUploadPolicy{}, time.Now)
 	status, err := restarted.Status(ctx, actor, created.ID)
 	if err != nil || len(status.Parts) != 1 || status.Parts[0].SHA256 != hash {
 		t.Fatalf("status=%+v err=%v", status, err)
@@ -412,7 +412,7 @@ func TestFileAccessPostgresAuthorizationAndDenyLog(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, allowed).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'secret.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "private/"+uuid.NewString(), fmt.Sprintf("%064x", 7), allowed).Scan(&versionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'secret.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "private/"+uuid.NewString(), fmt.Sprintf("%064x", 7), allowed).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,'pdf',$2,'application/pdf',4,$3,'ready')`, versionID, "preview/"+uuid.NewString(), fmt.Sprintf("%064x", 8)); err != nil {
@@ -518,7 +518,7 @@ func TestPublishSnapshotsFilesAndAttachmentSearchDoesNotDuplicate(t *testing.T) 
 		if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, admin).Scan(&fileID); err != nil {
 			t.Fatal(err)
 		}
-		if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,$3,'application/pdf',4,$4,'ready',$5) RETURNING id`, fileID, "original/"+uuid.NewString(), fmt.Sprintf("牛顿资料%d.pdf", i+1), fmt.Sprintf("%064x", 20+i), admin).Scan(&versionID); err != nil {
+		if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,$3,'application/pdf',4,$4,'ready',$5) RETURNING id`, fileID, "original/"+uuid.NewString(), fmt.Sprintf("牛顿资料%d.pdf", i+1), fmt.Sprintf("%064x", 20+i), admin).Scan(&versionID); err != nil {
 			t.Fatal(err)
 		}
 		versions = append(versions, versionID)
@@ -577,7 +577,7 @@ func TestFinalizationAndRevisionFileInsertSerialize(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actor).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'race.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "race/"+uuid.NewString(), fmt.Sprintf("%064x", 91), actor).Scan(&versionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,'race.pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, fileID, "race/"+uuid.NewString(), fmt.Sprintf("%064x", 91), actor).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := pool.Begin(ctx)

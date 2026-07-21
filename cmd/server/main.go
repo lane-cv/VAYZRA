@@ -79,6 +79,7 @@ type applicationDependencies struct {
 	newStudents        func(*pgxpool.Pool) students.HTTPService
 	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
 	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newQAUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
 	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
 	newFileCenter      func(*pgxpool.Pool) files.FileCenterHTTPService
@@ -104,6 +105,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newStudents:        newProductionStudentService,
 		newTeaching:        newProductionTeachingService,
 		newUploads:         newProductionUploadService,
+		newQAUploads:       newProductionQAUploadService,
 		newFileAccess:      newProductionFileAccessService,
 		newFileBindings:    newProductionFileBindingService,
 		newFileCenter:      newProductionFileCenterService,
@@ -159,6 +161,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if err != nil {
 			closePool()
 			return nil, nil, errors.New("initialize upload service")
+		}
+	}
+	var qaUploadService files.UploadHTTPService
+	if deps.newQAUploads != nil {
+		qaUploadService, err = deps.newQAUploads(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize question upload service")
 		}
 	}
 	var studentTeachingService teaching.StudentHTTPService
@@ -241,6 +251,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Students:          studentService,
 		Teaching:          teachingService,
 		Uploads:           uploadService,
+		QAUploads:         qaUploadService,
 		FileAccess:        fileAccessService,
 		FileBindings:      fileBindingService,
 		FileCenter:        fileCenterService,
@@ -319,6 +330,14 @@ func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService 
 }
 
 func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
+	return newProductionUploadServiceWithPolicy(ctx, pool, cfg, files.TeachingUploadPolicy{})
+}
+
+func newProductionQAUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
+	return newProductionUploadServiceWithPolicy(ctx, pool, cfg, files.QAUploadPolicy{})
+}
+
+func newProductionUploadServiceWithPolicy(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, policy files.UploadPolicy) (files.UploadHTTPService, error) {
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
@@ -328,7 +347,7 @@ func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg con
 		log.Printf("object_store_startup_error stage=%s", err)
 		return nil, err
 	}
-	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, time.Now), nil
+	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, policy, time.Now), nil
 }
 
 func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.AccessHTTPService, error) {

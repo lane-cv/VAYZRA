@@ -29,11 +29,15 @@ type UploadHTTPService interface {
 	Cancel(context.Context, Principal, uuid.UUID) error
 }
 
-type UploadHTTPConfig struct{ TrustedProxyCIDRs []netip.Prefix }
+type UploadHTTPConfig struct {
+	TrustedProxyCIDRs []netip.Prefix
+	AllowedRoles      []auth.Role
+}
 
 type UploadHandler struct {
 	service           UploadHTTPService
 	trustedProxyCIDRs []netip.Prefix
+	allowedRoles      map[auth.Role]struct{}
 }
 
 func NewUploadHandler(service UploadHTTPService) *UploadHandler {
@@ -41,19 +45,42 @@ func NewUploadHandler(service UploadHTTPService) *UploadHandler {
 }
 
 func NewUploadHandlerWithConfig(service UploadHTTPService, cfg UploadHTTPConfig) *UploadHandler {
-	return &UploadHandler{service: service, trustedProxyCIDRs: append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...)}
+	roles := append([]auth.Role(nil), cfg.AllowedRoles...)
+	if len(roles) == 0 {
+		roles = []auth.Role{auth.RoleAdmin}
+	}
+	allowed := make(map[auth.Role]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[role] = struct{}{}
+	}
+	return &UploadHandler{service: service, trustedProxyCIDRs: append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...), allowedRoles: allowed}
 }
 
 func (h *UploadHandler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(httpx.NoStore)
-	r.Use(auth.RequireRole(auth.RoleAdmin))
+	r.Use(h.requireAllowedRole)
 	r.Post("/", h.Create)
 	r.Get("/{id}", h.Status)
 	r.Put("/{id}/parts/{number}", h.PutPart)
 	r.Post("/{id}/complete", h.Complete)
 	r.Post("/{id}/cancel", h.Cancel)
 	return r
+}
+
+func (h *UploadHandler) requireAllowedRole(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := auth.UserFromContext(r.Context())
+		if !ok {
+			httpx.Error(w, r, http.StatusUnauthorized, "unauthorized", "请先登录")
+			return
+		}
+		if _, ok := h.allowedRoles[user.Role]; !ok || user.Status != auth.StatusActive {
+			httpx.Error(w, r, http.StatusForbidden, "forbidden", "无权访问")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *UploadHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +287,10 @@ func uploadHTTPError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusConflict, "upload_conflict", "上传状态冲突")
 	case errors.Is(err, ErrPartHashMismatch), errors.Is(err, ErrFinalHashMismatch):
 		httpx.Error(w, r, http.StatusUnprocessableEntity, "upload_hash_mismatch", "上传校验失败")
+	case errors.Is(err, ErrFileTooLarge):
+		httpx.Error(w, r, http.StatusRequestEntityTooLarge, "file_too_large", "文件过大")
+	case errors.Is(err, ErrFileTypeRejected):
+		httpx.Error(w, r, http.StatusUnprocessableEntity, "file_type_rejected", "文件类型不支持")
 	case errors.Is(err, ErrInvalid), strings.Contains(err.Error(), "request body too large"):
 		uploadBad(w, r)
 	default:

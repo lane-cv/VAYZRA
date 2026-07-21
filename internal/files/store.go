@@ -9,13 +9,13 @@ import (
 
 type UploadStore interface {
 	CreateSession(context.Context, UploadSession) error
-	GetSession(context.Context, uuid.UUID, uuid.UUID) (UploadSession, []UploadPart, error)
-	AdmitPart(context.Context, uuid.UUID, uuid.UUID, int, int64, string, time.Time) (UploadSession, *UploadPart, error)
+	GetSession(context.Context, uuid.UUID, uuid.UUID, UploadPurpose) (UploadSession, []UploadPart, error)
+	AdmitPart(context.Context, uuid.UUID, uuid.UUID, UploadPurpose, int, int64, string, time.Time) (UploadSession, *UploadPart, error)
 	RecordPart(context.Context, uuid.UUID, UploadPart) (UploadPart, error)
-	BeginCompletion(context.Context, uuid.UUID, uuid.UUID, time.Time) (UploadSession, []UploadPart, *CompletedUpload, error)
+	BeginCompletion(context.Context, uuid.UUID, uuid.UUID, UploadPurpose, time.Time) (UploadSession, []UploadPart, *CompletedUpload, error)
 	ReopenCompletion(context.Context, uuid.UUID) error
 	FinishCompletion(context.Context, UploadSession, Principal) (CompletedUpload, error)
-	CancelSession(context.Context, uuid.UUID, uuid.UUID, UploadState) (UploadSession, error)
+	CancelSession(context.Context, uuid.UUID, uuid.UUID, UploadPurpose, UploadState) (UploadSession, error)
 	ClaimCleanup(context.Context, time.Time, int) ([]UploadSession, error)
 	ConfirmCleanup(context.Context, uuid.UUID) (UploadSession, error)
 	FinishCleanup(context.Context, uuid.UUID) error

@@ -23,7 +23,7 @@ func TestUploadCreateValidationAndCompensation(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store := newFakeUploadStore()
 	objects := newFakeObjects()
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	actor := uploadAdmin()
 	valid := CreateUploadInput{DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 3, ExpectedSHA256: digestOf([]byte("pdf"))}
 
@@ -54,11 +54,30 @@ func TestUploadCreateValidationAndCompensation(t *testing.T) {
 	}
 }
 
+func TestQAUploadRejectsBeforeMultipartAndCannotCrossPurpose(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	store, objects := newFakeUploadStore(), newFakeObjects()
+	svc := NewUploadService(store, objects, QAUploadPolicy{}, func() time.Time { return now })
+	actor := uploadAdmin()
+	actor.User.Role = auth.RoleStudent
+	bad := CreateUploadInput{DisplayName: "archive.zip", DeclaredMIME: "application/zip", ExpectedSize: 1, ExpectedSHA256: digestOf([]byte("x"))}
+	if _, err := svc.Create(context.Background(), actor, bad); !errors.Is(err, ErrFileTypeRejected) {
+		t.Fatalf("rejected type err=%v", err)
+	}
+	if objects.createCalls.Load() != 0 {
+		t.Fatalf("denied upload created multipart object: %d", objects.createCalls.Load())
+	}
+	teaching := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(time.Hour))
+	if _, err := svc.Status(context.Background(), actor, teaching.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-purpose status err=%v", err)
+	}
+}
+
 func TestUploadPartExpirationIdempotencyConflictAndStreamingHash(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store := newFakeUploadStore()
 	objects := newFakeObjects()
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	actor := uploadAdmin()
 	payload := []byte("part-data")
 	session := store.seed(actor.User.ID, int64(len(payload)), digestOf(payload), now.Add(time.Hour))
@@ -93,7 +112,7 @@ func TestUploadCompleteMissingPartDuplicateAndFinalHashCompensation(t *testing.T
 	actor := uploadAdmin()
 	t.Run("missing part", func(t *testing.T) {
 		store, objects := newFakeUploadStore(), newFakeObjects()
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		s := store.seed(actor.User.ID, UploadPartSize+1, digestOf(make([]byte, UploadPartSize+1)), now.Add(time.Hour))
 		store.parts[s.ID] = []UploadPart{{SessionID: s.ID, Number: 2, Size: 1, SHA256: digestOf([]byte{0}), ETag: "two"}}
 		if _, err := svc.Complete(context.Background(), actor, s.ID); !errors.Is(err, ErrUploadIncomplete) {
@@ -104,7 +123,7 @@ func TestUploadCompleteMissingPartDuplicateAndFinalHashCompensation(t *testing.T
 		payload := []byte("complete")
 		store, objects := newFakeUploadStore(), newFakeObjects()
 		objects.data = payload
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		s := store.seed(actor.User.ID, int64(len(payload)), digestOf(payload), now.Add(time.Hour))
 		store.parts[s.ID] = []UploadPart{{SessionID: s.ID, Number: 1, Size: int64(len(payload)), SHA256: digestOf(payload), ETag: "one"}}
 		first, err := svc.Complete(context.Background(), actor, s.ID)
@@ -119,7 +138,7 @@ func TestUploadCompleteMissingPartDuplicateAndFinalHashCompensation(t *testing.T
 	t.Run("hash mismatch deletes object and cancels", func(t *testing.T) {
 		store, objects := newFakeUploadStore(), newFakeObjects()
 		objects.data = []byte("evil")
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		s := store.seed(actor.User.ID, 4, digestOf([]byte("good")), now.Add(time.Hour))
 		store.parts[s.ID] = []UploadPart{{SessionID: s.ID, Number: 1, Size: 4, SHA256: digestOf([]byte("good")), ETag: "one"}}
 		if _, err := svc.Complete(context.Background(), actor, s.ID); !errors.Is(err, ErrFinalHashMismatch) {
@@ -135,7 +154,7 @@ func TestUploadObjectFailureAndCleanupSkipsCompletedReferencedObjects(t *testing
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	actor := uploadAdmin()
 	store, objects := newFakeUploadStore(), newFakeObjects()
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	s := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(time.Hour))
 	objects.putErr = objectstore.ErrUnavailable
 	if _, err := svc.PutPart(context.Background(), actor, PutPartInput{SessionID: s.ID, Number: 1, Size: 1, SHA256: digestOf([]byte("x")), Body: bytes.NewReader([]byte("x"))}); err == nil {
@@ -180,7 +199,7 @@ func newFakeUploadStore() *fakeUploadStore {
 	return &fakeUploadStore{sessions: map[uuid.UUID]UploadSession{}, parts: map[uuid.UUID][]UploadPart{}, completed: map[uuid.UUID]CompletedUpload{}, referenced: map[string]bool{}}
 }
 func (s *fakeUploadStore) seed(actor uuid.UUID, size int64, hash string, expires time.Time) UploadSession {
-	u := UploadSession{ID: uuid.New(), ActorUserID: actor, ObjectKey: "uploads/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", ExpectedSize: size, ExpectedSHA256: hash, State: UploadOpen, ExpiresAt: expires}
+	u := UploadSession{ID: uuid.New(), ActorUserID: actor, Purpose: UploadPurposeTeaching, ObjectKey: "uploads/" + uuid.NewString(), MinIOUploadID: uuid.NewString(), DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", ExpectedSize: size, ExpectedSHA256: hash, State: UploadOpen, ExpiresAt: expires}
 	s.sessions[u.ID] = u
 	return u
 }
@@ -191,17 +210,17 @@ func (s *fakeUploadStore) CreateSession(_ context.Context, u UploadSession) erro
 	s.sessions[u.ID] = u
 	return nil
 }
-func (s *fakeUploadStore) GetSession(_ context.Context, id, actor uuid.UUID) (UploadSession, []UploadPart, error) {
+func (s *fakeUploadStore) GetSession(_ context.Context, id, actor uuid.UUID, purpose UploadPurpose) (UploadSession, []UploadPart, error) {
 	s.getCalls.Add(1)
 	u, ok := s.sessions[id]
-	if !ok || u.ActorUserID != actor {
+	if !ok || u.ActorUserID != actor || u.Purpose != purpose {
 		return UploadSession{}, nil, ErrNotFound
 	}
 	return u, append([]UploadPart(nil), s.parts[id]...), nil
 }
-func (s *fakeUploadStore) AdmitPart(_ context.Context, id, actor uuid.UUID, n int, size int64, hash string, now time.Time) (UploadSession, *UploadPart, error) {
+func (s *fakeUploadStore) AdmitPart(_ context.Context, id, actor uuid.UUID, purpose UploadPurpose, n int, size int64, hash string, now time.Time) (UploadSession, *UploadPart, error) {
 	s.admitCalls.Add(1)
-	u, p, e := s.GetSession(context.Background(), id, actor)
+	u, p, e := s.GetSession(context.Background(), id, actor, purpose)
 	if e != nil {
 		return u, nil, e
 	}
@@ -235,8 +254,8 @@ func (s *fakeUploadStore) RecordPart(_ context.Context, id uuid.UUID, p UploadPa
 	s.parts[id] = append(s.parts[id], p)
 	return p, nil
 }
-func (s *fakeUploadStore) BeginCompletion(_ context.Context, id, actor uuid.UUID, now time.Time) (UploadSession, []UploadPart, *CompletedUpload, error) {
-	u, p, e := s.GetSession(context.Background(), id, actor)
+func (s *fakeUploadStore) BeginCompletion(_ context.Context, id, actor uuid.UUID, purpose UploadPurpose, now time.Time) (UploadSession, []UploadPart, *CompletedUpload, error) {
+	u, p, e := s.GetSession(context.Background(), id, actor, purpose)
 	if e != nil {
 		return u, nil, nil, e
 	}
@@ -269,12 +288,12 @@ func (s *fakeUploadStore) FinishCompletion(_ context.Context, u UploadSession, _
 	s.sessions[u.ID] = u
 	return c, nil
 }
-func (s *fakeUploadStore) CancelSession(_ context.Context, id, actor uuid.UUID, state UploadState) (UploadSession, error) {
+func (s *fakeUploadStore) CancelSession(_ context.Context, id, actor uuid.UUID, purpose UploadPurpose, state UploadState) (UploadSession, error) {
 	if s.cancelFailures > 0 {
 		s.cancelFailures--
 		return UploadSession{}, errors.New("cancel persistence failed")
 	}
-	u, _, e := s.GetSession(context.Background(), id, actor)
+	u, _, e := s.GetSession(context.Background(), id, actor, purpose)
 	if e != nil {
 		return u, e
 	}
@@ -326,15 +345,16 @@ func (s *fakeUploadStore) FinishCleanup(_ context.Context, id uuid.UUID) error {
 }
 
 type fakeObjects struct {
-	data                                             []byte
-	putErr                                           error
-	abortErr                                         error
-	deleteErr                                        error
-	abortCalls, putCalls, completeCalls, deleteCalls atomic.Int64
+	data                                                          []byte
+	putErr                                                        error
+	abortErr                                                      error
+	deleteErr                                                     error
+	createCalls, abortCalls, putCalls, completeCalls, deleteCalls atomic.Int64
 }
 
 func newFakeObjects() *fakeObjects { return &fakeObjects{data: []byte("complete")} }
 func (o *fakeObjects) CreateMultipart(context.Context, string, objectstore.ObjectMeta) (string, error) {
+	o.createCalls.Add(1)
 	return uuid.NewString(), nil
 }
 func (o *fakeObjects) PutPart(_ context.Context, _ string, _ string, n int, r io.Reader, size int64, _ string) (objectstore.Part, error) {
@@ -376,7 +396,7 @@ func TestUploadPartRejectsThirdInFlightRequest(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store := newFakeUploadStore()
 	objects := &blockingObjects{fakeObjects: newFakeObjects(), entered: make(chan struct{}, 2), release: make(chan struct{})}
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	actor := uploadAdmin()
 	firstPayload := bytes.Repeat([]byte{0}, int(UploadPartSize))
 	firstHash := digestOf(firstPayload)
@@ -425,7 +445,7 @@ func TestUploadFinalHashCompensationLeavesCancelledCleanupCandidate(t *testing.T
 	store, objects := newFakeUploadStore(), newFakeObjects()
 	objects.data = []byte("evil")
 	objects.deleteErr = objectstore.ErrUnavailable
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	s := store.seed(actor.User.ID, 4, digestOf([]byte("good")), now.Add(time.Hour))
 	store.parts[s.ID] = []UploadPart{{SessionID: s.ID, Number: 1, Size: 4, SHA256: digestOf([]byte("good")), ETag: "one"}}
 	if _, err := svc.Complete(context.Background(), actor, s.ID); err == nil || store.sessions[s.ID].State != UploadCancelled {
@@ -448,7 +468,7 @@ func TestUploadCleanupRetriesFailedAbort(t *testing.T) {
 	store, objects := newFakeUploadStore(), newFakeObjects()
 	s := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(-2*time.Hour))
 	objects.abortErr = objectstore.ErrUnavailable
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	if err := svc.CleanupExpired(context.Background(), 100); err == nil || store.sessions[s.ID].State != UploadExpired {
 		t.Fatalf("first err=%v state=%s", err, store.sessions[s.ID].State)
 	}
@@ -464,7 +484,7 @@ func TestUploadConflictingConcurrentPartNeverReachesObjectStore(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store := newFakeUploadStore()
 	objects := &blockingObjects{fakeObjects: newFakeObjects(), entered: make(chan struct{}, 2), release: make(chan struct{})}
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	actor := uploadAdmin()
 	session := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(time.Hour))
 	errs := make(chan error, 2)
@@ -502,7 +522,7 @@ func TestUploadCreatePreservesAbortFailure(t *testing.T) {
 	store, objects := newFakeUploadStore(), newFakeObjects()
 	store.createErr = errors.New("database unavailable")
 	objects.abortErr = objectstore.ErrUnavailable
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	_, err := svc.Create(context.Background(), uploadAdmin(), CreateUploadInput{DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 3, ExpectedSHA256: digestOf([]byte("pdf"))})
 	if !errors.Is(err, objectstore.ErrUnavailable) || objects.abortCalls.Load() != 1 {
 		t.Fatalf("err=%v aborts=%d", err, objects.abortCalls.Load())
@@ -514,7 +534,7 @@ func TestUploadMismatchCancellationPersistsBeforeDeleteAndRetries(t *testing.T) 
 	store, objects := newFakeUploadStore(), newFakeObjects()
 	store.cancelFailures = 1
 	objects.data = []byte("evil")
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	s := store.seed(actor.User.ID, 4, digestOf([]byte("good")), now.Add(time.Hour))
 	store.parts[s.ID] = []UploadPart{{SessionID: s.ID, Number: 1, Size: 4, SHA256: digestOf([]byte("good")), ETag: "one"}}
 	if _, err := svc.Complete(context.Background(), actor, s.ID); err == nil {
@@ -536,7 +556,7 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 	t.Run("grace boundary", func(t *testing.T) {
 		store, objects := newFakeUploadStore(), newFakeObjects()
 		withinGrace := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(-cleanupGrace+time.Second))
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 			t.Fatal(err)
 		}
@@ -561,7 +581,7 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 		u := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(-2*time.Hour))
 		u.State = UploadCompleting
 		store.sessions[u.ID] = u
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 			t.Fatal(err)
 		}
@@ -576,7 +596,7 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 		u.State = UploadCancelled
 		store.sessions[u.ID] = u
 		objects.deleteErr = objectstore.ErrUnavailable
-		svc := NewUploadService(store, objects, func() time.Time { return now })
+		svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 		if err := svc.CleanupExpired(context.Background(), 100); err == nil {
 			t.Fatal("expected delete failure")
 		}
@@ -594,7 +614,7 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 }
 
 func TestUploadGateRegistriesEvictIdleEntries(t *testing.T) {
-	svc := NewUploadService(newFakeUploadStore(), newFakeObjects(), time.Now)
+	svc := NewUploadService(newFakeUploadStore(), newFakeObjects(), TeachingUploadPolicy{}, time.Now)
 	for i := 0; i < 1000; i++ {
 		id := uuid.New()
 		gate, releaseGate := svc.acquireGate(id)
@@ -625,7 +645,7 @@ func TestUploadPartStreamsWithBoundedReaderRequests(t *testing.T) {
 	expectedHash := hex.EncodeToString(hash.Sum(nil))
 	session := store.seed(actor.User.ID, UploadPartSize, expectedHash, now.Add(time.Hour))
 	probe := &boundedZeroReader{remaining: UploadPartSize, maxAllowed: 64 * 1024}
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	if _, err := svc.PutPart(context.Background(), actor, PutPartInput{
 		SessionID: session.ID,
 		Number:    1,
@@ -686,7 +706,7 @@ func TestUploadCleanupContinuesAfterCandidateFailure(t *testing.T) {
 	baseStore.sessions[second.ID] = second
 	store := &orderedCleanupStore{fakeUploadStore: baseStore, claimed: []UploadSession{first, second}}
 	objects := &selectiveCleanupObjects{fakeObjects: newFakeObjects(), failKey: first.ObjectKey}
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	if err := svc.CleanupExpired(context.Background(), 100); err == nil {
 		t.Fatal("expected opaque aggregate cleanup failure")
 	}
@@ -738,7 +758,7 @@ func TestUploadCleanupConfirmsReferenceBeforeObjectDeletion(t *testing.T) {
 		}
 		store.referenced[candidate.ObjectKey] = true
 	}
-	svc := NewUploadService(store, objects, func() time.Time { return now })
+	svc := NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })
 	if err := svc.CleanupExpired(context.Background(), 100); err == nil {
 		t.Fatal("expected cleanup confirmation conflict")
 	}

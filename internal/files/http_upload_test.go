@@ -23,7 +23,7 @@ func TestUploadHTTPStrictStreamingPart(t *testing.T) {
 	actor := uploadAdmin()
 	payload := []byte("streamed")
 	session := store.seed(actor.User.ID, int64(len(payload)), digestOf(payload), now.Add(time.Hour))
-	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, func() time.Time { return now })).Routes())
+	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })).Routes())
 
 	request := func(contentType string, body []byte) *http.Request {
 		r := httptest.NewRequest(http.MethodPut, "/"+session.ID.String()+"/parts/1", bytes.NewReader(body))
@@ -61,7 +61,7 @@ func TestUploadHTTPAdminJSONRoutesAndOpaqueResponse(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store, objects := newFakeUploadStore(), newFakeObjects()
 	actor := uploadAdmin()
-	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, func() time.Time { return now })).Routes())
+	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })).Routes())
 	body := `{"displayName":"lesson.pdf","declaredMime":"application/pdf","expectedSize":3,"expectedSha256":"` + digestOf([]byte("pdf")) + `"}`
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	r = r.WithContext(auth.ContextWithUser(r.Context(), actor.User))
@@ -87,6 +87,26 @@ func TestUploadHTTPAdminJSONRoutesAndOpaqueResponse(t *testing.T) {
 	}
 }
 
+func TestUploadHTTPAllowedRolesAreCopied(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	store, objects := newFakeUploadStore(), newFakeObjects()
+	actor := uploadAdmin()
+	actor.User.Role = auth.RoleStudent
+	session := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(time.Hour))
+	session.Purpose = UploadPurposeQA
+	store.sessions[session.ID] = session
+	roles := []auth.Role{auth.RoleStudent}
+	h := httpx.RequestID(NewUploadHandlerWithConfig(NewUploadService(store, objects, QAUploadPolicy{}, func() time.Time { return now }), UploadHTTPConfig{AllowedRoles: roles}).Routes())
+	roles[0] = auth.RoleAdmin
+	r := httptest.NewRequest(http.MethodGet, "/"+session.ID.String(), nil)
+	r = r.WithContext(auth.ContextWithUser(r.Context(), actor.User))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mutated role config affected handler: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestUploadHTTPSourceDoesNotBufferBodies(t *testing.T) {
 	source, err := os.ReadFile("http_upload.go")
 	if err != nil {
@@ -104,7 +124,7 @@ func TestUploadHTTPAdmissionCoversStoreAndRejectsThird(t *testing.T) {
 	firstPayload := bytes.Repeat([]byte{0}, int(UploadPartSize))
 	finalPayload := []byte("x")
 	session := store.seed(actor.User.ID, UploadPartSize+1, digestOf([]byte("whole")), now.Add(time.Hour))
-	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, func() time.Time { return now })).Routes())
+	h := httpx.RequestID(NewUploadHandler(NewUploadService(store, objects, TeachingUploadPolicy{}, func() time.Time { return now })).Routes())
 	request := func(number int, payload []byte) *http.Request {
 		r := httptest.NewRequest(http.MethodPut, "/"+session.ID.String()+"/parts/"+strconv.Itoa(number), bytes.NewReader(payload))
 		r = r.WithContext(auth.ContextWithUser(r.Context(), actor.User))

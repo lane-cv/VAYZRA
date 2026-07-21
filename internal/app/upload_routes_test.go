@@ -53,3 +53,41 @@ func TestApplicationMountsUploadRoutesBehindAuthOriginAndCSRF(t *testing.T) {
 		t.Fatalf("cross-site status=%d creates=%d body=%s", w.Code, service.creates, w.Body.String())
 	}
 }
+
+func TestApplicationMountsQuestionUploadsWithExactRoles(t *testing.T) {
+	body := `{"displayName":"answer.pdf","declaredMime":"application/pdf","expectedSize":3,"expectedSha256":"4d4b21e9ef71e1291183a46b913ae6f2a0d68f4e83bb5c89ae36c15ebc1cb64f"}`
+	request := func(path string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Origin", "https://learn.example.com")
+		r.Header.Set("X-CSRF-Token", "qa-upload-csrf")
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "token"})
+		r.AddCookie(&http.Cookie{Name: "hl_csrf", Value: "qa-upload-csrf"})
+		return r
+	}
+	studentService := &appUploadService{}
+	studentApp := New(Dependencies{Auth: &appStudentAuth{}, QAUploads: studentService, PublicOrigin: "https://learn.example.com"})
+	w := httptest.NewRecorder()
+	studentApp.ServeHTTP(w, request("/api/v1/student/question-uploads"))
+	if w.Code != http.StatusCreated || studentService.creates != 1 {
+		t.Fatalf("student route status=%d creates=%d body=%s", w.Code, studentService.creates, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	studentApp.ServeHTTP(w, request("/api/v1/admin/question-uploads"))
+	if w.Code != http.StatusForbidden || studentService.creates != 1 {
+		t.Fatalf("student crossed admin route status=%d creates=%d", w.Code, studentService.creates)
+	}
+
+	adminService := &appUploadService{}
+	adminApp := New(Dependencies{Auth: &appAdminAuth{}, QAUploads: adminService, PublicOrigin: "https://learn.example.com"})
+	w = httptest.NewRecorder()
+	adminApp.ServeHTTP(w, request("/api/v1/admin/question-uploads"))
+	if w.Code != http.StatusCreated || adminService.creates != 1 {
+		t.Fatalf("admin route status=%d creates=%d body=%s", w.Code, adminService.creates, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	adminApp.ServeHTTP(w, request("/api/v1/student/question-uploads"))
+	if w.Code != http.StatusForbidden || adminService.creates != 1 {
+		t.Fatalf("admin crossed student route status=%d creates=%d", w.Code, adminService.creates)
+	}
+}
