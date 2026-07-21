@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -87,6 +88,14 @@ func validateAndMarshal(event Event) ([]byte, error) {
 			return nil, ErrInvalidEvent
 		}
 	}
+	if event.Action == "qa.thread_created" || event.Action == "qa.student_followed_up" {
+		messageCount, messageOK := event.Metadata["messageCount"].(string)
+		attachmentCount, attachmentOK := event.Metadata["attachmentCount"].(string)
+		attachments, countErr := strconv.Atoi(attachmentCount)
+		if len(event.Metadata) != 2 || !messageOK || messageCount != "1" || !attachmentOK || countErr != nil || attachments < 0 || attachments > 20 {
+			return nil, ErrInvalidEvent
+		}
+	}
 	return json.Marshal(event.Metadata)
 }
 
@@ -96,6 +105,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"lesson.draft_saved": {}, "lesson.published": {"revision_id": true}, "lesson.withdrawn": {}, "lesson.archived": {},
 	"file.uploaded": {}, "file.policy_changed": {}, "file.processing_retried": {}, "file.replaced": {}, "file.draft_rolled_back": {}, "file.delete_requested": {},
 	"file.cleanup_scheduled": {"previewCount": true}, "file.cleanup_completed": {},
+	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -104,4 +114,5 @@ var allowedTargetTypes = map[string]string{
 	"lesson.draft_saved": "lesson", "lesson.published": "lesson", "lesson.withdrawn": "lesson", "lesson.archived": "lesson",
 	"file.uploaded": "file_version", "file.policy_changed": "lesson", "file.processing_retried": "file_version", "file.replaced": "file", "file.draft_rolled_back": "file_version", "file.delete_requested": "file",
 	"file.cleanup_scheduled": "file_version", "file.cleanup_completed": "file_version",
+	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread",
 }

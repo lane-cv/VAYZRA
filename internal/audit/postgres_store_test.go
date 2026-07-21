@@ -42,3 +42,36 @@ func TestPostgresWriterSanitizesAndAuditRowsAreImmutable(t *testing.T) {
 		t.Fatal("audit delete unexpectedly succeeded")
 	}
 }
+
+func TestQandaStudentAuditEventsAcceptOnlySafeCounts(t *testing.T) {
+	base := Event{
+		ActorUserID: uuid.New(), TargetType: "qa_thread", TargetID: uuid.NewString(),
+		Metadata:  map[string]any{"messageCount": "1", "attachmentCount": "0"},
+		RequestID: "request-qa", IP: net.ParseIP("192.0.2.5"),
+	}
+	for _, action := range []string{"qa.thread_created", "qa.student_followed_up"} {
+		event := base
+		event.Action = action
+		if _, err := validateAndMarshal(event); err != nil {
+			t.Fatalf("approved action %q rejected: %v", action, err)
+		}
+	}
+	for name, mutate := range map[string]func(Event) Event{
+		"title metadata": func(event Event) Event { event.Metadata = map[string]any{"title": "private"}; return event },
+		"body metadata":  func(event Event) Event { event.Metadata = map[string]any{"body": "private"}; return event },
+		"wrong target":   func(event Event) Event { event.TargetType = "student"; return event },
+		"numeric count":  func(event Event) Event { event.Metadata = map[string]any{"messageCount": 1}; return event },
+		"body under count key": func(event Event) Event {
+			event.Metadata = map[string]any{"messageCount": "private question body", "attachmentCount": "0"}
+			return event
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			event := mutate(base)
+			event.Action = "qa.thread_created"
+			if _, err := validateAndMarshal(event); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("unsafe event error=%v", err)
+			}
+		})
+	}
+}

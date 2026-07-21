@@ -1,0 +1,244 @@
+package qanda
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/tests/integration"
+)
+
+func TestPostgresStudentIsolationDisabledDenialAndStableCursor(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	first, second := insertQAStudent(t, pool), insertQAStudent(t, pool)
+	stamp := time.Date(2026, 7, 22, 6, 0, 0, 0, time.UTC)
+	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() > ids[j].String() })
+	for i, id := range ids {
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,last_message_at,created_at,updated_at) VALUES($1,$2,$3,'pending',$4,$4,$4)`, id, first, fmt.Sprintf("thread-%d", i), stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='completed',completed_at=$2 WHERE id=$1`, ids[0], stamp); err != nil {
+		t.Fatal(err)
+	}
+	otherThread := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,last_message_at) VALUES($1,$2,'private','pending',$3)`, otherThread, second, stamp); err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresStore(pool)
+	page1, next, err := store.ListStudentThreads(ctx, first, "", ThreadCursor{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 2 || page1[0].ID != ids[0] || page1[1].ID != ids[1] || next.ID != ids[1] || !next.LastMessageAt.Equal(stamp) {
+		t.Fatalf("page1=%#v next=%#v", page1, next)
+	}
+	page2, _, err := store.ListStudentThreads(ctx, first, "", next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 || page2[0].ID != ids[2] {
+		t.Fatalf("page2=%#v", page2)
+	}
+	pending, _, err := store.ListStudentThreads(ctx, first, StatusPending, ThreadCursor{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].ID != ids[1] || pending[1].ID != ids[2] {
+		t.Fatalf("pending=%#v", pending)
+	}
+	if _, err := store.GetStudentThread(ctx, first, otherThread); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-student get error=%v", err)
+	}
+	if _, err := store.GetStudentThread(ctx, second, ids[0]); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("reverse cross-student get error=%v", err)
+	}
+	malformedKey := strings.Repeat("m", 16)
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','must remain private',$4,$5)`, uuid.New(), otherThread, first, malformedKey, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.FindMessageByIdempotency(ctx, first, malformedKey); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-owner idempotency lookup error=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetStudentThread(ctx, first, ids[0]); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled get error=%v", err)
+	}
+	if threads, _, err := store.ListStudentThreads(ctx, first, "", ThreadCursor{Limit: 10}); !errors.Is(err, ErrNotFound) || threads != nil {
+		t.Fatalf("disabled list=%#v error=%v", threads, err)
+	}
+}
+
+func TestPostgresIdempotencyScopeAndNotificationRollback(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	admin := activeQAAdmin(t, pool)
+	first, second := insertQAStudent(t, pool), insertQAStudent(t, pool)
+	clock := func() time.Time { return time.Date(2026, 7, 22, 7, 0, 0, 0, time.UTC) }
+	key := strings.Repeat("i", 16)
+
+	notifications := &capturingNotifications{}
+	service := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return notifications }), clock)
+	firstThread, firstMessage, err := service.CreateThread(ctx, postgresPrincipal(first), CreateThreadInput{Title: "First", Body: "Body", IdempotencyKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	againThread, againMessage, err := service.CreateThread(ctx, postgresPrincipal(first), CreateThreadInput{Title: "Changed", Body: "Changed", IdempotencyKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if againThread.ID != firstThread.ID || againMessage.ID != firstMessage.ID {
+		t.Fatalf("same-user retry created different records")
+	}
+	secondThread, _, err := service.CreateThread(ctx, postgresPrincipal(second), CreateThreadInput{Title: "Second", Body: "Body", IdempotencyKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondThread.ID == firstThread.ID {
+		t.Fatal("different students shared an idempotency result")
+	}
+	if notifications.count() != 2 {
+		t.Fatalf("notifications=%d", notifications.count())
+	}
+	for _, intent := range notifications.snapshot() {
+		if intent.RecipientUserID != admin {
+			t.Fatalf("recipient=%s admin=%s", intent.RecipientUserID, admin)
+		}
+	}
+
+	failing := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(tx pgx.Tx) NotificationWriter { return failingTxNotification{tx: tx} }), clock)
+	rollbackKey := strings.Repeat("z", 16)
+	if _, _, err := failing.CreateThread(ctx, postgresPrincipal(first), CreateThreadInput{Title: "Rollback", Body: "Body", IdempotencyKey: rollbackKey}); err == nil {
+		t.Fatal("notification failure did not fail transaction")
+	}
+	var threads, messages, audits int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1 AND idempotency_key=$2`, first, rollbackKey).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_threads WHERE student_id=$1 AND title='Rollback'`, first).Scan(&threads); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE actor_user_id=$1 AND action='qa.thread_created' AND metadata->>'messageCount'='1'`, first).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if threads != 0 || messages != 0 || audits != 1 { // one audit belongs to the committed first create
+		t.Fatalf("threads=%d messages=%d audits=%d", threads, messages, audits)
+	}
+}
+
+func TestPostgresConcurrentStudentFollowUpsAppendOnce(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	activeQAAdmin(t, pool)
+	student := insertQAStudent(t, pool)
+	notifications := &capturingNotifications{}
+	clock := func() time.Time { return time.Date(2026, 7, 22, 8, 0, 0, 0, time.UTC) }
+	service := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return notifications }), clock)
+	thread, _, err := service.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Concurrent", Body: "Initial", IdempotencyKey: strings.Repeat("a", 16)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='waiting_student',version=2 WHERE id=$1`, thread.ID); err != nil {
+		t.Fatal(err)
+	}
+	in := AddMessageInput{ThreadID: thread.ID, Body: "Follow up", IdempotencyKey: strings.Repeat("b", 16)}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			_, _, err := service.AddStudentMessage(context.Background(), postgresPrincipal(student), in)
+			results <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	var status Status
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1 AND idempotency_key=$2`, student, in.IdempotencyKey).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM qa_threads WHERE id=$1`, thread.ID).Scan(&status, &version); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || status != StatusPending || version != 3 || notifications.count() != 2 { // create + one follow-up
+		t.Fatalf("messages=%d status=%s version=%d notifications=%d", count, status, version, notifications.count())
+	}
+}
+
+func postgresFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, pool
+}
+
+func insertQAStudent(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := pool.QueryRow(context.Background(), `INSERT INTO users(username,display_name,role,status,password_hash) VALUES($1,'Q&A student','student','active','hash') RETURNING id`, "qanda_student_"+uuid.NewString()).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func activeQAAdmin(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE role='admin' AND status='active' AND deleted_at IS NULL LIMIT 1`).Scan(&id); err == nil {
+		return id
+	}
+	if err := pool.QueryRow(context.Background(), `INSERT INTO users(username,display_name,role,status,password_hash) VALUES($1,'Q&A teacher','admin','active','hash') RETURNING id`, "qanda_admin_"+uuid.NewString()).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func postgresPrincipal(id uuid.UUID) Principal {
+	return Principal{User: auth.User{ID: id, Role: auth.RoleStudent, Status: auth.StatusActive}, RequestID: "postgres-req-" + id.String(), IP: net.ParseIP("127.0.0.1")}
+}
+
+type capturingNotifications struct {
+	mu      sync.Mutex
+	intents []NotificationIntent
+}
+
+func (w *capturingNotifications) Notify(_ context.Context, intent NotificationIntent) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.intents = append(w.intents, intent)
+	return nil
+}
+func (w *capturingNotifications) count() int { w.mu.Lock(); defer w.mu.Unlock(); return len(w.intents) }
+func (w *capturingNotifications) snapshot() []NotificationIntent {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]NotificationIntent(nil), w.intents...)
+}
+
+type failingTxNotification struct{ tx pgx.Tx }
+
+func (w failingTxNotification) Notify(ctx context.Context, _ NotificationIntent) error {
+	_, err := w.tx.Exec(ctx, `SELECT 1/0`)
+	return err
+}
