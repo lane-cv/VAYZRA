@@ -11,6 +11,7 @@ import (
 
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
+	"happylearn.local/app/internal/notifications"
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
@@ -34,6 +35,7 @@ type Dependencies struct {
 	StudentTeaching   teaching.StudentHTTPService
 	StudentQuestions  qanda.StudentHTTPService
 	AdminQuestions    qanda.AdminHTTPService
+	Notifications     notifications.HTTPService
 	PublicOrigin      string
 	CookieSecure      bool
 	TrustedProxyCIDRs []netip.Prefix
@@ -106,6 +108,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.AdminQuestions != nil {
 					private.Mount("/admin/questions", qanda.NewAdminHandlerWithConfig(d.AdminQuestions, qanda.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.Notifications != nil {
+					private.Mount("/notifications", notifications.NewHandler(d.Notifications).Routes())
 				}
 				if d.FileAccess != nil {
 					private.Mount("/files", files.NewAccessHandler(d.FileAccess, d.TrustedProxyCIDRs).Routes())

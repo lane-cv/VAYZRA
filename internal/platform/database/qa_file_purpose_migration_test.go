@@ -21,7 +21,7 @@ func TestQAFilePurposeMigrationBackfillsConstrainsAndReverses(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 11); err != nil {
+		if _, err := provider.UpTo(context.Background(), 12); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})

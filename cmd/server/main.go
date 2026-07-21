@@ -16,6 +16,7 @@ import (
 	"happylearn.local/app/internal/app"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
+	"happylearn.local/app/internal/notifications"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
@@ -87,6 +88,7 @@ type applicationDependencies struct {
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions       func(*pgxpool.Pool) qanda.HTTPServices
+	newNotifications   func(*pgxpool.Pool) notifications.HTTPService
 	ready              func(*pgxpool.Pool) func(context.Context) error
 	objectReady        func(context.Context, config.Config) (func(context.Context) error, error)
 	readinessTimeout   time.Duration
@@ -114,6 +116,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		startUploadCleanup: files.StartCleanupRunner,
 		newStudentTeaching: newProductionStudentTeachingService,
 		newQuestions:       newProductionQuestionServices,
+		newNotifications:   newProductionNotificationService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -180,6 +183,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	var questionServices qanda.HTTPServices
 	if deps.newQuestions != nil {
 		questionServices = deps.newQuestions(pool)
+	}
+	var notificationService notifications.HTTPService
+	if deps.newNotifications != nil {
+		notificationService = deps.newNotifications(pool)
 	}
 	var fileAccessService files.AccessHTTPService
 	if deps.newFileAccess != nil {
@@ -269,6 +276,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentTeaching:   studentTeachingService,
 		StudentQuestions:  questionServices.Student,
 		AdminQuestions:    questionServices.Admin,
+		Notifications:     notificationService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
@@ -399,21 +407,14 @@ func newProductionStudentTeachingService(pool *pgxpool.Pool) teaching.StudentHTT
 func newProductionQuestionServices(pool *pgxpool.Pool) qanda.HTTPServices {
 	store := qanda.NewPostgresStore(pool)
 	uow := qanda.NewPostgresUnitOfWork(pool, func(tx pgx.Tx) qanda.NotificationWriter {
-		return transactionNoopNotificationWriter{tx: tx}
+		return notifications.NewWriter(tx)
 	})
 	service := qanda.NewService(store, uow, time.Now)
 	return qanda.HTTPServices{Student: service, Admin: service}
 }
 
-// transactionNoopNotificationWriter is temporary production wiring until the
-// durable notification module supplies a writer backed by this same pgx.Tx.
-type transactionNoopNotificationWriter struct{ tx pgx.Tx }
-
-func (w transactionNoopNotificationWriter) Notify(context.Context, qanda.NotificationIntent) error {
-	if w.tx == nil {
-		return errors.New("qanda notification transaction is not configured")
-	}
-	return nil
+func newProductionNotificationService(pool *pgxpool.Pool) notifications.HTTPService {
+	return notifications.NewService(notifications.NewPostgresStore(pool))
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {
