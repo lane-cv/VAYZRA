@@ -427,15 +427,35 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 	if _, err = tx.Exec(ctx, `DELETE FROM lesson_draft_files WHERE lesson_id=$1`, lessonID); err != nil {
 		return nil, err
 	}
-	out := make([]DraftBinding, 0, len(inputs))
-	for _, in := range inputs {
-		var exists bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=$1 AND f.deleted_at IS NULL)`, in.FileVersionID).Scan(&exists); err != nil {
+	versionIDs := make([]uuid.UUID, len(inputs))
+	for i := range inputs {
+		versionIDs[i] = inputs[i].FileVersionID
+	}
+	if len(versionIDs) > 0 {
+		locked, lockErr := tx.Query(ctx, `SELECT fv.id FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=ANY($1) AND f.deleted_at IS NULL ORDER BY f.id,fv.id FOR SHARE OF f,fv`, versionIDs)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		lockedCount := 0
+		for locked.Next() {
+			var ignored uuid.UUID
+			if err = locked.Scan(&ignored); err != nil {
+				locked.Close()
+				return nil, err
+			}
+			lockedCount++
+		}
+		if err = locked.Err(); err != nil {
+			locked.Close()
 			return nil, err
 		}
-		if !exists {
+		locked.Close()
+		if lockedCount != len(versionIDs) {
 			return nil, ErrNotFound
 		}
+	}
+	out := make([]DraftBinding, 0, len(inputs))
+	for _, in := range inputs {
 		b := DraftBinding{ID: uuid.New(), LessonID: lessonID, DraftBindingInput: in}
 		_, err = tx.Exec(ctx, `INSERT INTO lesson_draft_files(id,lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,$3,$4,$5,$6,$7)`, b.ID, lessonID, in.FileVersionID, in.Policy, in.SortPosition, in.DisplayName, in.Description)
 		if err != nil {

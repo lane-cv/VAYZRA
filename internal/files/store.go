@@ -28,3 +28,25 @@ type AccessStore interface {
 type BindingStore interface {
 	ReplaceDraftBindings(context.Context, Principal, uuid.UUID, int64, []DraftBindingInput) ([]DraftBinding, error)
 }
+
+type FileCenterStore interface {
+	ListFiles(context.Context, FileFilter, Cursor) (FilePage, error)
+	FileDetail(context.Context, uuid.UUID) (FileDetail, error)
+	FileVersion(context.Context, uuid.UUID) (FileVersionDetail, error)
+	RetryFile(context.Context, Principal, uuid.UUID) error
+	ReplaceFile(context.Context, Principal, uuid.UUID, uuid.UUID, time.Time) error
+	RollbackFile(context.Context, Principal, uuid.UUID, uuid.UUID, uuid.UUID) error
+	DeleteFile(context.Context, Principal, uuid.UUID, time.Time) error
+}
+
+type FileCleanupCandidate struct {
+	FileID      uuid.UUID
+	VersionID   uuid.UUID
+	OriginalKey string
+	PreviewKeys []string
+}
+
+type FileCleanupStore interface {
+	ClaimFileCleanup(context.Context, time.Time, string, time.Duration) (FileCleanupCandidate, bool, error)
+	CompleteFileCleanup(context.Context, FileCleanupCandidate, string, time.Time) error
+}

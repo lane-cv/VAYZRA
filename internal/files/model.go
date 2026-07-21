@@ -31,7 +31,12 @@ var (
 	ErrRangeNotSatisfiable = errors.New("range not satisfiable")
 	ErrAccessUnavailable   = errors.New("file access unavailable")
 	ErrDraftConflict       = errors.New("draft version conflict")
+	ErrFileInUse           = errors.New("file is referenced")
+	ErrFileVersionExpired  = errors.New("file version expired")
+	ErrFileNotRetryable    = errors.New("file processing is not retryable")
 )
+
+const FileRetentionPeriod = 30 * 24 * time.Hour
 
 type UploadState string
 
@@ -196,4 +201,63 @@ type OpenedFile struct {
 	Range         ResponseRange
 	Playable      bool
 	ReportFailure func(context.Context, string) error
+}
+
+type FileFilter struct {
+	Name        string
+	Type        string
+	State       string
+	Reference   string
+	CreatedFrom *time.Time
+	CreatedTo   *time.Time
+}
+
+type Cursor struct {
+	AfterCreatedAt time.Time
+	AfterID        uuid.UUID
+	Limit          int
+}
+
+type FileReference struct {
+	Kind        string    `json:"kind"`
+	LessonID    uuid.UUID `json:"lessonId"`
+	LessonTitle string    `json:"lessonTitle"`
+	RevisionID  uuid.UUID `json:"revisionId,omitempty"`
+}
+
+type FileVersionDetail struct {
+	ID              uuid.UUID  `json:"id"`
+	FileID          uuid.UUID  `json:"fileId"`
+	Version         int64      `json:"version"`
+	DisplayName     string     `json:"displayName"`
+	DeclaredMIME    string     `json:"declaredMime"`
+	DetectedMIME    string     `json:"detectedMime,omitempty"`
+	Size            int64      `json:"size"`
+	ProcessingState string     `json:"processingState"`
+	FailureCategory string     `json:"failureCategory,omitempty"`
+	PreviewState    string     `json:"previewState,omitempty"`
+	BrowserPlayable bool       `json:"browserPlayable"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	RetentionUntil  *time.Time `json:"retentionUntil,omitempty"`
+}
+
+type FileListItem struct {
+	ID         uuid.UUID         `json:"id"`
+	CreatedAt  time.Time         `json:"createdAt"`
+	DeletedAt  *time.Time        `json:"deletedAt,omitempty"`
+	Latest     FileVersionDetail `json:"latest"`
+	References int               `json:"referenceCount"`
+}
+
+type FilePage struct {
+	Items      []FileListItem `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
+}
+
+type FileDetail struct {
+	ID         uuid.UUID           `json:"id"`
+	CreatedAt  time.Time           `json:"createdAt"`
+	DeletedAt  *time.Time          `json:"deletedAt,omitempty"`
+	Versions   []FileVersionDetail `json:"versions"`
+	References []FileReference     `json:"references"`
 }

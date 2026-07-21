@@ -60,3 +60,34 @@ func TestApplicationMountsAdminLessonFileBindings(t *testing.T) {
 		t.Fatalf("status=%d calls=%d body=%s", w.Code, svc.calls, w.Body.String())
 	}
 }
+
+type appFileCenter struct{ calls int }
+
+func (s *appFileCenter) List(context.Context, files.Principal, files.FileFilter, files.Cursor) (files.FilePage, error) {
+	s.calls++
+	return files.FilePage{Items: []files.FileListItem{}}, nil
+}
+func (*appFileCenter) Detail(context.Context, files.Principal, uuid.UUID) (files.FileDetail, error) {
+	return files.FileDetail{}, nil
+}
+func (*appFileCenter) Retry(context.Context, files.Principal, uuid.UUID) error { return nil }
+func (*appFileCenter) Replace(context.Context, files.Principal, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+func (*appFileCenter) RollbackDraftBinding(context.Context, files.Principal, uuid.UUID, uuid.UUID, uuid.UUID) error {
+	return nil
+}
+func (*appFileCenter) RequestDelete(context.Context, files.Principal, uuid.UUID) error { return nil }
+
+func TestApplicationMountsAdminFileCenter(t *testing.T) {
+	service := &appFileCenter{}
+	handler := New(Dependencies{Auth: &appAdminAuth{}, FileCenter: service, PublicOrigin: "https://learn.example.com"})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/files/?limit=25", nil)
+	req.RemoteAddr = net.JoinHostPort("192.0.2.2", "1234")
+	req.AddCookie(&http.Cookie{Name: "hl_session", Value: "token"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || service.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, service.calls, w.Body.String())
+	}
+}

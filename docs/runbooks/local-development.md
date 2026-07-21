@@ -32,6 +32,13 @@ docker compose -p happylearn-dev -f deploy/compose.dev.yml logs --no-log-prefix 
 
 Worker logs intentionally contain stable error categories rather than uploaded names, object keys, or file contents. A readiness failure means PostgreSQL, object storage, tmpfs, or one of `clamscan`, `soffice`, `pdfinfo`, and `ffprobe` is unavailable.
 
+Soft-deleted, unreferenced file versions remain recoverable for 30 days. Run bounded cleanup from the same hardened image; it rechecks draft and published references under database locks and retains metadata whenever object deletion fails:
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml run --rm --no-deps \
+  --entrypoint /app/happylearn-maintenance worker cleanup-files --limit 100
+```
+
 ## Local configuration, migration, and bootstrap
 
 Create a private local secret directory and environment file. The values below are development-only placeholders; do not reuse them outside local testing.

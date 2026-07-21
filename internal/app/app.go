@@ -27,6 +27,7 @@ type Dependencies struct {
 	Uploads           files.UploadHTTPService
 	FileAccess        files.AccessHTTPService
 	FileBindings      files.BindingHTTPService
+	FileCenter        files.FileCenterHTTPService
 	StudentTeaching   teaching.StudentHTTPService
 	PublicOrigin      string
 	CookieSecure      bool
@@ -82,6 +83,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.Uploads != nil {
 					private.Mount("/admin/uploads", files.NewUploadHandlerWithConfig(d.Uploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.FileCenter != nil {
+					private.Mount("/admin/files", files.NewFileCenterHandler(d.FileCenter, d.TrustedProxyCIDRs).Routes())
 				}
 				if d.StudentTeaching != nil {
 					private.Mount("/student", teaching.NewStudentHandlerWithConfig(d.StudentTeaching, teaching.StudentHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProgressLimiter: d.ProgressLimiter, SearchLimiter: d.SearchLimiter}).Routes())

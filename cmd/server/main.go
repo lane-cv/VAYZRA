@@ -79,6 +79,7 @@ type applicationDependencies struct {
 	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
 	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
+	newFileCenter      func(*pgxpool.Pool) files.FileCenterHTTPService
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	ready              func(*pgxpool.Pool) func(context.Context) error
@@ -102,6 +103,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newUploads:         newProductionUploadService,
 		newFileAccess:      newProductionFileAccessService,
 		newFileBindings:    newProductionFileBindingService,
+		newFileCenter:      newProductionFileCenterService,
 		startUploadCleanup: files.StartCleanupRunner,
 		newStudentTeaching: newProductionStudentTeachingService,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
@@ -171,6 +173,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newFileBindings != nil {
 		fileBindingService = deps.newFileBindings(pool)
 	}
+	var fileCenterService files.FileCenterHTTPService
+	if deps.newFileCenter != nil {
+		fileCenterService = deps.newFileCenter(pool)
+	}
 	databaseReady := deps.ready(pool)
 	if databaseReady == nil {
 		closePool()
@@ -229,6 +235,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Uploads:           uploadService,
 		FileAccess:        fileAccessService,
 		FileBindings:      fileBindingService,
+		FileCenter:        fileCenterService,
 		StudentTeaching:   studentTeachingService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
@@ -324,6 +331,9 @@ func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg
 
 func newProductionFileBindingService(pool *pgxpool.Pool) files.BindingHTTPService {
 	return files.NewBindingService(files.NewPostgresStore(pool))
+}
+func newProductionFileCenterService(pool *pgxpool.Pool) files.FileCenterHTTPService {
+	return files.NewFileCenterService(files.NewPostgresStore(pool), time.Now)
 }
 func newProductionStudentTeachingService(pool *pgxpool.Pool) teaching.StudentHTTPService {
 	return teaching.NewStudentService(teaching.NewPostgresStore(pool), time.Now)

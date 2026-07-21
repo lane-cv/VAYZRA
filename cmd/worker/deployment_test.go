@@ -11,7 +11,7 @@ func TestWorkerDeploymentIsBoundedAndNonRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"go build", "clamscan", "libreoffice", "poppler-utils", "ffmpeg", "USER 10002:10002", "ENTRYPOINT [\"/app/happylearn-worker\"]"} {
+	for _, required := range []string{"go build", "happylearn-maintenance", "clamscan", "libreoffice", "poppler-utils", "ffmpeg", "USER 10002:10002", "ENTRYPOINT [\"/app/happylearn-worker\"]"} {
 		if !strings.Contains(string(dockerfile), required) {
 			t.Errorf("Dockerfile.worker missing %q", required)
 		}

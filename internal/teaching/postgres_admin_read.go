@@ -36,13 +36,20 @@ func (s *PostgresStore) PublicationBlockers(ctx context.Context, lessonID uuid.U
 		}
 	}
 	rows, err := s.q.Query(ctx, `
-SELECT blocker FROM (
+SELECT DISTINCT blocker FROM (
  SELECT 'draft_changed' blocker WHERE NOT EXISTS(SELECT 1 FROM lesson_drafts WHERE lesson_id=$1 AND lock_version=$2)
  UNION ALL
- SELECT 'file_not_ready' FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN files f ON f.id=fv.file_id
+ SELECT CASE
+  WHEN f.deleted_at IS NOT NULL THEN 'file_deleted'
+  WHEN fv.processing_state='pending_scan' OR (fv.processing_state='processing' AND fv.scan_result IS NULL) THEN 'scan_pending'
+  WHEN fv.processing_state='rejected' THEN 'scan_rejected'
+  WHEN fv.processing_state='processing' AND fv.scan_result='clean' THEN 'conversion_pending'
+  WHEN fv.processing_state='failed' THEN 'conversion_failed'
+  ELSE 'file_not_ready' END
+ FROM lesson_draft_files b JOIN file_versions fv ON fv.id=b.file_version_id JOIN files f ON f.id=fv.file_id
  WHERE b.lesson_id=$1 AND (fv.processing_state<>'ready' OR f.deleted_at IS NOT NULL)
  UNION ALL
- SELECT 'preview_not_ready' FROM lesson_draft_files b WHERE b.lesson_id=$1 AND b.access_policy='preview' AND NOT EXISTS(
+ SELECT 'preview_missing' FROM lesson_draft_files b WHERE b.lesson_id=$1 AND b.access_policy='preview' AND NOT EXISTS(
   SELECT 1 FROM file_previews fp WHERE fp.file_version_id=b.file_version_id AND fp.processing_state='ready')
 ) blockers ORDER BY blocker`, lessonID, sourceVersion)
 	if err != nil {

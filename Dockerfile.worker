@@ -7,7 +7,8 @@ COPY cmd cmd
 COPY db db
 COPY internal internal
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-worker ./cmd/worker
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-worker ./cmd/worker \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-maintenance ./cmd/maintenance
 
 FROM debian:12.12-slim AS runtime
 RUN apt-get update \
@@ -20,6 +21,7 @@ RUN groupadd --gid 10002 worker && useradd --uid 10002 --gid 10002 --no-create-h
     && install -d -o 10002 -g 10002 -m 0700 /work /app
 WORKDIR /app
 COPY --from=worker-build /out/happylearn-worker /app/happylearn-worker
-RUN chown 10002:10002 /app/happylearn-worker && chmod 0555 /app/happylearn-worker
+COPY --from=worker-build /out/happylearn-maintenance /app/happylearn-maintenance
+RUN chown 10002:10002 /app/happylearn-worker /app/happylearn-maintenance && chmod 0555 /app/happylearn-worker /app/happylearn-maintenance
 USER 10002:10002
 ENTRYPOINT ["/app/happylearn-worker"]
