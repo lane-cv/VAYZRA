@@ -9,10 +9,10 @@
     "build": "vue-tsc --noEmit && vite build"
   },
   "dependencies": {
-    "dompurify": "3.3.1",
+    "dompurify": "3.4.11",
     "element-plus": "2.14.3",
     "katex": "0.16.22",
-    "markdown-it": "14.1.0",
+    "markdown-it": "14.3.0",
     "pinia": "3.0.4",
     "vue": "3.5.40",
     "vue-router": "4.6.4"

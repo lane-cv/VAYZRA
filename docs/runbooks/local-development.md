@@ -1,6 +1,6 @@
 # HappyLearn local development and Ubuntu container runbook
 
-This phase produces one same-origin Go/API and Vue-console image. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL and Redis remain private to the Docker network. This runbook does not deploy to a remote server.
+This phase produces a same-origin Go/API and Vue-console image plus a serial file-processing worker. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL, Redis, AIStor S3, and the worker health endpoint remain private to the Docker network. This runbook does not deploy to a remote server.
 
 ## Shell requirement
 
@@ -20,7 +20,7 @@ docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d --build
 docker compose -p happylearn-dev -f deploy/compose.dev.yml ps
 ```
 
-Wait until the infrastructure and worker services report `healthy`. PostgreSQL is available only at `127.0.0.1:54329` and Redis only at `127.0.0.1:56379` for local development. The worker health endpoint is private to the Compose network and is not published on the host.
+Wait until all services report `healthy`. The application is available at `127.0.0.1:8080`; PostgreSQL, Redis, and the AIStor S3/console development ports bind only to loopback. The worker health endpoint is private to the Compose network and is not published on the host. Production deployment must remove every database, Redis, S3, and S3-console host mapping.
 
 The worker runs as UID/GID `10002`, with a read-only root filesystem, no Linux capabilities, and a 1024 MiB tmpfs work directory. It has no published port and its network has no public route. Each uploaded version is processed serially through type validation, ClamAV scanning, bounded Office conversion or video probing, and private preview storage. Processing fails closed when the baked-in daily ClamAV definitions are missing or older than seven days. Rebuild and redeploy `Dockerfile.worker` at least weekly (and immediately for urgent signature releases):
 
@@ -86,10 +86,10 @@ Run all unit, integration, static-web, frontend, type, build, vulnerability, and
 make verify
 ```
 
-For browser acceptance, use the disposable runner. It creates a uniquely named `happylearn_e2e_*` database, dedicated Redis DB 15, generated test-only credentials, and a read-only app container; its Bash trap removes them even when Playwright fails. It never touches the main development database and disables traces, screenshots, videos, and artifact uploads because forms contain credentials:
+Complete Phase 2 acceptance requires the AIStor Free license path and uses unique containers, an internal network, and dedicated data/fixture/runner volumes. It includes the Phase 1 authentication scenarios, generates all file fixtures inside Linux, uses only disposable credentials, stores failure evidence under `test-results/phase2`, and removes only its own resources in a trap:
 
 ```bash
-make e2e
+HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license" make e2e
 ```
 
 For manual diagnosis only, start the server as above and use new test-only passwords (never production values):
@@ -99,7 +99,8 @@ export E2E_ADMIN_PASSWORD='replace-with-a-local-test-password'
 export E2E_STUDENT_PASSWORD='replace-with-a-local-temporary-password'
 export E2E_STUDENT_NEW_PASSWORD='replace-with-a-local-changed-password'
 pnpm exec playwright install chromium
-pnpm exec playwright test tests/e2e/auth-students.spec.ts
+E2E_FIXTURE_DIR=/absolute/path/to/disposable/generated-fixtures \
+  pnpm exec playwright test tests/e2e/teaching.spec.ts tests/e2e/files.spec.ts tests/e2e/learning.spec.ts
 unset E2E_ADMIN_PASSWORD E2E_STUDENT_PASSWORD E2E_STUDENT_NEW_PASSWORD
 ```
 
@@ -108,7 +109,8 @@ unset E2E_ADMIN_PASSWORD E2E_STUDENT_PASSWORD E2E_STUDENT_NEW_PASSWORD
 Build the phase image after a clean frontend build is available to the Docker build stages:
 
 ```bash
-docker build -t happylearn:phase1 .
+docker build -t happylearn:phase2 .
+docker build -f Dockerfile.worker -t happylearn-worker:phase2 .
 ```
 
 For a local container smoke test, create a separate owner-only file using the Compose-network hostnames, then run the image with a read-only root filesystem. Replace `CHANGE_ME_LOCAL_ONLY` with a generated local secret, never a real production secret.
@@ -124,12 +126,12 @@ HAPPYLEARN_LOGIN_THROTTLE_SECRET=CHANGE_ME_LOCAL_ONLY_AT_LEAST_32_BYTES_LONG
 HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:8080
 EOF
 chmod 600 .env.container
-docker run --rm --name happylearn-phase1 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-  --user 10001:10001 --network happylearn-dev_happylearn --env-file .env.container -p 8080:8080 happylearn:phase1
+docker run --rm --name happylearn-phase2 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --user 10001:10001 --network happylearn-dev_happylearn --env-file .env.container -p 8080:8080 happylearn:phase2
 # In another terminal:
 curl --fail http://127.0.0.1:8080/api/v1/health/live
 curl --fail http://127.0.0.1:8080/api/v1/health/ready
-docker inspect -f '{{.Config.User}}' happylearn-phase1
+docker inspect -f '{{.Config.User}}' happylearn-phase2
 ```
 
 ## Backup and restore
@@ -141,6 +143,8 @@ mkdir -p backups
 docker compose -p happylearn-dev -f deploy/compose.dev.yml exec -T postgres \
   pg_dump -U happylearn -Fc happylearn > backups/happylearn-dev-$(date +%F).dump
 ```
+
+The database dump is not a complete Phase 2 backup. Snapshot the `minio_data` volume in the same maintenance window and retain the exact database/object-store pair; immutable revision rows refer to object keys. See [phase2-files.md](phase2-files.md) for recovery and rollback procedures.
 
 **Destructive development-only restore:** this replaces data in the `happylearn` database of the explicitly named `happylearn-dev` Compose project. Confirm the backup file and project name before running it.
 

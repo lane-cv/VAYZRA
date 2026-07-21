@@ -8,69 +8,79 @@ on:
 permissions:
   contents: read
 
+env:
+  HAPPYLEARN_AISTOR_LICENSE_FILE: ${{ runner.temp }}/minio.license
+
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:18.4
-        env:
-          POSTGRES_USER: happylearn
-          POSTGRES_PASSWORD: happylearn_dev
-          POSTGRES_DB: happylearn
-        ports: ['54329:5432']
-        options: >-
-          --health-cmd "pg_isready -U happylearn -d happylearn"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-      redis:
-        image: redis:8.8
-        ports: ['56379:6379']
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.18.0
-          cache: pnpm
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6.0.2
+      - uses: pnpm/action-setup@v6.0.8
         with:
           version: 11.9.0
           run_install: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - uses: actions/setup-go@v6.4.0
         with:
           go-version: 1.26.5
           cache: true
+      - name: Configure disposable AIStor license
+        env:
+          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
+        run: |
+          test -n "$AISTOR_LICENSE"
+          umask 077
+          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
       - run: pnpm install --frozen-lockfile
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      - run: go test ./...
-      - run: go test -race ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Start private integration dependencies
+        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml up -d --wait --wait-timeout 120 postgres redis minio
+      - run: go test ./... -count=1
+      - run: go test -race ./... -count=1
       - run: go vet ./...
       - run: govulncheck ./...
-      - run: pnpm test
-      - run: pnpm typecheck
-      - run: pnpm build
+      - run: pnpm --dir web test
+      - run: pnpm --dir web typecheck
+      - run: pnpm --dir web build
+      - run: pnpm audit --prod
       - run: docker compose -f deploy/compose.dev.yml config --quiet
       - run: docker build --tag happylearn:ci .
+      - run: docker build --file Dockerfile.worker --tag happylearn-worker:ci .
+      - name: Verify hardened image metadata
+        run: |
+          test "$(docker image inspect -f '{{.Config.User}}' happylearn:ci)" = '10001:10001'
+          test "$(docker image inspect -f '{{.Config.User}}' happylearn-worker:ci)" = '10002:10002'
+          test "$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' happylearn:ci)" != 'null'
+          test "$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' happylearn-worker:ci)" != 'null'
+      - name: Stop integration dependencies
+        if: always()
+        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml down --volumes --remove-orphans
 
-  e2e:
+  phase2-e2e:
     runs-on: ubuntu-24.04
     needs: verify
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6.0.2
+      - name: Configure disposable AIStor license
+        env:
+          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
+        run: |
+          test -n "$AISTOR_LICENSE"
+          umask 077
+          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+      - name: Run isolated Phase 2 acceptance
+        run: bash scripts/e2e-phase2.sh
+      - name: Upload disposable failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
         with:
-          node-version: 24.18.0
-          cache: pnpm
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.9.0
-          run_install: false
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 1.26.5
-          cache: true
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: make e2e
+          name: phase2-failure-${{ github.run_id }}
+          path: test-results/phase2
+          if-no-files-found: ignore
+          retention-days: 7

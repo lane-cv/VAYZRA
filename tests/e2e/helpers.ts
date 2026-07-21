@@ -1,4 +1,7 @@
-import { expect, type Page } from '@playwright/test'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { basename } from 'node:path'
+import { expect, type APIResponse, type Page } from '@playwright/test'
 
 export async function login(page: Page, username: string, password: string) {
   await page.goto('/login')
@@ -32,3 +35,89 @@ export async function csrfHeader(page: Page): Promise<Record<string, string>> {
   if (!csrf) throw new Error('missing CSRF cookie')
   return { 'X-CSRF-Token': csrf, Origin: new URL(page.url()).origin }
 }
+
+export async function apiJSON<T>(page: Page, method: string, path: string, data?: unknown, headers: Record<string, string> = {}): Promise<T> {
+  const response = await page.request.fetch(path, { method, data, headers: { ...(await csrfHeader(page)), ...headers } })
+  await expect(response, `${method} ${path}`).toBeOK()
+  if (response.status() === 204) return undefined as T
+  return (await response.json()).data as T
+}
+
+export type StudentRecord = { id: string; username: string; displayName: string; status: 'active' | 'disabled' }
+export async function createStudentAPI(page: Page, username: string, displayName: string, temporaryPassword: string) {
+  return apiJSON<StudentRecord>(page, 'POST', '/api/v1/admin/students', { username, displayName, temporaryPassword })
+}
+
+type CatalogNode = { id: string; kind: string; name: string }
+export type Draft = { lessonId: string; chapterId: string; title: string; summary: string; bodyMarkdown: string; sortKey: number; lockVersion: number; audience: { mode: 'all' | 'selected'; userIds: string[] }; externalVideos: unknown[] }
+export async function createTeachingPath(page: Page, suffix: string) {
+  let parentId = ''
+  const names = [`高一-${suffix}`, `上学期-${suffix}`, `物理-${suffix}`, `力学-${suffix}`]
+  for (const [index, kind] of ['grade', 'term', 'subject', 'chapter'].entries()) {
+    const node = await apiJSON<CatalogNode>(page, 'POST', `/api/v1/admin/catalog/${kind}`, { parentId, name: names[index], description: '', sortKey: 10 })
+    parentId = node.id
+  }
+  const draft = await apiJSON<Draft>(page, 'POST', '/api/v1/admin/lessons', { chapterId: parentId, title: `牛顿定律-${suffix}` })
+  return { chapterId: parentId, draft, names }
+}
+
+export async function createTeachingPathUI(page: Page, suffix: string) {
+  await page.goto('/admin/teaching')
+  const names = [`高一-${suffix}`, `上学期-${suffix}`, `物理-${suffix}`, `力学-${suffix}`, `牛顿定律-${suffix}`]
+  const kinds = ['年级', '学期', '学科', '章节', '课程']
+  for (let index = 0; index < names.length; index += 1) {
+    if (index > 0) await page.getByRole('treeitem', { name: names[index - 1], exact: true }).click()
+    await page.getByRole('button', { name: `创建${kinds[index]}`, exact: true }).last().click()
+    await page.getByLabel(index === 4 ? '课程名称' : '目录名称').fill(names[index])
+    await page.getByRole('button', { name: '确认', exact: true }).click()
+    await expect(page.getByRole('treeitem', { name: names[index], exact: true })).toBeVisible()
+  }
+  await page.getByRole('treeitem', { name: names[4], exact: true }).click()
+  await page.getByRole('link', { name: `编辑课程 ${names[4]}` }).click()
+  await expect(page).toHaveURL(/\/admin\/teaching\/lessons\/[^/]+$/)
+  const lessonId = new URL(page.url()).pathname.split('/').pop()!
+  const detail = await apiJSON<{ draft: Draft }>(page, 'GET', `/api/v1/admin/lessons/${lessonId}`)
+  return { lessonId, draft: detail.draft, names }
+}
+
+export async function saveDraft(page: Page, draft: Draft, patch: Partial<Omit<Draft, 'lessonId' | 'chapterId' | 'lockVersion'>>) {
+  return apiJSON<Draft>(page, 'PUT', `/api/v1/admin/lessons/${draft.lessonId}/draft`, {
+    title: patch.title ?? draft.title,
+    summary: patch.summary ?? draft.summary,
+    bodyMarkdown: patch.bodyMarkdown ?? draft.bodyMarkdown,
+    sortKey: patch.sortKey ?? draft.sortKey,
+    audience: patch.audience ?? draft.audience,
+    externalVideos: patch.externalVideos ?? draft.externalVideos,
+  }, { 'If-Match': String(draft.lockVersion) })
+}
+
+export async function publishDraft(page: Page, draft: Draft) {
+  return apiJSON<{ id: string; lessonId: string; version: number }>(page, 'POST', `/api/v1/admin/lessons/${draft.lessonId}/publish`, undefined, { 'If-Match': String(draft.lockVersion) })
+}
+
+export type UploadedFile = { fileId: string; fileVersionId: string; processingState: string }
+export async function uploadFixture(page: Page, path: string, declaredMime: string): Promise<UploadedFile> {
+  const bytes = await readFile(path)
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  const session = await apiJSON<{ id: string }>(page, 'POST', '/api/v1/admin/uploads', { displayName: basename(path), declaredMime, expectedSize: bytes.length, expectedSha256: sha256 })
+  const partSize = 8 * 1024 * 1024
+  for (let offset = 0, number = 1; offset < bytes.length; offset += partSize, number += 1) {
+    const part = bytes.subarray(offset, Math.min(offset + partSize, bytes.length))
+    const response = await page.request.put(`/api/v1/admin/uploads/${session.id}/parts/${number}`, { data: part, headers: { ...(await csrfHeader(page)), 'Content-Type': 'application/octet-stream', 'X-Part-SHA256': createHash('sha256').update(part).digest('hex') } })
+    await expect(response, `upload part ${number}`).toBeOK()
+  }
+  return apiJSON<UploadedFile>(page, 'POST', `/api/v1/admin/uploads/${session.id}/complete`, {})
+}
+
+export async function waitForFileState(page: Page, fileId: string, accepted: string[], timeout = 120_000) {
+  const deadline = Date.now() + timeout
+  let last: { versions: Array<{ id: string; processingState: string; previewState?: string; browserPlayable: boolean; failureCategory?: string }> } | undefined
+  while (Date.now() < deadline) {
+    last = await apiJSON<typeof last>(page, 'GET', `/api/v1/admin/files/${fileId}`)
+    if (last?.versions[0] && accepted.includes(last.versions[0].processingState)) return last
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  throw new Error(`file ${fileId} did not reach ${accepted.join('/')} (last=${JSON.stringify(last)})`)
+}
+
+export async function expectStatus(response: APIResponse, status: number) { expect(response.status()).toBe(status) }

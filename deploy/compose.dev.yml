@@ -14,6 +14,8 @@ services:
       retries: 10
     networks:
       - happylearn
+    mem_limit: 512m
+    cpus: 0.35
 
   redis:
     image: redis:8.8
@@ -26,6 +28,8 @@ services:
       retries: 10
     networks:
       - happylearn
+    mem_limit: 128m
+    cpus: 0.15
 
   minio-data-init:
     image: quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120
@@ -64,6 +68,52 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    networks:
+      - happylearn
+    mem_limit: 512m
+    cpus: 0.3
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "10001:10001"
+    environment:
+      HAPPYLEARN_ENV: development
+      HAPPYLEARN_LISTEN: ":8080"
+      HAPPYLEARN_DATABASE_URL: postgres://happylearn:happylearn_dev@postgres:5432/happylearn?sslmode=disable
+      HAPPYLEARN_REDIS_URL: redis://redis:6379/0
+      HAPPYLEARN_LOGIN_THROTTLE_SECRET: development-only-app-secret-at-least-32-bytes
+      HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_MINIO_ENDPOINT: minio:9000
+      HAPPYLEARN_MINIO_ACCESS_KEY: ${HAPPYLEARN_MINIO_ACCESS_KEY:-happylearn_dev}
+      HAPPYLEARN_MINIO_SECRET_KEY: ${HAPPYLEARN_MINIO_SECRET_KEY:-happylearn_minio_dev_secret}
+      HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
+      HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/v1/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks:
       - happylearn
 

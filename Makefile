@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e
+.PHONY: test-go test-web tools verify e2e e2e-phase2
 
 test-go:
 	$(GO) test ./...
@@ -17,7 +17,7 @@ tools: $(GOVULNCHECK)
 
 $(GOVULNCHECK): go.mod go.sum
 	@mkdir -p $(GOBIN)
-	GOBIN=$(GOBIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+	GOBIN=$(GOBIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
 verify: tools
 	$(GO) test -race ./...
@@ -29,4 +29,7 @@ verify: tools
 	docker compose -f deploy/compose.dev.yml config --quiet
 
 e2e:
-	bash scripts/e2e-disposable.sh
+	bash scripts/e2e-phase2.sh
+
+e2e-phase2:
+	bash scripts/e2e-phase2.sh
