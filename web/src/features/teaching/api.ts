@@ -1,5 +1,5 @@
 import { request } from '../../api/client'
-import type { CatalogKind, CatalogNode, LessonDetail, LessonDraft } from './types'
+import type { CatalogKind, CatalogNode, LessonDetail, LessonDraft, LessonRevision } from './types'
 
 export async function listCatalog(signal?: AbortSignal): Promise<CatalogNode[]> {
   return request<CatalogNode[]>('/admin/catalog?limit=200', { signal })
@@ -38,5 +38,16 @@ export function saveDraft(draft: LessonDraft): Promise<LessonDraft> {
       audience: draft.audience,
       externalVideos: draft.externalVideos,
     },
+  })
+}
+
+export function createLesson(chapterId: string, title: string): Promise<LessonDraft> {
+  return request<LessonDraft>('/admin/lessons', { method: 'POST', json: { chapterId, title } })
+}
+
+export function publishLesson(lessonId: string, lockVersion: number): Promise<LessonRevision> {
+  return request<LessonRevision>(`/admin/lessons/${encodeURIComponent(lessonId)}/publish`, {
+    method: 'POST',
+    headers: { 'If-Match': String(lockVersion) },
   })
 }

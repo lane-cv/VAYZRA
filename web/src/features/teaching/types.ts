@@ -44,4 +44,20 @@ export interface LessonDetail {
   status: 'draft' | 'published' | 'withdrawn' | 'archived'
   publishedRevisionId?: string
   draft: LessonDraft
+  currentPublication?: LessonRevision | null
+}
+
+export interface LessonRevision {
+  id: string
+  lessonId: string
+  version: number
+  sourceDraftVersion: number
+  title: string
+  summary: string
+  bodyMarkdown: string
+  sortKey: number
+  audience: LessonAudience
+  externalVideos: ExternalVideo[]
+  publishedBy: string
+  publishedAt: string
 }
