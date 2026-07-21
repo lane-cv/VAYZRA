@@ -67,9 +67,60 @@ services:
     networks:
       - happylearn
 
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile.worker
+    user: "10002:10002"
+    environment:
+      HAPPYLEARN_ENV: development
+      HAPPYLEARN_LISTEN: ":8080"
+      HAPPYLEARN_DATABASE_URL: postgres://happylearn:happylearn_dev@postgres:5432/happylearn?sslmode=disable
+      HAPPYLEARN_REDIS_URL: redis://redis:6379/0
+      HAPPYLEARN_LOGIN_THROTTLE_SECRET: development-only-worker-secret-at-least-32-bytes
+      HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_MINIO_ENDPOINT: minio:9000
+      HAPPYLEARN_MINIO_ACCESS_KEY: ${HAPPYLEARN_MINIO_ACCESS_KEY:-happylearn_dev}
+      HAPPYLEARN_MINIO_SECRET_KEY: ${HAPPYLEARN_MINIO_SECRET_KEY:-happylearn_minio_dev_secret}
+      HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
+      HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
+      HAPPYLEARN_WORK_DIR: /work
+    read_only: true
+    tmpfs:
+      - /work:rw,noexec,nosuid,size=1024m,uid=10002,gid=10002,mode=0700
+      - /tmp:rw,noexec,nosuid,size=32m,uid=10002,gid=10002,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1792m
+    cpus: 1.0
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1792m
+          cpus: "1.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8081/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - happylearn
+
 networks:
   happylearn:
     driver: bridge
+    internal: true
 
 volumes:
   minio_data:

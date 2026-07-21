@@ -80,7 +80,10 @@ func run() error {
 	if err != nil {
 		return errors.New("worker identity")
 	}
-	worker, err := buildWorker(processing.NewPostgresStore(pool), owner, newProductionProcessor)
+	processingStore := processing.NewPostgresStore(pool)
+	worker, err := buildWorker(processingStore, owner, func() (processing.Processor, error) {
+		return newProductionProcessor(processingStore, stores.Originals, stores.Previews, workDir)
+	})
 	if err != nil {
 		return errors.New("worker processing pipeline")
 	}
@@ -129,11 +132,11 @@ func run() error {
 
 type processorFactory func() (processing.Processor, error)
 
-func newProductionProcessor() (processing.Processor, error) {
-	// Processing Task 2 replaces this fail-closed staging dependency with the
-	// scanner/converter/prober pipeline. Failing before Worker.Run guarantees
-	// that no durable lease or retry attempt is consumed prematurely.
-	return nil, errors.New("processing pipeline unavailable")
+func newProductionProcessor(sources processing.SourceStore, originals, previews processing.BlobStore, workDir string) (processing.Processor, error) {
+	if sources == nil || originals == nil || previews == nil || !filepath.IsAbs(workDir) {
+		return nil, errors.New("processing pipeline unavailable")
+	}
+	return &processing.Pipeline{Sources: sources, Originals: originals, Previews: previews, Runner: processing.ExecRunner{}, WorkRoot: workDir, ClamDefinitionsDir: "/var/lib/clamav"}, nil
 }
 
 func buildWorker(store processing.Store, owner string, factory processorFactory) (*processing.Worker, error) {

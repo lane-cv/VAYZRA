@@ -12,7 +12,7 @@ const patchedAIStorImage = "quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-
 
 func TestMinIODeploymentSecurityContract(t *testing.T) {
 	compose := repositoryFile(t, "deploy", "compose.dev.yml")
-	if strings.Contains(compose, "build:") || strings.Contains(compose, "Dockerfile.minio") || strings.Contains(compose, "RELEASE.2025-10-15T17-29-55Z") {
+	if strings.Contains(compose, "Dockerfile.minio") || strings.Contains(compose, "RELEASE.2025-10-15T17-29-55Z") {
 		t.Fatal("development Compose still builds or references the vulnerable OSS server")
 	}
 	if strings.Count(compose, "image: "+patchedAIStorImage) != 2 {

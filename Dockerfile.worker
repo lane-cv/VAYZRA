@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM golang:1.26.5-bookworm AS worker-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY cmd cmd
+COPY db db
+COPY internal internal
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-worker ./cmd/worker
+
+FROM debian:12.12-slim AS runtime
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+       ca-certificates clamav clamav-freshclam curl ffmpeg libreoffice-calc libreoffice-core libreoffice-impress libreoffice-writer poppler-utils \
+    && freshclam --stdout \
+	&& clamscan --version \
+    && rm -rf /var/lib/apt/lists/* /var/log/clamav/*
+RUN groupadd --gid 10002 worker && useradd --uid 10002 --gid 10002 --no-create-home --shell /usr/sbin/nologin worker \
+    && install -d -o 10002 -g 10002 -m 0700 /work /app
+WORKDIR /app
+COPY --from=worker-build /out/happylearn-worker /app/happylearn-worker
+RUN chown 10002:10002 /app/happylearn-worker && chmod 0555 /app/happylearn-worker
+USER 10002:10002
+ENTRYPOINT ["/app/happylearn-worker"]

@@ -11,14 +11,26 @@ All commands in this runbook are Bash commands. On Windows, run them from WSL2 o
 - Go `1.26.5`, Node `24.18.0`, and pnpm `11.9.0`
 - `openssl` for generating local-only secrets
 
-Use the fixed Compose project name below so network and cleanup targets stay narrow:
+Use the fixed Compose project name below so network and cleanup targets stay narrow. The object store requires an AIStor Free license file; keep it outside the repository and point Compose to it before starting the stack:
 
 ```bash
-docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d
+export HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license"
+test -r "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d --build
 docker compose -p happylearn-dev -f deploy/compose.dev.yml ps
 ```
 
-Wait until both services report `healthy`. PostgreSQL is available only at `127.0.0.1:54329` and Redis only at `127.0.0.1:56379` for local development.
+Wait until the infrastructure and worker services report `healthy`. PostgreSQL is available only at `127.0.0.1:54329` and Redis only at `127.0.0.1:56379` for local development. The worker health endpoint is private to the Compose network and is not published on the host.
+
+The worker runs as UID/GID `10002`, with a read-only root filesystem, no Linux capabilities, and a 1024 MiB tmpfs work directory. It has no published port and its network has no public route. Each uploaded version is processed serially through type validation, ClamAV scanning, bounded Office conversion or video probing, and private preview storage. Processing fails closed when the baked-in daily ClamAV definitions are missing or older than seven days. Rebuild and redeploy `Dockerfile.worker` at least weekly (and immediately for urgent signature releases):
+
+```bash
+docker compose -p happylearn-dev -f deploy/compose.dev.yml build --pull worker
+docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d worker
+docker compose -p happylearn-dev -f deploy/compose.dev.yml logs --no-log-prefix worker
+```
+
+Worker logs intentionally contain stable error categories rather than uploaded names, object keys, or file contents. A readiness failure means PostgreSQL, object storage, tmpfs, or one of `clamscan`, `soffice`, `pdfinfo`, and `ffprobe` is unavailable.
 
 ## Local configuration, migration, and bootstrap
 

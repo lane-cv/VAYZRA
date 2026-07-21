@@ -39,6 +39,24 @@ type Result struct {
 	VideoDurationMS *int64
 	VideoWidth      *int
 	VideoHeight     *int
+	Preview         *PreviewResult
+}
+
+type PreviewResult struct {
+	Kind        string
+	ObjectKey   string
+	ContentType string
+	Size        int64
+	SHA256      string
+}
+
+type SourceFile struct {
+	VersionID    uuid.UUID
+	ObjectKey    string
+	DisplayName  string
+	DeclaredMIME string
+	Size         int64
+	SHA256       string
 }
 
 type Failure struct {

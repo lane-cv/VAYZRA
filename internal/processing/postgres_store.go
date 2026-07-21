@@ -17,6 +17,12 @@ type PostgresStore struct{ pool *pgxpool.Pool }
 
 func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore { return &PostgresStore{pool: pool} }
 
+func (s *PostgresStore) LoadSource(ctx context.Context, id uuid.UUID) (SourceFile, error) {
+	var source SourceFile
+	err := s.pool.QueryRow(ctx, `SELECT id,object_key,display_name,declared_mime,size_bytes,sha256 FROM file_versions WHERE id=$1`, id).Scan(&source.VersionID, &source.ObjectKey, &source.DisplayName, &source.DeclaredMIME, &source.Size, &source.SHA256)
+	return source, err
+}
+
 func (s *PostgresStore) LeaseNext(ctx context.Context, owner string, now time.Time, duration time.Duration) (Job, error) {
 	if s.pool == nil || owner == "" || len(owner) > 128 || duration <= 0 {
 		return Job{}, errors.New("invalid lease request")
@@ -112,6 +118,15 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 	}
 	if _, err := tx.Exec(ctx, `UPDATE file_versions SET processing_state='ready',detected_mime=$2,scan_result=$3,browser_playable=$4,video_container=NULLIF($5,''),video_codec=NULLIF($6,''),video_duration_ms=$7,video_width=$8,video_height=$9,failure_category=NULL WHERE id=$1`, job.FileVersionID, result.DetectedMIME, result.ScanResult, result.BrowserPlayable, result.VideoContainer, result.VideoCodec, result.VideoDurationMS, result.VideoWidth, result.VideoHeight); err != nil {
 		return err
+	}
+	if result.Preview != nil {
+		preview := result.Preview
+		if preview.Kind == "" || preview.ObjectKey == "" || preview.ContentType == "" || preview.Size < 1 || preview.SHA256 == "" {
+			return errors.New("invalid preview completion")
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,$2,$3,$4,$5,$6,'ready') ON CONFLICT(file_version_id,preview_kind) DO UPDATE SET object_key=EXCLUDED.object_key,content_type=EXCLUDED.content_type,size_bytes=EXCLUDED.size_bytes,sha256=EXCLUDED.sha256,processing_state='ready'`, job.FileVersionID, preview.Kind, preview.ObjectKey, preview.ContentType, preview.Size, preview.SHA256); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE file_processing_jobs SET state='completed',lease_owner=NULL,lease_until=NULL,last_failure_category=NULL,updated_at=now() WHERE id=$1`, job.ID); err != nil {
 		return err

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/internal/processing"
 )
 
@@ -74,9 +76,23 @@ func (*leaseCountingStore) Fail(context.Context, processing.Job, processing.Fail
 
 func TestDefaultProcessorWiringFailsBeforeAnyLease(t *testing.T) {
 	store := &leaseCountingStore{}
-	worker, err := buildWorker(store, "staged-worker", newProductionProcessor)
+	worker, err := buildWorker(store, "staged-worker", func() (processing.Processor, error) { return newProductionProcessor(nil, nil, nil, "") })
 	if err == nil || worker != nil || store.leases != 0 || strings.Contains(err.Error(), "clamscan") {
 		t.Fatalf("worker=%v err=%v leases=%d", worker, err, store.leases)
+	}
+}
+
+func TestProductionProcessorWiringReturnsPipelineForCompleteDependencies(t *testing.T) {
+	processor, err := newProductionProcessor(sourceReaderStub{}, &workerBlobStub{}, &workerBlobStub{}, t.TempDir())
+	if err != nil || processor == nil {
+		t.Fatalf("processor=%v err=%v", processor, err)
+	}
+	pipeline, ok := processor.(*processing.Pipeline)
+	if !ok {
+		t.Fatalf("processor=%T", processor)
+	}
+	if pipeline.ClamDefinitionsDir != "/var/lib/clamav" {
+		t.Fatalf("definitions=%q", pipeline.ClamDefinitionsDir)
 	}
 }
 
@@ -99,6 +115,21 @@ type processorStub struct{}
 
 func (processorStub) Process(context.Context, processing.Job) (processing.Result, error) {
 	return processing.Result{}, nil
+}
+
+type sourceReaderStub struct{}
+
+func (sourceReaderStub) LoadSource(context.Context, uuid.UUID) (processing.SourceFile, error) {
+	return processing.SourceFile{}, nil
+}
+
+type workerBlobStub struct{}
+
+func (*workerBlobStub) Get(context.Context, string, *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
+	return io.NopCloser(strings.NewReader("")), objectstore.ObjectInfo{}, nil
+}
+func (*workerBlobStub) Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error) {
+	return objectstore.ObjectInfo{}, nil
 }
 func TestHealthAddressIsLoopbackOnlyAndShutdownBounded(t *testing.T) {
 	if !strings.HasPrefix(workerHealthAddress, "127.0.0.1:") || workerShutdownLimit.String() != "20s" {
