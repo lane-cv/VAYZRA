@@ -110,6 +110,7 @@ func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing
 	ownerFile := insertQATestFileVersion(t, pool, owner, "visible-student.pdf")
 	otherFile := insertQATestFileVersion(t, pool, other, "cross-student-secret.pdf")
 	adminFile := insertQATestFileVersion(t, pool, admin, "visible-admin.pdf")
+	teachingFile := insertTeachingTestFileVersion(t, pool, owner, "legacy-teaching.pdf")
 	studentOwnedFile := insertQATestFileVersion(t, pool, owner, "admin-foreign-secret.pdf")
 	for _, binding := range []struct {
 		message, version uuid.UUID
@@ -120,6 +121,7 @@ func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing
 		{studentMessage, otherFile, 1, "cross-student-secret.pdf"},
 		{adminMessage, adminFile, 0, "visible-admin.pdf"},
 		{adminMessage, studentOwnedFile, 1, "admin-foreign-secret.pdf"},
+		{studentMessage, teachingFile, 2, "legacy-teaching.pdf"},
 	} {
 		if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,$3,$4)`, binding.message, binding.version, binding.position, binding.name); err != nil {
 			t.Fatal(err)
@@ -135,8 +137,15 @@ func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing
 	if len(messages[0].Attachments) != 1 || messages[0].Attachments[0].FileVersionID != ownerFile || len(messages[1].Attachments) != 1 || messages[1].Attachments[0].FileVersionID != adminFile {
 		t.Fatalf("attachments=%#v/%#v", messages[0].Attachments, messages[1].Attachments)
 	}
+	adminMessages, _, err := NewPostgresStore(pool).ListAdminMessages(ctx, threadID, MessageCursor{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adminMessages) != 2 || len(adminMessages[0].Attachments) != 1 || adminMessages[0].Attachments[0].FileVersionID != ownerFile || len(adminMessages[1].Attachments) != 1 || adminMessages[1].Attachments[0].FileVersionID != adminFile {
+		t.Fatalf("admin attachments=%#v", adminMessages)
+	}
 	dump := fmt.Sprintf("%#v", messages)
-	for _, secret := range []string{"cross student secret", "non-admin sender secret", "cross-student-secret.pdf", "admin-foreign-secret.pdf", otherFile.String(), studentOwnedFile.String()} {
+	for _, secret := range []string{"cross student secret", "non-admin sender secret", "cross-student-secret.pdf", "admin-foreign-secret.pdf", "legacy-teaching.pdf", otherFile.String(), studentOwnedFile.String(), teachingFile.String()} {
 		if strings.Contains(dump, secret) {
 			t.Fatalf("history leaked %q in %s", secret, dump)
 		}
@@ -205,7 +214,7 @@ func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
 	student, other := insertQAStudent(t, pool), insertQAStudent(t, pool)
 	valid := insertReadyQAAttachment(t, pool, student, "  answer.pdf  ", "application/pdf", 1024)
 	foreign := insertReadyQAAttachment(t, pool, other, "secret.pdf", "application/pdf", 1024)
-	teaching := insertQATestFileVersion(t, pool, student, "lesson.pdf")
+	teaching := insertTeachingTestFileVersion(t, pool, student, "lesson.pdf")
 	svc := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return &capturingNotifications{} }), time.Now)
 	_, message, err := svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "With file", Body: "Please review", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: valid, SortPosition: 0}}})
 	if err != nil {
@@ -230,6 +239,17 @@ func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
 	}
 	if _, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Teaching", Body: "bad", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: teaching, SortPosition: 0}}}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("teaching purpose err=%v", err)
+	}
+	deleted := insertReadyQAAttachment(t, pool, student, "deleted.pdf", "application/pdf", 1)
+	if _, err = pool.Exec(ctx, `UPDATE files SET deleted_at=now() WHERE id=(SELECT file_id FROM file_versions WHERE id=$1)`, deleted); err != nil {
+		t.Fatal(err)
+	}
+	deletedKey := uuid.NewString()
+	if _, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Deleted", Body: "bad", IdempotencyKey: deletedKey, Attachments: []AttachmentInput{{FileVersionID: deleted, SortPosition: 0}}}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("deleted attachment err=%v", err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1 AND idempotency_key=$2`, student, deletedKey).Scan(&messages); err != nil || messages != 0 {
+		t.Fatalf("deleted rollback messages=%d err=%v", messages, err)
 	}
 
 	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='failed' WHERE id=$1`, valid); err != nil {
@@ -568,7 +588,20 @@ func insertQATestFileVersion(t *testing.T, pool *pgxpool.Pool, creator uuid.UUID
 	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, creator).Scan(&fileID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,$3,'application/pdf',1,$4,'ready',$5) RETURNING id`, fileID, "qa-test/"+uuid.NewString(), displayName, strings.Repeat("a", 64), creator).Scan(&versionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'qa_attachment',$2,$3,'application/pdf','application/pdf',1,$4,'ready',$5) RETURNING id`, fileID, "qa-test/"+uuid.NewString(), displayName, strings.Repeat("a", 64), creator).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	return versionID
+}
+
+func insertTeachingTestFileVersion(t *testing.T, pool *pgxpool.Pool, creator uuid.UUID, name string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	var fileID, versionID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, creator).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'teaching',$2,$3,'application/pdf','application/pdf',1,$4,'ready',$5) RETURNING id`, fileID, "teaching-test/"+uuid.NewString(), name, strings.Repeat("c", 64), creator).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
 	return versionID

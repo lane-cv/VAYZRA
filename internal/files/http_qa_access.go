@@ -30,7 +30,18 @@ func NewQAAccessHandler(service QAAccessHTTPService, trusted []netip.Prefix) *QA
 
 func (h *QAAccessHandler) Routes() http.Handler {
 	r := chi.NewRouter()
-	r.Use(httpx.NoStore, h.requireQAActor)
+	r.Use(httpx.NoStore, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			next.ServeHTTP(w, r)
+		})
+	}, h.requireQAActor)
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不允许")
+	})
 	r.Get("/{version}/status", h.Status)
 	r.Get("/{version}/preview", func(w http.ResponseWriter, r *http.Request) { h.open(w, r, ActionPreview) })
 	r.Get("/{version}/download", func(w http.ResponseWriter, r *http.Request) { h.open(w, r, ActionDownload) })

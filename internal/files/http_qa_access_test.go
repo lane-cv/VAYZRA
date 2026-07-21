@@ -53,6 +53,13 @@ func TestQAAccessHTTPStatusIsSafeAndRoutesAreStrict(t *testing.T) {
 		if got.Code != tc.want {
 			t.Fatalf("%s %s status=%d body=%s", tc.method, tc.path, got.Code, got.Body.String())
 		}
+		if !strings.Contains(got.Body.String(), `"requestId":`) || got.Header().Get("Content-Type") != "application/json; charset=utf-8" || got.Header().Get("Cache-Control") != "no-store, private" || got.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("%s %s non-uniform error headers=%v body=%s", tc.method, tc.path, got.Header(), got.Body.String())
+		}
+	}
+	unknown := request(http.MethodGet, "/"+id.String()+"/unknown", student)
+	if unknown.Code != 404 || !strings.Contains(unknown.Body.String(), `"code":"not_found"`) || !strings.Contains(unknown.Body.String(), `"requestId":`) || unknown.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("unknown status=%d headers=%v body=%s", unknown.Code, unknown.Header(), unknown.Body.String())
 	}
 }
 

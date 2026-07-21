@@ -117,6 +117,16 @@ func TestPostgresQAAccessAuthorizationIsDerivedFromBoundThread(t *testing.T) {
 	bound := makeVersion("qa_attachment", "ready", true)
 	unbound := makeVersion("qa_attachment", "ready", false)
 	teaching := makeVersion("teaching", "ready", false)
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,1,'teaching.txt')`, message, teaching); err != nil {
+		t.Fatal(err)
+	}
+	deleted := makeVersion("qa_attachment", "ready", false)
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,2,'deleted.txt')`, message, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE files SET deleted_at=now() WHERE id=(SELECT file_id FROM file_versions WHERE id=$1)`, deleted); err != nil {
+		t.Fatal(err)
+	}
 	store := NewPostgresStore(pool)
 	principal := func(id uuid.UUID, role auth.Role) Principal {
 		return Principal{User: auth.User{ID: id, Role: role, Status: auth.StatusActive}, RequestID: "qa-access-request", IP: net.ParseIP("192.0.2.8")}
@@ -141,6 +151,15 @@ func TestPostgresQAAccessAuthorizationIsDerivedFromBoundThread(t *testing.T) {
 	}
 	if _, err := store.ResolveQAStatus(ctx, principal(owner, auth.RoleStudent), teaching); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("teaching status err=%v", err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(owner, auth.RoleStudent), teaching, ActionDownload); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("teaching bound access err=%v", err)
+	}
+	if _, err := store.ResolveQAStatus(ctx, principal(owner, auth.RoleStudent), deleted); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted status err=%v", err)
+	}
+	if _, err := store.ResolveQAAccess(ctx, principal(admin, auth.RoleAdmin), deleted, ActionDownload); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted admin access err=%v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, owner); err != nil {
 		t.Fatal(err)

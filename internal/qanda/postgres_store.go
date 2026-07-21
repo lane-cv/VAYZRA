@@ -464,7 +464,7 @@ func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal,
 		positions[in.SortPosition] = struct{}{}
 	}
 	rows, err := s.q.Query(ctx, `SELECT fv.id,f.created_by,fv.purpose,fv.processing_state,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.display_name
-	 FROM file_versions fv JOIN files f ON f.id=fv.file_id
+	 FROM file_versions fv JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
 	 WHERE fv.id=ANY($1) ORDER BY fv.id FOR UPDATE OF fv,f`, ids)
 	if err != nil {
 		return nil, mapPostgresError(err)
@@ -559,7 +559,7 @@ func (s *PostgresStore) BindMessageAttachments(ctx context.Context, messageID uu
 }
 
 func (s *PostgresStore) listAdminMessageAttachments(ctx context.Context, messageID uuid.UUID) ([]Attachment, error) {
-	rows, err := s.q.Query(ctx, `SELECT mf.file_version_id,mf.sort_position,mf.display_name FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id JOIN files f ON f.id=(SELECT file_id FROM file_versions WHERE id=mf.file_version_id) AND f.created_by=m.sender_user_id AND f.deleted_at IS NULL WHERE mf.message_id=$1 ORDER BY mf.sort_position,mf.file_version_id`, messageID)
+	rows, err := s.q.Query(ctx, `SELECT mf.file_version_id,mf.sort_position,mf.display_name FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id JOIN file_versions fv ON fv.id=mf.file_version_id AND fv.purpose='qa_attachment' AND fv.processing_state='ready' JOIN files f ON f.id=fv.file_id AND f.created_by=m.sender_user_id AND f.deleted_at IS NULL WHERE mf.message_id=$1 ORDER BY mf.sort_position,mf.file_version_id`, messageID)
 	if err != nil {
 		return nil, mapPostgresError(err)
 	}
@@ -589,6 +589,7 @@ func (s *PostgresStore) listStudentMessageAttachments(ctx context.Context, stude
 		JOIN qa_threads q ON q.id=m.thread_id
 		JOIN users u ON u.id=q.student_id AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
 		JOIN file_versions fv ON fv.id=mf.file_version_id
+		  AND fv.purpose='qa_attachment' AND fv.processing_state='ready'
 		JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
 		LEFT JOIN users sender_admin ON sender_admin.id=m.sender_user_id AND sender_admin.role='admin' AND sender_admin.status='active' AND sender_admin.deleted_at IS NULL
 		WHERE mf.message_id=$1 AND q.student_id=$2

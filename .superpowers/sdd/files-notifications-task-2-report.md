@@ -35,3 +35,13 @@ Authorization regressions cover random/cross-student uniform 404 envelopes, disa
 ## Environment concern
 
 The pre-existing MinIO/AIStor integration requires an unavailable local object-store service/license. Per task instructions, this task used in-memory object stores plus PostgreSQL authorization/integration tests and did not wait for that external environment.
+
+## Independent-review remediation
+
+The first independent review found three Important issues; each was reproduced RED before repair:
+
+- Chi's default unknown-method/path responses were empty/non-JSON. Q&A file child routes now install explicit JSON `NotFound` and `MethodNotAllowed` handlers and set no-store/nosniff consistently.
+- The lock query admitted soft-deleted files. It now requires `files.deleted_at IS NULL`; exact-set comparison maps missing/deleted rows to the same fail-closed error and the surrounding message transaction rolls back.
+- Historical/malformed teaching-purpose bindings could appear in Q&A message DTOs. Every `qa_message_files` read was audited; student/admin message reads now require `purpose='qa_attachment'`, `processing_state='ready'`, an undeleted file, and correct sender ownership. Status/access resolution already enforces Q&A purpose and was extended with regressions for malicious teaching bindings and soft-deleted files.
+
+Post-remediation full affected unit/PG/app/server, affected integration, race, vet, and diff checks pass.
