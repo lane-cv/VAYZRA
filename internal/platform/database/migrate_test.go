@@ -62,6 +62,46 @@ func TestAuthMigrationHasUserUniquenessIndexes(t *testing.T) {
 	}
 }
 
+func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(context.Background(), pool); err != nil {
+		t.Fatal(err)
+	}
+	var tables, triggers, indexes, idempotencyKeys int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema='public' AND table_name IN
+		('qa_threads','qa_messages','qa_message_files','teacher_notes')`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_trigger
+		WHERE NOT tgisinternal AND tgname IN
+		('qa_messages_immutable','qa_message_files_immutable','teacher_notes_immutable')`).Scan(&triggers); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_indexes
+		WHERE schemaname='public' AND indexname IN
+		('qa_threads_student_activity_idx','qa_threads_teacher_queue_idx','qa_messages_thread_time_idx')`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pg_constraint c
+		JOIN pg_class r ON r.oid=c.conrelid
+		WHERE r.relname='qa_messages' AND c.contype='u'
+		  AND c.conkey=ARRAY[
+			(SELECT attnum FROM pg_attribute WHERE attrelid=r.oid AND attname='sender_user_id'),
+			(SELECT attnum FROM pg_attribute WHERE attrelid=r.oid AND attname='idempotency_key')
+		]`).Scan(&idempotencyKeys); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 4 || triggers != 3 || indexes != 3 || idempotencyKeys != 1 {
+		t.Fatalf("tables=%d triggers=%d indexes=%d idempotency_keys=%d", tables, triggers, indexes, idempotencyKeys)
+	}
+}
+
 func TestTeachingMigrationCreatesCatalogSchema(t *testing.T) {
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(context.Background(), pool); err != nil {
