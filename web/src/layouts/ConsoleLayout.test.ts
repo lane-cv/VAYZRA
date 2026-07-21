@@ -39,6 +39,7 @@ describe('ConsoleLayout drawer', () => {
   it('never renders teaching administration for students', () => {
     const { wrapper } = mountLayout('student')
     expect(wrapper.find('a[href="/admin/teaching"]').exists()).toBe(false)
+    expect(wrapper.get('a[href="/student/learning"]').text()).toContain('课程学习')
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
     const { wrapper, route } = mountLayout(); const trigger = wrapper.get('button[aria-label="打开导航"]')

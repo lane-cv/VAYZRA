@@ -10,6 +10,10 @@ describe('console router guards', () => {
   it('redirects a student away from admin routes', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin'); expect(router.currentRoute.value.fullPath).toBe('/student')
   })
+  it('allows students to open the learning space and lesson reader', async () => {
+    const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }; const router = createAppRouter(); await router.push('/student/learning'); expect(router.currentRoute.value.name).toBe('student-learning')
+    await router.push('/student/learning/11111111-1111-4111-8111-111111111111'); expect(router.currentRoute.value.params.lessonId).toBe('11111111-1111-4111-8111-111111111111')
+  })
   it('allows an admin to open the student management route', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin/students'); expect(router.currentRoute.value.fullPath).toBe('/admin/students')
   })

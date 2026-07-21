@@ -8,6 +8,7 @@ import StudentHomeView from '../features/home/StudentHomeView.vue'
 import TeachingManagerView from '../features/teaching/TeachingManagerView.vue'
 import FileCenterView from '../features/files/FileCenterView.vue'
 import LessonEditorView from '../features/teaching/LessonEditorView.vue'
+import LearningView from '../features/learning/LearningView.vue'
 import { useSessionStore } from '../stores/session'
 import type { Role } from '../api/client'
 
@@ -18,7 +19,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: LoginView },
   { path: '/change-password', name: 'change-password', component: ChangePasswordView, meta: { requiresAuth: true, allowDuringPasswordChange: true } },
   { path: '/admin', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['admin'] }, children: [{ path: '', name: 'admin-home', component: AdminHomeView }, { path: 'students', name: 'admin-students', component: StudentListView }, { path: 'teaching', name: 'admin-teaching', component: TeachingManagerView }, { path: 'teaching/lessons/:lessonId', name: 'admin-lesson-editor', component: LessonEditorView, props: true }, { path: 'files', name: 'admin-files', component: FileCenterView }] },
-  { path: '/student', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['student'] }, children: [{ path: '', name: 'student-home', component: StudentHomeView }] },
+  { path: '/student', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['student'] }, children: [{ path: '', name: 'student-home', component: StudentHomeView }, { path: 'learning', name: 'student-learning', component: LearningView }, { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true }] },
   { path: '/:pathMatch(.*)*', redirect: '/login' },
 ]
 

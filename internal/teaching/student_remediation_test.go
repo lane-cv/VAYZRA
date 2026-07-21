@@ -95,6 +95,27 @@ func TestStudentHTTPUsesCompactLowerCamelDTOs(t *testing.T) {
 	}
 }
 
+func TestStudentLessonDTOIncludesOnlyAuthorizedPublishedFileMetadata(t *testing.T) {
+	lessonID, revisionID, versionID := uuid.New(), uuid.New(), uuid.New()
+	service := &remediationStudentHTTPService{lesson: StudentLesson{
+		Revision: Revision{ID: revisionID, LessonID: lessonID, Title: "力学"},
+		Files:    []StudentFile{{FileVersionID: versionID, Policy: "preview", DisplayName: "讲义.pdf", Description: "课堂讲义", SortPosition: 10, DetectedMIME: "application/pdf", PreviewAvailable: true}},
+	}}
+	h := NewStudentHandler(service).Routes()
+	r := httptest.NewRequest(http.MethodGet, "/lessons/"+lessonID.String(), nil)
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"fileVersionId":"`+versionID.String()+`"`) || !strings.Contains(w.Body.String(), `"previewAvailable":true`) {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	for _, forbidden := range []string{"objectKey", "sha256", "createdBy"} {
+		if strings.Contains(w.Body.String(), forbidden) {
+			t.Fatalf("leaked %s in %s", forbidden, w.Body.String())
+		}
+	}
+}
+
 func TestStudentSearchRateLimitReturnsStable429BeforeDispatch(t *testing.T) {
 	service := &remediationStudentHTTPService{}
 	limiter := &denySearchLimiter{decision: redisx.ResourceDecision{RetryAfter: 3 * time.Second}}
@@ -165,6 +186,7 @@ func (*remediationStudentStore) UpdateProgress(context.Context, uuid.UUID, Progr
 
 type remediationStudentHTTPService struct {
 	search                     []SearchResult
+	lesson                     StudentLesson
 	searchCalls, progressCalls int
 }
 
@@ -174,8 +196,8 @@ func (*remediationStudentHTTPService) Browse(context.Context, Principal, BrowseI
 func (*remediationStudentHTTPService) Recent(context.Context, Principal, int) ([]RecentLesson, error) {
 	return nil, nil
 }
-func (*remediationStudentHTTPService) GetLesson(context.Context, Principal, uuid.UUID) (StudentLesson, error) {
-	return StudentLesson{}, nil
+func (s *remediationStudentHTTPService) GetLesson(context.Context, Principal, uuid.UUID) (StudentLesson, error) {
+	return s.lesson, nil
 }
 func (*remediationStudentHTTPService) GetPosition(context.Context, Principal, uuid.UUID) (LessonProgress, error) {
 	return LessonProgress{}, nil

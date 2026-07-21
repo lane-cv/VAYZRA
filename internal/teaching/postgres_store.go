@@ -474,6 +474,30 @@ ORDER BY v.sort_key,v.id`, studentID, lessonID)
 	if !found {
 		return StudentLesson{}, ErrNotFound
 	}
+	rows.Close()
+	fileRows, err := s.q.Query(ctx, `
+SELECT b.file_version_id,b.access_policy,b.display_name,b.description,b.sort_position,
+       COALESCE(fv.detected_mime,''),fv.browser_playable,
+       (fv.browser_playable OR EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready'))
+FROM lesson_revision_files b
+JOIN file_versions fv ON fv.id=b.file_version_id AND fv.processing_state='ready'
+JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
+WHERE b.revision_id=$1
+ORDER BY b.sort_position,b.file_version_id`, lesson.Revision.ID)
+	if err != nil {
+		return StudentLesson{}, mapTeachingError(err)
+	}
+	defer fileRows.Close()
+	for fileRows.Next() {
+		var file StudentFile
+		if err = fileRows.Scan(&file.FileVersionID, &file.Policy, &file.DisplayName, &file.Description, &file.SortPosition, &file.DetectedMIME, &file.BrowserPlayable, &file.PreviewAvailable); err != nil {
+			return StudentLesson{}, mapTeachingError(err)
+		}
+		lesson.Files = append(lesson.Files, file)
+	}
+	if err = fileRows.Err(); err != nil {
+		return StudentLesson{}, mapTeachingError(err)
+	}
 	return lesson, nil
 }
 func (s *PostgresStore) GetPosition(ctx context.Context, studentID, lessonID uuid.UUID) (LessonProgress, error) {

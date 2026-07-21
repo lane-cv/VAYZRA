@@ -292,7 +292,18 @@ type studentLessonDTO struct {
 	SortKey        int64               `json:"sortKey"`
 	PublishedAt    time.Time           `json:"publishedAt"`
 	ExternalVideos []studentVideoDTO   `json:"externalVideos"`
+	Files          []studentFileDTO    `json:"files"`
 	Progress       *studentProgressDTO `json:"progress,omitempty"`
+}
+type studentFileDTO struct {
+	FileVersionID    uuid.UUID `json:"fileVersionId"`
+	Policy           string    `json:"policy"`
+	DisplayName      string    `json:"displayName"`
+	Description      string    `json:"description"`
+	SortPosition     int64     `json:"sortPosition"`
+	DetectedMIME     string    `json:"detectedMime"`
+	BrowserPlayable  bool      `json:"browserPlayable"`
+	PreviewAvailable bool      `json:"previewAvailable"`
 }
 type studentSearchDTO struct {
 	LessonID       uuid.UUID `json:"lessonId"`
@@ -336,9 +347,12 @@ func progressDTO(p LessonProgress) studentProgressDTO {
 }
 func lessonDTO(lesson StudentLesson) studentLessonDTO {
 	r := lesson.Revision
-	dto := studentLessonDTO{LessonID: r.LessonID, RevisionID: r.ID, Version: r.Version, Title: r.Title, Summary: r.Summary, BodyMarkdown: r.BodyMarkdown, SortKey: r.SortKey, PublishedAt: r.PublishedAt, ExternalVideos: make([]studentVideoDTO, len(r.ExternalVideos))}
+	dto := studentLessonDTO{LessonID: r.LessonID, RevisionID: r.ID, Version: r.Version, Title: r.Title, Summary: r.Summary, BodyMarkdown: r.BodyMarkdown, SortKey: r.SortKey, PublishedAt: r.PublishedAt, ExternalVideos: make([]studentVideoDTO, len(r.ExternalVideos)), Files: make([]studentFileDTO, len(lesson.Files))}
 	for i, v := range r.ExternalVideos {
 		dto.ExternalVideos[i] = studentVideoDTO{ID: v.ID, URL: v.URL, Title: v.Title, Description: v.Description, SortKey: v.SortKey}
+	}
+	for i, f := range lesson.Files {
+		dto.Files[i] = studentFileDTO{FileVersionID: f.FileVersionID, Policy: f.Policy, DisplayName: f.DisplayName, Description: f.Description, SortPosition: f.SortPosition, DetectedMIME: f.DetectedMIME, BrowserPlayable: f.BrowserPlayable, PreviewAvailable: f.PreviewAvailable}
 	}
 	if lesson.Progress != nil {
 		p := progressDTO(*lesson.Progress)

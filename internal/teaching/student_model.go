@@ -38,6 +38,18 @@ type LessonProgress struct {
 type StudentLesson struct {
 	Revision Revision
 	Progress *LessonProgress
+	Files    []StudentFile
+}
+
+type StudentFile struct {
+	FileVersionID    uuid.UUID
+	Policy           string
+	DisplayName      string
+	Description      string
+	SortPosition     int64
+	DetectedMIME     string
+	BrowserPlayable  bool
+	PreviewAvailable bool
 }
 
 type SearchResult struct {

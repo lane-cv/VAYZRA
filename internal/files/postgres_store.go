@@ -360,12 +360,15 @@ func (s *PostgresStore) ResolveAccess(ctx context.Context, actorID, requestedID 
 	var d Delivery
 	err := s.pool.QueryRow(ctx, `
 SELECT fv.id,r.id,
- CASE WHEN $3='preview' THEN fp.object_key ELSE fv.object_key END,
+ CASE WHEN $3='preview' AND NOT fv.browser_playable THEN fp.object_key ELSE fv.object_key END,
  b.display_name,
- CASE WHEN $3='preview' THEN fp.content_type ELSE 'application/octet-stream' END,
- CASE WHEN $3='preview' THEN fp.size_bytes ELSE fv.size_bytes END,
+ CASE WHEN $3='preview' AND fv.browser_playable THEN COALESCE(NULLIF(fv.detected_mime,''),fv.declared_mime) WHEN $3='preview' THEN fp.content_type ELSE 'application/octet-stream' END,
+ CASE WHEN $3='preview' AND NOT fv.browser_playable THEN fp.size_bytes ELSE fv.size_bytes END,
  b.access_policy,
- ($3='preview')
+	-- Preview identifies the derived-preview bucket. Browser-playable originals stay
+	-- in the original bucket even though the requested action is preview.
+	($3='preview' AND NOT fv.browser_playable),
+ ($3='preview' AND fv.browser_playable)
 FROM users u
 JOIN lessons l ON l.archived_at IS NULL
 JOIN chapters c ON c.id=l.chapter_id AND c.archived_at IS NULL
@@ -386,13 +389,11 @@ LEFT JOIN LATERAL (
 WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
  AND (ra.mode='all' OR EXISTS(SELECT 1 FROM lesson_revision_audience_users x WHERE x.revision_id=r.id AND x.user_id=$1))
  AND ($3<>'download' OR b.access_policy='download')
- AND ($3<>'preview' OR fp.object_key IS NOT NULL)`, actorID, requestedID, action).Scan(
-		&d.VersionID, &d.RevisionID, &d.ObjectKey, &d.DisplayName, &d.ContentType, &d.Size, &d.Policy, &d.Preview)
+ AND ($3<>'preview' OR fv.browser_playable OR fp.object_key IS NOT NULL)`, actorID, requestedID, action).Scan(
+		&d.VersionID, &d.RevisionID, &d.ObjectKey, &d.DisplayName, &d.ContentType, &d.Size, &d.Policy, &d.Preview, &d.Playable)
 	if err != nil {
 		return Delivery{}, mapStoreError(err)
 	}
-	// Processing Task will set a trusted browser-playable field. Never infer it from declared MIME.
-	d.Playable = false
 	return d, nil
 }
 

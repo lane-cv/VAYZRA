@@ -33,6 +33,7 @@ func (s *accessStoreStub) WriteAccessLog(_ context.Context, l AccessLog) error {
 type accessObjectsStub struct {
 	data      []byte
 	requested *objectstore.ByteRange
+	gets      int
 }
 
 func (s *accessObjectsStub) CreateMultipart(context.Context, string, objectstore.ObjectMeta) (string, error) {
@@ -53,12 +54,36 @@ func (s *accessObjectsStub) Put(context.Context, string, io.Reader, int64, objec
 }
 func (s *accessObjectsStub) Delete(context.Context, string) error { panic("unused") }
 func (s *accessObjectsStub) Get(_ context.Context, _ string, r *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
+	s.gets++
 	s.requested = r
 	b := s.data
 	if r != nil {
 		b = b[r.Offset : r.Offset+r.Length]
 	}
 	return io.NopCloser(bytes.NewReader(b)), objectstore.ObjectInfo{Size: int64(len(s.data)), ContentType: "video/mp4"}, nil
+}
+
+func TestPlayablePreviewReadsTrustedOriginalObject(t *testing.T) {
+	data := bytes.Repeat([]byte{'v'}, 256)
+	store := &accessStoreStub{delivery: Delivery{
+		VersionID: uuid.New(), RevisionID: uuid.New(), ObjectKey: "trusted-video",
+		DisplayName: "lesson.mp4", ContentType: "video/mp4", Size: int64(len(data)),
+		Policy: PolicyPreview, Playable: true, Preview: false,
+	}}
+	originals := &accessObjectsStub{data: data}
+	previews := &accessObjectsStub{data: []byte("derived-preview")}
+	svc := NewAccessService(store, originals, previews)
+
+	out, err := svc.Open(context.Background(), activeStudent(), OpenInput{
+		VersionID: store.delivery.VersionID, Action: ActionPreview, Range: "bytes=16-31",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Body.Close()
+	if originals.gets != 1 || previews.gets != 0 {
+		t.Fatalf("original gets=%d preview gets=%d", originals.gets, previews.gets)
+	}
 }
 
 func activeStudent() Principal {
