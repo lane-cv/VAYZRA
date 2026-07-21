@@ -33,5 +33,5 @@ export async function requestWithMeta<T>(path: string, options: RequestOptions =
   return envelope.meta === undefined ? { data: envelope.data } : { data: envelope.data, meta: envelope.meta as Record<string, unknown> }
 }
 function isSafeMethod(method: string): boolean { return method === 'GET' || method === 'HEAD' || method === 'OPTIONS' }
-function csrfCookie(): string | undefined { const values=document.cookie.split(';').map((part)=>part.trim()).filter((part)=>part.startsWith('hl_csrf=')).map((part)=>part.slice(8)); if(values.length!==1||!values[0]) return undefined; try { const value=decodeURIComponent(values[0]); return value || undefined } catch { return undefined } }
+export function csrfCookie(): string | undefined { const values=document.cookie.split(';').map((part)=>part.trim()).filter((part)=>part.startsWith('hl_csrf=')).map((part)=>part.slice(8)); if(values.length!==1||!values[0]) return undefined; try { const value=decodeURIComponent(values[0]); return value || undefined } catch { return undefined } }
 async function parseJSON(response: Response): Promise<unknown> { try { return await response.json() } catch { return undefined } }

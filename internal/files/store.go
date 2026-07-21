@@ -26,6 +26,7 @@ type AccessStore interface {
 }
 
 type BindingStore interface {
+	ListDraftBindings(context.Context, uuid.UUID) ([]DraftBinding, error)
 	ReplaceDraftBindings(context.Context, Principal, uuid.UUID, int64, []DraftBindingInput) ([]DraftBinding, error)
 }
 

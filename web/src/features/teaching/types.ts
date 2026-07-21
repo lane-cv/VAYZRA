@@ -61,3 +61,13 @@ export interface LessonRevision {
   publishedBy: string
   publishedAt: string
 }
+
+export interface DraftFileBinding {
+  id: string
+  lessonId: string
+  fileVersionId: string
+  policy: 'preview' | 'download'
+  displayName: string
+  description: string
+  sortPosition: number
+}

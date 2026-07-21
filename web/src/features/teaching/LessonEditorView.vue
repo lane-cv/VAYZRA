@@ -6,6 +6,7 @@ import { getLesson, publishLesson, saveDraft } from './api'
 import MarkdownPreview from './MarkdownPreview.vue'
 import AudiencePicker from './AudiencePicker.vue'
 import ExternalVideoEditor from './ExternalVideoEditor.vue'
+import UploadPanel from './UploadPanel.vue'
 import type { LessonDetail, LessonDraft } from './types'
 
 type SaveKind = 'clean' | 'dirty' | 'saving' | 'failed' | 'conflict'
@@ -185,6 +186,7 @@ onBeforeUnmount(() => { activeLoad?.abort(); clearTimeout(saveTimer); window.rem
         <div><h2>实时预览</h2><MarkdownPreview :source="draft.bodyMarkdown" /></div>
       </div>
       <AudiencePicker v-model="draft.audience" @validation-change="audienceProblems = $event" />
+      <UploadPanel :lesson-id="draft.lessonId" :lock-version="draft.lockVersion" :can-bind="saveKind === 'clean'" @binding-changed="load" />
       <ExternalVideoEditor v-model="draft.externalVideos" />
       <div v-if="publishOpen" class="dialog-backdrop" @click.self="publishOpen = false">
         <section role="dialog" aria-modal="true" aria-labelledby="publish-title" class="dialog-card">

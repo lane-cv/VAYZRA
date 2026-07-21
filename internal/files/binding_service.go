@@ -12,6 +12,15 @@ import (
 type BindingService struct{ store BindingStore }
 
 func NewBindingService(store BindingStore) *BindingService { return &BindingService{store: store} }
+func (s *BindingService) List(ctx context.Context, actor Principal, lessonID uuid.UUID) ([]DraftBinding, error) {
+	if actor.User.Role != auth.RoleAdmin || actor.User.Status != auth.StatusActive {
+		return nil, ErrForbidden
+	}
+	if lessonID == uuid.Nil {
+		return nil, ErrInvalid
+	}
+	return s.store.ListDraftBindings(ctx, lessonID)
+}
 func (s *BindingService) Replace(ctx context.Context, actor Principal, lessonID uuid.UUID, expected int64, in []DraftBindingInput) ([]DraftBinding, error) {
 	if actor.User.Role != auth.RoleAdmin || actor.User.Status != auth.StatusActive {
 		return nil, ErrForbidden

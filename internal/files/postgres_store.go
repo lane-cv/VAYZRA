@@ -475,5 +475,29 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 	return out, nil
 }
 
+func (s *PostgresStore) ListDraftBindings(ctx context.Context, lessonID uuid.UUID) ([]DraftBinding, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM lesson_drafts WHERE lesson_id=$1)`, lessonID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id,lesson_id,file_version_id,access_policy,display_name,description,sort_position FROM lesson_draft_files WHERE lesson_id=$1 ORDER BY sort_position,id`, lessonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]DraftBinding, 0)
+	for rows.Next() {
+		var item DraftBinding
+		if err = rows.Scan(&item.ID, &item.LessonID, &item.FileVersionID, &item.Policy, &item.DisplayName, &item.Description, &item.SortPosition); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 var _ AccessStore = (*PostgresStore)(nil)
 var _ BindingStore = (*PostgresStore)(nil)

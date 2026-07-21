@@ -16,6 +16,7 @@ import (
 )
 
 type BindingHTTPService interface {
+	List(context.Context, Principal, uuid.UUID) ([]DraftBinding, error)
 	Replace(context.Context, Principal, uuid.UUID, int64, []DraftBindingInput) ([]DraftBinding, error)
 }
 type BindingHandler struct {
@@ -29,8 +30,30 @@ func NewBindingHandler(service BindingHTTPService, trusted []netip.Prefix) *Bind
 func (h *BindingHandler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(auth.RequireRole(auth.RoleAdmin))
+	r.Get("/{id}/files", h.List)
 	r.Put("/{id}/files", h.Replace)
 	return r
+}
+func (h *BindingHandler) List(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil || id == uuid.Nil {
+		uploadBad(w, r)
+		return
+	}
+	user, _ := auth.UserFromContext(r.Context())
+	addr, err := httpx.ClientIP(r, h.trusted)
+	if err != nil {
+		uploadBad(w, r)
+		return
+	}
+	out, err := h.service.List(r.Context(), Principal{User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: net.IP(addr.AsSlice())}, id)
+	if err != nil {
+		uploadHTTPError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data []DraftBinding `json:"data"`
+	}{out})
 }
 func (h *BindingHandler) Replace(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))

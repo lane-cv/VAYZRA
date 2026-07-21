@@ -14,6 +14,13 @@ type bindingStoreStub struct {
 	err   error
 }
 
+func (s *bindingStoreStub) ListDraftBindings(_ context.Context, lesson uuid.UUID) ([]DraftBinding, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return []DraftBinding{{LessonID: lesson, DraftBindingInput: DraftBindingInput{FileVersionID: uuid.New(), Policy: PolicyPreview, DisplayName: "讲义.pdf", SortPosition: 10}}}, nil
+}
+
 func (s *bindingStoreStub) ReplaceDraftBindings(_ context.Context, _ Principal, lesson uuid.UUID, _ int64, in []DraftBindingInput) ([]DraftBinding, error) {
 	s.calls++
 	s.items = in
@@ -52,5 +59,20 @@ func TestBindingReturnsDedicatedDraftConflict(t *testing.T) {
 	_, err := svc.Replace(context.Background(), actor, uuid.New(), 7, []DraftBindingInput{{FileVersionID: uuid.New(), Policy: PolicyPreview, DisplayName: "x", SortPosition: 1}})
 	if !errors.Is(err, ErrDraftConflict) || errors.Is(err, ErrUploadConflict) {
 		t.Fatalf("error=%v, want dedicated draft conflict", err)
+	}
+}
+
+func TestBindingListRequiresAdminAndReturnsDraftBindings(t *testing.T) {
+	store := &bindingStoreStub{}
+	svc := NewBindingService(store)
+	lesson := uuid.New()
+	admin := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}
+	items, err := svc.List(context.Background(), admin, lesson)
+	if err != nil || len(items) != 1 || items[0].LessonID != lesson {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	admin.User.Role = auth.RoleStudent
+	if _, err = svc.List(context.Background(), admin, lesson); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("student err=%v", err)
 	}
 }

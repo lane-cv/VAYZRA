@@ -39,6 +39,11 @@ func TestApplicationMountsStudentFileAccessBehindAuthentication(t *testing.T) {
 
 type appFileBinding struct{ calls int }
 
+func (s *appFileBinding) List(context.Context, files.Principal, uuid.UUID) ([]files.DraftBinding, error) {
+	s.calls++
+	return []files.DraftBinding{}, nil
+}
+
 func (s *appFileBinding) Replace(context.Context, files.Principal, uuid.UUID, int64, []files.DraftBindingInput) ([]files.DraftBinding, error) {
 	s.calls++
 	return []files.DraftBinding{}, nil
