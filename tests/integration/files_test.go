@@ -33,7 +33,7 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 	}
 
 	var version int
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 7 {
+	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 8 {
 		t.Fatalf("migration version=%d err=%v", version, err)
 	}
 	var count int
@@ -113,7 +113,7 @@ func TestMinIOObjectStoreMultipartRangeAndAbort(t *testing.T) {
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: endpoint, AccessKey: accessKey, SecretKey: secretKey,
 		OriginalsBucket: "test-originals-" + suffix, PreviewsBucket: "test-previews-" + suffix,
-		OperationTimeout: 10 * time.Second,
+		OperationTimeout: 10 * time.Second, SkipLifecycleBootstrap: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -201,6 +201,109 @@ func insertFileSchemaRevision(t *testing.T, pool *pgxpool.Pool, actorID uuid.UUI
 		t.Fatal(err)
 	}
 	return revisionID
+}
+
+func TestReplaceFileMovesReadyUploadIntoExistingFile(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actorID := insertFileSchemaUser(t, pool, "replace_actor")
+	revisionID := insertFileSchemaRevision(t, pool, actorID)
+	var lessonID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT lesson_id FROM lesson_revisions WHERE id=$1`, revisionID).Scan(&lessonID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_drafts(lesson_id,title,body_markdown,lock_version,updated_by) VALUES($1,'Replace lesson','body',1,$2)`, lessonID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	var originalFileID, originalVersionID, uploadedFileID, uploadedVersionID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&originalFileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'original.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 81), actorID).Scan(&originalVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_files(lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,'download',10,'original.docx','')`, lessonID, originalVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&uploadedFileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'replacement.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.openxmlformats-officedocument.wordprocessingml.document',4,$3,'ready',$4) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 82), actorID).Scan(&uploadedVersionID); err != nil {
+		t.Fatal(err)
+	}
+	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "replace-request", IP: net.ParseIP("192.0.2.82")}
+	if err := securefiles.NewPostgresStore(pool).ReplaceFile(ctx, actor, originalFileID, uploadedVersionID, time.Now().Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var currentFileID uuid.UUID
+	var currentVersion int
+	if err := pool.QueryRow(ctx, `SELECT file_id,version FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&currentFileID, &currentVersion); err != nil || currentFileID != originalFileID || currentVersion != 2 {
+		t.Fatalf("file=%s version=%d err=%v", currentFileID, currentVersion, err)
+	}
+}
+
+func TestReplaceFileRejectsUndeliverableUpload(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actorID := insertFileSchemaUser(t, pool, "replace_reject_actor")
+	actor := securefiles.Principal{User: auth.User{ID: actorID, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "replace-reject-request", IP: net.ParseIP("192.0.2.83")}
+
+	for _, tc := range []struct {
+		name   string
+		state  string
+		policy string
+	}{
+		{name: "pending download", state: "pending_scan", policy: "download"},
+		{name: "rejected download", state: "rejected", policy: "download"},
+		{name: "preview without deliverable representation", state: "ready", policy: "preview"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			revisionID := insertFileSchemaRevision(t, pool, actorID)
+			var lessonID uuid.UUID
+			if err := pool.QueryRow(ctx, `SELECT lesson_id FROM lesson_revisions WHERE id=$1`, revisionID).Scan(&lessonID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO lesson_drafts(lesson_id,title,body_markdown,lock_version,updated_by) VALUES($1,'Replace rejection','body',1,$2)`, lessonID, actorID); err != nil {
+				t.Fatal(err)
+			}
+			var originalFileID, originalVersionID, uploadedFileID, uploadedVersionID uuid.UUID
+			if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&originalFileID); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'original.pdf','application/pdf','application/pdf',4,$3,'ready',$4) RETURNING id`, originalFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 91), actorID).Scan(&originalVersionID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO lesson_draft_files(lesson_id,file_version_id,access_policy,sort_position,display_name,description) VALUES($1,$2,$3,10,'original.pdf','')`, lessonID, originalVersionID, tc.policy); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actorID).Scan(&uploadedFileID); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,detected_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'replacement.pdf','application/pdf','application/pdf',4,$3,$4,$5) RETURNING id`, uploadedFileID, "original/"+uuid.NewString(), fmt.Sprintf("%064x", 92), tc.state, actorID).Scan(&uploadedVersionID); err != nil {
+				t.Fatal(err)
+			}
+
+			err := securefiles.NewPostgresStore(pool).ReplaceFile(ctx, actor, originalFileID, uploadedVersionID, time.Now().Add(30*24*time.Hour))
+			if !errors.Is(err, securefiles.ErrAccessUnavailable) {
+				t.Fatalf("ReplaceFile() err=%v, want ErrAccessUnavailable", err)
+			}
+			var currentFileID uuid.UUID
+			var currentVersion int
+			if err := pool.QueryRow(ctx, `SELECT file_id,version FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&currentFileID, &currentVersion); err != nil || currentFileID != uploadedFileID || currentVersion != 1 {
+				t.Fatalf("replacement moved after rejection: file=%s version=%d err=%v", currentFileID, currentVersion, err)
+			}
+			var boundVersionID uuid.UUID
+			if err := pool.QueryRow(ctx, `SELECT file_version_id FROM lesson_draft_files WHERE lesson_id=$1`, lessonID).Scan(&boundVersionID); err != nil || boundVersionID != originalVersionID {
+				t.Fatalf("binding changed after rejection: version=%s err=%v", boundVersionID, err)
+			}
+		})
+	}
 }
 
 func envOr(name, fallback string) string {

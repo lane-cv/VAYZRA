@@ -252,6 +252,8 @@ func uploadHTTPError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusConflict, "upload_part_conflict", "分片内容冲突")
 	case errors.Is(err, ErrUploadIncomplete):
 		httpx.Error(w, r, http.StatusConflict, "upload_incomplete", "上传分片不完整")
+	case errors.Is(err, ErrAccessUnavailable):
+		httpx.Error(w, r, http.StatusConflict, "file_access_unavailable", "文件尚未就绪或不支持所选访问方式")
 	case errors.Is(err, ErrDraftConflict):
 		httpx.Error(w, r, http.StatusConflict, "draft_conflict", "草稿已更新，请刷新后重试")
 	case errors.Is(err, ErrUploadConflict):

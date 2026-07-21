@@ -21,7 +21,7 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	username := "procmig_" + uuid.NewString()
 	objectKey := "test-processing/migration/" + uuid.NewString()
 	// Register fixture cleanup before creating the provider. Cleanup is LIFO:
-	// registerMigrationProviderCleanup is added next, so schema v7 is restored
+	// registerMigrationProviderCleanup is added next, so the latest schema is restored
 	// before this callback removes any partially-created fixture rows.
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), migrationFixtureCleanupTimeout)
@@ -36,7 +36,7 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	}
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	registerMigrationProviderCleanup(t, provider, closeProvider)
-	if _, err := provider.Down(ctx); err != nil {
+	if _, err := provider.DownTo(ctx, 6); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,status,password_hash) VALUES($1,$2,'Migration fixture','student','active','hash')`, actor, username); err != nil {
@@ -59,7 +59,7 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_processing_jobs WHERE file_version_id=$1 AND kind='process_file' AND state='queued'`, versionID).Scan(&jobs); err != nil {
 		t.Fatal(err)
 	}
-	if version != 7 || jobs != 1 {
+	if version != 8 || jobs != 1 {
 		t.Fatalf("migration version=%d jobs=%d", version, jobs)
 	}
 }

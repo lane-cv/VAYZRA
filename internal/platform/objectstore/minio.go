@@ -32,15 +32,20 @@ type MinIOConfig struct {
 	OriginalsBucket  string
 	PreviewsBucket   string
 	OperationTimeout time.Duration
+	// SkipLifecycleBootstrap supports single-node AIStor Free development
+	// deployments, where lifecycle management is not licensed. Production
+	// wiring leaves this false and continues to fail closed.
+	SkipLifecycleBootstrap bool
 }
 
 type MinIOStores struct {
 	Originals *MinIOStore
 	Previews  *MinIOStore
 
-	core             *minio.Core
-	buckets          []string
-	operationTimeout time.Duration
+	core                   *minio.Core
+	buckets                []string
+	operationTimeout       time.Duration
+	skipLifecycleBootstrap bool
 }
 
 type MinIOStore struct {
@@ -67,9 +72,10 @@ func NewMinIO(ctx context.Context, cfg MinIOConfig) (*MinIOStores, error) {
 		return nil, fmt.Errorf("initialize object store: %w", ErrUnavailable)
 	}
 	stores := &MinIOStores{
-		core:             core,
-		buckets:          uniqueBuckets(cfg.OriginalsBucket, cfg.PreviewsBucket),
-		operationTimeout: operationTimeout,
+		core:                   core,
+		buckets:                uniqueBuckets(cfg.OriginalsBucket, cfg.PreviewsBucket),
+		operationTimeout:       operationTimeout,
+		skipLifecycleBootstrap: cfg.SkipLifecycleBootstrap,
 	}
 	stores.Originals = &MinIOStore{core: core, bucket: cfg.OriginalsBucket, operationTimeout: operationTimeout}
 	stores.Previews = &MinIOStore{core: core, bucket: cfg.PreviewsBucket, operationTimeout: operationTimeout}
@@ -104,7 +110,7 @@ func (s *MinIOStores) bootstrap(ctx context.Context) error {
 		exists, err := s.core.BucketExists(opCtx, bucket)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("bootstrap object store: %w", mapMinIOError(err))
+			return fmt.Errorf("bootstrap object store: check bucket: %w", mapMinIOError(err))
 		}
 		if !exists {
 			opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
@@ -113,7 +119,7 @@ func (s *MinIOStores) bootstrap(ctx context.Context) error {
 			if err != nil {
 				response := minio.ToErrorResponse(err)
 				if response.Code != "BucketAlreadyOwnedByYou" && response.Code != "BucketAlreadyExists" {
-					return fmt.Errorf("bootstrap object store: %w", mapMinIOError(err))
+					return fmt.Errorf("bootstrap object store: create bucket: %w", mapMinIOError(err))
 				}
 			}
 		}
@@ -121,13 +127,15 @@ func (s *MinIOStores) bootstrap(ctx context.Context) error {
 		err = ensurePrivateBucketPolicies(opCtx, s.core.Client, []string{bucket})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("bootstrap object store: %w", err)
+			return fmt.Errorf("bootstrap object store: verify bucket privacy: %w", err)
 		}
-		opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
-		err = ensureIncompleteMultipartLifecycle(opCtx, s.core.Client, bucket)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("bootstrap object store: %w", err)
+		if !s.skipLifecycleBootstrap {
+			opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
+			err = ensureIncompleteMultipartLifecycle(opCtx, s.core.Client, bucket)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("bootstrap object store: configure multipart lifecycle: %w", err)
+			}
 		}
 	}
 	return nil

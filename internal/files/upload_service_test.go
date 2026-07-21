@@ -49,8 +49,8 @@ func TestUploadCreateValidationAndCompensation(t *testing.T) {
 	if _, err := svc.Create(context.Background(), actor, valid); err == nil {
 		t.Fatal("expected persistence failure")
 	}
-	if objects.abortCalls != 1 {
-		t.Fatalf("abort calls=%d", objects.abortCalls)
+	if objects.abortCalls.Load() != 1 {
+		t.Fatalf("abort calls=%d", objects.abortCalls.Load())
 	}
 }
 
@@ -67,10 +67,10 @@ func TestUploadPartExpirationIdempotencyConflictAndStreamingHash(t *testing.T) {
 	if err != nil || part.Number != 1 || part.SHA256 != in.SHA256 {
 		t.Fatalf("part=%+v err=%v", part, err)
 	}
-	objects.putCalls = 0
+	objects.putCalls.Store(0)
 	in.Body = bytes.NewReader(payload)
-	if _, err := svc.PutPart(context.Background(), actor, in); err != nil || objects.putCalls != 0 {
-		t.Fatalf("idempotent err=%v putCalls=%d", err, objects.putCalls)
+	if _, err := svc.PutPart(context.Background(), actor, in); err != nil || objects.putCalls.Load() != 0 {
+		t.Fatalf("idempotent err=%v putCalls=%d", err, objects.putCalls.Load())
 	}
 	conflict := in
 	conflict.SHA256 = digestOf([]byte("different"))
@@ -112,8 +112,8 @@ func TestUploadCompleteMissingPartDuplicateAndFinalHashCompensation(t *testing.T
 			t.Fatal(err)
 		}
 		second, err := svc.Complete(context.Background(), actor, s.ID)
-		if err != nil || second.FileVersionID != first.FileVersionID || objects.completeCalls != 1 {
-			t.Fatalf("first=%+v second=%+v calls=%d err=%v", first, second, objects.completeCalls, err)
+		if err != nil || second.FileVersionID != first.FileVersionID || objects.completeCalls.Load() != 1 {
+			t.Fatalf("first=%+v second=%+v calls=%d err=%v", first, second, objects.completeCalls.Load(), err)
 		}
 	})
 	t.Run("hash mismatch deletes object and cancels", func(t *testing.T) {
@@ -125,8 +125,8 @@ func TestUploadCompleteMissingPartDuplicateAndFinalHashCompensation(t *testing.T
 		if _, err := svc.Complete(context.Background(), actor, s.ID); !errors.Is(err, ErrFinalHashMismatch) {
 			t.Fatalf("err=%v", err)
 		}
-		if objects.deleteCalls != 1 || store.sessions[s.ID].State != UploadCancelled {
-			t.Fatalf("deletes=%d state=%s", objects.deleteCalls, store.sessions[s.ID].State)
+		if objects.deleteCalls.Load() != 1 || store.sessions[s.ID].State != UploadCancelled {
+			t.Fatalf("deletes=%d state=%s", objects.deleteCalls.Load(), store.sessions[s.ID].State)
 		}
 	})
 }
@@ -147,13 +147,13 @@ func TestUploadObjectFailureAndCleanupSkipsCompletedReferencedObjects(t *testing
 	store.sessions[completed.ID] = completed
 	referenced := store.seed(actor.User.ID, 1, digestOf([]byte("x")), now.Add(-2*time.Hour))
 	store.referenced[referenced.ObjectKey] = true
-	objects.abortCalls = 0
+	objects.abortCalls.Store(0)
 	if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 		t.Fatal(err)
 	}
 	_, expiredExists := store.sessions[expired.ID]
-	if objects.abortCalls != 1 || expiredExists || store.sessions[completed.ID].State != UploadCompleted || store.sessions[referenced.ID].State != UploadOpen {
-		t.Fatalf("aborts=%d expiredExists=%t completed=%s referenced=%s", objects.abortCalls, expiredExists, store.sessions[completed.ID].State, store.sessions[referenced.ID].State)
+	if objects.abortCalls.Load() != 1 || expiredExists || store.sessions[completed.ID].State != UploadCompleted || store.sessions[referenced.ID].State != UploadOpen {
+		t.Fatalf("aborts=%d expiredExists=%t completed=%s referenced=%s", objects.abortCalls.Load(), expiredExists, store.sessions[completed.ID].State, store.sessions[referenced.ID].State)
 	}
 }
 
@@ -330,7 +330,7 @@ type fakeObjects struct {
 	putErr                                           error
 	abortErr                                         error
 	deleteErr                                        error
-	abortCalls, putCalls, completeCalls, deleteCalls int
+	abortCalls, putCalls, completeCalls, deleteCalls atomic.Int64
 }
 
 func newFakeObjects() *fakeObjects { return &fakeObjects{data: []byte("complete")} }
@@ -338,7 +338,7 @@ func (o *fakeObjects) CreateMultipart(context.Context, string, objectstore.Objec
 	return uuid.NewString(), nil
 }
 func (o *fakeObjects) PutPart(_ context.Context, _ string, _ string, n int, r io.Reader, size int64, _ string) (objectstore.Part, error) {
-	o.putCalls++
+	o.putCalls.Add(1)
 	if o.putErr != nil {
 		return objectstore.Part{}, o.putErr
 	}
@@ -352,11 +352,11 @@ func (o *fakeObjects) PutPart(_ context.Context, _ string, _ string, n int, r io
 	return objectstore.Part{Number: n, ETag: "etag", Size: size}, nil
 }
 func (o *fakeObjects) CompleteMultipart(context.Context, string, string, []objectstore.Part) (objectstore.ObjectInfo, error) {
-	o.completeCalls++
+	o.completeCalls.Add(1)
 	return objectstore.ObjectInfo{Size: int64(len(o.data))}, nil
 }
 func (o *fakeObjects) AbortMultipart(context.Context, string, string) error {
-	o.abortCalls++
+	o.abortCalls.Add(1)
 	return o.abortErr
 }
 func (o *fakeObjects) Stat(context.Context, string) (objectstore.ObjectInfo, error) {
@@ -368,7 +368,10 @@ func (o *fakeObjects) Get(context.Context, string, *objectstore.ByteRange) (io.R
 func (o *fakeObjects) Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error) {
 	return objectstore.ObjectInfo{}, nil
 }
-func (o *fakeObjects) Delete(context.Context, string) error { o.deleteCalls++; return o.deleteErr }
+func (o *fakeObjects) Delete(context.Context, string) error {
+	o.deleteCalls.Add(1)
+	return o.deleteErr
+}
 func TestUploadPartRejectsThirdInFlightRequest(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	store := newFakeUploadStore()
@@ -432,8 +435,8 @@ func TestUploadFinalHashCompensationLeavesCancelledCleanupCandidate(t *testing.T
 	u.ExpiresAt = now.Add(-2 * time.Hour)
 	store.sessions[s.ID] = u
 	objects.deleteErr = nil
-	if err := svc.CleanupExpired(context.Background(), 100); err != nil || objects.deleteCalls != 2 {
-		t.Fatalf("cleanup err=%v deletes=%d", err, objects.deleteCalls)
+	if err := svc.CleanupExpired(context.Background(), 100); err != nil || objects.deleteCalls.Load() != 2 {
+		t.Fatalf("cleanup err=%v deletes=%d", err, objects.deleteCalls.Load())
 	}
 	if _, ok := store.sessions[s.ID]; ok {
 		t.Fatal("successful corrupt-object cleanup retained session")
@@ -450,8 +453,8 @@ func TestUploadCleanupRetriesFailedAbort(t *testing.T) {
 		t.Fatalf("first err=%v state=%s", err, store.sessions[s.ID].State)
 	}
 	objects.abortErr = nil
-	if err := svc.CleanupExpired(context.Background(), 100); err != nil || objects.abortCalls != 2 {
-		t.Fatalf("retry err=%v aborts=%d", err, objects.abortCalls)
+	if err := svc.CleanupExpired(context.Background(), 100); err != nil || objects.abortCalls.Load() != 2 {
+		t.Fatalf("retry err=%v aborts=%d", err, objects.abortCalls.Load())
 	}
 	if _, ok := store.sessions[s.ID]; ok {
 		t.Fatal("successful cleanup retained expired session")
@@ -490,8 +493,8 @@ func TestUploadConflictingConcurrentPartNeverReachesObjectStore(t *testing.T) {
 	if !errors.Is(first, ErrUploadPartConflict) && !errors.Is(second, ErrUploadPartConflict) {
 		t.Fatalf("missing conflict: %v / %v", first, second)
 	}
-	if objects.putCalls != 1 {
-		t.Fatalf("object put calls=%d", objects.putCalls)
+	if objects.putCalls.Load() != 1 {
+		t.Fatalf("object put calls=%d", objects.putCalls.Load())
 	}
 }
 func TestUploadCreatePreservesAbortFailure(t *testing.T) {
@@ -501,8 +504,8 @@ func TestUploadCreatePreservesAbortFailure(t *testing.T) {
 	objects.abortErr = objectstore.ErrUnavailable
 	svc := NewUploadService(store, objects, func() time.Time { return now })
 	_, err := svc.Create(context.Background(), uploadAdmin(), CreateUploadInput{DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", ExpectedSize: 3, ExpectedSHA256: digestOf([]byte("pdf"))})
-	if !errors.Is(err, objectstore.ErrUnavailable) || objects.abortCalls != 1 {
-		t.Fatalf("err=%v aborts=%d", err, objects.abortCalls)
+	if !errors.Is(err, objectstore.ErrUnavailable) || objects.abortCalls.Load() != 1 {
+		t.Fatalf("err=%v aborts=%d", err, objects.abortCalls.Load())
 	}
 }
 func TestUploadMismatchCancellationPersistsBeforeDeleteAndRetries(t *testing.T) {
@@ -517,14 +520,14 @@ func TestUploadMismatchCancellationPersistsBeforeDeleteAndRetries(t *testing.T) 
 	if _, err := svc.Complete(context.Background(), actor, s.ID); err == nil {
 		t.Fatal("expected cancellation persistence failure")
 	}
-	if objects.deleteCalls != 0 || store.sessions[s.ID].State != UploadCompleting {
-		t.Fatalf("first deleteCalls=%d state=%s", objects.deleteCalls, store.sessions[s.ID].State)
+	if objects.deleteCalls.Load() != 0 || store.sessions[s.ID].State != UploadCompleting {
+		t.Fatalf("first deleteCalls=%d state=%s", objects.deleteCalls.Load(), store.sessions[s.ID].State)
 	}
 	if _, err := svc.Complete(context.Background(), actor, s.ID); !errors.Is(err, ErrFinalHashMismatch) {
 		t.Fatalf("retry err=%v", err)
 	}
-	if objects.deleteCalls != 1 || store.sessions[s.ID].State != UploadCancelled {
-		t.Fatalf("retry deleteCalls=%d state=%s", objects.deleteCalls, store.sessions[s.ID].State)
+	if objects.deleteCalls.Load() != 1 || store.sessions[s.ID].State != UploadCancelled {
+		t.Fatalf("retry deleteCalls=%d state=%s", objects.deleteCalls.Load(), store.sessions[s.ID].State)
 	}
 }
 func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
@@ -537,8 +540,8 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 		if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 			t.Fatal(err)
 		}
-		if objects.abortCalls != 0 || objects.deleteCalls != 0 || store.sessions[withinGrace.ID].State != UploadOpen {
-			t.Fatalf("within grace aborts=%d deletes=%d state=%s", objects.abortCalls, objects.deleteCalls, store.sessions[withinGrace.ID].State)
+		if objects.abortCalls.Load() != 0 || objects.deleteCalls.Load() != 0 || store.sessions[withinGrace.ID].State != UploadOpen {
+			t.Fatalf("within grace aborts=%d deletes=%d state=%s", objects.abortCalls.Load(), objects.deleteCalls.Load(), store.sessions[withinGrace.ID].State)
 		}
 		store.sessions[withinGrace.ID] = func() UploadSession {
 			u := store.sessions[withinGrace.ID]
@@ -548,8 +551,8 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 		if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 			t.Fatal(err)
 		}
-		if objects.abortCalls != 1 || objects.deleteCalls != 1 {
-			t.Fatalf("boundary aborts=%d deletes=%d", objects.abortCalls, objects.deleteCalls)
+		if objects.abortCalls.Load() != 1 || objects.deleteCalls.Load() != 1 {
+			t.Fatalf("boundary aborts=%d deletes=%d", objects.abortCalls.Load(), objects.deleteCalls.Load())
 		}
 	})
 
@@ -562,8 +565,8 @@ func TestUploadCleanupGraceAndRecoveryStates(t *testing.T) {
 		if err := svc.CleanupExpired(context.Background(), 100); err != nil {
 			t.Fatal(err)
 		}
-		if objects.abortCalls != 1 || objects.deleteCalls != 1 {
-			t.Fatalf("aborts=%d deletes=%d", objects.abortCalls, objects.deleteCalls)
+		if objects.abortCalls.Load() != 1 || objects.deleteCalls.Load() != 1 {
+			t.Fatalf("aborts=%d deletes=%d", objects.abortCalls.Load(), objects.deleteCalls.Load())
 		}
 	})
 
@@ -739,8 +742,8 @@ func TestUploadCleanupConfirmsReferenceBeforeObjectDeletion(t *testing.T) {
 	if err := svc.CleanupExpired(context.Background(), 100); err == nil {
 		t.Fatal("expected cleanup confirmation conflict")
 	}
-	if objects.abortCalls != 0 || objects.deleteCalls != 0 {
-		t.Fatalf("object operations crossed failed confirmation: abort=%d delete=%d", objects.abortCalls, objects.deleteCalls)
+	if objects.abortCalls.Load() != 0 || objects.deleteCalls.Load() != 0 {
+		t.Fatalf("object operations crossed failed confirmation: abort=%d delete=%d", objects.abortCalls.Load(), objects.deleteCalls.Load())
 	}
 	if _, ok := store.sessions[candidate.ID]; !ok {
 		t.Fatal("confirmation conflict removed retry metadata")

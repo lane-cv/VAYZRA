@@ -17,7 +17,10 @@ func (*appAdminAuth) Authenticate(context.Context, string) (auth.Authentication,
 	return auth.Authentication{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}, nil
 }
 
-type appTeachingRead struct{ lists int }
+type appTeachingRead struct {
+	lists         int
+	createLessons int
+}
 
 func (s *appTeachingRead) ListAdminCatalog(context.Context, teaching.Principal, teaching.AdminCatalogInput) ([]teaching.AdminCatalogItem, teaching.AdminCatalogCursor, error) {
 	s.lists++
@@ -41,7 +44,8 @@ func (*appTeachingRead) ReorderCatalog(context.Context, teaching.Principal, teac
 func (*appTeachingRead) ArchiveCatalog(context.Context, teaching.Principal, teaching.CatalogArchiveInput) error {
 	return nil
 }
-func (*appTeachingRead) CreateLesson(context.Context, teaching.Principal, teaching.CreateLessonInput) (teaching.Draft, error) {
+func (s *appTeachingRead) CreateLesson(context.Context, teaching.Principal, teaching.CreateLessonInput) (teaching.Draft, error) {
+	s.createLessons++
 	return teaching.Draft{}, nil
 }
 func (*appTeachingRead) SaveDraft(context.Context, teaching.Principal, teaching.SaveDraftInput) (teaching.Draft, error) {

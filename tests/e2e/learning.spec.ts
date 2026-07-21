@@ -38,7 +38,8 @@ test('desktop/mobile learning navigation, search, recent lesson, and position wo
     expect(position.viewed).toBe(true)
     expect(position.scrollRatio).toBeGreaterThan(0)
     await desktopPage.goto('/student')
-    await expect(desktopPage.getByRole('link', { name: new RegExp(`继续学习.*动量课程-${suffix}`) })).toBeVisible()
+    await expect(desktopPage.getByRole('heading', { name: '最近学习' })).toBeVisible()
+    await expect(desktopPage.getByRole('link', { name: new RegExp(`动量课程-${suffix}.*阅读到`) })).toBeVisible()
 
     const mobilePage = await mobile.newPage()
     await login(mobilePage, student.username, `${studentNewPassword!} learning`)
@@ -46,7 +47,7 @@ test('desktop/mobile learning navigation, search, recent lesson, and position wo
     const trigger = mobilePage.getByRole('button', { name: '打开课程目录' })
     await expect(trigger).toBeVisible()
     await trigger.click()
-    await expect(mobilePage.getByRole('navigation', { name: '课程目录' })).toHaveAttribute('aria-modal', 'true')
+    await expect(mobilePage.getByRole('dialog', { name: '课程目录' })).toHaveAttribute('aria-modal', 'true')
     await mobilePage.keyboard.press('Escape')
     await expect(trigger).toBeFocused()
   } finally {

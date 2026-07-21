@@ -76,7 +76,9 @@ func New(d Dependencies) http.Handler {
 					private.Mount("/admin/students", students.NewHandlerWithConfig(d.Students, students.HTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.FileBindings != nil {
-					private.Mount("/admin/lessons", files.NewBindingHandler(d.FileBindings, d.TrustedProxyCIDRs).Routes())
+					bindingHTTP := files.NewBindingHandler(d.FileBindings, d.TrustedProxyCIDRs)
+					private.With(auth.RequireRole(auth.RoleAdmin)).Get("/admin/lessons/{id}/files", bindingHTTP.List)
+					private.With(auth.RequireRole(auth.RoleAdmin)).Put("/admin/lessons/{id}/files", bindingHTTP.Replace)
 				}
 				if d.Teaching != nil {
 					private.Mount("/admin", teaching.NewAdminHandlerWithConfig(d.Teaching, teaching.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())

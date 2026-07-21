@@ -61,7 +61,7 @@ func run() error {
 	if err := database.Migrate(ctx, pool); err != nil {
 		return errors.New("worker migration")
 	}
-	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket})
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development"})
 	if err != nil {
 		return errors.New("worker object storage")
 	}

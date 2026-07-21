@@ -139,6 +139,10 @@ func (s *PostgresStore) CreateLesson(ctx context.Context, in CreateLessonInput) 
 	if err != nil {
 		return Draft{}, mapTeachingError(err)
 	}
+	_, err = s.q.Exec(ctx, `INSERT INTO lesson_draft_audiences (lesson_id, mode) VALUES ($1,'all')`, lessonID)
+	if err != nil {
+		return Draft{}, mapTeachingError(err)
+	}
 	return s.GetDraft(ctx, lessonID)
 }
 func (s *PostgresStore) GetDraft(ctx context.Context, lessonID uuid.UUID) (Draft, error) {

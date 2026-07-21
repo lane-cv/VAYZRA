@@ -52,3 +52,16 @@ func safeBindingText(v string, max int, optional bool) bool {
 	}
 	return true
 }
+
+func bindingAccessAllowed(policy AccessPolicy, processingState, detectedMIME string, browserPlayable, previewReady bool) bool {
+	if processingState != "ready" {
+		return false
+	}
+	if policy == PolicyDownload {
+		return true
+	}
+	if strings.HasPrefix(detectedMIME, "video/") {
+		return browserPlayable
+	}
+	return browserPlayable || previewReady
+}

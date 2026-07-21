@@ -94,12 +94,14 @@ var allowedMetadata = map[string]map[string]bool{
 	"student.created": {"username": true, "display_name": true}, "student.disabled": {"status": true}, "student.enabled": {"status": true}, "student.password_reset": {},
 	"catalog.created": {"kind": true}, "catalog.renamed": {"kind": true}, "catalog.reordered": {"kind": true}, "catalog.archived": {"kind": true}, "catalog.restored": {"kind": true},
 	"lesson.draft_saved": {}, "lesson.published": {"revision_id": true}, "lesson.withdrawn": {}, "lesson.archived": {},
-	"file.uploaded": {},
+	"file.uploaded": {}, "file.policy_changed": {}, "file.processing_retried": {}, "file.replaced": {}, "file.draft_rolled_back": {}, "file.delete_requested": {},
+	"file.cleanup_scheduled": {"previewCount": true}, "file.cleanup_completed": {},
 }
 
 var allowedTargetTypes = map[string]string{
 	"student.created": "student", "student.disabled": "student", "student.enabled": "student", "student.password_reset": "student",
 	"catalog.created": "catalog", "catalog.renamed": "catalog", "catalog.reordered": "catalog", "catalog.archived": "catalog", "catalog.restored": "catalog",
 	"lesson.draft_saved": "lesson", "lesson.published": "lesson", "lesson.withdrawn": "lesson", "lesson.archived": "lesson",
-	"file.uploaded": "file_version",
+	"file.uploaded": "file_version", "file.policy_changed": "lesson", "file.processing_retried": "file_version", "file.replaced": "file", "file.draft_rolled_back": "file_version", "file.delete_requested": "file",
+	"file.cleanup_scheduled": "file_version", "file.cleanup_completed": "file_version",
 }

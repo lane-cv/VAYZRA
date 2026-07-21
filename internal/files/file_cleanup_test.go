@@ -17,8 +17,8 @@ func TestFileCleanupDeletesObjectsBeforeCompletingMetadata(t *testing.T) {
 	if err := service.Cleanup(context.Background(), 10); err != nil {
 		t.Fatal(err)
 	}
-	if store.completed != 1 || originals.deleteCalls != 1 || previews.deleteCalls != 2 {
-		t.Fatalf("completed=%d originals=%d previews=%d", store.completed, originals.deleteCalls, previews.deleteCalls)
+	if store.completed != 1 || originals.deleteCalls.Load() != 1 || previews.deleteCalls.Load() != 2 {
+		t.Fatalf("completed=%d originals=%d previews=%d", store.completed, originals.deleteCalls.Load(), previews.deleteCalls.Load())
 	}
 }
 

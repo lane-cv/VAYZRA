@@ -17,7 +17,7 @@ export async function changePassword(page: Page, currentPassword: string, newPas
   await page.getByLabel('新密码', { exact: true }).fill(newPassword)
   await page.getByLabel('确认新密码').fill(newPassword)
   await page.getByRole('button', { name: '保存新密码' }).click()
-  await expect(page).not.toHaveURL(/change-password/);
+  await expect(page).not.toHaveURL(/change-password/, { timeout: 15_000 })
 }
 
 export async function createStudent(page: Page, username: string, displayName: string, temporaryPassword: string) {

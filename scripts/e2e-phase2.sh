@@ -59,6 +59,12 @@ wait_for() {
   local attempt
   for attempt in $(seq 1 90); do
     if "$@"; then return 0; fi
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" != "true" ]]; then
+      echo "$label exited before becoming ready" >&2
+      docker inspect --format '{{json .State}}' "$container" >&2 || true
+      docker logs --tail 100 "$container" >&2 || true
+      return 1
+    fi
     sleep 1
   done
   echo "timed out waiting for $label" >&2
@@ -78,7 +84,7 @@ docker run --rm --network none --user 0:0 --entrypoint /bin/sh -v "$data_volume:
 docker run -d --name "$postgres" --network "$network" --memory 384m --cpus .25 \
   -e POSTGRES_USER=happylearn -e POSTGRES_PASSWORD=happylearn_e2e -e POSTGRES_DB="$database" postgres:18.4 >/dev/null
 docker run -d --name "$redis" --network "$network" --memory 96m --cpus .1 redis:8.8 >/dev/null
-docker run -d --name "$minio" --network "$network" --user 1000:0 --memory 384m --cpus .2 \
+docker run -d --name "$minio" --network "$network" --network-alias minio --user 1000:0 --memory 384m --cpus .2 \
   -e MINIO_ROOT_USER=happylearn_e2e -e MINIO_ROOT_PASSWORD="phase2-minio-${nonce}-secret" \
   -v "$data_volume:/data" -v "$license_file:/minio.license:ro" "$minio_image" \
   minio server /data --console-address :9001 --license /minio.license >/dev/null
@@ -92,7 +98,7 @@ common_env=(
   -e "HAPPYLEARN_REDIS_URL=redis://${redis}:6379/0"
   -e "HAPPYLEARN_LOGIN_THROTTLE_SECRET=phase2-throttle-${nonce}-at-least-32-bytes"
   -e HAPPYLEARN_PUBLIC_ORIGIN=http://app:8080
-  -e "HAPPYLEARN_MINIO_ENDPOINT=${minio}:9000"
+  -e HAPPYLEARN_MINIO_ENDPOINT=minio:9000
   -e HAPPYLEARN_MINIO_ACCESS_KEY=happylearn_e2e
   -e "HAPPYLEARN_MINIO_SECRET_KEY=phase2-minio-${nonce}-secret"
   -e HAPPYLEARN_MINIO_ORIGINALS_BUCKET=phase2-originals
@@ -107,8 +113,9 @@ wait_for application "$app" docker exec "$app" curl --fail --silent http://127.0
 password_file="$tmpdir/admin-password"
 umask 077
 printf '%s' "$admin_password" > "$password_file"
-chmod 0444 "$password_file"
-docker run --rm --network "$network" --read-only --user 10001:10001 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+chmod 0600 "$password_file"
+docker run --rm --network "$network" --read-only --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   "${common_env[@]}" -v "$password_file:/run/admin-password:ro" --entrypoint /app/happylearn-admin "$app_image" \
   create-teacher --username admin --display-name 'Phase 2 Teacher' --password-file /run/admin-password
 
@@ -121,13 +128,14 @@ wait_for worker "$worker" docker exec "$worker" curl --fail --silent http://127.
 docker run --rm --user 0:0 --memory 768m --cpus .5 --entrypoint /bin/bash -v "$PWD:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
   /src/scripts/generate-phase2-fixtures.sh /fixtures
 docker run --rm --memory 1280m --cpus .6 -v "$PWD:/source:ro" -v "$runner_volume:/workspace" --entrypoint /bin/bash "$playwright_image" \
-  -lc 'cp -a /source/. /workspace/ && cd /workspace && corepack enable && pnpm install --frozen-lockfile'
+  -lc '/source/scripts/copy-e2e-workspace.sh /source /workspace && cd /workspace && COREPACK_HOME=/workspace/.corepack corepack pnpm install --frozen-lockfile'
 
 install -d -m 0700 "$artifact_dir"
 docker run --rm --network "$network" --shm-size 512m --memory 1280m --cpus .6 --cap-drop ALL --security-opt no-new-privileges \
   -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures:ro" \
   -v "$artifact_dir:/artifacts" -w /workspace \
+  -e COREPACK_HOME=/workspace/.corepack \
   -e E2E_BASE_URL=http://app:8080 -e "E2E_ADMIN_PASSWORD=$admin_password" -e "E2E_STUDENT_PASSWORD=$student_password" \
   -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" -e E2E_FIXTURE_DIR=/fixtures -e E2E_OUTPUT_DIR=/artifacts \
   "$playwright_image" /bin/bash -lc \
-  'pnpm exec playwright test tests/e2e/auth-students.spec.ts tests/e2e/teaching.spec.ts && pnpm exec playwright test tests/e2e/files.spec.ts tests/e2e/learning.spec.ts'
+  'corepack pnpm exec playwright test tests/e2e/auth-students.spec.ts tests/e2e/teaching.spec.ts && corepack pnpm exec playwright test tests/e2e/files.spec.ts tests/e2e/learning.spec.ts'

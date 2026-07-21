@@ -66,6 +66,24 @@ func TestApplicationMountsAdminLessonFileBindings(t *testing.T) {
 	}
 }
 
+func TestFileBindingsDoNotShadowTeachingLessonCreation(t *testing.T) {
+	binding := &appFileBinding{}
+	teachingService := &appTeachingRead{}
+	h := New(Dependencies{Auth: &appAdminAuth{}, Teaching: teachingService, FileBindings: binding, PublicOrigin: "https://learn.example.com"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/lessons", strings.NewReader(`{"chapterId":"`+uuid.NewString()+`","title":"Lesson"}`))
+	req.RemoteAddr = net.JoinHostPort("192.0.2.2", "1234")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://learn.example.com")
+	req.Header.Set("X-CSRF-Token", "csrf-token-123")
+	req.AddCookie(&http.Cookie{Name: "hl_session", Value: "token"})
+	req.AddCookie(&http.Cookie{Name: "hl_csrf", Value: "csrf-token-123"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated || teachingService.createLessons != 1 || binding.calls != 0 {
+		t.Fatalf("status=%d teaching calls=%d binding calls=%d body=%s", w.Code, teachingService.createLessons, binding.calls, w.Body.String())
+	}
+}
+
 type appFileCenter struct{ calls int }
 
 func (s *appFileCenter) List(context.Context, files.Principal, files.FileFilter, files.Cursor) (files.FilePage, error) {

@@ -3,6 +3,7 @@ package files
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -429,20 +430,31 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 		return nil, err
 	}
 	versionIDs := make([]uuid.UUID, len(inputs))
+	policies := make(map[uuid.UUID]AccessPolicy, len(inputs))
 	for i := range inputs {
 		versionIDs[i] = inputs[i].FileVersionID
+		policies[inputs[i].FileVersionID] = inputs[i].Policy
 	}
 	if len(versionIDs) > 0 {
-		locked, lockErr := tx.Query(ctx, `SELECT fv.id FROM file_versions fv JOIN files f ON f.id=fv.file_id WHERE fv.id=ANY($1) AND f.deleted_at IS NULL ORDER BY f.id,fv.id FOR SHARE OF f,fv`, versionIDs)
+		locked, lockErr := tx.Query(ctx, `SELECT fv.id,fv.processing_state,COALESCE(NULLIF(fv.detected_mime,''),fv.declared_mime),fv.browser_playable,
+ EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready')
+ FROM file_versions fv JOIN files f ON f.id=fv.file_id
+ WHERE fv.id=ANY($1) AND f.deleted_at IS NULL ORDER BY f.id,fv.id FOR SHARE OF f,fv`, versionIDs)
 		if lockErr != nil {
 			return nil, lockErr
 		}
 		lockedCount := 0
 		for locked.Next() {
-			var ignored uuid.UUID
-			if err = locked.Scan(&ignored); err != nil {
+			var versionID uuid.UUID
+			var processingState, detectedMIME string
+			var browserPlayable, previewReady bool
+			if err = locked.Scan(&versionID, &processingState, &detectedMIME, &browserPlayable, &previewReady); err != nil {
 				locked.Close()
 				return nil, err
+			}
+			if !bindingAccessAllowed(policies[versionID], processingState, strings.ToLower(detectedMIME), browserPlayable, previewReady) {
+				locked.Close()
+				return nil, ErrAccessUnavailable
 			}
 			lockedCount++
 		}

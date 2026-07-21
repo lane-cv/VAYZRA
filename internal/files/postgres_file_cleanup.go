@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,7 +69,7 @@ FOR UPDATE OF f,fv SKIP LOCKED LIMIT 1`, now).Scan(&candidate.FileID, &candidate
 	if _, err := tx.Exec(ctx, `UPDATE file_versions SET cleanup_state='deleting',cleanup_lease_owner=$2,cleanup_lease_until=$3,cleanup_attempts=cleanup_attempts+1 WHERE id=$1`, candidate.VersionID, owner, now.Add(lease)); err != nil {
 		return FileCleanupCandidate{}, false, err
 	}
-	if err := audit.NewPostgresWriter(tx).Write(ctx, audit.Event{ActorUserID: actorID, Action: "file.cleanup_scheduled", TargetType: "file_version", TargetID: candidate.VersionID.String(), Metadata: map[string]any{"previewCount": len(candidate.PreviewKeys)}, RequestID: "maintenance-cleanup", IP: net.ParseIP("127.0.0.1")}); err != nil {
+	if err := audit.NewPostgresWriter(tx).Write(ctx, audit.Event{ActorUserID: actorID, Action: "file.cleanup_scheduled", TargetType: "file_version", TargetID: candidate.VersionID.String(), Metadata: map[string]any{"previewCount": strconv.Itoa(len(candidate.PreviewKeys))}, RequestID: "maintenance-cleanup", IP: net.ParseIP("127.0.0.1")}); err != nil {
 		return FileCleanupCandidate{}, false, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO outbox_events(kind,payload)

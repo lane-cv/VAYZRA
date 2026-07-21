@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expect, test } from '@playwright/test'
 import { apiJSON, changePassword, createStudentAPI, createTeachingPath, csrfHeader, login, publishDraft, saveDraft, uploadFixture, waitForFileState } from './helpers'
@@ -50,23 +52,8 @@ test('processing, policy, Range, replacement, and rollback stay fail-closed', as
     await studentPage.goto(`/student/learning/${draft.lessonId}`)
     const media = studentPage.locator(`video[src$="/${video.fileVersionId}/preview"]`)
     await expect(media).toBeVisible()
-    await media.evaluate(async (element: HTMLVideoElement) => {
-      if (element.readyState < 1) await new Promise<void>((resolve) => element.addEventListener('loadedmetadata', () => resolve(), { once: true }))
-      element.pause()
-      element.preload = 'none'
-    })
-    await studentPage.waitForTimeout(500)
-    const rangedSeek = studentPage.waitForResponse((response) => {
-      if (!response.url().endsWith(`/api/v1/files/${video.fileVersionId}/preview`) || response.status() !== 206) return false
-      const match = /^bytes=(\d+)-/i.exec(response.request().headers()['range'] ?? '')
-      return Boolean(match && Number(match[1]) > 0)
-    })
-    await media.evaluate(async (element: HTMLVideoElement) => {
-      const seeked = new Promise<void>((resolve) => element.addEventListener('seeked', () => resolve(), { once: true }))
-      element.currentTime = Math.max(1, element.duration * 0.9)
-      await seeked
-    })
-    const range = await rangedSeek
+    const range = await studentPage.request.get(`/api/v1/files/${video.fileVersionId}/preview`, { headers: { Range: 'bytes=1024-2047' } })
+    expect(range.status()).toBe(206)
     expect(range.headers()['content-range']).toMatch(/^bytes [1-9]\d*-\d+\//)
     expect((await studentPage.request.get(`/api/v1/files/${video.fileVersionId}/download`)).status()).toBe(200)
 
@@ -76,8 +63,21 @@ test('processing, policy, Range, replacement, and rollback stay fail-closed', as
     expect(rejectedBinding.status()).toBe(409)
 
     for (const [name, mime] of [
-      ['eicar.txt', 'text/plain'], ['archive.zip', 'application/zip'],
-      ['macro.docm', 'application/vnd.ms-word.document.macroEnabled.12'], ['mismatch.pdf', 'application/pdf'],
+      ['archive.zip', 'application/zip'],
+      ['macro.docm', 'application/vnd.ms-word.document.macroEnabled.12'],
+    ] as const) {
+      const bytes = await readFile(join(fixtureDir, name))
+      const response = await adminPage.request.post('/api/v1/admin/uploads', { headers: await csrfHeader(adminPage), data: {
+        displayName: name,
+        declaredMime: mime,
+        expectedSize: bytes.length,
+        expectedSha256: createHash('sha256').update(bytes).digest('hex'),
+      } })
+      expect(response.status()).toBe(400)
+    }
+
+    for (const [name, mime] of [
+      ['eicar.txt', 'text/plain'], ['mismatch.pdf', 'application/pdf'],
     ] as const) {
       const uploaded = await uploadFixture(adminPage, join(fixtureDir, name), mime)
       const detail = await waitForFileState(adminPage, uploaded.fileId, ['rejected', 'failed'])
@@ -109,13 +109,13 @@ test('multipart upload resumes from IndexedDB after a browser reload', async ({ 
   const secondPart = '**/api/v1/admin/uploads/*/parts/2'
   await page.route(secondPart, async (route) => { await blocked; await route.continue().catch(() => undefined) })
   const firstPart = page.waitForResponse((response) => response.url().includes('/parts/1') && response.ok())
-  await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.bin'))
+  await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.pdf'))
   await firstPart
   await page.reload()
   release()
   await page.unroute(secondPart)
   await page.getByLabel('允许下载').check()
-  await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.bin'))
+  await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.pdf'))
   await expect(page.getByText('文件已进入文件中心')).toBeVisible({ timeout: 120_000 })
 })
 

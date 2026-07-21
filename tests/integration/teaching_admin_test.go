@@ -45,6 +45,9 @@ func TestTeachingAdminPublicationWritesFrozenRevisionAuditAndOutbox(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	if draft.Audience.Mode != teaching.AudienceAll {
+		t.Fatalf("new lesson audience mode=%q, want all", draft.Audience.Mode)
+	}
 	draft, err = svc.SaveDraft(ctx, actor, teaching.SaveDraftInput{LessonID: draft.LessonID, ExpectedVersion: draft.LockVersion, Title: "Lesson 1", BodyMarkdown: "Published body", Audience: teaching.Audience{Mode: teaching.AudienceSelected, UserIDs: []uuid.UUID{studentID}}})
 	if err != nil {
 		t.Fatal(err)

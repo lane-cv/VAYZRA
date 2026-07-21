@@ -32,7 +32,7 @@ func main() {
 
 	handler, closeResources, err := buildProductionApplication(context.Background(), cfg)
 	if err != nil {
-		log.Print("startup_error")
+		log.Printf("startup_error stage=%s", err)
 		os.Exit(1)
 	}
 	defer closeResources()
@@ -280,8 +280,10 @@ func newProductionObjectReadiness(ctx context.Context, cfg config.Config) (func(
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
+		log.Printf("object_store_startup_error stage=%s", err)
 		return nil, err
 	}
 	return stores.Ready, nil
@@ -310,8 +312,10 @@ func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg con
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
+		log.Printf("object_store_startup_error stage=%s", err)
 		return nil, err
 	}
 	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, time.Now), nil
@@ -321,6 +325,7 @@ func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
 		return nil, err

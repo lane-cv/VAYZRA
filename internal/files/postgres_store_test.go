@@ -199,8 +199,8 @@ func TestPostgresUploadCleanupConfirmsReferenceBeforeObjectOperations(t *testing
 	if err := svc.CleanupExpired(ctx, 100); err == nil || err.Error() != "cleanup expired uploads" {
 		t.Fatalf("cleanup err=%v", err)
 	}
-	if objects.abortCalls != 0 || objects.deleteCalls != 0 {
-		t.Fatalf("object operations crossed reference confirmation: abort=%d delete=%d", objects.abortCalls, objects.deleteCalls)
+	if objects.abortCalls.Load() != 0 || objects.deleteCalls.Load() != 0 {
+		t.Fatalf("object operations crossed reference confirmation: abort=%d delete=%d", objects.abortCalls.Load(), objects.deleteCalls.Load())
 	}
 	var sessions, versions int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM upload_sessions WHERE id=$1`, candidate.ID).Scan(&sessions); err != nil {

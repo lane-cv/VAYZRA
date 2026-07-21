@@ -14,7 +14,7 @@ import (
 
 func TestFileCenterHTTPRoutesAndStableLifecycleErrors(t *testing.T) {
 	fileID, lessonID, versionID := uuid.New(), uuid.New(), uuid.New()
-	service := &fileCenterHTTPStub{deleteErr: ErrFileInUse, rollbackErr: ErrFileVersionExpired}
+	service := &fileCenterHTTPStub{deleteErr: ErrFileInUse, replaceErr: ErrAccessUnavailable, rollbackErr: ErrFileVersionExpired}
 	handler := httpx.RequestID(NewFileCenterHandler(service, nil).Routes())
 
 	request := func(method, target, body string) *http.Request {
@@ -40,6 +40,12 @@ func TestFileCenterHTTPRoutesAndStableLifecycleErrors(t *testing.T) {
 	}
 
 	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, request(http.MethodPost, "/"+fileID.String()+"/replace", `{"uploadedVersionId":"`+versionID.String()+`"}`))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"file_access_unavailable"`) {
+		t.Fatalf("replace status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
 	body := `{"lessonId":"` + lessonID.String() + `","fileVersionId":"` + versionID.String() + `"}`
 	handler.ServeHTTP(w, request(http.MethodPost, "/"+fileID.String()+"/rollback", body))
 	if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), `"code":"file_version_expired"`) {
@@ -62,6 +68,7 @@ type fileCenterHTTPStub struct {
 	filter      FileFilter
 	cursor      Cursor
 	deleteErr   error
+	replaceErr  error
 	rollbackErr error
 }
 
@@ -73,8 +80,8 @@ func (*fileCenterHTTPStub) Detail(context.Context, Principal, uuid.UUID) (FileDe
 	return FileDetail{}, nil
 }
 func (*fileCenterHTTPStub) Retry(context.Context, Principal, uuid.UUID) error { return nil }
-func (*fileCenterHTTPStub) Replace(context.Context, Principal, uuid.UUID, uuid.UUID) error {
-	return nil
+func (s *fileCenterHTTPStub) Replace(context.Context, Principal, uuid.UUID, uuid.UUID) error {
+	return s.replaceErr
 }
 func (s *fileCenterHTTPStub) RollbackDraftBinding(context.Context, Principal, uuid.UUID, uuid.UUID, uuid.UUID) error {
 	return s.rollbackErr

@@ -28,7 +28,7 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=30:du
   -c:v libx264 -preset ultrafast -b:v 4M -maxrate 4M -bufsize 8M -pix_fmt yuv420p -c:a aac -movflags +faststart -y "$destination/lesson.mp4"
 ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=red:s=160x90:d=1 -c:v ffv1 -y "$destination/unsupported.mkv"
 
-dd if=/dev/zero of="$destination/resume.bin" bs=1M count=9 status=none
+dd if=/dev/zero of="$destination/resume.pdf" bs=1M count=9 status=none
 cp "$destination/lesson.docx" "$destination/archive.zip"
 cp "$destination/lesson.docx" "$destination/macro.docm"
 printf '%s\n' 'this is deliberately not a PDF' > "$destination/mismatch.pdf"
@@ -40,4 +40,4 @@ probe_b='$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
 printf '%s%s' "$probe_a" "$probe_b" > "$destination/eicar.txt"
 
 chmod 0600 "$destination"/*
-test "$(wc -c < "$destination/resume.bin")" -gt 8388608
+test "$(wc -c < "$destination/resume.pdf")" -gt 8388608

@@ -260,6 +260,8 @@ func fileCenterHTTPError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusGone, "file_version_expired", "文件版本已超过保留期")
 	case errors.Is(err, ErrFileNotRetryable):
 		httpx.Error(w, r, http.StatusConflict, "file_not_retryable", "该失败不可重试")
+	case errors.Is(err, ErrAccessUnavailable):
+		httpx.Error(w, r, http.StatusConflict, "file_access_unavailable", "文件尚未就绪或不支持现有访问方式")
 	case errors.Is(err, ErrInvalid):
 		fileCenterBad(w, r)
 	default:

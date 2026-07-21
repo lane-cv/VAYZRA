@@ -62,6 +62,32 @@ func TestBindingReturnsDedicatedDraftConflict(t *testing.T) {
 	}
 }
 
+func TestBindingAccessPolicyRequiresReadyDeliverable(t *testing.T) {
+	tests := []struct {
+		name            string
+		policy          AccessPolicy
+		state           string
+		detectedMIME    string
+		browserPlayable bool
+		previewReady    bool
+		want            bool
+	}{
+		{name: "download ready file", policy: PolicyDownload, state: "ready", detectedMIME: "application/pdf", want: true},
+		{name: "pending download", policy: PolicyDownload, state: "pending_scan", detectedMIME: "application/pdf", want: false},
+		{name: "derived document preview", policy: PolicyPreview, state: "ready", detectedMIME: "application/pdf", previewReady: true, want: true},
+		{name: "browser playable video", policy: PolicyPreview, state: "ready", detectedMIME: "video/mp4", browserPlayable: true, want: true},
+		{name: "unsupported video", policy: PolicyPreview, state: "ready", detectedMIME: "video/x-matroska", previewReady: true, want: false},
+		{name: "document without preview", policy: PolicyPreview, state: "ready", detectedMIME: "application/pdf", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bindingAccessAllowed(tt.policy, tt.state, tt.detectedMIME, tt.browserPlayable, tt.previewReady); got != tt.want {
+				t.Fatalf("bindingAccessAllowed()=%v want=%v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBindingListRequiresAdminAndReturnsDraftBindings(t *testing.T) {
 	store := &bindingStoreStub{}
 	svc := NewBindingService(store)

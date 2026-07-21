@@ -46,6 +46,7 @@ func run(ctx context.Context, args []string) error {
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
 		return errors.New("maintenance object storage")

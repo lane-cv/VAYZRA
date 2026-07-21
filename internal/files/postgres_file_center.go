@@ -2,6 +2,7 @@ package files
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -208,11 +209,18 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	versionLocks.Close()
 	var sourceVersion int64
 	var lockedSourceFileID uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT file_id,version FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&lockedSourceFileID, &sourceVersion); err != nil {
+	var processingState, detectedMIME string
+	var browserPlayable, previewReady bool
+	if err := tx.QueryRow(ctx, `SELECT file_id,version,processing_state,COALESCE(NULLIF(detected_mime,''),declared_mime),browser_playable,
+ EXISTS(SELECT 1 FROM file_previews WHERE file_version_id=$1 AND processing_state='ready')
+ FROM file_versions WHERE id=$1`, uploadedVersionID).Scan(&lockedSourceFileID, &sourceVersion, &processingState, &detectedMIME, &browserPlayable, &previewReady); err != nil {
 		return mapStoreError(err)
 	}
 	if lockedSourceFileID != sourceFileID || sourceVersion != 1 {
 		return ErrInvalid
+	}
+	if !bindingAccessAllowed(PolicyDownload, processingState, strings.ToLower(detectedMIME), browserPlayable, previewReady) {
+		return ErrAccessUnavailable
 	}
 	var sourceVersions int
 	var referenced bool
@@ -227,6 +235,26 @@ func (s *PostgresStore) ReplaceFile(ctx context.Context, actor Principal, fileID
 	if err := tx.QueryRow(ctx, `SELECT id,version FROM file_versions WHERE file_id=$1 ORDER BY version DESC,id DESC LIMIT 1 FOR UPDATE`, fileID).Scan(&previousVersionID, &previousVersion); err != nil {
 		return err
 	}
+	policies, err := tx.Query(ctx, `SELECT DISTINCT access_policy FROM lesson_draft_files WHERE file_version_id=$1 ORDER BY access_policy`, previousVersionID)
+	if err != nil {
+		return err
+	}
+	for policies.Next() {
+		var policy AccessPolicy
+		if err := policies.Scan(&policy); err != nil {
+			policies.Close()
+			return err
+		}
+		if !bindingAccessAllowed(policy, processingState, strings.ToLower(detectedMIME), browserPlayable, previewReady) {
+			policies.Close()
+			return ErrAccessUnavailable
+		}
+	}
+	if err := policies.Err(); err != nil {
+		policies.Close()
+		return err
+	}
+	policies.Close()
 	nextVersion := previousVersion + 1
 	if _, err := tx.Exec(ctx, `UPDATE file_versions SET retention_until=$2 WHERE id=$1`, previousVersionID, retentionUntil); err != nil {
 		return err
