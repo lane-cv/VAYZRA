@@ -1,4 +1,6 @@
 -- +goose Up
+DROP TRIGGER IF EXISTS file_access_logs_immutable ON file_access_logs;
+
 ALTER TABLE lesson_draft_files
   ADD COLUMN display_name text NOT NULL DEFAULT 'attachment' CHECK (char_length(display_name) BETWEEN 1 AND 255),
   ADD COLUMN description text NOT NULL DEFAULT '' CHECK (char_length(description) <= 500);
@@ -19,6 +21,9 @@ ALTER TABLE file_access_logs
   ADD COLUMN playback_session_hash text NOT NULL DEFAULT '' CHECK (char_length(playback_session_hash) IN (0,64));
 UPDATE file_access_logs SET requested_file_version_id=file_version_id WHERE requested_file_version_id IS NULL;
 UPDATE file_access_logs SET ip='0.0.0.0' WHERE ip IS NULL;
+CREATE TRIGGER file_access_logs_immutable
+  BEFORE UPDATE OR DELETE ON file_access_logs
+  FOR EACH ROW EXECUTE FUNCTION reject_secure_file_history_mutation();
 ALTER TABLE file_access_logs ALTER COLUMN requested_file_version_id SET NOT NULL;
 ALTER TABLE file_access_logs ALTER COLUMN result DROP DEFAULT;
 ALTER TABLE file_access_logs ALTER COLUMN reason_code DROP DEFAULT;
@@ -33,12 +38,28 @@ CREATE INDEX file_access_logs_requested_time_idx ON file_access_logs(requested_f
 CREATE UNIQUE INDEX file_access_logs_playback_sample_key ON file_access_logs(actor_user_id,requested_file_version_id,lesson_revision_id,access_policy,playback_session_hash) WHERE result='allow' AND playback_session_hash<>'';
 
 -- +goose Down
+LOCK TABLE file_access_logs IN ACCESS EXCLUSIVE MODE;
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM file_access_logs
+    WHERE file_version_id IS NULL OR result <> 'allow'
+  ) THEN
+    RAISE EXCEPTION 'file access history cannot be represented by migration 00005'
+      USING ERRCODE = '55000';
+  END IF;
+END;
+$$;
+-- +goose StatementEnd
+
 DROP INDEX IF EXISTS file_access_logs_playback_sample_key;
 DROP INDEX file_access_logs_requested_time_idx;
 DROP TRIGGER lesson_revision_files_insert_immutable ON lesson_revision_files;
 ALTER TABLE file_access_logs DROP CONSTRAINT file_access_logs_resolved_version_fkey;
-DROP TRIGGER file_access_logs_immutable ON file_access_logs;
-DELETE FROM file_access_logs WHERE file_version_id IS NULL;
+DROP TRIGGER IF EXISTS file_access_logs_immutable ON file_access_logs;
 CREATE TRIGGER file_access_logs_immutable BEFORE UPDATE OR DELETE ON file_access_logs FOR EACH ROW EXECUTE FUNCTION reject_secure_file_history_mutation();
 ALTER TABLE file_access_logs DROP COLUMN playback_session_hash,DROP COLUMN ip,DROP COLUMN reason_code,DROP COLUMN result,DROP COLUMN requested_file_version_id;
 ALTER TABLE file_access_logs ALTER COLUMN file_version_id SET NOT NULL;

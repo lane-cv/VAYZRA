@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -131,4 +132,58 @@ func hasSecureSessionCookie(cookies []*http.Cookie) bool {
 		}
 	}
 	return false
+}
+
+func TestBuildApplicationReadyRequiresObjectStoreAndHidesFailure(t *testing.T) {
+	called := false
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverFakeAuth{}, nil },
+		ready:   func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		objectReady: func(context.Context, config.Config) (func(context.Context) error, error) {
+			called = true
+			return func(context.Context) error { return errors.New("private object endpoint secret") }, nil
+		},
+		close: func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResources()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/health/ready", nil))
+	if !called || w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "secret") {
+		t.Fatalf("called=%t status=%d body=%s", called, w.Code, w.Body.String())
+	}
+}
+
+func TestReadyHandlerReturnsWhenSharedDependencyBudgetExpires(t *testing.T) {
+	cancelled := make(chan struct{})
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverFakeAuth{}, nil },
+		ready:   func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		objectReady: func(context.Context, config.Config) (func(context.Context) error, error) {
+			return func(ctx context.Context) error { <-ctx.Done(); close(cancelled); return ctx.Err() }, nil
+		},
+		readinessTimeout: 20 * time.Millisecond,
+		close:            func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResources()
+	started := time.Now()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/health/ready", nil))
+	if w.Code != http.StatusServiceUnavailable || time.Since(started) > 500*time.Millisecond || strings.Contains(w.Body.String(), "deadline") {
+		t.Fatalf("status=%d elapsed=%s body=%s", w.Code, time.Since(started), w.Body.String())
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("blocking object readiness context not cancelled")
+	}
 }

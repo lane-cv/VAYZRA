@@ -29,34 +29,33 @@ func NewAccessService(store AccessStore, originals, previews objectstore.Store) 
 	return &AccessService{store: store, originals: originals, previews: previews, now: time.Now}
 }
 
+func (s *AccessService) failClosedLog(ctx context.Context, log AccessLog, fallback error) error {
+	if err := s.store.WriteAccessLog(ctx, log); err != nil {
+		return ErrAccessUnavailable
+	}
+	return fallback
+}
+
 func (s *AccessService) Open(ctx context.Context, actor Principal, in OpenInput) (OpenedFile, error) {
 	log := AccessLog{ActorUserID: actor.User.ID, RequestedVersionID: in.VersionID, Action: in.Action, RequestID: actor.RequestID, IP: append([]byte(nil), actor.IP...)}
 	if actor.User.Role != auth.RoleStudent || actor.User.Status != auth.StatusActive || in.VersionID == uuid.Nil || (in.Action != ActionPreview && in.Action != ActionDownload) {
 		log.Result, log.Reason = AccessDenied, "not_found"
-		_ = s.store.WriteAccessLog(ctx, log)
-		return OpenedFile{}, ErrNotFound
+		return OpenedFile{}, s.failClosedLog(ctx, log, ErrNotFound)
 	}
 	d, err := s.store.ResolveAccess(ctx, actor.User.ID, in.VersionID, in.Action)
 	log.VersionID, log.RevisionID = d.VersionID, d.RevisionID
 	if err != nil {
 		log.Result, log.Reason = AccessDenied, "not_found"
-		if logErr := s.store.WriteAccessLog(ctx, log); logErr != nil {
-			return OpenedFile{}, logErr
-		}
-		return OpenedFile{}, ErrNotFound
+		return OpenedFile{}, s.failClosedLog(ctx, log, ErrNotFound)
 	}
 	if in.Action == ActionDownload && d.Policy != PolicyDownload {
 		log.Result, log.Reason = AccessDenied, "policy"
-		if err := s.store.WriteAccessLog(ctx, log); err != nil {
-			return OpenedFile{}, err
-		}
-		return OpenedFile{}, ErrNotFound
+		return OpenedFile{}, s.failClosedLog(ctx, log, ErrNotFound)
 	}
 	rng, err := parseByteRange(in.Range, d.Size, d.Playable)
 	if err != nil {
 		log.Result, log.Reason = AccessMalformed, "invalid_range"
-		_ = s.store.WriteAccessLog(ctx, log)
-		return OpenedFile{}, err
+		return OpenedFile{}, s.failClosedLog(ctx, log, err)
 	}
 	var requested *objectstore.ByteRange
 	if rng != nil {
@@ -70,14 +69,12 @@ func (s *AccessService) Open(ctx context.Context, actor Principal, in OpenInput)
 	body, info, err := objects.Get(ctx, d.ObjectKey, requested)
 	if err != nil {
 		log.Result, log.Reason = AccessFailed, "storage"
-		_ = s.store.WriteAccessLog(ctx, log)
-		return OpenedFile{}, errors.New("file delivery unavailable")
+		return OpenedFile{}, s.failClosedLog(ctx, log, ErrAccessUnavailable)
 	}
 	if info.Size != d.Size {
 		_ = body.Close()
 		log.Result, log.Reason = AccessFailed, "storage"
-		_ = s.store.WriteAccessLog(ctx, log)
-		return OpenedFile{}, errors.New("file delivery unavailable")
+		return OpenedFile{}, s.failClosedLog(ctx, log, ErrAccessUnavailable)
 	}
 	if rng != nil && d.Playable {
 		log.PlaybackSessionHash = s.playbackAggregationKey(actor.User.ID, d.VersionID, d.RevisionID, in.Action)
@@ -85,7 +82,7 @@ func (s *AccessService) Open(ctx context.Context, actor Principal, in OpenInput)
 	log.Result = AccessAllowed
 	if err := s.store.WriteAccessLog(ctx, log); err != nil {
 		_ = body.Close()
-		return OpenedFile{}, err
+		return OpenedFile{}, ErrAccessUnavailable
 	}
 	size := d.Size
 	if rng != nil {
@@ -147,6 +144,9 @@ func parseByteRange(raw string, size int64, playable bool) (*ResponseRange, erro
 				end = size - 1
 			}
 		}
+		// An explicit or implicit range ending at EOF may represent resume playback.
+		// It is intentionally exempt from the 64 MiB slice cap; file size is still
+		// bounded by the global 500 MiB upload limit and delivery remains streaming.
 		if end-start+1 > maxRangeLength && end != size-1 {
 			return nil, &RangeError{Size: size}
 		}

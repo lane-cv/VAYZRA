@@ -8,6 +8,7 @@ import (
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/httpx"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -23,12 +24,13 @@ type AccessHandler struct {
 	service          AccessHTTPService
 	trusted          []netip.Prefix
 	writeIdleTimeout time.Duration
+	logger           *slog.Logger
 }
 
 const defaultWriteIdleTimeout = 30 * time.Second
 
 func NewAccessHandler(service AccessHTTPService, trusted []netip.Prefix) *AccessHandler {
-	return &AccessHandler{service: service, trusted: append([]netip.Prefix(nil), trusted...), writeIdleTimeout: defaultWriteIdleTimeout}
+	return &AccessHandler{service: service, trusted: append([]netip.Prefix(nil), trusted...), writeIdleTimeout: defaultWriteIdleTimeout, logger: slog.Default()}
 }
 func (h *AccessHandler) Routes() http.Handler {
 	r := chi.NewRouter()
@@ -90,7 +92,7 @@ func (h *AccessHandler) open(w http.ResponseWriter, r *http.Request, action Acce
 	w.WriteHeader(status)
 	deliveryWriter := newIdleDeadlineWriter(w, h.writeIdleTimeout)
 	defer deliveryWriter.finish()
-	_ = deliverOpenedFile(r.Context(), deliveryWriter, opened)
+	_ = deliverOpenedFileWithLogger(r.Context(), deliveryWriter, opened, h.logger)
 }
 
 type idleDeadlineWriter struct {
@@ -148,6 +150,10 @@ func fileError(w http.ResponseWriter, r *http.Request, err error) {
 const transferFailureLogTimeout = 2 * time.Second
 
 func deliverOpenedFile(ctx context.Context, dst io.Writer, opened OpenedFile) error {
+	return deliverOpenedFileWithLogger(ctx, dst, opened, slog.Default())
+}
+
+func deliverOpenedFileWithLogger(ctx context.Context, dst io.Writer, opened OpenedFile, logger *slog.Logger) error {
 	_, copyErr := copyDeliveryContext(ctx, dst, opened.Body)
 	closeErr := opened.Body.Close()
 	if copyErr != nil {
@@ -158,21 +164,26 @@ func deliverOpenedFile(ctx context.Context, dst io.Writer, opened OpenedFile) er
 		if errors.Is(copyErr, errDeliveryCancelled) || ctx.Err() != nil {
 			reason = "cancelled"
 		}
-		reportTransferFailure(ctx, opened, reason)
+		reportTransferFailure(ctx, opened, reason, logger)
 		return copyErr
 	}
 	if closeErr != nil {
-		reportTransferFailure(ctx, opened, "stream_close")
+		reportTransferFailure(ctx, opened, "stream_close", logger)
 		return errors.New("delivery close failed")
 	}
 	return nil
 }
 
-func reportTransferFailure(requestCtx context.Context, opened OpenedFile, reason string) {
+func reportTransferFailure(requestCtx context.Context, opened OpenedFile, reason string, logger *slog.Logger) {
 	if opened.ReportFailure == nil {
 		return
 	}
 	logCtx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), transferFailureLogTimeout)
 	defer cancel()
-	_ = opened.ReportFailure(logCtx, reason)
+	if err := opened.ReportFailure(logCtx, reason); err != nil {
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.ErrorContext(logCtx, "file_transfer_audit_failed")
+	}
 }

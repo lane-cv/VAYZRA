@@ -11,11 +11,15 @@ import (
 type bindingStoreStub struct {
 	calls int
 	items []DraftBindingInput
+	err   error
 }
 
 func (s *bindingStoreStub) ReplaceDraftBindings(_ context.Context, _ Principal, lesson uuid.UUID, _ int64, in []DraftBindingInput) ([]DraftBinding, error) {
 	s.calls++
 	s.items = in
+	if s.err != nil {
+		return nil, s.err
+	}
 	return []DraftBinding{{LessonID: lesson, DraftBindingInput: in[0]}}, nil
 }
 func TestBindingValidationAndExactVersion(t *testing.T) {
@@ -38,5 +42,15 @@ func TestBindingValidationAndExactVersion(t *testing.T) {
 	student.User.Role = auth.RoleStudent
 	if _, err := svc.Replace(context.Background(), student, lesson, 7, []DraftBindingInput{}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("student err=%v", err)
+	}
+}
+
+func TestBindingReturnsDedicatedDraftConflict(t *testing.T) {
+	store := &bindingStoreStub{err: ErrDraftConflict}
+	svc := NewBindingService(store)
+	actor := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}
+	_, err := svc.Replace(context.Background(), actor, uuid.New(), 7, []DraftBindingInput{{FileVersionID: uuid.New(), Policy: PolicyPreview, DisplayName: "x", SortPosition: 1}})
+	if !errors.Is(err, ErrDraftConflict) || errors.Is(err, ErrUploadConflict) {
+		t.Fatalf("error=%v, want dedicated draft conflict", err)
 	}
 }

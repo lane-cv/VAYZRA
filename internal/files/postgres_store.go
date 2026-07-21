@@ -419,7 +419,7 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 		return nil, mapStoreError(err)
 	}
 	if version != expected {
-		return nil, ErrUploadConflict
+		return nil, ErrDraftConflict
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM lesson_draft_files WHERE lesson_id=$1`, lessonID); err != nil {
 		return nil, err

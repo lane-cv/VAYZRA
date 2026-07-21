@@ -82,6 +82,8 @@ type applicationDependencies struct {
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	ready              func(*pgxpool.Pool) func(context.Context) error
+	objectReady        func(context.Context, config.Config) (func(context.Context) error, error)
+	readinessTimeout   time.Duration
 	close              func(*pgxpool.Pool)
 	openRedis          func(string) (*redis.Client, error)
 	newThrottle        func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
@@ -105,8 +107,9 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
-		close:     func(pool *pgxpool.Pool) { pool.Close() },
-		openRedis: redisx.NewClient,
+		objectReady: newProductionObjectReadiness,
+		close:       func(pool *pgxpool.Pool) { pool.Close() },
+		openRedis:   redisx.NewClient,
 		newThrottle: func(client *redis.Client, cfg config.Config) (redisx.Limiter, redisx.CaptchaService) {
 			policy := redisx.Policy{Secret: []byte(cfg.LoginThrottleSecret), Window: 15 * time.Minute, AccountFailures: 5, IPFailures: 20, Lockout: 15 * time.Minute}
 			return redisx.NewLoginLimiter(client, policy), redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
@@ -168,11 +171,20 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	if deps.newFileBindings != nil {
 		fileBindingService = deps.newFileBindings(pool)
 	}
-	ready := deps.ready(pool)
-	if ready == nil {
+	databaseReady := deps.ready(pool)
+	if databaseReady == nil {
 		closePool()
 		return nil, nil, errors.New("initialize readiness check")
 	}
+	var objectReady func(context.Context) error
+	if deps.objectReady != nil {
+		objectReady, err = deps.objectReady(ctx, cfg)
+		if err != nil || objectReady == nil {
+			closePool()
+			return nil, nil, errors.New("initialize readiness check")
+		}
+	}
+	ready := combineReadinessWithTimeout(databaseReady, objectReady, deps.readinessTimeout)
 	var limiter redisx.Limiter
 	var captchas redisx.CaptchaService
 	var progressLimiter redisx.ProgressWriteLimiter
@@ -227,6 +239,45 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Captchas:          captchas,
 		StaticFiles:       os.DirFS("web/dist"),
 	}), closeResources, nil
+}
+
+const defaultReadinessTimeout = 5 * time.Second
+
+func combineReadiness(databaseReady, objectReady func(context.Context) error) func(context.Context) error {
+	return combineReadinessWithTimeout(databaseReady, objectReady, defaultReadinessTimeout)
+}
+
+func combineReadinessWithTimeout(databaseReady, objectReady func(context.Context) error, timeout time.Duration) func(context.Context) error {
+	if timeout <= 0 {
+		timeout = defaultReadinessTimeout
+	}
+	return func(ctx context.Context) error {
+		checkCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if databaseReady == nil {
+			return errors.New("dependency not ready")
+		}
+		if err := databaseReady(checkCtx); err != nil {
+			return errors.New("dependency not ready")
+		}
+		if objectReady != nil {
+			if err := objectReady(checkCtx); err != nil {
+				return errors.New("dependency not ready")
+			}
+		}
+		return nil
+	}
+}
+
+func newProductionObjectReadiness(ctx context.Context, cfg config.Config) (func(context.Context) error, error) {
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stores.Ready, nil
 }
 
 func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {

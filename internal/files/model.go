@@ -29,6 +29,8 @@ var (
 	ErrPartHashMismatch    = errors.New("upload part hash mismatch")
 	ErrFinalHashMismatch   = errors.New("upload final hash mismatch")
 	ErrRangeNotSatisfiable = errors.New("range not satisfiable")
+	ErrAccessUnavailable   = errors.New("file access unavailable")
+	ErrDraftConflict       = errors.New("draft version conflict")
 )
 
 type UploadState string

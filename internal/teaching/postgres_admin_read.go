@@ -8,6 +8,33 @@ import (
 )
 
 func (s *PostgresStore) PublicationBlockers(ctx context.Context, lessonID uuid.UUID, sourceVersion int64) ([]string, error) {
+	// Keep publication readiness and the revision snapshot in one stable read set.
+	// Processing writers must acquire these row classes in the same order:
+	// lesson_draft_files -> files -> file_versions -> file_previews.
+	lockQueries := []string{
+		"SELECT b.id FROM lesson_draft_files b WHERE b.lesson_id=$1 ORDER BY b.id FOR SHARE OF b",
+		"SELECT f.id FROM files f JOIN file_versions fv ON fv.file_id=f.id JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 ORDER BY f.id FOR SHARE OF f",
+		"SELECT fv.id FROM file_versions fv JOIN lesson_draft_files b ON b.file_version_id=fv.id WHERE b.lesson_id=$1 ORDER BY fv.id FOR SHARE OF fv",
+		"SELECT fp.file_version_id FROM file_previews fp JOIN lesson_draft_files b ON b.file_version_id=fp.file_version_id WHERE b.lesson_id=$1 ORDER BY fp.file_version_id,fp.preview_kind FOR SHARE OF fp",
+	}
+	for _, query := range lockQueries {
+		rows, err := s.q.Query(ctx, query, lessonID)
+		if err != nil {
+			return nil, mapTeachingError(err)
+		}
+		for rows.Next() {
+			var ignored uuid.UUID
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return nil, mapTeachingError(err)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, mapTeachingError(err)
+		}
+	}
 	rows, err := s.q.Query(ctx, `
 SELECT blocker FROM (
  SELECT 'draft_changed' blocker WHERE NOT EXISTS(SELECT 1 FROM lesson_drafts WHERE lesson_id=$1 AND lock_version=$2)

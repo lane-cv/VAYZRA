@@ -118,10 +118,39 @@ func (s *MinIOStores) bootstrap(ctx context.Context) error {
 			}
 		}
 		opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
+		err = ensurePrivateBucketPolicies(opCtx, s.core.Client, []string{bucket})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("bootstrap object store: %w", err)
+		}
+		opCtx, cancel = context.WithTimeout(ctx, s.operationTimeout)
 		err = ensureIncompleteMultipartLifecycle(opCtx, s.core.Client, bucket)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("bootstrap object store: %w", err)
+		}
+	}
+	return nil
+}
+
+type bucketPolicyClient interface {
+	GetBucketPolicy(context.Context, string) (string, error)
+}
+
+// ensurePrivateBucketPolicies fails closed if any configured bucket has a
+// policy document. A missing policy is the only MinIO error that means the
+// bucket remains private; backend and policy details are deliberately hidden.
+func ensurePrivateBucketPolicies(ctx context.Context, client bucketPolicyClient, buckets []string) error {
+	for _, bucket := range buckets {
+		policy, err := client.GetBucketPolicy(ctx, bucket)
+		if err != nil {
+			if minio.ToErrorResponse(err).Code == "NoSuchBucketPolicy" {
+				continue
+			}
+			return ErrUnavailable
+		}
+		if policy != "" {
+			return ErrUnavailable
 		}
 	}
 	return nil
