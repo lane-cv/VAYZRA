@@ -35,6 +35,7 @@ watch(() => route.fullPath, () => closeDrawer())
         <RouterLink v-if="isAdmin" to="/admin" @click="closeDrawer()">仪表盘</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/students" @click="closeDrawer()">学生管理</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/teaching" @click="closeDrawer()">教学管理</RouterLink>
+        <RouterLink v-if="isAdmin" to="/admin/files" @click="closeDrawer()">文件中心</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
       </nav>
       <p class="sidebar-note">高中数学 · 物理<br>循序渐进，稳步提升</p>

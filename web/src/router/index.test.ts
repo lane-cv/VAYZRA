@@ -17,6 +17,9 @@ describe('console router guards', () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin/teaching'); expect(router.currentRoute.value.fullPath).toBe('/admin/teaching')
     await router.push('/admin'); session.user = { id: 'u2', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }; await router.push('/admin/teaching'); expect(router.currentRoute.value.fullPath).toBe('/student')
   })
+  it('allows an admin to open the file center', async () => {
+    const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin/files'); expect(router.currentRoute.value.fullPath).toBe('/admin/files')
+  })
   it('redirects an authenticated user away from login without a loop', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/login'); expect(router.currentRoute.value.fullPath).toBe('/admin')
   })
