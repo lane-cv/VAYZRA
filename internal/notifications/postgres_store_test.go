@@ -143,6 +143,112 @@ func TestRealWriterFailureRollsBackQACreationAndAudit(t *testing.T) {
 	}
 }
 
+func TestRealWriterFailureRollsBackEveryQAMutation(t *testing.T) {
+	for _, operation := range []string{"create", "admin_reply", "student_follow_up", "status_change"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			pool := integration.StartPostgres(t)
+			if err := database.Migrate(ctx, pool); err != nil {
+				t.Fatal(err)
+			}
+			student := insertNotificationUser(t, pool, "student")
+			var admin uuid.UUID
+			if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE role='admin' AND status='active' AND deleted_at IS NULL LIMIT 1`).Scan(&admin); err != nil {
+				admin = insertNotificationUser(t, pool, "admin")
+			}
+			svc := qanda.NewService(qanda.NewPostgresStore(pool), qanda.NewPostgresUnitOfWork(pool, func(tx pgx.Tx) qanda.NotificationWriter { return NewWriter(tx) }), time.Now)
+			studentActor := qanda.Principal{User: auth.User{ID: student, Role: auth.RoleStudent, Status: auth.StatusActive}, RequestID: "rollback-student-" + uuid.NewString(), IP: net.ParseIP("192.0.2.20")}
+			adminActor := qanda.Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "rollback-admin-" + uuid.NewString(), IP: net.ParseIP("192.0.2.21")}
+			var thread qanda.Thread
+			if operation != "create" {
+				var err error
+				thread, _, err = svc.CreateThread(ctx, studentActor, qanda.CreateThreadInput{Title: "Rollback setup", Body: "setup", IdempotencyKey: "setup-create-" + uuid.NewString()})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if operation == "student_follow_up" {
+				var err error
+				thread, _, err = svc.AddAdminMessage(ctx, adminActor, qanda.AddAdminMessageInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Body: "setup reply", IdempotencyKey: "setup-reply-" + uuid.NewString()})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := qaRollbackSnapshot(t, pool, student, thread.ID)
+			if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION notification_test_failure_all() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'forced notification failure'; END; $$ LANGUAGE plpgsql; CREATE TRIGGER notification_test_failure_all BEFORE INSERT ON notifications FOR EACH ROW EXECUTE FUNCTION notification_test_failure_all()`); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS notification_test_failure_all ON notifications; DROP FUNCTION IF EXISTS notification_test_failure_all()`)
+			})
+			var err error
+			switch operation {
+			case "create":
+				_, _, err = svc.CreateThread(ctx, studentActor, qanda.CreateThreadInput{Title: "Must rollback", Body: "body", IdempotencyKey: "fail-create-" + uuid.NewString()})
+			case "admin_reply":
+				_, _, err = svc.AddAdminMessage(ctx, adminActor, qanda.AddAdminMessageInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Body: "must rollback", IdempotencyKey: "fail-reply-" + uuid.NewString()})
+			case "student_follow_up":
+				_, _, err = svc.AddStudentMessage(ctx, studentActor, qanda.AddMessageInput{ThreadID: thread.ID, Body: "must rollback", IdempotencyKey: "fail-follow-" + uuid.NewString()})
+			case "status_change":
+				_, err = svc.ChangeStatus(ctx, adminActor, qanda.ChangeStatusInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Status: qanda.StatusInProgress})
+			}
+			if err == nil {
+				t.Fatal("expected notification failure")
+			}
+			after := qaRollbackSnapshot(t, pool, student, thread.ID)
+			if before != after {
+				t.Fatalf("before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+type qaSnapshot struct {
+	Threads, Messages, Audits, Notifications int
+	Status                                   string
+	Version                                  int64
+	LastActivity, Updated                    string
+}
+
+func qaRollbackSnapshot(t *testing.T, pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, student, threadID uuid.UUID) qaSnapshot {
+	t.Helper()
+	ctx := context.Background()
+	var s qaSnapshot
+	if threadID == uuid.Nil {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_threads WHERE student_id=$1`, student).Scan(&s.Threads); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE sender_user_id=$1`, student).Scan(&s.Messages); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE actor_user_id=$1`, student).Scan(&s.Audits); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM notifications`).Scan(&s.Notifications); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,version,last_message_at::text,updated_at::text FROM qa_threads WHERE id=$1`, threadID).Scan(&s.Status, &s.Version, &s.LastActivity, &s.Updated); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_threads WHERE id=$1`, threadID).Scan(&s.Threads); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_messages WHERE thread_id=$1`, threadID).Scan(&s.Messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE target_id=$1`, threadID.String()).Scan(&s.Audits); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1`, threadID).Scan(&s.Notifications); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func TestRealWriterPersistsEveryQANotificationAndSkipsPrivateNotes(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

@@ -14,10 +14,13 @@ import (
 type fakeHTTPService struct {
 	recipient, notification uuid.UUID
 	calls                   string
+	cursor                  Cursor
+	markErr                 error
 }
 
-func (f *fakeHTTPService) List(context.Context, uuid.UUID, Cursor) ([]Notification, Cursor, error) {
+func (f *fakeHTTPService) List(_ context.Context, _ uuid.UUID, cursor Cursor) ([]Notification, Cursor, error) {
 	f.calls = "list"
+	f.cursor = cursor
 	return []Notification{}, Cursor{}, nil
 }
 func (f *fakeHTTPService) UnreadCount(_ context.Context, id uuid.UUID) (int64, error) {
@@ -29,7 +32,7 @@ func (f *fakeHTTPService) MarkRead(_ context.Context, r, id uuid.UUID) error {
 	f.recipient = r
 	f.notification = id
 	f.calls = "read"
-	return nil
+	return f.markErr
 }
 func (f *fakeHTTPService) MarkAllRead(_ context.Context, r uuid.UUID) (int64, error) {
 	f.recipient = r

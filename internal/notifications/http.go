@@ -35,7 +35,7 @@ type Handler struct {
 func NewHandler(s HTTPService) *Handler { return &Handler{service: s, now: time.Now} }
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
-	r.Use(httpx.NoStore, h.requireActive)
+	r.Use(httpx.NoStore, notificationNoSniff, h.requireActive)
 	r.Get("/", h.list)
 	r.Get("/unread-count", h.count)
 	r.Post("/{id}/read", h.markRead)
@@ -45,6 +45,12 @@ func (h *Handler) Routes() http.Handler {
 		httpx.Error(w, r, 405, "method_not_allowed", "请求方法不被允许")
 	})
 	return r
+}
+func notificationNoSniff(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
 }
 func (h *Handler) requireActive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
