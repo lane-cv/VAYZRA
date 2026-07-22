@@ -48,31 +48,32 @@ temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
 
 diagnostics() {
-  install -d -m 0700 "$artifact_dir"
-  printf 'diagnostics_version=1\n' > "$artifact_dir/containers.log"
+  install -d -m 0700 "$artifact_dir" || return 0
+  printf 'diagnostics_version=1\n' > "$artifact_dir/containers.log" || return 0
   for container in "$postgres" "$redis" "$minio" "$worker" "$app"; do
     if docker_bounded 15 ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
-      printf 'container=%s\n' "$container" >> "$artifact_dir/containers.log"
+      printf 'container=%s\n' "$container" >> "$artifact_dir/containers.log" || true
       docker_bounded 15 inspect --format 'state_status={{.State.Status}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 15 inspect --format 'exit_code={{.State.ExitCode}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 15 inspect --format 'oom_killed={{.State.OOMKilled}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 20 logs --tail 200 "$container" >> "$artifact_dir/containers.log" 2>&1 || true
     fi
   done
-  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir"
+  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" || true
 }
 
 cleanup() {
   local exit_status=$?
   trap - EXIT INT TERM
-  cancel_bounded_command
-  if (( exit_status != 0 )); then diagnostics; fi
+  set +e
+  cancel_bounded_command || true
+  if (( exit_status != 0 )); then diagnostics || true; fi
   docker_bounded 30 rm -f "${temporary_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 rm -f "${service_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 network rm "$network" >/dev/null 2>&1 || true
   docker_bounded 30 volume rm "$runner_volume" "$fixture_volume" "$data_volume" >/dev/null 2>&1 || true
   docker_bounded 60 image rm "$app_image" "$worker_image" >/dev/null 2>&1 || true
-  rm -rf "$tmpdir"
+  rm -rf "$tmpdir" || true
   exit "$exit_status"
 }
 trap cleanup EXIT INT TERM

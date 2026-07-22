@@ -80,7 +80,7 @@ case "${1:-}" in
     touch "$state/resources/containers/$name"
     if [[ "$name" == *_data_init ]]; then
       touch "$state/markers/normal-command-started"
-      if [[ "$scenario" == cleanup_hang ]]; then exit 9; fi
+      if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then exit 9; fi
       trap 'exit 143' TERM INT
       while :; do sleep .1; done
     fi
@@ -90,21 +90,34 @@ esac
 FAKE_DOCKER
 chmod +x "$tmpdir/bin/docker"
 
+cat > "$tmpdir/bin/bash" <<'FAKE_BASH'
+#!/bin/bash
+set -Eeuo pipefail
+if [[ "${FAKE_DOCKER_SCENARIO:-}" == sanitizer_fail && "${1:-}" == */sanitize-e2e-artifacts.sh ]]; then
+  touch "${FAKE_DOCKER_STATE:?}/markers/sanitizer-failed"
+  exit 86
+fi
+exec /bin/bash "$@"
+FAKE_BASH
+chmod +x "$tmpdir/bin/bash"
+
 snapshot() {
   find "$1/resources" -type f -print 2>/dev/null | sed "s#^$1/resources/##" | sort
 }
 
 run_case() {
-  local script="$1" scenario="$2" state status=0
+  local script="$1" scenario="$2" state status=0 expected_status
   state="$tmpdir/state-$(basename "$script")-$scenario"
   mkdir -p "$state/resources/containers" "$state/resources/networks" "$state/resources/volumes" "$state/resources/images" "$state/markers"
+  if [[ "$scenario" == diagnostics_write_fail ]]; then : > "$state/artifacts"; fi
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then expected_status=9; else expected_status='nonzero'; fi
   local before after started_at elapsed
   before="$(snapshot "$state")"
   started_at="$(date +%s)"
   if [[ "$scenario" == interrupt ]]; then
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
       HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
-      bash "$script" >"$state/stdout" 2>"$state/stderr" &
+      /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" &
     local pid=$!
     for _ in $(seq 1 50); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
     test -f "$state/markers/normal-command-started"
@@ -113,15 +126,17 @@ run_case() {
   else
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
       HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
-      bash "$script" >"$state/stdout" 2>"$state/stderr" || status=$?
+      /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" || status=$?
   fi
   test "$status" -ne 0
+  [[ "$expected_status" == nonzero ]] || test "$status" -eq "$expected_status"
   elapsed=$(( $(date +%s) - started_at ))
   test "$elapsed" -le 12
   after="$(snapshot "$state")"
   test "$after" = "$before"
   test -f "$state/markers/normal-command-started"
   [[ "$scenario" != cleanup_hang ]] || test -f "$state/markers/cleanup-hung"
+  [[ "$scenario" != sanitizer_fail ]] || test -f "$state/markers/sanitizer-failed"
   local container_line network_line volume_line image_line
   container_line="$(grep -n '^container-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
   network_line="$(grep -n '^network-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
@@ -136,6 +151,8 @@ for script in "$phase2" "$phase3"; do
   run_case "$script" interrupt
   run_case "$script" hang
   run_case "$script" cleanup_hang
+  run_case "$script" diagnostics_write_fail
+  run_case "$script" sanitizer_fail
 done
 
 echo 'E2E harness semantics contract: PASS'

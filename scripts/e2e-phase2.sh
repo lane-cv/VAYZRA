@@ -38,37 +38,37 @@ student_password="Phase2 Student ${nonce}!"
 student_new_password="Phase2 Changed ${nonce}!"
 artifact_dir="${E2E_ARTIFACT_DIR:-$PWD/test-results/phase2}"
 tmpdir="$(mktemp -d)"
-status=0
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$install_runner" "$e2e_runner")
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
 
 diagnostics() {
-  install -d -m 0700 "$artifact_dir"
-  printf 'diagnostics_version=1\n' > "$artifact_dir/containers.log"
+  install -d -m 0700 "$artifact_dir" || return 0
+  printf 'diagnostics_version=1\n' > "$artifact_dir/containers.log" || return 0
   for container in "$postgres" "$redis" "$minio" "$worker" "$app"; do
     if docker_bounded 15 ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
-      printf 'container=%s\n' "$container" >> "$artifact_dir/containers.log"
+      printf 'container=%s\n' "$container" >> "$artifact_dir/containers.log" || true
       docker_bounded 15 inspect --format 'state_status={{.State.Status}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 15 inspect --format 'exit_code={{.State.ExitCode}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 15 inspect --format 'oom_killed={{.State.OOMKilled}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
       docker_bounded 20 logs --tail 200 "$container" >> "$artifact_dir/containers.log" 2>&1 || true
     fi
   done
-  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir"
+  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" || true
 }
 
 cleanup() {
-  status=$?
+  local original_status=$?
   trap - EXIT INT TERM
-  cancel_bounded_command
-  if (( status != 0 )); then diagnostics; fi
+  set +e
+  cancel_bounded_command || true
+  if (( original_status != 0 )); then diagnostics || true; fi
   docker_bounded 30 rm -f "${temporary_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 rm -f "${service_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 network rm "$network" >/dev/null 2>&1 || true
   docker_bounded 30 volume rm "$runner_volume" "$fixture_volume" "$data_volume" >/dev/null 2>&1 || true
   docker_bounded 60 image rm "$app_image" "$worker_image" >/dev/null 2>&1 || true
-  rm -rf "$tmpdir"
-  exit "$status"
+  rm -rf "$tmpdir" || true
+  exit "$original_status"
 }
 trap cleanup EXIT INT TERM
 
@@ -95,7 +95,9 @@ docker_bounded 60 volume create "$fixture_volume" >/dev/null
 docker_bounded 60 volume create "$runner_volume" >/dev/null
 
 docker_bounded 120 run --rm --name "$data_init" --network none --user 0:0 --entrypoint /bin/sh -v "$data_volume:/data" "$minio_image" -c 'chown 1000:0 /data && chmod 0750 /data'
-docker_bounded 120 run --rm --name "$runner_init" --network none --user 0:0 --entrypoint /bin/sh -v "$runner_volume:/workspace" "$playwright_image" -c 'chown 1000:1000 /workspace && chmod 0700 /workspace'
+docker_bounded 120 run --rm --name "$runner_init" --network none --user 0:0 --entrypoint /bin/sh \
+  -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures" "$playwright_image" \
+  -c 'chown 1000:1000 /workspace /fixtures && chmod 0700 /workspace /fixtures'
 docker_bounded 60 run -d --name "$postgres" --network "$network" --memory 384m --cpus .25 \
   -e POSTGRES_USER=happylearn -e POSTGRES_PASSWORD=happylearn_e2e -e POSTGRES_DB="$database" postgres:18.4 >/dev/null
 docker_bounded 60 run -d --name "$redis" --network "$network" --memory 96m --cpus .1 redis:8.8 >/dev/null
@@ -140,7 +142,9 @@ docker_bounded 60 run -d --name "$worker" --network "$network" --read-only --use
   "${common_env[@]}" -e HAPPYLEARN_WORK_DIR=/work "$worker_image" >/dev/null
 wait_for worker "$worker" exec "$worker" curl --fail --silent http://127.0.0.1:8081/ready
 
-docker_bounded 300 run --rm --name "$fixture_runner" --user 0:0 --memory 768m --cpus .5 --entrypoint /bin/bash -v "$PWD:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
+docker_bounded 300 run --rm --name "$fixture_runner" --network none --read-only --user 1000:1000 --memory 768m --cpus .5 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=1000,gid=1000,mode=0700 -w /tmp --entrypoint /bin/bash \
+  -v "$PWD:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
   /src/scripts/generate-phase2-fixtures.sh /fixtures
 docker_bounded 600 run --rm --name "$install_runner" --read-only --user 1000:1000 --memory 1280m --cpus .6 --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   -v "$PWD:/source:ro" -v "$runner_volume:/workspace" --entrypoint /bin/bash \
@@ -153,6 +157,6 @@ docker_bounded 1200 run --rm --name "$e2e_runner" --network "$network" --read-on
   -v "$artifact_dir:/artifacts" -w /workspace \
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
   -e E2E_BASE_URL=http://app:8080 -e "E2E_ADMIN_PASSWORD=$admin_password" -e "E2E_STUDENT_PASSWORD=$student_password" \
-  -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" -e E2E_FIXTURE_DIR=/fixtures -e E2E_OUTPUT_DIR=/artifacts \
+  -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" -e E2E_FIXTURE_DIR=/fixtures -e E2E_OUTPUT_DIR=/artifacts/results \
   "$playwright_image" /bin/bash -lc \
   'corepack pnpm exec playwright test tests/e2e/auth-students.spec.ts tests/e2e/teaching.spec.ts && corepack pnpm exec playwright test tests/e2e/files.spec.ts tests/e2e/learning.spec.ts'
