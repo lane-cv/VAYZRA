@@ -43,7 +43,8 @@ Logs expose stable categories only. If the worker is unhealthy, check PostgreSQL
 A completed Q&A upload that is never bound to a submitted message is retained for 24 hours. Once bound, the file version becomes part of the append-only Q&A history and the orphan cleanup path cannot claim it. Run the existing maintenance cleanup at least hourly so abandoned uploads do not accumulate in the 4 GB deployment budget:
 
 ```bash
-docker compose -p happylearn-dev -f deploy/compose.dev.yml run --rm maintenance cleanup-files --limit 100
+docker compose -p happylearn-dev -f deploy/compose.dev.yml run --rm \
+  --entrypoint /app/happylearn-maintenance worker cleanup-files --limit 100
 ```
 
 Schedule the command with the deployment's trusted scheduler; do not run overlapping copies. Object deletion failures retain the database lease for bounded retry, while a binding that wins the row lock prevents cleanup. Monitor only aggregate `file.cleanup_scheduled` and `file.cleanup_completed` audit counts—never object keys or attachment names.
