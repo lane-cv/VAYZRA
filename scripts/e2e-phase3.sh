@@ -23,6 +23,7 @@ data_init="${prefix}_data_init"
 runner_init="${prefix}_runner_init"
 admin_init="${prefix}_admin_init"
 fixture_runner="${prefix}_fixture_runner"
+artifact_init="${prefix}_artifact_init"
 install_runner="${prefix}_install_runner"
 e2e_runner="${prefix}_e2e_runner"
 data_volume="${prefix}_data"
@@ -31,6 +32,7 @@ runner_volume="${prefix}_runner"
 app_image="happylearn:phase3-${nonce}"
 worker_image="happylearn-worker:phase3-${nonce}"
 playwright_image="mcr.microsoft.com/playwright:v1.57.0-noble"
+artifact_init_image="alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
 minio_image="quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120"
 database="happylearn_phase3_${nonce//-/_}"
 admin_password="Phase3 Admin ${nonce}!"
@@ -38,28 +40,42 @@ student_password="Phase3 Student ${nonce}!"
 student_new_password="Phase3 Changed ${nonce}!"
 object_secret="phase3-object-${nonce}-secret"
 artifact_dir="${E2E_ARTIFACT_DIR:-$PWD/test-results/phase3}"
+artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 e2e_group="${HAPPYLEARN_E2E_GROUP:-all}"
 case "$e2e_group" in
   all|phase3) ;;
   *) echo "HAPPYLEARN_E2E_GROUP must be all or phase3" >&2; exit 2 ;;
 esac
 tmpdir="$(mktemp -d)"
-temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$install_runner" "$e2e_runner")
+temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
 
 diagnostics() {
-  install -d -m 0700 "$artifact_dir" || return 0
-  printf 'diagnostics_version=1\n' > "$artifact_dir/containers.log" || return 0
+  local staging_dir="$tmpdir/diagnostics"
+  local staging_log="$staging_dir/containers.log"
+  local final_log="$artifact_dir/containers.log"
+  local publish_tmp="$artifact_dir/.containers.log.${nonce}.tmp"
+  rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
+  rm -rf "$staging_dir" || return 0
+  install -d -m 0700 "$staging_dir" || return 0
+  install -m 0600 /dev/null "$staging_log" || return 0
+  printf 'diagnostics_version=1\n' > "$staging_log" || return 0
   for container in "$postgres" "$redis" "$minio" "$worker" "$app"; do
     if docker_bounded 15 ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
-      printf 'container=%s\n' "$container" >> "$artifact_dir/containers.log" || true
-      docker_bounded 15 inspect --format 'state_status={{.State.Status}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
-      docker_bounded 15 inspect --format 'exit_code={{.State.ExitCode}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
-      docker_bounded 15 inspect --format 'oom_killed={{.State.OOMKilled}}' "$container" >> "$artifact_dir/containers.log" 2>&1 || true
-      docker_bounded 20 logs --tail 200 "$container" >> "$artifact_dir/containers.log" 2>&1 || true
+      printf 'container=%s\n' "$container" >> "$staging_log" || true
+      docker_bounded 15 inspect --format 'state_status={{.State.Status}}' "$container" >> "$staging_log" 2>&1 || true
+      docker_bounded 15 inspect --format 'exit_code={{.State.ExitCode}}' "$container" >> "$staging_log" 2>&1 || true
+      docker_bounded 15 inspect --format 'oom_killed={{.State.OOMKilled}}' "$container" >> "$staging_log" 2>&1 || true
+      docker_bounded 20 logs --tail 200 "$container" >> "$staging_log" 2>&1 || true
     fi
   done
-  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" || true
+  if ! bash "$script_dir/sanitize-e2e-artifacts.sh" "$staging_dir"; then
+    rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
+    return 0
+  fi
+  if ! install -m 0600 "$staging_log" "$publish_tmp" || ! mv -f "$publish_tmp" "$final_log"; then
+    rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
+  fi
 }
 
 cleanup() {
@@ -77,6 +93,12 @@ cleanup() {
   exit "$exit_status"
 }
 trap cleanup EXIT INT TERM
+
+install -d -m 0700 "$artifact_dir" || true
+docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0 \
+  --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=4m \
+  -v "$artifact_init_script:/init-e2e-artifacts.sh:ro" -v "$artifact_dir:/artifacts" \
+  "$artifact_init_image" /bin/sh /init-e2e-artifacts.sh /artifacts
 
 wait_for() {
   local label="$1" container="$2"
@@ -153,7 +175,6 @@ docker_bounded 600 run --rm --name "$install_runner" --read-only --user 1000:100
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
   "$playwright_image" -lc '/source/scripts/copy-e2e-workspace.sh /source /workspace && cd /workspace && corepack pnpm install --frozen-lockfile --store-dir /workspace/.pnpm-store'
 
-install -d -m 0700 "$artifact_dir"
 if [[ "$e2e_group" == phase3 ]]; then
   e2e_command='E2E_OUTPUT_DIR=/artifacts/results/phase3 corepack pnpm exec playwright test tests/e2e/questions.spec.ts tests/e2e/notifications.spec.ts'
 else
@@ -161,7 +182,7 @@ else
 fi
 docker_bounded 1200 run --rm --name "$e2e_runner" --network "$network" --read-only --user 1000:1000 --shm-size 512m --memory 2048m --cpus 1 \
   --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=256m \
-  -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures:ro" -v "$artifact_dir:/artifacts" -w /workspace \
+  -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures:ro" -v "$artifact_dir/results:/artifacts/results" -w /workspace \
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm -e E2E_BASE_URL=http://app:8080 \
   -e "E2E_ADMIN_PASSWORD=$admin_password" -e "E2E_STUDENT_PASSWORD=$student_password" -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" \
   -e E2E_FIXTURE_DIR=/fixtures "$playwright_image" /bin/bash -lc \

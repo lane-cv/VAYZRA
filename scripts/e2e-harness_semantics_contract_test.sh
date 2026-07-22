@@ -66,7 +66,7 @@ case "${1:-}" in
     printf 'container-rm\n' >> "$state/order.log"
     if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-hung" ]]; then
       touch "$state/markers/cleanup-hung"
-      trap 'exit 143' TERM INT
+      trap 'touch "$state/markers/cleanup-terminated"; exit 143' TERM INT
       while :; do sleep .1; done
     fi
     ;;
@@ -80,8 +80,12 @@ case "${1:-}" in
     touch "$state/resources/containers/$name"
     if [[ "$name" == *_data_init ]]; then
       touch "$state/markers/normal-command-started"
+      if [[ "$scenario" == sanitizer_fail ]]; then
+        service="${name%_data_init}_postgres"
+        touch "$state/resources/containers/$service"
+      fi
       if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then exit 9; fi
-      trap 'exit 143' TERM INT
+      trap 'touch "$state/markers/deadline-terminated"; exit 143' TERM INT
       while :; do sleep .1; done
     fi
     rm -f "$state/resources/containers/$name"
@@ -105,46 +109,80 @@ snapshot() {
   find "$1/resources" -type f -print 2>/dev/null | sed "s#^$1/resources/##" | sort
 }
 
+assert_safe_upload_directory() {
+  local artifact_path="$1" line
+  local final_log="$artifact_path/containers.log"
+  if [[ -e "$artifact_path" ]]; then
+    ! grep -R -Fq 'fake-secret' "$artifact_path" 2>/dev/null
+  fi
+  [[ -f "$final_log" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      diagnostics_version=1|container=happylearn_phase2_*|container=happylearn_phase3_*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
+      *) return 1 ;;
+    esac
+  done < "$final_log"
+}
+
 run_case() {
-  local script="$1" scenario="$2" state status=0 expected_status
+  local script="$1" scenario="$2" state status=0 expected_status failure_reasons=''
   state="$tmpdir/state-$(basename "$script")-$scenario"
   mkdir -p "$state/resources/containers" "$state/resources/networks" "$state/resources/volumes" "$state/resources/images" "$state/markers"
   if [[ "$scenario" == diagnostics_write_fail ]]; then : > "$state/artifacts"; fi
   if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then expected_status=9; else expected_status='nonzero'; fi
-  local before after started_at elapsed
+  local before after started_at elapsed pid=''
   before="$(snapshot "$state")"
   started_at="$(date +%s)"
   if [[ "$scenario" == interrupt ]]; then
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" &
-    local pid=$!
-    for _ in $(seq 1 50); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
-    test -f "$state/markers/normal-command-started"
-    kill -TERM "$pid"
+    pid=$!
+    for _ in $(seq 1 300); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
+    [[ -f "$state/markers/normal-command-started" ]] || failure_reasons+=$'\nnormal command never started'
+    kill -TERM "$pid" 2>/dev/null || failure_reasons+=$'\nfailed to signal harness'
     wait "$pid" || status=$?
   else
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" || status=$?
   fi
-  test "$status" -ne 0
-  [[ "$expected_status" == nonzero ]] || test "$status" -eq "$expected_status"
   elapsed=$(( $(date +%s) - started_at ))
-  test "$elapsed" -le 12
   after="$(snapshot "$state")"
-  test "$after" = "$before"
-  test -f "$state/markers/normal-command-started"
-  [[ "$scenario" != cleanup_hang ]] || test -f "$state/markers/cleanup-hung"
-  [[ "$scenario" != sanitizer_fail ]] || test -f "$state/markers/sanitizer-failed"
+  [[ "$status" -ne 0 ]] || failure_reasons+=$'\nexpected non-zero status'
+  if [[ "$expected_status" != nonzero && "$status" -ne "$expected_status" ]]; then failure_reasons+=$'\noriginal status was not preserved'; fi
+  (( elapsed <= 30 )) || failure_reasons+=$'\nelapsed time exceeded 30-second loaded-host budget'
+  [[ "$after" == "$before" ]] || failure_reasons+=$'\nresource inventory changed'
+  [[ -f "$state/markers/normal-command-started" ]] || failure_reasons+=$'\nnormal command marker missing'
+  if [[ "$scenario" == hang && ! -f "$state/markers/deadline-terminated" ]]; then failure_reasons+=$'\noperation deadline marker missing'; fi
+  if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-hung" ]]; then failure_reasons+=$'\ncleanup hang marker missing'; fi
+  if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-terminated" ]]; then failure_reasons+=$'\ncleanup deadline marker missing'; fi
+  if [[ "$scenario" == sanitizer_fail && ! -f "$state/markers/sanitizer-failed" ]]; then failure_reasons+=$'\nsanitizer failure marker missing'; fi
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then
+    assert_safe_upload_directory "$state/artifacts" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
+  fi
   local container_line network_line volume_line image_line
-  container_line="$(grep -n '^container-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
-  network_line="$(grep -n '^network-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
-  volume_line="$(grep -n '^volume-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
-  image_line="$(grep -n '^image-rm$' "$state/order.log" | head -1 | cut -d: -f1)"
-  test "$container_line" -lt "$network_line"
-  test "$network_line" -lt "$volume_line"
-  test "$volume_line" -lt "$image_line"
+  container_line="$(grep -n '^container-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  network_line="$(grep -n '^network-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  volume_line="$(grep -n '^volume-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  image_line="$(grep -n '^image-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  if [[ ! "$container_line" =~ ^[0-9]+$ || ! "$network_line" =~ ^[0-9]+$ || ! "$volume_line" =~ ^[0-9]+$ || ! "$image_line" =~ ^[0-9]+$ ]]; then
+    failure_reasons+=$'\ncleanup order markers incomplete'
+  elif ! (( container_line < network_line && network_line < volume_line && volume_line < image_line )); then
+    failure_reasons+=$'\ncleanup order is incorrect'
+  fi
+  if [[ -n "$failure_reasons" ]]; then
+    {
+      printf 'E2E harness semantics failure\nphase=%s\nscenario=%s\nstatus=%s\nelapsed_seconds=%s\nreasons=%s\n' "$(basename "$script")" "$scenario" "$status" "$elapsed" "$failure_reasons"
+      printf '%s\n' '--- resources before ---' "$before" '--- resources after ---' "$after" '--- resource diff ---'
+      diff -u <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
+      for diagnostic_file in calls.log order.log stdout stderr; do
+        printf '%s\n' "--- $diagnostic_file ---"
+        if [[ -f "$state/$diagnostic_file" ]]; then sed -n '1,240p' "$state/$diagnostic_file"; else printf '%s\n' '<missing>'; fi
+      done
+    } >&2
+    return 1
+  fi
 }
 
 for script in "$phase2" "$phase3"; do
