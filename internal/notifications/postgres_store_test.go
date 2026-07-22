@@ -188,7 +188,7 @@ func TestRealWriterFailureRollsBackEveryQAMutation(t *testing.T) {
 			case "admin_reply":
 				_, _, err = svc.AddAdminMessage(ctx, adminActor, qanda.AddAdminMessageInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Body: "must rollback", IdempotencyKey: "fail-reply-" + uuid.NewString()})
 			case "student_follow_up":
-				_, _, err = svc.AddStudentMessage(ctx, studentActor, qanda.AddMessageInput{ThreadID: thread.ID, Body: "must rollback", IdempotencyKey: "fail-follow-" + uuid.NewString()})
+				_, _, err = svc.AddStudentMessage(ctx, studentActor, qanda.AddMessageInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Body: "must rollback", IdempotencyKey: "fail-follow-" + uuid.NewString()})
 			case "status_change":
 				_, err = svc.ChangeStatus(ctx, adminActor, qanda.ChangeStatusInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Status: qanda.StatusInProgress})
 			}
@@ -272,7 +272,7 @@ func TestRealWriterPersistsEveryQANotificationAndSkipsPrivateNotes(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	thread, followedMessage, err := svc.AddStudentMessage(ctx, studentActor, qanda.AddMessageInput{ThreadID: thread.ID, Body: "private follow-up body", IdempotencyKey: "followed-" + uuid.NewString()})
+	thread, followedMessage, err := svc.AddStudentMessage(ctx, studentActor, qanda.AddMessageInput{ThreadID: thread.ID, ExpectedVersion: thread.Version, Body: "private follow-up body", IdempotencyKey: "followed-" + uuid.NewString()})
 	if err != nil {
 		t.Fatal(err)
 	}

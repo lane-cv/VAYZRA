@@ -26,12 +26,12 @@ export async function unreadNotificationCount(signal?: AbortSignal): Promise<num
   if (!data || typeof data !== 'object' || !Number.isSafeInteger((data as { count?: unknown }).count) || Number((data as { count: number }).count) < 0) throw invalid()
   return (data as { count: number }).count
 }
-export async function markNotificationRead(id: string): Promise<void> {
-  const data = await request<unknown>(`/notifications/${encodeURIComponent(id)}/read`, { method: 'POST', json: {} })
+export async function markNotificationRead(id: string, signal?: AbortSignal): Promise<void> {
+  const data = await request<unknown>(`/notifications/${encodeURIComponent(id)}/read`, { method: 'POST', json: {}, signal })
   if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length !== 0) throw invalid()
 }
-export async function markAllNotificationsRead(): Promise<number> {
-  const data = await request<unknown>('/notifications/read-all', { method: 'POST', json: {} })
+export async function markAllNotificationsRead(signal?: AbortSignal): Promise<number> {
+  const data = await request<unknown>('/notifications/read-all', { method: 'POST', json: {}, signal })
   if (!data || typeof data !== 'object' || !Number.isSafeInteger((data as { count?: unknown }).count) || Number((data as { count: number }).count) < 0) throw invalid()
   return (data as { count: number }).count
 }

@@ -23,6 +23,15 @@ describe('notification api', () => {
     ])
     for (const call of vi.mocked(fetch).mock.calls.slice(1)) expect(JSON.parse(String(call[1]?.body))).toEqual({})
   })
+  it('forwards abort signals for both notification mutations', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: {} })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: { count: 1 } })))
+    const one = new AbortController(), all = new AbortController()
+    await markNotificationRead('n1', one.signal)
+    await markAllNotificationsRead(all.signal)
+    expect(vi.mocked(fetch).mock.calls[0][1]?.signal).toBe(one.signal)
+    expect(vi.mocked(fetch).mock.calls[1][1]?.signal).toBe(all.signal)
+  })
   it('rejects a non-object or non-empty mark-read data body', async () => {
     for (const data of [[], { unexpected: true }, null, '']) {
       vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data })))

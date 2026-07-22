@@ -11,7 +11,8 @@ export const useNotificationStore = defineStore('notifications', () => {
   const listLoading = ref(false), listError = ref(''), requestId = ref('')
   let timer: ReturnType<typeof setInterval> | undefined, countController: AbortController | undefined
   let countPromise: Promise<void> | undefined, listController: AbortController | undefined
-  let generation = 0, listGeneration = 0, lastWakeAt: number | undefined
+  let mutationController: AbortController | undefined
+  let generation = 0, listGeneration = 0, mutationGeneration = 0, lastWakeAt: number | undefined
 
   function clearTimer() { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
   function schedule() { clearTimer(); if (activeUserId.value && !document.hidden) timer = setInterval(() => void refresh(), POLL_MS) }
@@ -42,10 +43,11 @@ export const useNotificationStore = defineStore('notifications', () => {
     schedule(); void refresh()
   }
   function cancelList() { listGeneration++; listController?.abort(); listController = undefined; listLoading.value = false }
+  function cancelMutations() { mutationGeneration++; mutationController?.abort(); mutationController = undefined }
   function stop() {
     generation++; activeUserId.value = undefined; lastWakeAt = undefined; clearTimer()
     document.removeEventListener('visibilitychange', visibility); window.removeEventListener('focus', focus)
-    countController?.abort(); countController = undefined; countPromise = undefined; cancelList()
+    countController?.abort(); countController = undefined; countPromise = undefined; cancelList(); cancelMutations()
     unreadCount.value = 0; items.value = []; nextCursor.value = undefined; listError.value = ''; requestId.value = ''
   }
   async function list(cursor?: string) {
@@ -63,13 +65,24 @@ export const useNotificationStore = defineStore('notifications', () => {
     } finally { if (current === listGeneration) { listLoading.value = false; listController = undefined } }
   }
   async function markRead(id: string) {
-    await markNotificationRead(id)
-    const found = items.value.find((entry) => entry.id === id)
-    if (found && !found.readAt) { found.readAt = new Date().toISOString(); unreadCount.value = Math.max(0, unreadCount.value - 1) }
+    mutationController?.abort(); const controller = new AbortController(); mutationController = controller
+    const current = ++mutationGeneration, userId = activeUserId.value
+    try {
+      await markNotificationRead(id, controller.signal)
+      if (current !== mutationGeneration || controller.signal.aborted || activeUserId.value !== userId) return
+      const found = items.value.find((entry) => entry.id === id)
+      if (found && !found.readAt) { found.readAt = new Date().toISOString(); unreadCount.value = Math.max(0, unreadCount.value - 1) }
+    } finally { if (mutationController === controller) mutationController = undefined }
   }
   async function markAllRead() {
-    await markAllNotificationsRead(); const now = new Date().toISOString()
-    items.value.forEach((entry) => { if (!entry.readAt) entry.readAt = now }); unreadCount.value = 0
+    mutationController?.abort(); const controller = new AbortController(); mutationController = controller
+    const current = ++mutationGeneration, userId = activeUserId.value
+    try {
+      await markAllNotificationsRead(controller.signal)
+      if (current !== mutationGeneration || controller.signal.aborted || activeUserId.value !== userId) return
+      const now = new Date().toISOString()
+      items.value.forEach((entry) => { if (!entry.readAt) entry.readAt = now }); unreadCount.value = 0
+    } finally { if (mutationController === controller) mutationController = undefined }
   }
-  return { unreadCount, badgeText: computed(() => unreadCount.value > 99 ? '99+' : String(unreadCount.value)), activeUserId, items, nextCursor, listLoading, listError, requestId, start, stop, refresh, list, cancelList, markRead, markAllRead }
+  return { unreadCount, badgeText: computed(() => unreadCount.value > 99 ? '99+' : String(unreadCount.value)), activeUserId, items, nextCursor, listLoading, listError, requestId, start, stop, refresh, list, cancelList, cancelMutations, markRead, markAllRead }
 })

@@ -11,7 +11,7 @@ async function open(item: NotificationItem) { const target = safeNotificationTar
 async function markOne(id: string) { actionPending.value = true; actionError.value = ''; actionRequestId.value = ''; try { await notifications.markRead(id) } catch (cause) { actionError.value = cause instanceof Error ? cause.message : '操作失败'; actionRequestId.value = cause instanceof APIError ? cause.requestId : '' } finally { actionPending.value = false } }
 async function markAll() { actionPending.value = true; actionError.value = ''; actionRequestId.value = ''; try { await notifications.markAllRead() } catch (cause) { actionError.value = cause instanceof Error ? cause.message : '操作失败'; actionRequestId.value = cause instanceof APIError ? cause.requestId : '' } finally { actionPending.value = false } }
 onMounted(() => void notifications.list())
-onBeforeUnmount(() => notifications.cancelList())
+onBeforeUnmount(() => { notifications.cancelList(); notifications.cancelMutations() })
 </script>
 <template>
   <section class="notifications" aria-labelledby="notification-title">

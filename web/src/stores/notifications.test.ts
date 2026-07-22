@@ -3,13 +3,15 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useNotificationStore } from './notifications'
 
 function countResponse(count: number) { return new Response(JSON.stringify({ data: { count } })) }
+const unreadItem = { id:'n1',kind:'qa_replied' as const,title:'New',summary:'Summary',targetType:'qa_thread',targetId:'q1',targetPath:'/student/questions/q1',createdAt:'2026-07-22T00:00:00Z' }
+function pageResponse() { return new Response(JSON.stringify({ data: [unreadItem], meta: {} })) }
 function listeners() {
   const addDocument = vi.spyOn(document, 'addEventListener'), removeDocument = vi.spyOn(document, 'removeEventListener')
   const addWindow = vi.spyOn(window, 'addEventListener'), removeWindow = vi.spyOn(window, 'removeEventListener')
   return { addDocument, removeDocument, addWindow, removeWindow }
 }
 describe('notification polling lifecycle', () => {
-  beforeEach(() => { setActivePinia(createPinia()); vi.useFakeTimers(); vi.stubGlobal('fetch', vi.fn().mockResolvedValue(countResponse(4))); vi.spyOn(document, 'hidden', 'get').mockReturnValue(false) })
+  beforeEach(() => { document.cookie = 'hl_csrf=csrf; path=/'; setActivePinia(createPinia()); vi.useFakeTimers(); vi.stubGlobal('fetch', vi.fn().mockResolvedValue(countResponse(4))); vi.spyOn(document, 'hidden', 'get').mockReturnValue(false) })
   afterEach(() => { useNotificationStore().stop(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
   it('refreshes immediately and has exactly one 15 second timer for duplicate starts', async () => {
@@ -56,5 +58,36 @@ describe('notification polling lifecycle', () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id:'n2',kind:'qa_replied',title:'New',summary:'Summary',targetType:'qa_thread',targetId:'q2',targetPath:'/student/questions/q2',createdAt:'2026-07-22T00:00:00Z' }], meta: { nextCursor: 'c2' } })))
     const store = useNotificationStore(); void store.list(); await vi.runAllTicks(); await store.list('c1')
     expect(firstSignal?.aborted).toBe(true); expect(store.items.map((entry) => entry.id)).toEqual(['n2']); expect(store.nextCursor).toBe('c2')
+  })
+  it('aborts mark-read on account switch and ignores a late old-account response', async () => {
+    let mutationSignal: AbortSignal | undefined, releaseMutation: ((response: Response) => void) | undefined
+    vi.mocked(fetch).mockImplementation((url, init) => {
+      const path = String(url)
+      if (path.includes('/unread-count')) return Promise.resolve(countResponse(1))
+      if (path.includes('/notifications?')) return Promise.resolve(pageResponse())
+      mutationSignal = init?.signal as AbortSignal
+      return new Promise<Response>((resolve) => { releaseMutation = resolve })
+    })
+    const store = useNotificationStore(); store.start('u1'); await store.refresh(); await store.list()
+    const pending = store.markRead('n1'); await vi.runAllTicks()
+    store.start('u2'); await store.list()
+    expect(mutationSignal?.aborted).toBe(true)
+    releaseMutation?.(new Response(JSON.stringify({ data: {} }))); await pending
+    expect(store.activeUserId).toBe('u2'); expect(store.items[0]?.readAt).toBeUndefined(); expect(store.unreadCount).toBe(1)
+  })
+  it('aborts mark-all on stop and prevents its late response from changing a restarted account', async () => {
+    let mutationSignal: AbortSignal | undefined, releaseMutation: ((response: Response) => void) | undefined
+    vi.mocked(fetch).mockImplementation((url, init) => {
+      const path = String(url)
+      if (path.includes('/unread-count')) return Promise.resolve(countResponse(1))
+      if (path.includes('/notifications?')) return Promise.resolve(pageResponse())
+      mutationSignal = init?.signal as AbortSignal
+      return new Promise<Response>((resolve) => { releaseMutation = resolve })
+    })
+    const store = useNotificationStore(); store.start('u1'); await store.refresh(); await store.list()
+    const pending = store.markAllRead(); await vi.runAllTicks(); store.stop(); store.start('u2'); await store.list()
+    expect(mutationSignal?.aborted).toBe(true)
+    releaseMutation?.(new Response(JSON.stringify({ data: { count: 1 } }))); await pending
+    expect(store.activeUserId).toBe('u2'); expect(store.items[0]?.readAt).toBeUndefined(); expect(store.unreadCount).toBe(1)
   })
 })

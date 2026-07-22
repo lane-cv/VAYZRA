@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/platform/database"
@@ -193,7 +192,7 @@ func TestPostgresOutboxDeliversSelectedAudienceOnceAndSkipsDisabled(t *testing.T
 	}
 }
 
-func TestPostgresOutboxAllAudienceAndWithdrawnRevisionSafety(t *testing.T) {
+func TestPostgresOutboxAllAudienceDeliversFinalizedRevisionAfterWithdrawal(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(ctx, pool); err != nil {
@@ -229,12 +228,12 @@ func TestPostgresOutboxAllAudienceAndWithdrawnRevisionSafety(t *testing.T) {
 	if err = store.DeliverLessonPublication(ctx, events[0], "withdraw-worker"); err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1`, withdrawnLesson).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("withdrawn count=%d err=%v", count, err)
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1`, withdrawnLesson).Scan(&count); err != nil || count < 2 {
+		t.Fatalf("withdrawn historical publication count=%d err=%v", count, err)
 	}
 }
 
-func TestLessonPublicationDeliveryUsesCompleteActiveCatalogChain(t *testing.T) {
+func TestLessonPublicationDeliveryUsesFinalizedRevisionAfterCatalogArchive(t *testing.T) {
 	for _, level := range []string{"lesson", "chapter", "subject", "term", "grade"} {
 		t.Run(level, func(t *testing.T) {
 			ctx := context.Background()
@@ -245,8 +244,8 @@ func TestLessonPublicationDeliveryUsesCompleteActiveCatalogChain(t *testing.T) {
 			if _, err := pool.Exec(ctx, `DELETE FROM outbox_events WHERE published_at IS NULL`); err != nil {
 				t.Fatal(err)
 			}
-			insertNotificationUser(t, pool, "student")
-			lesson, _ := insertPublishedLessonOutboxFixture(t, pool, "all", nil)
+			student := insertNotificationUser(t, pool, "student")
+			lesson, _ := insertPublishedLessonOutboxFixture(t, pool, "selected", []uuid.UUID{student})
 			archiveCatalogLevel(t, pool, lesson, level)
 			store := NewPostgresOutboxStore(pool)
 			events, err := store.Claim(ctx, "archive-"+level)
@@ -257,77 +256,60 @@ func TestLessonPublicationDeliveryUsesCompleteActiveCatalogChain(t *testing.T) {
 				t.Fatal(err)
 			}
 			var count int
-			if err = pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1 OR target_path LIKE '%'||$1::text||'%'`, lesson).Scan(&count); err != nil || count != 0 {
-				t.Fatalf("archived %s leaked lesson notification count=%d err=%v", level, count, err)
+			if err = pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1 OR target_path LIKE '%'||$1::text||'%'`, lesson).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("archived %s historical publication count=%d err=%v", level, count, err)
 			}
 		})
 	}
 }
 
-func TestLessonDeliverySerializesWithEveryAncestorArchive(t *testing.T) {
-	for _, level := range []string{"chapter", "subject", "term", "grade"} {
-		level := level
-		t.Run(level+"/delivery-first", func(t *testing.T) {
-			ctx, pool, lesson, event := ancestorArchiveFixture(t, "delivery-first-"+level)
-			store := NewPostgresOutboxStore(pool)
-			locked, release := make(chan struct{}), make(chan struct{})
-			store.afterCatalogLock = func() { close(locked); <-release }
-			delivered := make(chan error, 1)
-			go func() { delivered <- store.DeliverLessonPublication(ctx, event, "delivery-first-"+level) }()
-			<-locked
-			archiveStarted, archived := make(chan struct{}), make(chan error, 1)
-			go func() { close(archiveStarted); archived <- archiveCatalogLevelError(ctx, pool, lesson, level) }()
-			<-archiveStarted
-			deadline := time.NewTimer(150 * time.Millisecond)
-			select {
-			case err := <-archived:
-				deadline.Stop()
-				close(release)
-				<-delivered
-				t.Fatalf("%s archive bypassed delivery catalog lock: %v", level, err)
-			case <-deadline.C:
-			}
-			close(release)
-			if err := <-delivered; err != nil {
-				t.Fatal(err)
-			}
-			if err := <-archived; err != nil {
-				t.Fatal(err)
-			}
-			assertLessonNotificationCount(t, pool, lesson, 1)
-		})
+func TestLessonPublicationDeliveryPreservesConsecutiveRevisionAudiences(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM outbox_events WHERE published_at IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	studentA, studentB := insertNotificationUser(t, pool, "student"), insertNotificationUser(t, pool, "student")
+	lesson, revisionA := insertPublishedLessonOutboxFixture(t, pool, "selected", []uuid.UUID{studentA})
+	revisionB := uuid.New()
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO lesson_revisions(id,lesson_id,version,source_draft_version,title,published_by) SELECT $1,$2,2,2,'Notification lesson B',published_by FROM lesson_revisions WHERE id=$3`, []any{revisionB, lesson, revisionA}},
+		{`INSERT INTO lesson_revision_audiences(revision_id,mode) VALUES($1,'selected')`, []any{revisionB}},
+		{`INSERT INTO lesson_revision_audience_users(revision_id,user_id) VALUES($1,$2)`, []any{revisionB, studentB}},
+		{`INSERT INTO lesson_revision_finalizations(revision_id,lesson_id) VALUES($1,$2)`, []any{revisionB, lesson}},
+		{`UPDATE lessons SET published_revision_id=$1 WHERE id=$2`, []any{revisionB, lesson}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{"schemaVersion": 1, "lessonId": lesson, "revisionId": revisionB})
+	if _, err := pool.Exec(ctx, `INSERT INTO outbox_events(kind,payload,dedupe_key) VALUES('lesson.published',$1,$2)`, payload, "lesson.published:"+revisionB.String()); err != nil {
+		t.Fatal(err)
+	}
 
-		t.Run(level+"/archive-first", func(t *testing.T) {
-			ctx, pool, lesson, event := ancestorArchiveFixture(t, "archive-first-"+level)
-			archiveTx, err := pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = archiveCatalogLevelTx(ctx, archiveTx, lesson, level); err != nil {
-				t.Fatal(err)
-			}
-			deliveryStarted, delivered := make(chan struct{}), make(chan error, 1)
-			go func() {
-				close(deliveryStarted)
-				delivered <- NewPostgresOutboxStore(pool).DeliverLessonPublication(ctx, event, "archive-first-"+level)
-			}()
-			<-deliveryStarted
-			deadline := time.NewTimer(150 * time.Millisecond)
-			select {
-			case err = <-delivered:
-				deadline.Stop()
-				_ = archiveTx.Rollback(ctx)
-				t.Fatalf("delivery bypassed pending %s archive: %v", level, err)
-			case <-deadline.C:
-			}
-			if err = archiveTx.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if err = <-delivered; err != nil {
-				t.Fatal(err)
-			}
-			assertLessonNotificationCount(t, pool, lesson, 0)
-		})
+	store := NewPostgresOutboxStore(pool)
+	events, err := store.Claim(ctx, "revision-worker")
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	for _, event := range events {
+		if err = store.DeliverLessonPublication(ctx, event, "revision-worker"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, student := range []uuid.UUID{studentA, studentB} {
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM notifications WHERE target_id=$1 AND recipient_user_id=$2`, lesson, student).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("student=%s notification count=%d err=%v", student, count, err)
+		}
 	}
 }
 
@@ -494,37 +476,6 @@ func archiveCatalogLevelError(ctx context.Context, q archiveExecer, lesson uuid.
 	}
 	_, err := q.Exec(ctx, query, lesson)
 	return err
-}
-
-func archiveCatalogLevelTx(ctx context.Context, tx pgx.Tx, lesson uuid.UUID, level string) error {
-	return archiveCatalogLevelError(ctx, tx, lesson, level)
-}
-
-func ancestorArchiveFixture(t *testing.T, owner string) (context.Context, *pgxpool.Pool, uuid.UUID, OutboxEvent) {
-	t.Helper()
-	ctx := context.Background()
-	pool := integration.StartPostgres(t)
-	if err := database.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `DELETE FROM outbox_events WHERE published_at IS NULL`); err != nil {
-		t.Fatal(err)
-	}
-	student := insertNotificationUser(t, pool, "student")
-	lesson, _ := insertPublishedLessonOutboxFixture(t, pool, "selected", []uuid.UUID{student})
-	events, err := NewPostgresOutboxStore(pool).Claim(ctx, owner)
-	if err != nil || len(events) != 1 {
-		t.Fatalf("events=%v err=%v", events, err)
-	}
-	return ctx, pool, lesson, events[0]
-}
-
-func assertLessonNotificationCount(t *testing.T, pool *pgxpool.Pool, lesson uuid.UUID, want int) {
-	t.Helper()
-	var count int
-	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM notifications WHERE target_id=$1 OR target_path LIKE '%'||$1::text||'%'`, lesson).Scan(&count); err != nil || count != want {
-		t.Fatalf("lesson notification count=%d want=%d err=%v", count, want, err)
-	}
 }
 
 var _ = json.RawMessage{}

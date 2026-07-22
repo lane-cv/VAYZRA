@@ -13,8 +13,7 @@ import (
 )
 
 type PostgresOutboxStore struct {
-	pool             *pgxpool.Pool
-	afterCatalogLock func()
+	pool *pgxpool.Pool
 }
 
 func NewPostgresOutboxStore(pool *pgxpool.Pool) *PostgresOutboxStore {
@@ -86,26 +85,15 @@ func (s *PostgresOutboxStore) DeliverLessonPublication(ctx context.Context, even
 		return err
 	}
 	var mode string
-	// Keep the shared hierarchy lock order aligned with teaching publication
-	// (lesson, chapter, subject, term, grade). Catalog archive mutations lock
-	// only their target row, so they cannot form the reverse half of a cycle.
 	err = tx.QueryRow(ctx, `SELECT ra.mode FROM lessons l
- JOIN chapters c ON c.id=l.chapter_id AND c.archived_at IS NULL
- JOIN subjects s ON s.id=c.subject_id AND s.archived_at IS NULL
- JOIN terms t ON t.id=s.term_id AND t.archived_at IS NULL
- JOIN grades g ON g.id=t.grade_id AND g.archived_at IS NULL
- JOIN lesson_revision_finalizations rf ON rf.lesson_id=l.id AND rf.revision_id=l.published_revision_id
- JOIN lesson_revisions r ON r.id=rf.revision_id AND r.lesson_id=l.id
- JOIN lesson_revision_audiences ra ON ra.revision_id=r.id
- WHERE l.id=$1 AND l.published_revision_id=$2 AND l.archived_at IS NULL
- FOR UPDATE OF l,c,s,t,g`, payload.LessonID, payload.RevisionID).Scan(&mode)
+	 JOIN lesson_revisions r ON r.lesson_id=l.id AND r.id=$2
+	 JOIN lesson_revision_finalizations rf ON rf.lesson_id=l.id AND rf.revision_id=r.id
+	 JOIN lesson_revision_audiences ra ON ra.revision_id=r.id
+	 WHERE l.id=$1`, payload.LessonID, payload.RevisionID).Scan(&mode)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
 	if err == nil {
-		if s.afterCatalogLock != nil {
-			s.afterCatalogLock()
-		}
 		var insert string
 		switch mode {
 		case "all":

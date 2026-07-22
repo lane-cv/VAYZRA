@@ -32,6 +32,13 @@ describe('NotificationCenterView', () => {
     const { wrapper, push } = render(); await flushPromises(); await wrapper.get('a').trigger('click'); await flushPromises()
     expect(push).toHaveBeenCalledWith('/student/questions/q1')
   })
+  it('aborts an in-flight mutation when the notification center unmounts', async () => {
+    let signal: AbortSignal | undefined
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: records, meta: {} })))
+      .mockImplementationOnce((_url, init) => { signal = init?.signal as AbortSignal; return new Promise(() => {}) })
+    const { wrapper } = render(); await flushPromises(); await wrapper.get('li button').trigger('click'); await Promise.resolve()
+    wrapper.unmount(); expect(signal?.aborted).toBe(true)
+  })
   it('rejects another role path and encoded or scheme-relative paths', async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ data: records.map((record, index) => ({ ...record, targetPath: index ? '/student/%2f%2fevil' : '/admin/questions/q1' })), meta: {} })))
     const { wrapper } = render('student'); await flushPromises(); expect(wrapper.find('a').exists()).toBe(false)
