@@ -12,7 +12,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type PostgresOutboxStore struct{ pool *pgxpool.Pool }
+type PostgresOutboxStore struct {
+	pool            *pgxpool.Pool
+	afterLessonLock func()
+}
 
 func NewPostgresOutboxStore(pool *pgxpool.Pool) *PostgresOutboxStore {
 	return &PostgresOutboxStore{pool: pool}
@@ -24,8 +27,12 @@ func (s *PostgresOutboxStore) Claim(ctx context.Context, owner string) ([]Outbox
 	}
 	// A process may die after taking its final allowed lease. Once that lease
 	// expires, make the terminal state explicit instead of stranding the row.
-	if _, err := s.pool.Exec(ctx, `UPDATE outbox_events SET published_at=clock_timestamp(),lease_owner=NULL,lease_until=NULL,last_error_category='max_attempts'
- WHERE published_at IS NULL AND attempts>=$1 AND (lease_until IS NULL OR lease_until<=clock_timestamp())`, OutboxMaxAttempts); err != nil {
+	if _, err := s.pool.Exec(ctx, `WITH terminal AS (
+ SELECT id FROM outbox_events
+ WHERE published_at IS NULL AND attempts>=$1 AND (lease_until IS NULL OR lease_until<=clock_timestamp())
+ ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT $2
+) UPDATE outbox_events e SET published_at=clock_timestamp(),lease_owner=NULL,lease_until=NULL,last_error_category='max_attempts'
+ FROM terminal WHERE e.id=terminal.id`, OutboxMaxAttempts, OutboxBatchLimit); err != nil {
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `WITH ready AS (
@@ -80,14 +87,22 @@ func (s *PostgresOutboxStore) DeliverLessonPublication(ctx context.Context, even
 	}
 	var mode string
 	err = tx.QueryRow(ctx, `SELECT ra.mode FROM lessons l
+ JOIN chapters c ON c.id=l.chapter_id AND c.archived_at IS NULL
+ JOIN subjects s ON s.id=c.subject_id AND s.archived_at IS NULL
+ JOIN terms t ON t.id=s.term_id AND t.archived_at IS NULL
+ JOIN grades g ON g.id=t.grade_id AND g.archived_at IS NULL
  JOIN lesson_revision_finalizations rf ON rf.lesson_id=l.id AND rf.revision_id=l.published_revision_id
  JOIN lesson_revisions r ON r.id=rf.revision_id AND r.lesson_id=l.id
  JOIN lesson_revision_audiences ra ON ra.revision_id=r.id
- WHERE l.id=$1 AND l.published_revision_id=$2 AND l.archived_at IS NULL`, payload.LessonID, payload.RevisionID).Scan(&mode)
+ WHERE l.id=$1 AND l.published_revision_id=$2 AND l.archived_at IS NULL
+ FOR UPDATE OF l`, payload.LessonID, payload.RevisionID).Scan(&mode)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
 	if err == nil {
+		if s.afterLessonLock != nil {
+			s.afterLessonLock()
+		}
 		var insert string
 		switch mode {
 		case "all":
