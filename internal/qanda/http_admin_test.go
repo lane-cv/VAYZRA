@@ -40,10 +40,14 @@ func TestAdminHTTPListAcceptsCanonicalFractionalEndOfDay(t *testing.T) {
 	for _, tc := range []struct {
 		name, value string
 		want        int
+		parsed      time.Time
 	}{
-		{"canonical milliseconds", "2025-07-22T23:59:59.999Z", http.StatusOK},
-		{"non canonical trailing zero", "2025-07-22T23:59:59.9990Z", http.StatusBadRequest},
-		{"non canonical offset", "2025-07-22T23:59:59.999+00:00", http.StatusBadRequest},
+		{"frontend historical start", "2025-07-22T00:00:00Z", http.StatusOK, time.Date(2025, 7, 22, 0, 0, 0, 0, time.UTC)},
+		{"frontend historical end", "2025-07-22T23:59:59.999Z", http.StatusOK, time.Date(2025, 7, 22, 23, 59, 59, 999000000, time.UTC)},
+		{"frontend capped now", "2025-07-22T12:34:56.12Z", http.StatusOK, time.Date(2025, 7, 22, 12, 34, 56, 120000000, time.UTC)},
+		{"non canonical zero milliseconds", "2025-07-22T00:00:00.000Z", http.StatusBadRequest, time.Time{}},
+		{"non canonical trailing zero", "2025-07-22T12:34:56.120Z", http.StatusBadRequest, time.Time{}},
+		{"non canonical offset", "2025-07-22T23:59:59.999+00:00", http.StatusBadRequest, time.Time{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := &fakeAdminHTTPService{}
@@ -54,7 +58,7 @@ func TestAdminHTTPListAcceptsCanonicalFractionalEndOfDay(t *testing.T) {
 			if w.Code != tc.want {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
-			if tc.want == http.StatusOK && !svc.filter.To.Equal(time.Date(2025, 7, 22, 23, 59, 59, 999000000, time.UTC)) {
+			if tc.want == http.StatusOK && !svc.filter.To.Equal(tc.parsed) {
 				t.Fatalf("to=%s", svc.filter.To)
 			}
 		})
