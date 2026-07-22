@@ -305,7 +305,7 @@ export function createIndexedDBUploadSessionStore(): UploadSessionStore {
     })
   }
   return {
-    get: async (key) => access<string | undefined>('readonly', (store) => store.get(key)),
+    get: async (key) => access<string | undefined>('readonly', (store) => store.get(key) as IDBRequest<string | undefined>),
     set: async (key, value) => { await access<IDBValidKey>('readwrite', (store) => store.put(value, key)) },
     delete: async (key) => { await access<undefined>('readwrite', (store) => store.delete(key)) },
   }

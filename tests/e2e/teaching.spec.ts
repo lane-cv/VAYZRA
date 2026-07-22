@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { apiJSON, changePassword, createStudentAPI, createTeachingPath, createTeachingPathUI, login, type Draft } from './helpers'
+import { apiJSON, changePassword, createStudentAPI, createTeachingPathUI, login, type Draft } from './helpers'
 
 const adminPassword = process.env.E2E_ADMIN_PASSWORD
 const studentPassword = process.env.E2E_STUDENT_PASSWORD
@@ -62,8 +62,7 @@ test('teacher UI publishes immutable, audience-bound lessons and revokes access'
     await expect(adminPage.getByText('发布成功：第 2 版')).toBeVisible()
     expect(await apiJSON<{ version: number }>(studentAPage, 'GET', `/api/v1/student/lessons/${draft.lessonId}`)).toMatchObject({ version: 2 })
 
-    const selectedPath = await createTeachingPath(adminPage, `selected-${suffix}`)
-    await adminPage.goto(`/admin/teaching/lessons/${selectedPath.draft.lessonId}`)
+    const selectedPath = await createTeachingPathUI(adminPage, `selected-${suffix}`)
     await adminPage.getByLabel('课程正文', { exact: true }).fill('# 定向课程\n\n仅学生甲可见。')
     await adminPage.getByLabel('指定学生').check()
     await adminPage.getByLabel(`选择学生 ${studentA.username}`).check()

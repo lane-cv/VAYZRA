@@ -31,7 +31,7 @@ watch(() => session.user?.id, (userId) => { if (userId) notifications.start(user
 <template>
   <div class="console-shell" :class="{ 'drawer-open': drawerOpen }">
     <button class="scrim" aria-label="关闭导航" @click="closeDrawer()"></button>
-    <aside id="console-navigation" class="sidebar" aria-label="主导航" :aria-hidden="isMobile && !drawerOpen ? 'true' : undefined" :inert="isMobile && !drawerOpen || undefined">
+    <aside class="sidebar" aria-label="主导航" :aria-hidden="isMobile && !drawerOpen ? 'true' : undefined" :inert="isMobile && !drawerOpen || undefined">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>HappyLearn</span></div>
       <p class="role-label">{{ isAdmin ? '教师空间' : '学生空间' }}</p>
       <nav id="console-navigation" ref="navigation" aria-label="主导航">

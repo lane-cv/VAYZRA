@@ -27,6 +27,7 @@ describe('QuestionAttachmentUploader', () => {
     Object.defineProperty(wrapper.get('input').element, 'files', { configurable: true, value: [file] })
     await wrapper.get('input').trigger('change'); await flushPromises()
     expect(wrapper.text()).toContain('answer.pdf')
+    expect(wrapper.text()).toContain('已就绪')
     expect(wrapper.emitted('update:attachments')?.slice(-1)[0]?.[0]).toEqual([{ fileVersionId: 'v1', sortPosition: 0 }])
   })
   it('cancels hashing and stops the remaining file queue when unmounted', async () => {

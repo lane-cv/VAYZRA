@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { apiJSON, changePassword, createStudentAPI, createTeachingPath, login, publishDraft, saveDraft, waitForNotifications } from './helpers'
+import { apiJSON, changePassword, createStudentAPI, createTeachingPathUI, login, waitForNotifications } from './helpers'
 
 const adminPassword = process.env.E2E_ADMIN_PASSWORD
 const studentPassword = process.env.E2E_STUDENT_PASSWORD
@@ -26,17 +26,30 @@ test('lesson audience notifications and durable read state survive reloads', asy
     await login(pageB, studentB.username, studentPassword!)
     await changePassword(pageB, studentPassword!, `${studentNewPassword!} notify-b`)
 
-    const allPath = await createTeachingPath(admin, `all-${suffix}`)
-    const allDraft = await saveDraft(admin, allPath.draft, { bodyMarkdown: '# 全体课程', audience: { mode: 'all', userIds: [] } })
-    await publishDraft(admin, allDraft)
-    const selectedPath = await createTeachingPath(admin, `selected-${suffix}`)
-    const selectedDraft = await saveDraft(admin, selectedPath.draft, { bodyMarkdown: '# 定向课程', audience: { mode: 'selected', userIds: [studentA.id] } })
-    await publishDraft(admin, selectedDraft)
+    const allPath = await createTeachingPathUI(admin, `notify-all-${suffix}`)
+    await admin.getByLabel('课程正文', { exact: true }).fill('# 全体课程')
+    await expect(admin.getByText('已保存', { exact: true })).toBeVisible()
+    await admin.getByRole('button', { name: '发布课程' }).click()
+    const allPublish = admin.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/api/v1/admin/lessons/${allPath.lessonId}/publish`))
+    await admin.getByRole('button', { name: '确认发布课程' }).click()
+    expect((await allPublish).status()).toBe(201)
+    await expect(admin.getByText('发布成功：第 1 版')).toBeVisible()
 
-    const notificationsA = await waitForNotifications(pageA, (items) => items.filter((item) => item.kind === 'lesson_published' && [allDraft.lessonId, selectedDraft.lessonId].includes(item.targetId)).length === 2)
-    const notificationsB = await waitForNotifications(pageB, (items) => items.filter((item) => item.kind === 'lesson_published' && item.targetId === allDraft.lessonId).length === 1)
-    expect(notificationsA.filter((item) => item.kind === 'lesson_published' && [allDraft.lessonId, selectedDraft.lessonId].includes(item.targetId))).toHaveLength(2)
-    expect(notificationsB.filter((item) => item.targetId === selectedDraft.lessonId)).toHaveLength(0)
+    const selectedPath = await createTeachingPathUI(admin, `notify-selected-${suffix}`)
+    await admin.getByLabel('课程正文', { exact: true }).fill('# 定向课程')
+    await admin.getByLabel('指定学生').check()
+    await admin.getByLabel(`选择学生 ${studentA.username}`).check()
+    await expect(admin.getByText('已保存', { exact: true })).toBeVisible()
+    await admin.getByRole('button', { name: '发布课程' }).click()
+    const selectedPublish = admin.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/api/v1/admin/lessons/${selectedPath.lessonId}/publish`))
+    await admin.getByRole('button', { name: '确认发布课程' }).click()
+    expect((await selectedPublish).status()).toBe(201)
+    await expect(admin.getByText('发布成功：第 1 版')).toBeVisible()
+
+    const notificationsA = await waitForNotifications(pageA, (items) => items.filter((item) => item.kind === 'lesson_published' && [allPath.lessonId, selectedPath.lessonId].includes(item.targetId)).length === 2)
+    const notificationsB = await waitForNotifications(pageB, (items) => items.filter((item) => item.kind === 'lesson_published' && item.targetId === allPath.lessonId).length === 1)
+    expect(notificationsA.filter((item) => item.kind === 'lesson_published' && [allPath.lessonId, selectedPath.lessonId].includes(item.targetId))).toHaveLength(2)
+    expect(notificationsB.filter((item) => item.targetId === selectedPath.lessonId)).toHaveLength(0)
 
     await pageA.goto('/notifications')
     await expect(pageA.getByRole('heading', { name: '通知中心' })).toBeVisible()
