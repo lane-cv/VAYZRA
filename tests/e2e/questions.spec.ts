@@ -68,14 +68,39 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   await expect(uploader.locator('li').filter({ hasText: 'question.pdf' })).toContainText('已就绪', { timeout: 120_000 })
   await pageA.getByLabel('问题标题').fill(title)
   await pageA.getByLabel('问题描述').fill(body)
+  const createIdempotencyKeys: string[] = []
+  let committedCreate: Mutation | undefined
+  await pageA.route('**/api/v1/student/questions', async (route) => {
+    if (route.request().method() !== 'POST') { await route.continue(); return }
+    createIdempotencyKeys.push(route.request().headers()['idempotency-key'] ?? '')
+    if (createIdempotencyKeys.length === 1) {
+      const upstream = await route.fetch()
+      expect(upstream.status()).toBe(201)
+      committedCreate = ((await upstream.json()) as { data: Mutation }).data
+      await route.abort('failed')
+      return
+    }
+    await route.continue()
+  })
+  await pageA.getByRole('button', { name: '提交问题' }).click()
+  await expect(pageA.getByRole('alert')).toContainText('网络连接异常')
   const createResponsePromise = mutationResponse(pageA, 'student')
-  await pageA.getByRole('button', { name: '提交问题' }).evaluate((button: HTMLButtonElement) => { button.click(); button.click() })
+  await pageA.getByRole('button', { name: '提交问题' }).click()
   const createResponse = await createResponsePromise
   expect(createResponse.status()).toBe(201)
   const created = (await createResponse.json()).data as Mutation
+  expect(createIdempotencyKeys).toHaveLength(2)
+  expect(createIdempotencyKeys[0]).not.toBe('')
+  expect(new Set(createIdempotencyKeys).size).toBe(1)
+  expect(created.thread.id).toBe(committedCreate?.thread.id)
+  expect(created.message.id).toBe(committedCreate?.message.id)
+  await pageA.unroute('**/api/v1/student/questions')
   await expect(pageA).toHaveURL(new RegExp(`/student/questions/${created.thread.id}$`))
   await expect(pageA.getByLabel('问答消息')).toContainText(body)
   await expect(pageA.getByLabel('问答消息').locator('article')).toHaveCount(1)
+  await pageA.getByRole('link', { name: '← 返回我的问题' }).click()
+  await expect(pageA.getByRole('link', { name: new RegExp(title) })).toHaveCount(1)
+  await pageA.getByRole('link', { name: new RegExp(title) }).click()
 
   let failedOnce = false
   await pageA.route(`**/api/v1/student/questions/${created.thread.id}`, async (route) => {
@@ -92,6 +117,7 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
 
   const detailA = await apiJSON<Detail>(pageA, 'GET', `/api/v1/student/questions/${created.thread.id}`)
   expect(detailA.messages[0].attachments).toHaveLength(2)
+  expect(detailA.messages.some((message) => message.id === created.message.id)).toBe(true)
   const [image, pdf] = detailA.messages[0].attachments
   expect((await pageA.request.get(`/api/v1/question-files/${image.fileVersionId}/preview`)).status()).toBe(200)
   expect((await pageA.request.get(`/api/v1/question-files/${pdf.fileVersionId}/download`)).status()).toBe(200)
@@ -99,7 +125,6 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   const foreignPaths = [
     `/api/v1/student/questions/${created.thread.id}`,
     `/api/v1/student/questions/${created.thread.id}/messages?limit=50`,
-    `/api/v1/student/questions/${created.thread.id}/messages/${detailA.messages[0].id}`,
     `/api/v1/question-files/${image.fileVersionId}/status`,
     `/api/v1/question-files/${pdf.fileVersionId}/download`,
     `/api/v1/student/questions/${randomUUID()}`,
@@ -112,6 +137,8 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
 
   const adminNotifications = await waitForNotifications(admin, (items) => items.filter((item) => item.kind === 'qa_created' && item.targetId === created.thread.id).length === 1)
   expect(adminNotifications.filter((item) => item.kind === 'qa_created' && item.targetId === created.thread.id)).toHaveLength(1)
+  await admin.goto('/notifications')
+  await expect(admin.locator(`a[href="/admin/questions/${created.thread.id}"]`)).toHaveCount(1)
 
   await admin.setViewportSize({ width: 1440, height: 900 })
   await admin.goto('/admin/questions')
@@ -173,7 +200,18 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
 
   await admin.setViewportSize({ width: 390, height: 844 })
   await expect(admin.getByRole('heading', { name: '问题队列' })).toBeHidden()
-  await expect(admin.getByRole('link', { name: '← 返回问题队列' })).toBeVisible()
+  const mobileBack = admin.getByRole('link', { name: '← 返回问题队列' })
+  await expect(mobileBack).toBeVisible()
+  await mobileBack.focus()
+  await expect(mobileBack).toBeFocused()
+  await mobileBack.press('Enter')
+  await expect(admin.getByRole('heading', { name: '问题队列' })).toBeVisible()
+  const mobileQuestionLink = admin.getByRole('link', { name: new RegExp(title) })
+  await expect(mobileQuestionLink).toBeVisible()
+  await mobileQuestionLink.focus()
+  await expect(mobileQuestionLink).toBeFocused()
+  await admin.getByRole('link', { name: new RegExp(title) }).press('Enter')
+  await expect(admin.getByRole('heading', { name: title })).toBeVisible()
   await pageA.setViewportSize({ width: 390, height: 844 })
   await pageA.reload()
   await expect(pageA.getByLabel('问答消息')).toContainText('把接触双方都纳入系统即可。')

@@ -8,11 +8,21 @@ find "$artifact_dir" -depth -type d ! -path "$artifact_dir" -empty -delete
 log="$artifact_dir/containers.log"
 [[ -f "$log" ]] || exit 0
 temporary="$(mktemp "${log}.XXXXXX")"
-sed -E \
-  -e 's#postgres://[^[:space:]]+#postgres://REDACTED#g' \
-  -e 's#redis://[^[:space:]]+#redis://REDACTED#g' \
-  -e 's#(password|secret|token|authorization|cookie|body)=([^[:space:]]+)#\1=REDACTED#gI' \
-  -e 's#(Bearer)[[:space:]]+[^[:space:]]+#\1 REDACTED#gI' \
-  "$log" > "$temporary"
+omitted=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    diagnostics_version=1|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|oom_killed=true|oom_killed=false)
+      printf '%s\n' "$line" >> "$temporary"
+      ;;
+    container=happylearn_phase2_*|container=happylearn_phase3_*)
+      if [[ "$line" =~ ^container=happylearn_phase[23]_[A-Za-z0-9_-]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
+      ;;
+    exit_code=*)
+      if [[ "$line" =~ ^exit_code=[0-9]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
+      ;;
+    *) omitted=$((omitted+1)) ;;
+  esac
+done < "$log"
+printf 'log_lines_omitted=%d\n' "$omitted" >> "$temporary"
 chmod 0600 "$temporary"
 mv "$temporary" "$log"

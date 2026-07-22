@@ -222,7 +222,7 @@ function blobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(reader.result as ArrayBuffer)
-    reader.onerror = () => reject(reader.error)
+    reader.onerror = () => reject(reader.error ?? new Error('读取文件失败'))
     reader.readAsArrayBuffer(blob)
   })
 }
@@ -292,7 +292,7 @@ export function createIndexedDBUploadSessionStore(): UploadSessionStore {
     const request = indexedDB.open('vayzra-upload-sessions', 1)
     request.onupgradeneeded = () => request.result.createObjectStore('sessions')
     request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
+    request.onerror = () => reject(request.error ?? new Error('打开上传会话数据库失败'))
   })
   const access = async <T>(mode: IDBTransactionMode, action: (store: IDBObjectStore) => IDBRequest<T>) => {
     const db = await database()
@@ -300,7 +300,7 @@ export function createIndexedDBUploadSessionStore(): UploadSessionStore {
       const transaction = db.transaction('sessions', mode)
       const request = action(transaction.objectStore('sessions'))
       request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
+      request.onerror = () => reject(request.error ?? new Error('访问上传会话数据库失败'))
       transaction.oncomplete = () => db.close()
     })
   }

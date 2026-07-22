@@ -46,7 +46,7 @@ async function choose(event: Event) {
   for (const file of files) {
     if (!isActive(token)) break
     items.value.push({ name: file.name, size: file.size, state: 'pending', message: '等待上传' })
-    const item = items.value[items.value.length - 1]!
+    const item = items.value[items.value.length - 1]
     publish(token)
     const uid=props.userId||session?.user?.id||'unknown'
     const manager = createUploadManager({ transport: props.role==='admin'?adminQuestionUploadTransport:studentQuestionUploadTransport, sessions: props.role==='admin'?createAdminQuestionSessionStore(uid):createStudentQuestionSessionStore(uid), onState: (state: UploadManagerState) => {
