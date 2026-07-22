@@ -57,7 +57,7 @@ tests := []struct{ role auth.Role; mime string; size int64; want error }{
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `go test ./internal/files ./internal/platform/database -run 'UploadPurpose|QAUploadPolicy' -count=1`  
+Run: `go test ./internal/files ./internal/platform/database -run 'UploadPurpose|QAUploadPolicy' -count=1`
 Expected: FAIL because purpose fields and policies are absent.
 
 - [ ] **Step 3: Add purpose columns with safe Phase 2 compatibility**
@@ -149,7 +149,7 @@ Test ownership, `purpose='qa_attachment'`, `processing_state='ready'`, allowed d
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `go test ./internal/qanda ./internal/files -run 'QAAttachment|QAAccess' -count=1`  
+Run: `go test ./internal/qanda ./internal/files -run 'QAAttachment|QAAccess' -count=1`
 Expected: FAIL because validation and access services are missing.
 
 - [ ] **Step 3: Validate and bind while holding the message transaction**
@@ -217,7 +217,7 @@ Test table constraints, recipient-scoped dedupe keys, unread partial index, immu
 
 - [ ] **Step 2: Run tests to verify RED**
 
-Run: `go test ./internal/notifications ./internal/platform/database -run 'Notification' -count=1`  
+Run: `go test ./internal/notifications ./internal/platform/database -run 'Notification' -count=1`
 Expected: FAIL because the module and migration do not exist.
 
 - [ ] **Step 3: Add notification and outbox lease schema**
@@ -311,7 +311,7 @@ Cover exclusive `FOR UPDATE SKIP LOCKED` claims, lease expiry takeover, attempt 
 
 - [ ] **Step 2: Run tests to verify RED**
 
-Run: `go test ./internal/notifications ./tests/integration -run 'Outbox|LessonPublicationNotification' -count=1`  
+Run: `go test ./internal/notifications ./tests/integration -run 'Outbox|LessonPublicationNotification' -count=1`
 Expected: FAIL because runner/store methods are absent.
 
 - [ ] **Step 3: Version the teaching event payload**

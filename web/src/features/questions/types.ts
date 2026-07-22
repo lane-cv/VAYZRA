@@ -1,5 +1,5 @@
 export type QuestionStatus = 'pending' | 'in_progress' | 'waiting_student' | 'completed'
-export type QuestionAttachment = { fileVersionId: string; sortPosition: number; displayName: string }
+export type QuestionAttachment = { fileVersionId: string; sortPosition: number; displayName: string; previewAvailable: boolean }
 export type QuestionMessage = { id: string; senderRole: 'admin' | 'student'; kind: 'initial' | 'student_follow_up' | 'admin_reply'; body: string; createdAt: string; attachments: QuestionAttachment[] }
 export type QuestionThread = { id: string; title: string; status: QuestionStatus; version: number; lastMessageAt: string; createdAt: string; updatedAt: string; completedAt?: string }
 export type AttachmentInput = { fileVersionId: string; sortPosition: number }

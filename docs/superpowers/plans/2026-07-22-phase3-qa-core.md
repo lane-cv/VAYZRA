@@ -56,7 +56,7 @@ func TestQASchemaAndHistoryAreDatabaseEnforced(t *testing.T) {
 
 - [ ] **Step 2: Run the migration test to verify RED**
 
-Run: `go test ./internal/platform/database ./tests/integration -run 'QASchema|QAMigration' -count=1`  
+Run: `go test ./internal/platform/database ./tests/integration -run 'QASchema|QAMigration' -count=1`
 Expected: FAIL because migration `00009_teacher_qa.sql` and the tables do not exist.
 
 - [ ] **Step 3: Add the exact schema and constraints**
@@ -113,12 +113,12 @@ Use one `reject_qa_history_mutation()` trigger function on `BEFORE UPDATE OR DEL
 
 Insert a teacher, student, thread, message, binding, and note. Assert `UPDATE` and `DELETE` fail for each append-only table, then run the provider down migration and assert all four tables are absent.
 
-Run: `go test ./internal/platform/database ./tests/integration -run 'QA' -count=1`  
+Run: `go test ./internal/platform/database ./tests/integration -run 'QA' -count=1`
 Expected: PASS.
 
 - [ ] **Step 5: Run the database regression suite**
 
-Run: `go test ./internal/platform/database ./tests/integration -count=1`  
+Run: `go test ./internal/platform/database ./tests/integration -count=1`
 Expected: PASS, including all Phase 1–2 migration and downgrade tests.
 
 - [ ] **Step 6: Commit the schema contract**
@@ -164,7 +164,7 @@ Test every permitted transition from the spec and assert all other combinations 
 
 - [ ] **Step 2: Run the domain tests to verify RED**
 
-Run: `go test ./internal/qanda -run 'State|Validate|Create|Student' -count=1`  
+Run: `go test ./internal/qanda -run 'State|Validate|Create|Student' -count=1`
 Expected: FAIL because package `internal/qanda` does not exist.
 
 - [ ] **Step 3: Define focused domain types and interfaces**
@@ -192,7 +192,7 @@ Keep `Store` read methods separate from `TxStore` writes. `UnitOfWork.WithinTx` 
 
 - [ ] **Step 5: Verify service GREEN and rollback behavior**
 
-Run: `go test ./internal/qanda -run 'Service|Student|Idempotent|Rollback' -count=1`  
+Run: `go test ./internal/qanda -run 'Service|Student|Idempotent|Rollback' -count=1`
 Expected: PASS. Include a fake UOW that discards copied state when audit or notification returns an error.
 
 - [ ] **Step 6: Implement PostgreSQL student isolation inside queries**
@@ -213,7 +213,7 @@ ORDER BY last_message_at DESC,id DESC LIMIT $4;
 
 Test two students, duplicate idempotency keys scoped to different users, same-user duplicate keys, stable cursor traversal with equal timestamps, concurrent follow-ups, disabled-student denial, and transaction rollback when notification insertion fails.
 
-Run: `go test ./internal/qanda -run Postgres -count=1`  
+Run: `go test ./internal/qanda -run Postgres -count=1`
 Expected: PASS with PostgreSQL available through `HAPPYLEARN_TEST_DATABASE_URL` or the documented default.
 
 - [ ] **Step 8: Commit the student Q&A core**
@@ -255,7 +255,7 @@ if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"code":"
 
 - [ ] **Step 2: Run the HTTP tests to verify RED**
 
-Run: `go test ./internal/qanda ./internal/app -run 'StudentHTTP|QARoutes' -count=1`  
+Run: `go test ./internal/qanda ./internal/app -run 'StudentHTTP|QARoutes' -count=1`
 Expected: FAIL because the handler and dependency wiring do not exist.
 
 - [ ] **Step 3: Implement routes and stable DTOs**
@@ -278,7 +278,7 @@ Add `StudentQuestions qanda.StudentHTTPService` to `app.Dependencies`, mount it 
 
 - [ ] **Step 5: Run focused and full route tests**
 
-Run: `go test ./internal/qanda ./internal/app ./cmd/server -count=1`  
+Run: `go test ./internal/qanda ./internal/app ./cmd/server -count=1`
 Expected: PASS, including nil optional dependency tests and role-boundary regressions.
 
 - [ ] **Step 6: Commit the student HTTP boundary**
@@ -316,7 +316,7 @@ Test filters by status/student/date, stable cursor pagination, admin-only access
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `go test ./internal/qanda -run 'Admin|Teacher|Status|Note' -count=1`  
+Run: `go test ./internal/qanda -run 'Admin|Teacher|Status|Note' -count=1`
 Expected: FAIL because teacher methods and routes are missing.
 
 - [ ] **Step 3: Implement teacher transaction methods**

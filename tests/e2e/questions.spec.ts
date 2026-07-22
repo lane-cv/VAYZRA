@@ -10,7 +10,7 @@ const studentNewPassword = process.env.E2E_STUDENT_NEW_PASSWORD
 const fixtureDir = process.env.E2E_FIXTURE_DIR ?? 'tests/fixtures/teaching/generated'
 
 type Thread = { id: string; title: string; status: 'pending'|'in_progress'|'waiting_student'|'completed'; version: number }
-type Message = { id: string; body: string; attachments: Array<{ fileVersionId: string }> }
+type Message = { id: string; body: string; attachments: Array<{ fileVersionId: string; displayName: string; previewAvailable: boolean }> }
 type Detail = { thread: Thread; messages: Message[] }
 type Mutation = { thread: Thread; message: Message }
 
@@ -119,6 +119,10 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   expect(detailA.messages[0].attachments).toHaveLength(2)
   expect(detailA.messages.some((message) => message.id === created.message.id)).toBe(true)
   const [image, pdf] = detailA.messages[0].attachments
+  const imagePreview = pageA.getByRole('link', { name: '预览 question.png' })
+  await expect(imagePreview).toBeVisible()
+  await expect(imagePreview).toHaveAttribute('href', `/api/v1/question-files/${image.fileVersionId}/preview`)
+  await expect(pageA.getByRole('link', { name: '下载 question.pdf' })).toHaveAttribute('href', `/api/v1/question-files/${pdf.fileVersionId}/download`)
   expect((await pageA.request.get(`/api/v1/question-files/${image.fileVersionId}/preview`)).status()).toBe(200)
   expect((await pageA.request.get(`/api/v1/question-files/${pdf.fileVersionId}/download`)).status()).toBe(200)
 
@@ -179,17 +183,28 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   expect(studentNotifications.filter((item) => item.kind === 'qa_replied' && item.targetId === created.thread.id)).toHaveLength(1)
   expect(JSON.stringify(await (await pageA.request.get(`/api/v1/student/questions/${created.thread.id}`)).json())).not.toContain('仅教师')
 
+  await confirmStatus(admin, 'complete', '已完成')
   await pageA.reload()
+  await expect(pageA.getByText('已完成', { exact: true })).toBeVisible()
+  await expect(pageA.getByText('该问题已完成，但你仍可继续追问；提交后将重新进入待处理状态。')).toBeVisible()
   await pageA.getByLabel('追问内容').fill('如果有摩擦，系统怎么选？')
   const followResponsePromise = mutationResponse(pageA, 'student', created.thread.id)
   await pageA.getByRole('button', { name: '提交追问' }).evaluate((button: HTMLButtonElement) => { button.click(); button.click() })
-  expect((await followResponsePromise).status()).toBe(201)
+  const followResponse = await followResponsePromise
+  expect(followResponse.status()).toBe(201)
+  const followed = (await followResponse.json()).data as Mutation
+  expect(followed.thread.status).toBe('pending')
+  expect(followed.thread.version).toBeGreaterThan(created.thread.version)
   await expect(pageA.getByLabel('问答消息')).toContainText('如果有摩擦，系统怎么选？')
+  await expect(pageA.getByText('待老师处理', { exact: true })).toBeVisible()
   await pageA.reload()
   await expect(pageA.getByLabel('问答消息')).toContainText('如果有摩擦，系统怎么选？')
-  await waitForNotifications(admin, (items) => items.filter((item) => item.kind === 'qa_followed_up' && item.targetId === created.thread.id).length === 1)
+  const followNotifications = await waitForNotifications(admin, (items) => items.filter((item) => item.kind === 'qa_followed_up' && item.targetId === created.thread.id).length === 1)
+  expect(followNotifications.filter((item) => item.kind === 'qa_followed_up' && item.targetId === created.thread.id)).toHaveLength(1)
 
   await admin.reload()
+  await expect(admin.getByLabel('问题详情').getByText('待处理', { exact: true })).toBeVisible()
+  await confirmStatus(admin, 'claim', '处理中')
   await confirmStatus(admin, 'complete', '已完成')
   await confirmStatus(admin, 'reopen', '处理中')
   await admin.getByTestId('reply-form').getByLabel('回复内容').fill('把接触双方都纳入系统即可。')

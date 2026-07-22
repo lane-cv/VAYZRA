@@ -65,7 +65,7 @@ Test URL encoding, cursor/status query construction, random UUID-format idempote
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `pnpm --dir web test -- studentApi QuestionTimeline`  
+Run: `pnpm --dir web test -- studentApi QuestionTimeline`
 Expected: FAIL because the modules/components do not exist.
 
 - [ ] **Step 3: Implement the API and shared safe timeline**
@@ -140,7 +140,7 @@ Test exact status/student/date/cursor query encoding, reply idempotency, expecte
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `pnpm --dir web test -- adminApi TeacherQuestion`  
+Run: `pnpm --dir web test -- adminApi TeacherQuestion`
 Expected: FAIL because teacher modules and views are absent.
 
 - [ ] **Step 3: Implement the teacher API and queue state**
@@ -219,7 +219,7 @@ With Vitest fake timers, prove:
 
 - [ ] **Step 2: Run polling tests to verify RED**
 
-Run: `pnpm --dir web test -- notifications`  
+Run: `pnpm --dir web test -- notifications`
 Expected: FAIL because the store and API are absent.
 
 - [ ] **Step 3: Implement API and polling store**
@@ -296,7 +296,7 @@ Scenarios create one teacher and two students and prove:
 
 - [ ] **Step 2: Run E2E to verify RED**
 
-Run: `pnpm exec playwright test tests/e2e/questions.spec.ts tests/e2e/notifications.spec.ts`  
+Run: `pnpm exec playwright test tests/e2e/questions.spec.ts tests/e2e/notifications.spec.ts`
 Expected: FAIL until Phase 3 disposable environment, APIs, and views are wired.
 
 - [ ] **Step 3: Add frontend lint with an exact zero-warning gate**

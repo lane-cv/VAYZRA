@@ -5,7 +5,7 @@ const props = withDefaults(defineProps<{ messages: QuestionMessage[]; viewerRole
 const ordered = computed(() => [...props.messages].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)))
 const mine=(message:QuestionMessage)=>message.senderRole===props.viewerRole
 const speaker=(message:QuestionMessage)=>props.viewerRole==='admin'?(message.senderRole==='admin'?'我（老师）':'学生'):(message.senderRole==='student'?'我':'老师')
-const filePath = (id: string) => `/api/v1/question-files/${encodeURIComponent(id)}/download`
+const filePath = (id: string, action: 'preview'|'download') => `/api/v1/question-files/${encodeURIComponent(id)}/${action}`
 </script>
 <template>
   <section class="timeline" aria-label="问答消息">
@@ -15,7 +15,8 @@ const filePath = (id: string) => `/api/v1/question-files/${encodeURIComponent(id
       <ul v-if="message.attachments.length" aria-label="消息附件">
         <li v-for="attachment in message.attachments" :key="attachment.fileVersionId">
           <span>{{ attachment.displayName }}</span>
-          <a :href="filePath(attachment.fileVersionId)">下载</a>
+          <a v-if="attachment.previewAvailable" :href="filePath(attachment.fileVersionId, 'preview')" target="_blank" rel="noopener" :aria-label="`预览 ${attachment.displayName}`">预览</a>
+          <a :href="filePath(attachment.fileVersionId, 'download')" :aria-label="`下载 ${attachment.displayName}`">下载</a>
         </li>
       </ul>
     </article>
