@@ -26,4 +26,5 @@ describe('admin question api', () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({data:{thread:{id:'q1',studentId:'s1'},messages:[],notes:[{id:'n1',authorUserId:'a1',body:'private',createdAt:'now'}]}})))
     await expect(getAdminQuestion('q1')).resolves.toMatchObject({thread:{studentId:'s1'},notes:[{body:'private'}]})
   })
+  it('strictly encodes optional detail cursor and limit',async()=>{vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({data:{thread:{id:'q1',studentId:'s1'},messages:[],notes:[]}})));await getAdminQuestion('q/1',{cursor:'m+/=',limit:100});expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/questions/q%2F1?cursor=m%2B%2F%3D&limit=100')})
 })

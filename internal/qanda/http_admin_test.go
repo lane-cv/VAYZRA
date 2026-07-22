@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
@@ -25,11 +26,39 @@ type fakeAdminHTTPService struct {
 	detailCursor MessageCursor
 	err          error
 	lists        int
+	filter       AdminThreadFilter
 }
 
-func (s *fakeAdminHTTPService) ListAdminThreads(context.Context, Principal, AdminThreadFilter, ThreadCursor) ([]Thread, ThreadCursor, error) {
+func (s *fakeAdminHTTPService) ListAdminThreads(_ context.Context, _ Principal, filter AdminThreadFilter, _ ThreadCursor) ([]Thread, ThreadCursor, error) {
 	s.lists++
+	s.filter = filter
 	return []Thread{studentHTTPThreadValue()}, ThreadCursor{}, s.err
+}
+
+func TestAdminHTTPListAcceptsCanonicalFractionalEndOfDay(t *testing.T) {
+	admin := auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}
+	for _, tc := range []struct {
+		name, value string
+		want        int
+	}{
+		{"canonical milliseconds", "2025-07-22T23:59:59.999Z", http.StatusOK},
+		{"non canonical trailing zero", "2025-07-22T23:59:59.9990Z", http.StatusBadRequest},
+		{"non canonical offset", "2025-07-22T23:59:59.999+00:00", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeAdminHTTPService{}
+			h := NewAdminHandler(svc)
+			h.now = func() time.Time { return time.Date(2025, 7, 23, 0, 0, 0, 0, time.UTC) }
+			w := httptest.NewRecorder()
+			h.Routes().ServeHTTP(w, studentHTTPRequest(http.MethodGet, "/?to="+tc.value, "", admin))
+			if w.Code != tc.want {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if tc.want == http.StatusOK && !svc.filter.To.Equal(time.Date(2025, 7, 22, 23, 59, 59, 999000000, time.UTC)) {
+				t.Fatalf("to=%s", svc.filter.To)
+			}
+		})
+	}
 }
 func (s *fakeAdminHTTPService) GetAdminThread(_ context.Context, _ Principal, _ uuid.UUID, cursor MessageCursor) (AdminThreadDetail, error) {
 	s.detailCursor = cursor

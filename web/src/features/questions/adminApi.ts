@@ -19,7 +19,7 @@ export async function listAdminQuestions(filters: AdminQuestionFilters, cursor?:
   const result=await requestWithMeta<AdminQuestionThread[]>(`/admin/questions${query.size?`?${query.toString()}`:''}`,{signal})
   return {items:result.data,nextCursor:typeof result.meta?.nextCursor==='string'?result.meta.nextCursor:undefined}
 }
-export function getAdminQuestion(id:string,signal?:AbortSignal):Promise<AdminQuestionDetail>{return request(`/admin/questions/${encodeURIComponent(id)}`,{signal})}
+export function getAdminQuestion(id:string,options:{cursor?:string;limit?:number}={},signal?:AbortSignal):Promise<AdminQuestionDetail>{const query=new URLSearchParams();if(options.cursor)query.set('cursor',options.cursor);if(options.limit!==undefined)query.set('limit',String(options.limit));return request(`/admin/questions/${encodeURIComponent(id)}${query.size?`?${query.toString()}`:''}`,{signal})}
 export function replyToQuestion(id:string,body:string,attachments:AttachmentInput[],key:string,expectedVersion:number,signal?:AbortSignal):Promise<AdminMutationResult>{return request(`/admin/questions/${encodeURIComponent(id)}/messages`,{method:'POST',headers:{'Idempotency-Key':key},json:{body,attachments,expectedVersion},signal})}
 export function changeQuestionStatus(id:string,status:QuestionStatus,expectedVersion:number,signal?:AbortSignal):Promise<AdminQuestionThread>{return request(`/admin/questions/${encodeURIComponent(id)}/status`,{method:'POST',json:{status,expectedVersion},signal})}
 export function addTeacherNote(id:string,body:string,signal?:AbortSignal):Promise<TeacherNote>{return request(`/admin/questions/${encodeURIComponent(id)}/notes`,{method:'POST',json:{body},signal})}

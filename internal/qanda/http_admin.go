@@ -302,8 +302,8 @@ func adminDateQuery(w http.ResponseWriter, r *http.Request, q map[string][]strin
 	if !ok || !present {
 		return time.Time{}, ok
 	}
-	at, err := time.Parse(time.RFC3339, raw)
-	if err != nil || at.Location() != time.UTC || at.Format(time.RFC3339) != raw || at.After(now.UTC()) {
+	at, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || at.Location() != time.UTC || at.Format(time.RFC3339Nano) != raw || at.After(now.UTC()) {
 		qandaBad(w, r)
 		return time.Time{}, false
 	}

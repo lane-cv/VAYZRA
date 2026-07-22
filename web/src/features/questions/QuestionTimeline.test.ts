@@ -21,4 +21,5 @@ describe('QuestionTimeline', () => {
     expect(wrapper.get('a').attributes('href')).toBe('/api/v1/question-files/v%2F2/download')
     expect(wrapper.text()).not.toContain('预览')
   })
+  it('uses the correct speaker and bubble perspective for an admin viewer',()=>{const wrapper=mount(QuestionTimeline,{props:{viewerRole:'admin',messages:[{id:'s',senderRole:'student',kind:'initial',body:'student',createdAt:'2026-01-01',attachments:[]},{id:'a',senderRole:'admin',kind:'admin_reply',body:'admin',createdAt:'2026-01-02',attachments:[]}]}});const articles=wrapper.findAll('article');expect(articles[0].text()).toContain('学生');expect(articles[0].classes()).toContain('other');expect(articles[1].text()).toContain('我（老师）');expect(articles[1].classes()).toContain('mine')})
 })
