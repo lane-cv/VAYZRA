@@ -59,7 +59,7 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_processing_jobs WHERE file_version_id=$1 AND kind='process_file' AND state='queued'`, versionID).Scan(&jobs); err != nil {
 		t.Fatal(err)
 	}
-	if version != 13 || jobs != 1 {
+	if version != 14 || jobs != 1 {
 		t.Fatalf("migration version=%d jobs=%d", version, jobs)
 	}
 }

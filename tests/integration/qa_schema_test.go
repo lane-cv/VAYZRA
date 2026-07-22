@@ -160,6 +160,18 @@ func TestQAOwnershipSenderAndAttachmentIntegrity(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,0,'one.pdf')`, adminMessage, versionID); err == nil {
 		t.Fatal("file version reused across messages")
 	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, student); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','student_follow_up','disabled sender',$4)`, uuid.New(), threadID, student, uuid.NewString()); err == nil {
+		t.Fatal("disabled student sender insert succeeded")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET deleted_at=now() WHERE id=$1`, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'admin','admin_reply','deleted sender',$4)`, uuid.New(), threadID, admin, uuid.NewString()); err == nil {
+		t.Fatal("deleted admin sender insert succeeded")
+	}
 }
 
 func qaTeacher(t *testing.T, pool *pgxpool.Pool) uuid.UUID {

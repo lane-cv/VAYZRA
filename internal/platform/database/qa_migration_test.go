@@ -26,7 +26,7 @@ func TestQAMigrationDownRemovesSchema(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 13); err != nil {
+		if _, err := provider.UpTo(context.Background(), 14); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
@@ -55,7 +55,7 @@ func TestQAMessageKindMigrationBackfillsAndReversesIncrementally(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 13); err != nil {
+		if _, err := provider.UpTo(context.Background(), 14); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})

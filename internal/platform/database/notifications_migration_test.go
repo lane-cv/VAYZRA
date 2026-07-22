@@ -18,7 +18,7 @@ func TestNotificationMigrationPreservesLegacyOutboxRowsUpAndDown(t *testing.T) {
 	}
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
-	t.Cleanup(func() { _, _ = provider.UpTo(context.Background(), 13) })
+	t.Cleanup(func() { _, _ = provider.UpTo(context.Background(), 14) })
 	if _, err := provider.DownTo(ctx, 11); err != nil {
 		t.Fatal(err)
 	}

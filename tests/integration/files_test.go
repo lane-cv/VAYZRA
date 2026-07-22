@@ -33,7 +33,7 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 	}
 
 	var version int
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 13 {
+	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 14 {
 		t.Fatalf("migration version=%d err=%v", version, err)
 	}
 	var count int
