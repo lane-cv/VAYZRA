@@ -15,6 +15,7 @@ import StudentQuestionDetailView from '../features/questions/StudentQuestionDeta
 import TeacherQuestionDetailView from '../features/questions/TeacherQuestionDetailView.vue'
 import TeacherQuestionWorkspaceView from '../features/questions/TeacherQuestionWorkspaceView.vue'
 import TeacherQuestionPlaceholder from '../features/questions/TeacherQuestionPlaceholder.vue'
+import NotificationCenterView from '../features/notifications/NotificationCenterView.vue'
 import { useSessionStore } from '../stores/session'
 import type { Role } from '../api/client'
 
@@ -33,6 +34,7 @@ const routes: RouteRecordRaw[] = [
     { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
     { path: 'questions/:questionId', name: 'student-question-detail', component: StudentQuestionDetailView, props: true },
   ] },
+  { path: '/notifications', component: ConsoleLayout, meta: { requiresAuth: true }, children: [{ path: '', name: 'notifications', component: NotificationCenterView }] },
   { path: '/:pathMatch(.*)*', redirect: '/login' },
 ]
 
