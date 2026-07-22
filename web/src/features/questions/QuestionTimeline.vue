@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import type { QuestionMessage } from './types'
 const props = defineProps<{ messages: QuestionMessage[] }>()
 const ordered = computed(() => [...props.messages].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)))
-const filePath = (id: string, action: 'preview' | 'download') => `/api/v1/question-files/${encodeURIComponent(id)}/${action}`
+const filePath = (id: string) => `/api/v1/question-files/${encodeURIComponent(id)}/download`
 </script>
 <template>
   <section class="timeline" aria-label="问答消息">
@@ -13,8 +13,7 @@ const filePath = (id: string, action: 'preview' | 'download') => `/api/v1/questi
       <ul v-if="message.attachments.length" aria-label="消息附件">
         <li v-for="attachment in message.attachments" :key="attachment.fileVersionId">
           <span>{{ attachment.displayName }}</span>
-          <a :href="filePath(attachment.fileVersionId, 'preview')" target="_blank" rel="noopener">预览</a>
-          <a :href="filePath(attachment.fileVersionId, 'download')">下载</a>
+          <a :href="filePath(attachment.fileVersionId)">下载</a>
         </li>
       </ul>
     </article>

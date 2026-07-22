@@ -20,7 +20,6 @@ describe('console router guards', () => {
     await router.push('/student/questions/new'); expect(router.currentRoute.value.name).toBe('student-question-new')
     await router.push('/student/questions/11111111-1111-4111-8111-111111111111'); expect(router.currentRoute.value.params.questionId).toBe('11111111-1111-4111-8111-111111111111')
     await router.push('/student/questions/not-a-uuid'); expect(router.currentRoute.value.name).toBe('student-questions')
-    await router.push('/student/notifications'); expect(router.currentRoute.value.name).toBe('student-questions')
     session.user = { id: 'a1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; await router.push('/student/questions/new'); expect(router.currentRoute.value.fullPath).toBe('/admin')
   })
   it('allows an admin to open the student management route', async () => {

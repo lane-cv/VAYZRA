@@ -8,33 +8,37 @@ import { addStudentMessage, getStudentQuestion, listStudentMessages, newIdempote
 import type { AttachmentInput, QuestionDetail, QuestionMessage, QuestionStatus } from './types'
 const props = withDefaults(defineProps<{ questionId: string; userId?: string }>(), { userId: '' })
 const session = props.userId ? undefined : useSessionStore(), detail = ref<QuestionDetail>(), loading = ref(false), error = ref(''), requestId = ref(''), reply = ref(''), attachments = ref<AttachmentInput[]>([]), uploadsPending = ref(false), submitting = ref(false), errorBox = ref<HTMLElement>(), uploaderKey = ref(0)
-let controller: AbortController | undefined, generation = 0
+let controller: AbortController | undefined, moreController: AbortController | undefined, generation = 0, mutationKey = '', mutationFingerprint = ''
 const labels: Record<QuestionStatus,string> = { pending:'待老师处理', in_progress:'老师处理中', waiting_student:'等待我回复', completed:'已完成' }
 const chars = (value:string) => Array.from(value.trim()).length
+function current(token:number,id:string){return token===generation&&id===props.questionId}
+function resetThread() { generation+=1;controller?.abort();moreController?.abort();detail.value=undefined;reply.value='';attachments.value=[];uploadsPending.value=false;submitting.value=false;error.value='';requestId.value='';mutationKey='';mutationFingerprint='';uploaderKey.value+=1 }
 async function load() {
-  const current=++generation; controller?.abort(); controller=new AbortController(); loading.value=true; error.value=''; requestId.value=''
-  try { const result=await getStudentQuestion(props.questionId,controller.signal); if(current===generation) detail.value=result }
-  catch(cause){if(controller.signal.aborted||current!==generation)return; showError(cause,'加载问题失败')}
-  finally{if(current===generation)loading.value=false}
+  controller?.abort(); moreController?.abort(); const token=++generation,id=props.questionId,requestController=new AbortController(); controller=requestController; loading.value=true; error.value=''; requestId.value=''
+  try { const result=await getStudentQuestion(id,requestController.signal); if(current(token,id)) detail.value=result }
+  catch(cause){if(requestController.signal.aborted||!current(token,id))return; showError(cause,'加载问题失败')}
+  finally{if(current(token,id))loading.value=false}
 }
 async function more() {
   if (!detail.value?.nextMessageCursor || loading.value) return
-  loading.value=true
-  try { const page=await listStudentMessages(props.questionId,detail.value.nextMessageCursor,100); detail.value={...detail.value,messages:merge(detail.value.messages,page.items),nextMessageCursor:page.nextCursor} }
-  catch(cause){showError(cause,'加载更多消息失败')} finally{loading.value=false}
+  const token=generation,id=props.questionId,cursor=detail.value.nextMessageCursor,requestController=new AbortController();moreController?.abort();moreController=requestController;loading.value=true
+  try { const page=await listStudentMessages(id,cursor,100,requestController.signal); if(current(token,id)&&detail.value?.thread.id===id) detail.value={...detail.value,messages:merge(detail.value.messages,page.items),nextMessageCursor:page.nextCursor} }
+  catch(cause){if(!requestController.signal.aborted&&current(token,id))showError(cause,'加载更多消息失败')} finally{if(current(token,id))loading.value=false}
 }
 async function submit() {
   if(submitting.value)return; error.value='';requestId.value=''
   if(chars(reply.value)<1||chars(reply.value)>20000) { error.value='追问内容需为 1–20,000 个字符'; await focusError(); return }
   if(uploadsPending.value){error.value='请等待附件完成安全检查';await focusError();return}
+  const id=props.questionId,token=generation,currentFingerprint=JSON.stringify([id,reply.value.trim(),attachments.value.map((attachment)=>attachment.fileVersionId)])
+  if(!mutationKey||mutationFingerprint!==currentFingerprint){mutationKey=newIdempotencyKey();mutationFingerprint=currentFingerprint}
   submitting.value=true
-  try { const result=await addStudentMessage(props.questionId,{body:reply.value.trim(),attachments:attachments.value},newIdempotencyKey()); if(detail.value) detail.value={thread:result.thread,messages:merge(detail.value.messages,result.messages),nextMessageCursor:detail.value.nextMessageCursor}; reply.value='';attachments.value=[];uploaderKey.value+=1 }
-  catch(cause){showError(cause,'追问提交失败');await focusError()} finally{submitting.value=false}
+  try { const result=await addStudentMessage(id,{body:reply.value.trim(),attachments:attachments.value},mutationKey);if(!current(token,id))return;if(detail.value) detail.value={thread:result.thread,messages:merge(detail.value.messages,result.messages),nextMessageCursor:detail.value.nextMessageCursor};reply.value='';attachments.value=[];mutationKey='';mutationFingerprint='';uploaderKey.value+=1 }
+  catch(cause){if(!current(token,id))return;showError(cause,'追问提交失败');await focusError()} finally{if(current(token,id))submitting.value=false}
 }
 function merge(first:QuestionMessage[],second:QuestionMessage[]){const byID=new Map(first.map((item)=>[item.id,item]));second.forEach((item)=>byID.set(item.id,item));return [...byID.values()]}
 function showError(cause:unknown,fallback:string){error.value=cause instanceof Error?cause.message:fallback;requestId.value=cause instanceof APIError?cause.requestId:''}
 async function focusError(){await nextTick();errorBox.value?.focus()}
-onMounted(()=>void load());watch(()=>props.questionId,()=>void load());onBeforeUnmount(()=>controller?.abort())
+onMounted(()=>void load());watch(()=>props.questionId,()=>{resetThread();void load()});onBeforeUnmount(()=>{generation+=1;controller?.abort();moreController?.abort()})
 </script>
 <template>
   <section class="detail" aria-labelledby="question-title">

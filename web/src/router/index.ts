@@ -29,7 +29,6 @@ const routes: RouteRecordRaw[] = [
     { path: 'questions', name: 'student-questions', component: StudentQuestionListView },
     { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
     { path: 'questions/:questionId', name: 'student-question-detail', component: StudentQuestionDetailView, props: true },
-    { path: 'notifications', redirect: { name: 'student-questions' } },
   ] },
   { path: '/:pathMatch(.*)*', redirect: '/login' },
 ]

@@ -9,7 +9,9 @@ import type { AttachmentInput } from './types'
 const props = withDefaults(defineProps<{ userId?: string }>(), { userId: '' })
 const router = useRouter(), session = props.userId ? undefined : useSessionStore()
 const title = ref(''), body = ref(''), attachments = ref<AttachmentInput[]>([]), uploadsPending = ref(false), submitting = ref(false), error = ref(''), requestId = ref(''), errorBox = ref<HTMLElement>()
+let mutationKey = '', mutationFingerprint = ''
 const chars = (value: string) => Array.from(value.trim()).length
+const fingerprint = () => JSON.stringify([title.value.trim(), body.value.trim(), attachments.value.map((attachment) => attachment.fileVersionId)])
 async function submit() {
   if (submitting.value) return
   error.value = ''; requestId.value = ''
@@ -17,9 +19,12 @@ async function submit() {
   else if (chars(body.value) < 1 || chars(body.value) > 20000) error.value = '问题描述需为 1–20,000 个字符'
   else if (uploadsPending.value) error.value = '请等待附件完成安全检查'
   if (error.value) { await nextTick(); errorBox.value?.focus(); return }
+  const currentFingerprint = fingerprint()
+  if (!mutationKey || mutationFingerprint !== currentFingerprint) { mutationKey = newIdempotencyKey(); mutationFingerprint = currentFingerprint }
   submitting.value = true
   try {
-    const detail = await createQuestion({ title: title.value.trim(), body: body.value.trim(), attachments: attachments.value }, newIdempotencyKey())
+    const detail = await createQuestion({ title: title.value.trim(), body: body.value.trim(), attachments: attachments.value }, mutationKey)
+    mutationKey = ''; mutationFingerprint = ''
     title.value = ''; body.value = ''; attachments.value = []
     await router.replace(`/student/questions/${encodeURIComponent(detail.thread.id)}`)
   } catch (cause) { error.value = cause instanceof Error ? cause.message : '提交失败，请稍后重试'; requestId.value = cause instanceof APIError ? cause.requestId : ''; await nextTick(); errorBox.value?.focus() }

@@ -41,7 +41,7 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.find('a[href="/admin/teaching"]').exists()).toBe(false)
     expect(wrapper.get('a[href="/student/learning"]').text()).toContain('课程学习')
     expect(wrapper.get('a[href="/student/questions"]').text()).toContain('老师答疑')
-    expect(wrapper.get('a[href="/student/notifications"]').text()).toContain('通知中心')
+    expect(wrapper.find('a[href="/student/notifications"]').exists()).toBe(false)
     expect(wrapper.find('a[href="/admin/questions"]').exists()).toBe(false)
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
