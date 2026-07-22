@@ -1,18 +1,13 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { APIError, type Role } from '../../api/client'
+import { APIError } from '../../api/client'
 import { useNotificationStore } from '../../stores/notifications'
 import { useSessionStore } from '../../stores/session'
-import type { NotificationItem } from './types'
+import { safeNotificationTarget, type NotificationItem } from './types'
 const notifications = useNotificationStore(), session = useSessionStore(), router = useRouter()
 const actionPending = ref(false), actionError = ref(''), actionRequestId = ref('')
-function safeTarget(path: string, role: Role | undefined): string | undefined {
-  const prefix = role === 'admin' ? '/admin/' : role === 'student' ? '/student/' : ''
-  if (!prefix || !path.startsWith(prefix) || path.includes('//') || path.includes('\\') || path.includes('%') || /[\u0000-\u001f]/.test(path)) return undefined
-  return path
-}
-async function open(item: NotificationItem) { const target = safeTarget(item.targetPath, session.user?.role); if (!target) return; try { await notifications.markRead(item.id) } catch { /* An idempotent read failure must not trap navigation. */ } await router.push(target) }
+async function open(item: NotificationItem) { const target = safeNotificationTarget(item.targetPath, session.user?.role); if (!target) return; try { await notifications.markRead(item.id) } catch { /* An idempotent read failure must not trap navigation. */ } await router.push(target) }
 async function markOne(id: string) { actionPending.value = true; actionError.value = ''; actionRequestId.value = ''; try { await notifications.markRead(id) } catch (cause) { actionError.value = cause instanceof Error ? cause.message : '操作失败'; actionRequestId.value = cause instanceof APIError ? cause.requestId : '' } finally { actionPending.value = false } }
 async function markAll() { actionPending.value = true; actionError.value = ''; actionRequestId.value = ''; try { await notifications.markAllRead() } catch (cause) { actionError.value = cause instanceof Error ? cause.message : '操作失败'; actionRequestId.value = cause instanceof APIError ? cause.requestId : '' } finally { actionPending.value = false } }
 onMounted(() => void notifications.list())
@@ -27,7 +22,7 @@ onBeforeUnmount(() => notifications.cancelList())
     <p v-else-if="!notifications.items.length" class="empty">暂时没有通知。</p>
     <ul v-else>
       <li v-for="item in notifications.items" :key="item.id" :class="{ unread: !item.readAt }">
-        <a v-if="safeTarget(item.targetPath, session.user?.role)" :href="safeTarget(item.targetPath, session.user?.role)" @click.prevent="open(item)"><strong>{{ item.title }}</strong><span>{{ item.summary }}</span><time :datetime="item.createdAt">{{ new Date(item.createdAt).toLocaleString('zh-CN') }}</time></a>
+        <a v-if="safeNotificationTarget(item.targetPath, session.user?.role)" :href="safeNotificationTarget(item.targetPath, session.user?.role)" @click.prevent="open(item)"><strong>{{ item.title }}</strong><span>{{ item.summary }}</span><time :datetime="item.createdAt">{{ new Date(item.createdAt).toLocaleString('zh-CN') }}</time></a>
         <div v-else><strong>{{ item.title }}</strong><span>{{ item.summary }}</span><time :datetime="item.createdAt">{{ new Date(item.createdAt).toLocaleString('zh-CN') }}</time></div>
         <button v-if="!item.readAt" type="button" :disabled="actionPending" @click="markOne(item.id)">标为已读</button>
       </li>

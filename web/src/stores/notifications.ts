@@ -5,22 +5,25 @@ import { listNotifications, markAllNotificationsRead, markNotificationRead, unre
 import type { NotificationItem } from '../features/notifications/types'
 
 const POLL_MS = 15_000
+const WAKE_COOLDOWN_MS = 250
 export const useNotificationStore = defineStore('notifications', () => {
   const unreadCount = ref(0), activeUserId = ref<string>(), items = ref<NotificationItem[]>([]), nextCursor = ref<string>()
   const listLoading = ref(false), listError = ref(''), requestId = ref('')
   let timer: ReturnType<typeof setInterval> | undefined, countController: AbortController | undefined
   let countPromise: Promise<void> | undefined, listController: AbortController | undefined
-  let generation = 0, listGeneration = 0, refreshQueued = false
+  let generation = 0, listGeneration = 0, lastWakeAt: number | undefined
 
   function clearTimer() { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
   function schedule() { clearTimer(); if (activeUserId.value && !document.hidden) timer = setInterval(() => void refresh(), POLL_MS) }
-  function queueRefresh() {
-    if (refreshQueued || !activeUserId.value || document.hidden) return
-    refreshQueued = true
-    queueMicrotask(() => { refreshQueued = false; void refresh() })
+  function wake() {
+    if (!activeUserId.value || document.hidden) return
+    const now = performance.now()
+    if (lastWakeAt !== undefined && now - lastWakeAt < WAKE_COOLDOWN_MS) return
+    lastWakeAt = now
+    void refresh()
   }
-  function visibility() { if (document.hidden) clearTimer(); else { schedule(); queueRefresh() } }
-  function focus() { queueRefresh() }
+  function visibility() { if (document.hidden) { clearTimer(); lastWakeAt = undefined } else { schedule(); wake() } }
+  function focus() { wake() }
 
   async function refresh(): Promise<void> {
     if (!activeUserId.value || countPromise) return countPromise
@@ -40,7 +43,7 @@ export const useNotificationStore = defineStore('notifications', () => {
   }
   function cancelList() { listGeneration++; listController?.abort(); listController = undefined; listLoading.value = false }
   function stop() {
-    generation++; activeUserId.value = undefined; refreshQueued = false; clearTimer()
+    generation++; activeUserId.value = undefined; lastWakeAt = undefined; clearTimer()
     document.removeEventListener('visibilitychange', visibility); window.removeEventListener('focus', focus)
     countController?.abort(); countController = undefined; countPromise = undefined; cancelList()
     unreadCount.value = 0; items.value = []; nextCursor.value = undefined; listError.value = ''; requestId.value = ''

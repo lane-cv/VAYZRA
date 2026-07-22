@@ -18,10 +18,18 @@ describe('notification polling lifecycle', () => {
   })
   it('pauses while hidden and coalesces visibility and focus refreshes', async () => {
     let hidden = false; vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden)
-    const store = useNotificationStore(); store.start('u1'); await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+    const store = useNotificationStore(); store.start('u1'); await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1)); await store.refresh()
     hidden = true; document.dispatchEvent(new Event('visibilitychange')); expect(vi.getTimerCount()).toBe(0)
     await vi.advanceTimersByTimeAsync(30_000); expect(fetch).toHaveBeenCalledTimes(1)
     hidden = false; document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('focus')); await vi.runAllTicks(); await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2)); expect(vi.getTimerCount()).toBe(1)
+  })
+  it('coalesces adjacent-task visibility and focus wakes even after a fast request settles', async () => {
+    let hidden = true; vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden)
+    const store = useNotificationStore(); store.start('u1'); await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1)); await store.refresh()
+    hidden = false; document.dispatchEvent(new Event('visibilitychange')); await vi.runAllTicks(); await Promise.resolve()
+    expect(fetch).toHaveBeenCalledTimes(2)
+    window.dispatchEvent(new Event('focus')); await vi.runAllTicks(); expect(fetch).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(250); window.dispatchEvent(new Event('focus')); await vi.runAllTicks(); expect(fetch).toHaveBeenCalledTimes(3)
   })
   it('does the one immediate refresh when started hidden but creates no timer', async () => {
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)

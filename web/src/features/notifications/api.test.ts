@@ -23,4 +23,10 @@ describe('notification api', () => {
     ])
     for (const call of vi.mocked(fetch).mock.calls.slice(1)) expect(JSON.parse(String(call[1]?.body))).toEqual({})
   })
+  it('rejects a non-object or non-empty mark-read data body', async () => {
+    for (const data of [[], { unexpected: true }, null, '']) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data })))
+      await expect(markNotificationRead('n1')).rejects.toMatchObject({ code: 'invalid_response' })
+    }
+  })
 })
