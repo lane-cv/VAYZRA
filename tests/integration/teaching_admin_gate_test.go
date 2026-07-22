@@ -57,7 +57,7 @@ func TestPublicationCheckRunsUnderDraftLockAndFailureRollsBack(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM lesson_revision_finalizations f JOIN lesson_revisions r ON r.id=f.revision_id WHERE r.lesson_id=$1`, lessonID).Scan(&finalizations); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE payload->>'lesson_id'=$1`, lessonID.String()).Scan(&outbox); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE payload->>'lessonId'=$1`, lessonID.String()).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE target_id=$1 AND action='lesson.published'`, lessonID.String()).Scan(&audits); err != nil {

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -89,6 +90,7 @@ type applicationDependencies struct {
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions       func(*pgxpool.Pool) qanda.HTTPServices
 	newNotifications   func(*pgxpool.Pool) notifications.HTTPService
+	startOutbox        func(*pgxpool.Pool) func()
 	ready              func(*pgxpool.Pool) func(context.Context) error
 	objectReady        func(context.Context, config.Config) (func(context.Context) error, error)
 	readinessTimeout   time.Duration
@@ -117,6 +119,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newStudentTeaching: newProductionStudentTeachingService,
 		newQuestions:       newProductionQuestionServices,
 		newNotifications:   newProductionNotificationService,
+		startOutbox:        newProductionOutboxRunner,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -262,7 +265,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closeOtherResources()
 		}
 	}
-	return app.New(app.Dependencies{
+	handler := app.New(app.Dependencies{
 		Ready:             ready,
 		Auth:              service,
 		Students:          studentService,
@@ -285,7 +288,20 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		SearchLimiter:     searchLimiter,
 		Captchas:          captchas,
 		StaticFiles:       os.DirFS("web/dist"),
-	}), closeResources, nil
+	})
+	if deps.startOutbox != nil {
+		stopOutbox := deps.startOutbox(pool)
+		if stopOutbox == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize notification delivery")
+		}
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopOutbox()
+			closeOtherResources()
+		}
+	}
+	return handler, closeResources, nil
 }
 
 const defaultReadinessTimeout = 5 * time.Second
@@ -415,6 +431,13 @@ func newProductionQuestionServices(pool *pgxpool.Pool) qanda.HTTPServices {
 
 func newProductionNotificationService(pool *pgxpool.Pool) notifications.HTTPService {
 	return notifications.NewService(notifications.NewPostgresStore(pool))
+}
+
+func newProductionOutboxRunner(pool *pgxpool.Pool) func() {
+	return notifications.StartOutboxRunner(notifications.Runner{
+		Store: notifications.NewPostgresOutboxStore(pool), Owner: uuid.NewString(),
+		PollInterval: time.Second, BatchTimeout: 10 * time.Second, ShutdownTimeout: 2 * time.Second,
+	})
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {

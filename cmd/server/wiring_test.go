@@ -304,3 +304,43 @@ func TestReadyHandlerReturnsWhenSharedDependencyBudgetExpires(t *testing.T) {
 		t.Fatal("blocking object readiness context not cancelled")
 	}
 }
+
+func TestBuildApplicationStartsOutboxAfterServicesAndStopsBeforeDatabase(t *testing.T) {
+	var order []string
+	_, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { order = append(order, "open"); return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { order = append(order, "migrate"); return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+			order = append(order, "services")
+			return serverFakeAuth{}, nil
+		},
+		ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		startOutbox: func(*pgxpool.Pool) func() {
+			order = append(order, "outbox-start")
+			return func() { order = append(order, "outbox-stop") }
+		},
+		close: func(*pgxpool.Pool) { order = append(order, "database-close") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResources()
+	want := []string{"open", "migrate", "services", "outbox-start", "outbox-stop", "database-close"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("order=%v want=%v", order, want)
+	}
+}
+
+func TestBuildApplicationDoesNotStartOutboxWhenServiceConstructionFails(t *testing.T) {
+	started := false
+	_, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:        func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth:     func(*pgxpool.Pool) (auth.HTTPService, error) { return nil, errors.New("private") },
+		startOutbox: func(*pgxpool.Pool) func() { started = true; return func() {} },
+		close:       func(*pgxpool.Pool) {},
+	})
+	if err == nil || closeResources != nil || started {
+		t.Fatalf("err=%v closeNil=%t started=%t", err, closeResources == nil, started)
+	}
+}

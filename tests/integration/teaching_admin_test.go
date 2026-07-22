@@ -67,7 +67,7 @@ func TestTeachingAdminPublicationWritesFrozenRevisionAuditAndOutbox(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='lesson.published' AND target_id=$1`, draft.LessonID.String()).Scan(&audits); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE kind='lesson.published' AND payload->>'lesson_id'=$1`, draft.LessonID.String()).Scan(&outbox); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE kind='lesson.published' AND payload=$1::jsonb AND dedupe_key=$2`, `{"schemaVersion":1,"lessonId":"`+draft.LessonID.String()+`","revisionId":"`+revision.ID.String()+`"}`, "lesson.published:"+revision.ID.String()).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
 	if finalizations != 1 || audits != 1 || outbox != 1 {

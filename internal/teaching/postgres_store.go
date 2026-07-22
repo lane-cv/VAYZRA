@@ -288,8 +288,15 @@ func (s *PostgresStore) PublishSnapshot(ctx context.Context, in PublishInput, d 
 	if _, err = s.q.Exec(ctx, `UPDATE lessons SET published_revision_id=$2,updated_at=now() WHERE id=$1`, in.LessonID, revision.ID); err != nil {
 		return Revision{}, mapTeachingError(err)
 	}
-	payload, _ := json.Marshal(map[string]string{"lesson_id": in.LessonID.String(), "revision_id": revision.ID.String()})
-	if _, err = s.q.Exec(ctx, `INSERT INTO outbox_events (kind,payload) VALUES ('lesson.published',$1::jsonb)`, payload); err != nil {
+	payload, err := json.Marshal(struct {
+		SchemaVersion int       `json:"schemaVersion"`
+		LessonID      uuid.UUID `json:"lessonId"`
+		RevisionID    uuid.UUID `json:"revisionId"`
+	}{SchemaVersion: 1, LessonID: revision.LessonID, RevisionID: revision.ID})
+	if err != nil {
+		return Revision{}, mapTeachingError(err)
+	}
+	if _, err = s.q.Exec(ctx, `INSERT INTO outbox_events (kind,payload,dedupe_key) VALUES ('lesson.published',$1::jsonb,$2) ON CONFLICT(dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`, payload, "lesson.published:"+revision.ID.String()); err != nil {
 		return Revision{}, mapTeachingError(err)
 	}
 	return revision, nil
