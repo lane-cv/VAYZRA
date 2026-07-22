@@ -32,7 +32,7 @@ async function submit() {
   const id=props.questionId,token=generation,currentFingerprint=JSON.stringify([id,reply.value.trim(),attachments.value.map((attachment)=>attachment.fileVersionId)])
   if(!mutationKey||mutationFingerprint!==currentFingerprint){mutationKey=newIdempotencyKey();mutationFingerprint=currentFingerprint}
   submitting.value=true
-  try { const result=await addStudentMessage(id,{body:reply.value.trim(),attachments:attachments.value},mutationKey);if(!current(token,id))return;if(detail.value) detail.value={thread:result.thread,messages:merge(detail.value.messages,result.messages),nextMessageCursor:detail.value.nextMessageCursor};reply.value='';attachments.value=[];mutationKey='';mutationFingerprint='';uploaderKey.value+=1 }
+  try { const expectedVersion=detail.value?.thread.version;if(expectedVersion===undefined)return;const result=await addStudentMessage(id,{body:reply.value.trim(),attachments:attachments.value},mutationKey,expectedVersion);if(!current(token,id))return;if(detail.value) detail.value={thread:result.thread,messages:merge(detail.value.messages,result.messages),nextMessageCursor:detail.value.nextMessageCursor};reply.value='';attachments.value=[];mutationKey='';mutationFingerprint='';uploaderKey.value+=1 }
   catch(cause){if(!current(token,id))return;showError(cause,'追问提交失败');await focusError()} finally{if(current(token,id))submitting.value=false}
 }
 function merge(first:QuestionMessage[],second:QuestionMessage[]){const byID=new Map(first.map((item)=>[item.id,item]));second.forEach((item)=>byID.set(item.id,item));return [...byID.values()]}

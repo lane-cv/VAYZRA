@@ -139,7 +139,7 @@ func (s *PostgresStore) ListAdminMessages(ctx context.Context, threadID uuid.UUI
 		createdAt = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 		id = uuid.Nil
 	}
-	rows, err := s.q.Query(ctx, `SELECT m.id,m.thread_id,m.sender_user_id,m.sender_role,m.message_kind,m.body_text,m.created_at FROM qa_messages m JOIN qa_threads q ON q.id=m.thread_id LEFT JOIN users sender ON sender.id=m.sender_user_id AND sender.status='active' AND sender.deleted_at IS NULL WHERE m.thread_id=$1 AND (m.created_at,m.id)>($2,$3) AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up')) OR (m.sender_role='admin' AND sender.role='admin' AND m.message_kind='admin_reply')) ORDER BY m.created_at,m.id LIMIT $4`, threadID, createdAt, id, cursor.Limit)
+	rows, err := s.q.Query(ctx, `SELECT m.id,m.thread_id,m.sender_user_id,m.sender_role,m.message_kind,m.body_text,m.created_at FROM qa_messages m JOIN qa_threads q ON q.id=m.thread_id WHERE m.thread_id=$1 AND (m.created_at,m.id)>($2,$3) AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up')) OR (m.sender_role='admin' AND m.message_kind='admin_reply')) ORDER BY m.created_at,m.id LIMIT $4`, threadID, createdAt, id, cursor.Limit)
 	if err != nil {
 		return nil, MessageCursor{}, mapPostgresError(err)
 	}
@@ -220,10 +220,9 @@ func (s *PostgresStore) ListStudentMessages(ctx context.Context, studentID, thre
 		FROM qa_messages m
 		JOIN qa_threads q ON q.id=m.thread_id
 		JOIN users u ON u.id=q.student_id AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
-		LEFT JOIN users sender_admin ON sender_admin.id=m.sender_user_id AND sender_admin.role='admin' AND sender_admin.status='active' AND sender_admin.deleted_at IS NULL
 		WHERE m.thread_id=$1 AND q.student_id=$2 AND (m.created_at,m.id)>($3,$4)
 		  AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up'))
-		    OR (m.sender_role='admin' AND sender_admin.id IS NOT NULL AND m.message_kind='admin_reply'))
+		    OR (m.sender_role='admin' AND m.message_kind='admin_reply'))
 		ORDER BY m.created_at,m.id LIMIT $5`, threadID, studentID, createdAt, id, cursor.Limit)
 	if err != nil {
 		return nil, MessageCursor{}, mapPostgresError(err)
@@ -422,9 +421,11 @@ func nullableTime(value time.Time) any {
 }
 
 type lockedQAAttachment struct {
-	id, owner                  uuid.UUID
-	purpose, state, mime, name string
-	size                       int64
+	id, owner                                uuid.UUID
+	purpose, state, mime, name, cleanupState string
+	size                                     int64
+	preview                                  bool
+	purgedAt                                 *time.Time
 }
 
 var qaAttachmentLimits = map[string]int64{
@@ -463,7 +464,8 @@ func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal,
 		requested[in.FileVersionID] = in
 		positions[in.SortPosition] = struct{}{}
 	}
-	rows, err := s.q.Query(ctx, `SELECT fv.id,f.created_by,fv.purpose,fv.processing_state,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.display_name
+	rows, err := s.q.Query(ctx, `SELECT fv.id,f.created_by,fv.purpose,fv.processing_state,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.display_name,
+	 EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready'),COALESCE(fv.cleanup_state,''),fv.purged_at
 	 FROM file_versions fv JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
 	 WHERE fv.id=ANY($1) ORDER BY fv.id FOR UPDATE OF fv,f`, ids)
 	if err != nil {
@@ -473,7 +475,7 @@ func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal,
 	locked := make(map[uuid.UUID]lockedQAAttachment, len(ids))
 	for rows.Next() {
 		var a lockedQAAttachment
-		if err = rows.Scan(&a.id, &a.owner, &a.purpose, &a.state, &a.mime, &a.size, &a.name); err != nil {
+		if err = rows.Scan(&a.id, &a.owner, &a.purpose, &a.state, &a.mime, &a.size, &a.name, &a.preview, &a.cleanupState, &a.purgedAt); err != nil {
 			return nil, mapPostgresError(err)
 		}
 		locked[a.id] = a
@@ -484,12 +486,19 @@ func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal,
 	if len(locked) != len(requested) {
 		return nil, ErrForbidden
 	}
+	var bound bool
+	if err = s.q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM qa_message_files WHERE file_version_id=ANY($1))`, ids).Scan(&bound); err != nil {
+		return nil, mapPostgresError(err)
+	}
+	if bound {
+		return nil, ErrInvalidInput
+	}
 	out := make([]Attachment, 0, len(inputs))
 	images := 0
 	var total int64
 	for id, in := range requested {
 		a := locked[id]
-		if a.owner != actor.User.ID || a.purpose != "qa_attachment" {
+		if a.owner != actor.User.ID || a.purpose != "qa_attachment" || a.cleanupState == "deleting" || a.purgedAt != nil {
 			return nil, ErrForbidden
 		}
 		if a.state != "ready" {
@@ -517,7 +526,7 @@ func (s *PostgresStore) ValidateForMessage(ctx context.Context, actor Principal,
 		if !validQAAttachmentName(name) {
 			return nil, ErrInvalidInput
 		}
-		out = append(out, Attachment{FileVersionID: id, SortPosition: in.SortPosition, DisplayName: name})
+		out = append(out, Attachment{FileVersionID: id, SortPosition: in.SortPosition, DisplayName: name, PreviewAvailable: a.preview})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SortPosition < out[j].SortPosition })
 	return out, nil
@@ -559,7 +568,7 @@ func (s *PostgresStore) BindMessageAttachments(ctx context.Context, messageID uu
 }
 
 func (s *PostgresStore) listAdminMessageAttachments(ctx context.Context, messageID uuid.UUID) ([]Attachment, error) {
-	rows, err := s.q.Query(ctx, `SELECT mf.file_version_id,mf.sort_position,mf.display_name FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id JOIN file_versions fv ON fv.id=mf.file_version_id AND fv.purpose='qa_attachment' AND fv.processing_state='ready' JOIN files f ON f.id=fv.file_id AND f.created_by=m.sender_user_id AND f.deleted_at IS NULL WHERE mf.message_id=$1 ORDER BY mf.sort_position,mf.file_version_id`, messageID)
+	rows, err := s.q.Query(ctx, `SELECT mf.file_version_id,mf.sort_position,mf.display_name,EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=mf.file_version_id AND fp.processing_state='ready') FROM qa_message_files mf JOIN qa_messages m ON m.id=mf.message_id JOIN file_versions fv ON fv.id=mf.file_version_id AND fv.purpose='qa_attachment' AND fv.processing_state='ready' JOIN files f ON f.id=fv.file_id AND f.created_by=m.sender_user_id AND f.deleted_at IS NULL WHERE mf.message_id=$1 ORDER BY mf.sort_position,mf.file_version_id`, messageID)
 	if err != nil {
 		return nil, mapPostgresError(err)
 	}
@@ -567,7 +576,7 @@ func (s *PostgresStore) listAdminMessageAttachments(ctx context.Context, message
 	out := make([]Attachment, 0)
 	for rows.Next() {
 		var a Attachment
-		if err := rows.Scan(&a.FileVersionID, &a.SortPosition, &a.DisplayName); err != nil {
+		if err := rows.Scan(&a.FileVersionID, &a.SortPosition, &a.DisplayName, &a.PreviewAvailable); err != nil {
 			return nil, mapPostgresError(err)
 		}
 		out = append(out, a)
@@ -583,7 +592,8 @@ func (s *PostgresStore) requireActiveStudent(ctx context.Context, studentID uuid
 
 func (s *PostgresStore) listStudentMessageAttachments(ctx context.Context, studentID, messageID uuid.UUID) ([]Attachment, error) {
 	rows, err := s.q.Query(ctx, `
-		SELECT mf.file_version_id,mf.sort_position,mf.display_name
+		SELECT mf.file_version_id,mf.sort_position,mf.display_name,
+		  EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=mf.file_version_id AND fp.processing_state='ready')
 		FROM qa_message_files mf
 		JOIN qa_messages m ON m.id=mf.message_id
 		JOIN qa_threads q ON q.id=m.thread_id
@@ -591,10 +601,9 @@ func (s *PostgresStore) listStudentMessageAttachments(ctx context.Context, stude
 		JOIN file_versions fv ON fv.id=mf.file_version_id
 		  AND fv.purpose='qa_attachment' AND fv.processing_state='ready'
 		JOIN files f ON f.id=fv.file_id AND f.deleted_at IS NULL
-		LEFT JOIN users sender_admin ON sender_admin.id=m.sender_user_id AND sender_admin.role='admin' AND sender_admin.status='active' AND sender_admin.deleted_at IS NULL
 		WHERE mf.message_id=$1 AND q.student_id=$2
 		  AND ((m.sender_role='student' AND m.sender_user_id=q.student_id AND m.message_kind IN ('initial','student_follow_up') AND f.created_by=q.student_id)
-		    OR (m.sender_role='admin' AND sender_admin.id IS NOT NULL AND m.message_kind='admin_reply' AND f.created_by=m.sender_user_id))
+		    OR (m.sender_role='admin' AND m.message_kind='admin_reply' AND f.created_by=m.sender_user_id))
 		ORDER BY mf.sort_position,mf.file_version_id`, messageID, studentID)
 	if err != nil {
 		return nil, mapPostgresError(err)
@@ -603,7 +612,7 @@ func (s *PostgresStore) listStudentMessageAttachments(ctx context.Context, stude
 	attachments := make([]Attachment, 0)
 	for rows.Next() {
 		var attachment Attachment
-		if err := rows.Scan(&attachment.FileVersionID, &attachment.SortPosition, &attachment.DisplayName); err != nil {
+		if err := rows.Scan(&attachment.FileVersionID, &attachment.SortPosition, &attachment.DisplayName, &attachment.PreviewAvailable); err != nil {
 			return nil, mapPostgresError(err)
 		}
 		attachments = append(attachments, attachment)
@@ -656,6 +665,9 @@ func mapPostgresError(err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
+		if pgErr.Code == "23505" && pgErr.ConstraintName == "qa_message_files_file_version_unique" {
+			return ErrInvalidInput
+		}
 		switch pgErr.Code {
 		case "23505":
 			return ErrIdempotencyConflict

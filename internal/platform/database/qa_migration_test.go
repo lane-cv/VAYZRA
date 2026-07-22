@@ -26,7 +26,7 @@ func TestQAMigrationDownRemovesSchema(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 12); err != nil {
+		if _, err := provider.UpTo(context.Background(), 13); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
@@ -55,7 +55,7 @@ func TestQAMessageKindMigrationBackfillsAndReversesIncrementally(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 12); err != nil {
+		if _, err := provider.UpTo(context.Background(), 13); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
@@ -71,7 +71,14 @@ func TestQAMessageKindMigrationBackfillsAndReversesIncrementally(t *testing.T) {
 		t.Fatal(err)
 	}
 	var admin uuid.UUID
-	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE role='admin' AND deleted_at IS NULL LIMIT 1`).Scan(&admin); err != nil {
+	if err := pool.QueryRow(ctx, `
+		WITH existing AS (SELECT id FROM users WHERE role='admin' AND deleted_at IS NULL LIMIT 1),
+		inserted AS (
+			INSERT INTO users(username,display_name,role,status,password_hash)
+			SELECT $1,'Migration admin','admin','active','hash' WHERE NOT EXISTS(SELECT 1 FROM existing)
+			RETURNING id
+		)
+		SELECT id FROM existing UNION ALL SELECT id FROM inserted LIMIT 1`, "qa_kind_admin_"+uuid.NewString()).Scan(&admin); err != nil {
 		t.Fatal(err)
 	}
 	threadID := uuid.New()

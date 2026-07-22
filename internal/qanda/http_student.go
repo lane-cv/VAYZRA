@@ -143,7 +143,7 @@ func (h *StudentHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *StudentHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id, ok := qandaRouteID(w, r)
+	id, ok := qandaStudentRouteID(w, r)
 	if !ok {
 		return
 	}
@@ -162,7 +162,7 @@ func (h *StudentHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *StudentHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
-	id, ok := qandaRouteID(w, r)
+	id, ok := qandaStudentRouteID(w, r)
 	if !ok {
 		return
 	}
@@ -208,13 +208,14 @@ func (h *StudentHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *StudentHandler) AddMessage(w http.ResponseWriter, r *http.Request) {
-	id, ok := qandaRouteID(w, r)
+	id, ok := qandaStudentRouteID(w, r)
 	if !ok {
 		return
 	}
 	var body struct {
-		Body        string                `json:"body"`
-		Attachments []attachmentInputWire `json:"attachments"`
+		ExpectedVersion int64                 `json:"expectedVersion"`
+		Body            string                `json:"body"`
+		Attachments     []attachmentInputWire `json:"attachments"`
 	}
 	if !decodeQANDAJSON(w, r, &body) {
 		return
@@ -231,7 +232,7 @@ func (h *StudentHandler) AddMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	thread, message, err := h.service.AddStudentMessage(r.Context(), actor, AddMessageInput{ThreadID: id, Body: body.Body, IdempotencyKey: key, Attachments: attachments})
+	thread, message, err := h.service.AddStudentMessage(r.Context(), actor, AddMessageInput{ThreadID: id, ExpectedVersion: body.ExpectedVersion, Body: body.Body, IdempotencyKey: key, Attachments: attachments})
 	if err != nil {
 		qandaError(w, r, err)
 		return
@@ -315,11 +316,25 @@ func qandaJSONDecodeError(w http.ResponseWriter, r *http.Request, err error) {
 
 func qandaIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
 	values := r.Header.Values("Idempotency-Key")
+	if len(values) == 0 {
+		httpx.Error(w, r, http.StatusBadRequest, "idempotency_key_required", "缺少幂等键")
+		return "", false
+	}
 	if len(values) != 1 || !validIdempotencyKey(values[0]) {
-		qandaBad(w, r)
+		httpx.Error(w, r, http.StatusBadRequest, "invalid_idempotency_key", "幂等键无效")
 		return "", false
 	}
 	return values[0], true
+}
+
+func qandaStudentRouteID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	raw := chi.URLParam(r, "id")
+	id, err := uuid.Parse(raw)
+	if err != nil || id == uuid.Nil || id.String() != raw {
+		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 func qandaRouteID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

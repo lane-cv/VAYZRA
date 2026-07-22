@@ -90,6 +90,7 @@ type CreateThreadInput struct {
 
 type AddMessageInput struct {
 	ThreadID             uuid.UUID
+	ExpectedVersion      int64
 	Body, IdempotencyKey string
 	Attachments          []AttachmentInput
 }
@@ -140,9 +141,10 @@ type Thread struct {
 }
 
 type Attachment struct {
-	FileVersionID uuid.UUID
-	SortPosition  int
-	DisplayName   string
+	FileVersionID    uuid.UUID
+	SortPosition     int
+	DisplayName      string
+	PreviewAvailable bool
 }
 
 type Message struct {
@@ -191,7 +193,7 @@ func normalizeCreateInput(in CreateThreadInput) (CreateThreadInput, error) {
 
 func normalizeAddMessageInput(in AddMessageInput) (AddMessageInput, error) {
 	in.Body = strings.TrimSpace(in.Body)
-	if in.ThreadID == uuid.Nil || !validText(in.Body, 1, 20000) || !validIdempotencyKey(in.IdempotencyKey) || !validAttachments(in.Attachments) {
+	if in.ThreadID == uuid.Nil || in.ExpectedVersion < 1 || !validText(in.Body, 1, 20000) || !validIdempotencyKey(in.IdempotencyKey) || !validAttachments(in.Attachments) {
 		return AddMessageInput{}, ErrInvalidInput
 	}
 	in.Attachments = append([]AttachmentInput(nil), in.Attachments...)

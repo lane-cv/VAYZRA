@@ -52,9 +52,10 @@ type threadDTO struct {
 }
 
 type attachmentDTO struct {
-	FileVersionID uuid.UUID `json:"fileVersionId"`
-	SortPosition  int       `json:"sortPosition"`
-	DisplayName   string    `json:"displayName"`
+	FileVersionID    uuid.UUID `json:"fileVersionId"`
+	SortPosition     int       `json:"sortPosition"`
+	DisplayName      string    `json:"displayName"`
+	PreviewAvailable bool      `json:"previewAvailable"`
 }
 
 type messageDTO struct {
@@ -83,7 +84,7 @@ func threadView(thread Thread) threadDTO {
 func messageView(message Message) messageDTO {
 	attachments := make([]attachmentDTO, len(message.Attachments))
 	for i, attachment := range message.Attachments {
-		attachments[i] = attachmentDTO{FileVersionID: attachment.FileVersionID, SortPosition: attachment.SortPosition, DisplayName: attachment.DisplayName}
+		attachments[i] = attachmentDTO{FileVersionID: attachment.FileVersionID, SortPosition: attachment.SortPosition, DisplayName: attachment.DisplayName, PreviewAvailable: attachment.PreviewAvailable}
 	}
 	return messageDTO{ID: message.ID, SenderRole: message.SenderRole, Kind: message.Kind, Body: message.Body, CreatedAt: message.CreatedAt, Attachments: attachments}
 }

@@ -14,6 +14,7 @@ describe('StudentQuestionDetailView', () => {
     const wrapper = mount(StudentQuestionDetailView, { props: { questionId: 'q1', userId: 'u1' } }); await flushPromises()
     expect(wrapper.text()).toContain('已完成'); expect(wrapper.text()).toContain('仍可继续追问')
     await wrapper.get('[aria-label="追问内容"]').setValue('追问'); await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(api.add).toHaveBeenCalledWith('q1',{body:'追问',attachments:[]},'11111111-1111-4111-8111-111111111111',3)
     expect(wrapper.text()).toContain('追问'); expect(wrapper.text()).not.toContain('教师备注')
   })
   it('reuses a follow-up key after response loss and ignores a late reply after route change', async () => {

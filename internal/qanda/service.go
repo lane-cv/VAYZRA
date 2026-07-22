@@ -167,6 +167,9 @@ func (s *Service) AddStudentMessage(ctx context.Context, actor Principal, in Add
 		if !errors.Is(findErr, ErrNotFound) {
 			return findErr
 		}
+		if thread.Version != in.ExpectedVersion {
+			return ErrThreadConflict
+		}
 		next, nextErr := NextStatus(thread.Status, ActionStudentFollowUp, auth.RoleStudent)
 		if nextErr != nil {
 			return nextErr

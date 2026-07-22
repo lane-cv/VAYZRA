@@ -34,8 +34,8 @@ export async function listStudentMessages(id: string, cursor?: string, limit = 1
   return { items: result.data, nextCursor }
 }
 
-export async function addStudentMessage(id: string, input: { body: string; attachments: AttachmentInput[] }, key: string): Promise<QuestionDetail> {
-  const result = await request<MutationResult>(`/student/questions/${encodeURIComponent(id)}/messages`, { method: 'POST', headers: { 'Idempotency-Key': key }, json: input })
+export async function addStudentMessage(id: string, input: { body: string; attachments: AttachmentInput[] }, key: string, expectedVersion: number): Promise<QuestionDetail> {
+	const result = await request<MutationResult>(`/student/questions/${encodeURIComponent(id)}/messages`, { method: 'POST', headers: { 'Idempotency-Key': key }, json: { ...input, expectedVersion } })
   return { thread: result.thread, messages: [result.message] }
 }
 

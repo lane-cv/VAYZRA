@@ -115,6 +115,53 @@ func TestQAStatusAndMessageIdempotencyConstraints(t *testing.T) {
 	}
 }
 
+func TestQAOwnershipSenderAndAttachmentIntegrity(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	student, other, admin := qaStudent(t, pool), qaStudent(t, pool), qaTeacher(t, pool)
+	threadID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_threads(id,student_id,title,status,last_message_at) VALUES($1,$2,'Integrity','pending',now())`, threadID, student); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET student_id=$2 WHERE id=$1`, threadID, other); err == nil {
+		t.Fatal("qa thread ownership mutation succeeded")
+	}
+	for _, tc := range []struct {
+		name, role, kind string
+		sender           uuid.UUID
+	}{
+		{"cross student", "student", "student_follow_up", other},
+		{"non admin", "admin", "admin_reply", other},
+	} {
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,$4,$5,'invalid sender',$6)`, uuid.New(), threadID, tc.sender, tc.role, tc.kind, uuid.NewString()); err == nil {
+			t.Fatalf("%s sender insert succeeded", tc.name)
+		}
+	}
+	studentMessage, adminMessage := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'student','initial','valid',$4)`, studentMessage, threadID, student, uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key) VALUES($1,$2,$3,'admin','admin_reply','valid',$4)`, adminMessage, threadID, admin, uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	var fileID, versionID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, student).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'qa_attachment',$2,'one.pdf','application/pdf',1,$3,'ready',$4) RETURNING id`, fileID, "qa/"+uuid.NewString(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", student).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,0,'one.pdf')`, studentMessage, versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,0,'one.pdf')`, adminMessage, versionID); err == nil {
+		t.Fatal("file version reused across messages")
+	}
+}
+
 func qaTeacher(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	t.Helper()
 	var teacher uuid.UUID

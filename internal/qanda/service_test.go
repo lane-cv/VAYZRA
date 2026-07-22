@@ -329,7 +329,7 @@ func TestServiceStudentFollowUpReopensAndIsIdempotent(t *testing.T) {
 	thread := Thread{ID: uuid.New(), StudentID: studentID, Title: "Question", Status: StatusCompleted, Version: 4, LastMessageAt: completed, CreatedAt: completed, UpdatedAt: completed, CompletedAt: &completed}
 	uow.state.threads[thread.ID] = thread
 	svc := NewService(uow.readStore(), uow, func() time.Time { return now })
-	in := AddMessageInput{ThreadID: thread.ID, Body: "  more detail  ", IdempotencyKey: strings.Repeat("f", 16)}
+	in := AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 4, Body: "  more detail  ", IdempotencyKey: strings.Repeat("f", 16)}
 
 	updated, message, err := svc.AddStudentMessage(context.Background(), studentPrincipal(studentID), in)
 	if err != nil {
@@ -348,6 +348,27 @@ func TestServiceStudentFollowUpReopensAndIsIdempotent(t *testing.T) {
 	}
 	if againThread.ID != updated.ID || againMessage.ID != message.ID || len(uow.state.messages) != 1 || len(uow.audits) != 1 || len(uow.notifications) != 1 {
 		t.Fatalf("duplicate result=%#v/%#v counts=%d/%d/%d", againThread, againMessage, len(uow.state.messages), len(uow.audits), len(uow.notifications))
+	}
+}
+
+func TestServiceStudentFollowUpRequiresCurrentVersionButReplaysIdempotently(t *testing.T) {
+	studentID := uuid.New()
+	uow := newFakeUOW(uuid.New())
+	thread := Thread{ID: uuid.New(), StudentID: studentID, Status: StatusWaitingStudent, Version: 7, LastMessageAt: time.Now().Add(-time.Hour)}
+	uow.state.threads[thread.ID] = thread
+	svc := NewService(uow.readStore(), uow, time.Now)
+	actor := studentPrincipal(studentID)
+	key := strings.Repeat("v", 16)
+	if _, _, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 6, Body: "stale", IdempotencyKey: key}); !errors.Is(err, ErrThreadConflict) {
+		t.Fatalf("stale version error = %v, want ErrThreadConflict", err)
+	}
+	createdThread, createdMessage, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 7, Body: "current", IdempotencyKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedThread, replayedMessage, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 7, Body: "current", IdempotencyKey: key})
+	if err != nil || replayedThread.ID != createdThread.ID || replayedMessage.ID != createdMessage.ID {
+		t.Fatalf("idempotent replay = %#v/%#v, %v", replayedThread, replayedMessage, err)
 	}
 }
 
@@ -380,10 +401,10 @@ func TestServiceRejectsIdempotencyKeyReusedAcrossStudentThreads(t *testing.T) {
 	uow.state.threads[first.ID], uow.state.threads[second.ID] = first, second
 	svc := NewService(uow.readStore(), uow, time.Now)
 	key := strings.Repeat("x", 16)
-	if _, _, err := svc.AddStudentMessage(context.Background(), studentPrincipal(studentID), AddMessageInput{ThreadID: first.ID, Body: "first", IdempotencyKey: key}); err != nil {
+	if _, _, err := svc.AddStudentMessage(context.Background(), studentPrincipal(studentID), AddMessageInput{ThreadID: first.ID, ExpectedVersion: 1, Body: "first", IdempotencyKey: key}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.AddStudentMessage(context.Background(), studentPrincipal(studentID), AddMessageInput{ThreadID: second.ID, Body: "second", IdempotencyKey: key}); !errors.Is(err, ErrIdempotencyConflict) {
+	if _, _, err := svc.AddStudentMessage(context.Background(), studentPrincipal(studentID), AddMessageInput{ThreadID: second.ID, ExpectedVersion: 1, Body: "second", IdempotencyKey: key}); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -401,11 +422,11 @@ func TestServiceRejectsIdempotencyKeyReusedAcrossOperations(t *testing.T) {
 	ready := uow.state.threads[thread.ID]
 	ready.Status = StatusWaitingStudent
 	uow.state.threads[thread.ID] = ready
-	if _, _, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, Body: "Follow", IdempotencyKey: createKey}); !errors.Is(err, ErrIdempotencyConflict) {
+	if _, _, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 1, Body: "Follow", IdempotencyKey: createKey}); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("create key reused for follow-up error=%v", err)
 	}
 	followKey := strings.Repeat("p", 16)
-	if _, _, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, Body: "Follow", IdempotencyKey: followKey}); err != nil {
+	if _, _, err := svc.AddStudentMessage(context.Background(), actor, AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 1, Body: "Follow", IdempotencyKey: followKey}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := svc.CreateThread(context.Background(), actor, CreateThreadInput{Title: "Another", Body: "Another", IdempotencyKey: followKey}); !errors.Is(err, ErrIdempotencyConflict) {

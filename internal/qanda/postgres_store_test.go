@@ -66,8 +66,8 @@ func TestPostgresStudentIsolationDisabledDenialAndStableCursor(t *testing.T) {
 		t.Fatalf("reverse cross-student get error=%v", err)
 	}
 	malformedKey := strings.Repeat("m", 16)
-	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','student_follow_up','must remain private',$4,$5)`, uuid.New(), otherThread, first, malformedKey, stamp); err != nil {
-		t.Fatal(err)
+	if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,'student','student_follow_up','must remain private',$4,$5)`, uuid.New(), otherThread, first, malformedKey, stamp); err == nil {
+		t.Fatal("cross-owner sender insert succeeded")
 	}
 	if _, _, err := store.FindMessageByIdempotency(ctx, first, malformedKey); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-owner idempotency lookup error=%v", err)
@@ -92,19 +92,24 @@ func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing
 		t.Fatal(err)
 	}
 	studentMessage, adminMessage := uuid.New(), uuid.New()
-	malformedStudent, malformedAdmin := uuid.New(), uuid.New()
 	for _, row := range []struct {
 		id, sender            uuid.UUID
 		role, kind, body, key string
 		at                    time.Time
 	}{
 		{studentMessage, owner, "student", "initial", "visible student", uuid.NewString(), stamp},
-		{malformedStudent, other, "student", "student_follow_up", "cross student secret", uuid.NewString(), stamp.Add(time.Second)},
 		{adminMessage, admin, "admin", "admin_reply", "visible admin", uuid.NewString(), stamp.Add(2 * time.Second)},
-		{malformedAdmin, other, "admin", "admin_reply", "non-admin sender secret", uuid.NewString(), stamp.Add(3 * time.Second)},
 	} {
 		if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, row.id, threadID, row.sender, row.role, row.kind, row.body, row.key, row.at); err != nil {
 			t.Fatal(err)
+		}
+	}
+	for _, row := range []struct {
+		sender     uuid.UUID
+		role, kind string
+	}{{other, "student", "student_follow_up"}, {other, "admin", "admin_reply"}} {
+		if _, err := pool.Exec(ctx, `INSERT INTO qa_messages(id,thread_id,sender_user_id,sender_role,message_kind,body_text,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,'invalid sender',$6,$7)`, uuid.New(), threadID, row.sender, row.role, row.kind, uuid.NewString(), stamp.Add(time.Second)); err == nil {
+			t.Fatal("invalid sender message was accepted")
 		}
 	}
 	ownerFile := insertQATestFileVersion(t, pool, owner, "visible-student.pdf")
@@ -126,6 +131,10 @@ func TestPostgresStudentHistoryRejectsMalformedMessagesAndAttachments(t *testing
 		if _, err := pool.Exec(ctx, `INSERT INTO qa_message_files(message_id,file_version_id,sort_position,display_name) VALUES($1,$2,$3,$4)`, binding.message, binding.version, binding.position, binding.name); err != nil {
 			t.Fatal(err)
 		}
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `UPDATE users SET status='active' WHERE id=$1`, admin) })
+	if _, err := pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, admin); err != nil {
+		t.Fatal(err)
 	}
 	messages, _, err := NewPostgresStore(pool).ListStudentMessages(ctx, owner, threadID, MessageCursor{Limit: 10})
 	if err != nil {
@@ -213,6 +222,9 @@ func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
 	admin := activeQAAdmin(t, pool)
 	student, other := insertQAStudent(t, pool), insertQAStudent(t, pool)
 	valid := insertReadyQAAttachment(t, pool, student, "  answer.pdf  ", "application/pdf", 1024)
+	if _, err := pool.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,'pdf',$2,'application/pdf',1,$3,'ready')`, valid, "qa-preview/"+uuid.NewString(), strings.Repeat("d", 64)); err != nil {
+		t.Fatal(err)
+	}
 	foreign := insertReadyQAAttachment(t, pool, other, "secret.pdf", "application/pdf", 1024)
 	teaching := insertTeachingTestFileVersion(t, pool, student, "lesson.pdf")
 	svc := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return &capturingNotifications{} }), time.Now)
@@ -220,7 +232,7 @@ func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(message.Attachments) != 1 || message.Attachments[0].DisplayName != "answer.pdf" {
+	if len(message.Attachments) != 1 || message.Attachments[0].DisplayName != "answer.pdf" || !message.Attachments[0].PreviewAvailable {
 		t.Fatalf("attachments=%+v", message.Attachments)
 	}
 	var bound int
@@ -252,12 +264,20 @@ func TestQAAttachmentValidationBindsReadyOwnerPurposeAtomically(t *testing.T) {
 		t.Fatalf("deleted rollback messages=%d err=%v", messages, err)
 	}
 
-	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='failed' WHERE id=$1`, valid); err != nil {
+	notReady := insertReadyQAAttachment(t, pool, student, "not-ready.pdf", "application/pdf", 1)
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='failed' WHERE id=$1`, notReady); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Not ready", Body: "not ready", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: valid, SortPosition: 0}}})
+	_, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Not ready", Body: "not ready", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: notReady, SortPosition: 0}}})
 	if !errors.Is(err, ErrAttachmentNotReady) {
 		t.Fatalf("not ready err=%v", err)
+	}
+	deleting := insertReadyQAAttachment(t, pool, student, "deleting.pdf", "application/pdf", 1)
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET cleanup_state='deleting',cleanup_lease_owner='qa-test',cleanup_lease_until=now()+interval '1 minute' WHERE id=$1`, deleting); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = svc.CreateThread(ctx, postgresPrincipal(student), CreateThreadInput{Title: "Deleting", Body: "must reject", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: deleting, SortPosition: 0}}}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("deleting attachment err=%v", err)
 	}
 	_ = admin
 }
@@ -309,7 +329,7 @@ func TestPostgresConcurrentStudentFollowUpsAppendOnce(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='waiting_student',version=2 WHERE id=$1`, thread.ID); err != nil {
 		t.Fatal(err)
 	}
-	in := AddMessageInput{ThreadID: thread.ID, Body: "Follow up", IdempotencyKey: strings.Repeat("b", 16)}
+	in := AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 2, Body: "Follow up", IdempotencyKey: strings.Repeat("b", 16)}
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for i := 0; i < 2; i++ {
@@ -339,6 +359,44 @@ func TestPostgresConcurrentStudentFollowUpsAppendOnce(t *testing.T) {
 	}
 }
 
+func TestPostgresConcurrentAttachmentBindingAllowsOnlyOneMessage(t *testing.T) {
+	ctx, pool := postgresFixture(t)
+	activeQAAdmin(t, pool)
+	student := insertQAStudent(t, pool)
+	fileVersionID := insertReadyQAAttachment(t, pool, student, "single-use.pdf", "application/pdf", 1)
+	service := NewService(NewPostgresStore(pool), NewPostgresUnitOfWork(pool, func(pgx.Tx) NotificationWriter { return &capturingNotifications{} }), time.Now)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			<-start
+			_, _, err := service.CreateThread(context.Background(), postgresPrincipal(student), CreateThreadInput{Title: fmt.Sprintf("Concurrent %d", i), Body: "body", IdempotencyKey: uuid.NewString(), Attachments: []AttachmentInput{{FileVersionID: fileVersionID, SortPosition: 0}}})
+			results <- err
+		}()
+	}
+	close(start)
+	successes, rejected := 0, 0
+	for i := 0; i < 2; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrInvalidInput):
+			rejected++
+		default:
+			t.Fatalf("unexpected bind error: %v", err)
+		}
+	}
+	var bindings int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_message_files WHERE file_version_id=$1`, fileVersionID).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || rejected != 1 || bindings != 1 {
+		t.Fatalf("successes=%d rejected=%d bindings=%d", successes, rejected, bindings)
+	}
+}
+
 func TestPostgresStudentFollowUpUsesMonotonicActivityTime(t *testing.T) {
 	ctx, pool := postgresFixture(t)
 	activeQAAdmin(t, pool)
@@ -357,7 +415,7 @@ func TestPostgresStudentFollowUpUsesMonotonicActivityTime(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE qa_threads SET status='waiting_student',version=2 WHERE id=$1`, thread.ID); err != nil {
 		t.Fatal(err)
 	}
-	equalThread, equalMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, Body: "Equal", IdempotencyKey: uuid.NewString()})
+	equalThread, equalMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 2, Body: "Equal", IdempotencyKey: uuid.NewString()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +426,7 @@ func TestPostgresStudentFollowUpUsesMonotonicActivityTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock = base.Add(-time.Hour)
-	backwardThread, backwardMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, Body: "Backward", IdempotencyKey: uuid.NewString()})
+	backwardThread, backwardMessage, err := service.AddStudentMessage(ctx, postgresPrincipal(student), AddMessageInput{ThreadID: thread.ID, ExpectedVersion: 3, Body: "Backward", IdempotencyKey: uuid.NewString()})
 	if err != nil {
 		t.Fatal(err)
 	}

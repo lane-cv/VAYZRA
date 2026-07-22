@@ -61,7 +61,7 @@ func studentHTTPThreadValue() Thread {
 	return Thread{ID: studentHTTPThread, StudentID: studentHTTPUserID, Title: "Private title", Status: StatusPending, Version: 2, LastMessageAt: studentHTTPTime, CreatedAt: studentHTTPTime.Add(-time.Hour), UpdatedAt: studentHTTPTime}
 }
 func studentHTTPMessageValue() Message {
-	return Message{ID: studentHTTPMessage, ThreadID: studentHTTPThread, SenderUserID: studentHTTPUserID, SenderRole: auth.RoleStudent, Kind: MessageKindInitial, Body: "Private body", CreatedAt: studentHTTPTime, Attachments: []Attachment{{FileVersionID: studentHTTPFile, SortPosition: 0, DisplayName: "notes.txt"}}}
+	return Message{ID: studentHTTPMessage, ThreadID: studentHTTPThread, SenderUserID: studentHTTPUserID, SenderRole: auth.RoleStudent, Kind: MessageKindInitial, Body: "Private body", CreatedAt: studentHTTPTime, Attachments: []Attachment{{FileVersionID: studentHTTPFile, SortPosition: 0, DisplayName: "notes.txt", PreviewAvailable: true}}}
 }
 
 func TestStudentHTTPCreateStrictJSONAndIdempotencyContract(t *testing.T) {
@@ -81,8 +81,8 @@ func TestStudentHTTPCreateStrictJSONAndIdempotencyContract(t *testing.T) {
 		{name: "two objects", body: validBody + `{}`, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "body cap", body: `{"title":"Question","body":"` + strings.Repeat("x", 64*1024) + `"}`, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "request_too_large"},
 		{name: "body cap after valid object", body: validBody + strings.Repeat(" ", 64*1024), contentType: []string{"application/json"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "request_too_large"},
-		{name: "missing idempotency", body: validBody, contentType: []string{"application/json"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
-		{name: "duplicate idempotency", body: validBody, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef", "fedcba0987654321"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "missing idempotency", body: validBody, contentType: []string{"application/json"}, wantStatus: http.StatusBadRequest, wantCode: "idempotency_key_required"},
+		{name: "duplicate idempotency", body: validBody, contentType: []string{"application/json"}, keys: []string{"1234567890abcdef", "fedcba0987654321"}, wantStatus: http.StatusBadRequest, wantCode: "invalid_idempotency_key"},
 		{name: "valid", body: validBody, contentType: []string{"application/json; charset=utf-8"}, keys: []string{"1234567890abcdef"}, wantStatus: http.StatusCreated},
 	}
 	for _, tc := range tests {
@@ -167,7 +167,7 @@ func TestStudentHTTPDetailRepresentsMessageContinuationWithoutPrivateIdentifiers
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"nextMessageCursor":"`) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"fileVersionId":"`+studentHTTPFile.String()+`"`) || !strings.Contains(w.Body.String(), `"displayName":"notes.txt"`) {
+	if !strings.Contains(w.Body.String(), `"fileVersionId":"`+studentHTTPFile.String()+`"`) || !strings.Contains(w.Body.String(), `"displayName":"notes.txt"`) || !strings.Contains(w.Body.String(), `"previewAvailable":true`) {
 		t.Fatalf("missing safe attachment view: %s", w.Body.String())
 	}
 	for _, forbidden := range []string{"studentId", "senderUserId", "threadId", "objectKey", "bucket"} {
@@ -184,8 +184,8 @@ func TestStudentHTTPMessagesAndPathValidation(t *testing.T) {
 		wantStatus int
 	}{
 		{"valid", "/" + studentHTTPThread.String() + "/messages?cursor=" + validCursor + "&limit=50", http.StatusOK},
-		{"malformed thread", "/not-a-uuid/messages", http.StatusBadRequest},
-		{"zero thread", "/00000000-0000-0000-0000-000000000000/messages", http.StatusBadRequest},
+		{"malformed thread", "/not-a-uuid/messages", http.StatusNotFound},
+		{"zero thread", "/00000000-0000-0000-0000-000000000000/messages", http.StatusNotFound},
 		{"high limit", "/" + studentHTTPThread.String() + "/messages?limit=51", http.StatusBadRequest},
 		{"empty cursor", "/" + studentHTTPThread.String() + "/messages?cursor=", http.StatusBadRequest},
 		{"empty limit", "/" + studentHTTPThread.String() + "/messages?limit=", http.StatusBadRequest},
@@ -241,7 +241,7 @@ func TestStudentHTTPPreservesServiceSpecificDefaultLimits(t *testing.T) {
 }
 
 func TestStudentHTTPAddMessageStrictBodyAndMapsServiceErrors(t *testing.T) {
-	valid := `{"body":"Follow up","attachments":[]}`
+	valid := `{"expectedVersion":2,"body":"Follow up","attachments":[]}`
 	for _, tc := range []struct {
 		name, body string
 		err        error
@@ -252,6 +252,7 @@ func TestStudentHTTPAddMessageStrictBodyAndMapsServiceErrors(t *testing.T) {
 		{"unknown", `{"body":"Follow up","extra":true}`, nil, http.StatusBadRequest, "invalid_request"},
 		{"invalid input", valid, ErrInvalidInput, http.StatusBadRequest, "invalid_request"},
 		{"idempotency conflict", valid, ErrIdempotencyConflict, http.StatusConflict, "idempotency_conflict"},
+		{"thread conflict", valid, ErrThreadConflict, http.StatusConflict, "thread_conflict"},
 		{"not found", valid, ErrNotFound, http.StatusNotFound, "not_found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,10 +265,26 @@ func TestStudentHTTPAddMessageStrictBodyAndMapsServiceErrors(t *testing.T) {
 			if w.Code != tc.wantStatus || (tc.wantCode != "" && !strings.Contains(w.Body.String(), `"code":"`+tc.wantCode+`"`)) {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
-			if tc.wantStatus == http.StatusCreated && (svc.addInput.ThreadID != studentHTTPThread || svc.addInput.IdempotencyKey != "1234567890abcdef") {
+			if tc.wantStatus == http.StatusCreated && (svc.addInput.ThreadID != studentHTTPThread || svc.addInput.ExpectedVersion != 2 || svc.addInput.IdempotencyKey != "1234567890abcdef") {
 				t.Fatalf("input=%#v", svc.addInput)
 			}
 		})
+	}
+}
+
+func TestStudentHTTPInvalidThreadUUIDIsHiddenAsNotFound(t *testing.T) {
+	for _, target := range []string{"/not-a-uuid", "/20000000-0000-4000-8000-000000000002%20", "/20000000-0000-4000-8000-000000000002/messages"} {
+		r := studentHTTPRequest(http.MethodGet, target, "", auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive})
+		if strings.HasSuffix(target, "/messages") {
+			r = studentHTTPRequest(http.MethodPost, "/not-a-uuid/messages", `{"expectedVersion":2,"body":"x"}`, auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive})
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Idempotency-Key", "1234567890abcdef")
+		}
+		w := httptest.NewRecorder()
+		studentHTTPHandler(&fakeStudentHTTPService{}).ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"code":"not_found"`) {
+			t.Fatalf("target=%q status=%d body=%s", target, w.Code, w.Body.String())
+		}
 	}
 }
 

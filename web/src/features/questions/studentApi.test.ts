@@ -24,11 +24,11 @@ describe('student question api', () => {
     vi.mocked(fetch).mockImplementation(async () => new Response(JSON.stringify({ data: { thread: { id: 'q1' }, message: { id: 'm1' } } }), { status: 201 }))
     const key = crypto.randomUUID()
     await createQuestion({ title: 'Title', body: 'Body', attachments: [{ fileVersionId: 'v1', sortPosition: 0 }] }, key)
-    await addStudentMessage('q1', { body: 'More', attachments: [] }, key)
+    await addStudentMessage('q1', { body: 'More', attachments: [] }, key, 4)
     const calls = vi.mocked(fetch).mock.calls
     expect((calls[0][1]?.headers as Headers).get('Idempotency-Key')).toBe(key)
     expect(JSON.parse(String(calls[0][1]?.body))).toEqual({ title: 'Title', body: 'Body', attachments: [{ fileVersionId: 'v1', sortPosition: 0 }] })
-    expect(JSON.parse(String(calls[1][1]?.body))).toEqual({ body: 'More', attachments: [] })
+    expect(JSON.parse(String(calls[1][1]?.body))).toEqual({ body: 'More', attachments: [], expectedVersion: 4 })
   })
 
   it('preserves APIError request IDs', async () => {
