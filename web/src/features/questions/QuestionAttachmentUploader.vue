@@ -3,10 +3,10 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useSessionStore } from '../../stores/session'
 import { createUploadManager, type UploadManagerState } from '../teaching/uploadManager'
 import { questionFileStatus } from './studentApi'
-import { createStudentQuestionSessionStore, studentQuestionUploadTransport } from './questionUpload'
+import { adminQuestionUploadTransport, createAdminQuestionSessionStore, createStudentQuestionSessionStore, studentQuestionUploadTransport } from './questionUpload'
 import type { AttachmentInput, QAFileStatus } from './types'
 
-const props = withDefaults(defineProps<{ userId?: string; disabled?: boolean }>(), { userId: '', disabled: false })
+const props = withDefaults(defineProps<{ userId?: string; disabled?: boolean; role?: 'student'|'admin' }>(), { userId: '', disabled: false, role:'student' })
 const emit = defineEmits<{ 'update:attachments': [value: AttachmentInput[]]; 'pending-change': [value: boolean] }>()
 type Item = { name: string; size: number; state: 'pending' | 'ready' | 'rejected'; message: string; status?: QAFileStatus }
 const items = ref<Item[]>([])
@@ -47,7 +47,8 @@ async function choose(event: Event) {
     if (!isActive(token)) break
     const item: Item = { name: file.name, size: file.size, state: 'pending', message: '等待上传' }
     items.value.push(item); publish(token)
-    const manager = createUploadManager({ transport: studentQuestionUploadTransport, sessions: createStudentQuestionSessionStore(props.userId || session?.user?.id || 'unknown'), onState: (state: UploadManagerState) => {
+    const uid=props.userId||session?.user?.id||'unknown'
+    const manager = createUploadManager({ transport: props.role==='admin'?adminQuestionUploadTransport:studentQuestionUploadTransport, sessions: props.role==='admin'?createAdminQuestionSessionStore(uid):createStudentQuestionSessionStore(uid), onState: (state: UploadManagerState) => {
       if (!isActive(token)) return
       if (state.kind === 'hashing') item.message = `正在校验 ${state.progress}%`
       else if (state.kind === 'uploading') item.message = `正在上传 ${state.progress}%`

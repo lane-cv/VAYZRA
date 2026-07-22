@@ -1,0 +1,5 @@
+import { flushPromises,mount } from '@vue/test-utils'
+import { describe,expect,it,vi } from 'vitest'
+const api=vi.hoisted(()=>({list:vi.fn()}));vi.mock('./adminApi',async(original)=>({...(await original<typeof import('./adminApi')>()),listAdminQuestions:api.list}))
+import TeacherQuestionListView from './TeacherQuestionListView.vue'
+describe('TeacherQuestionListView',()=>{it('filters and renders the teacher queue without note data',async()=>{api.list.mockResolvedValue({items:[{id:'11111111-1111-4111-8111-111111111111',studentId:'s1',title:'题目',status:'pending',version:1,lastMessageAt:'2026-01-01',createdAt:'2026-01-01',updatedAt:'2026-01-01'}]});const w=mount(TeacherQuestionListView,{global:{stubs:{RouterLink:{props:['to'],template:'<a :href="to"><slot/></a>'}}}});await flushPromises();expect(w.text()).toContain('题目');await w.get('select').setValue('pending');await w.get('form').trigger('submit');await flushPromises();expect(api.list).toHaveBeenLastCalledWith(expect.objectContaining({status:'pending',limit:20}),undefined,expect.any(AbortSignal));expect(w.find('a[href="/admin/questions/11111111-1111-4111-8111-111111111111"]').exists()).toBe(true)})})

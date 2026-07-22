@@ -34,6 +34,7 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.get('a[href="/admin/students"]').text()).toContain('学生管理')
     expect(wrapper.get('a[href="/admin/teaching"]').text()).toContain('教学管理')
     expect(wrapper.get('a[href="/admin/files"]').text()).toContain('文件中心')
+    expect(wrapper.get('a[href="/admin/questions"]').text()).toContain('问题答疑')
     expect(wrapper.text()).not.toContain('即将开放')
   })
   it('never renders teaching administration for students', () => {

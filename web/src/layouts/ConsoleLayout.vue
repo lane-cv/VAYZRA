@@ -36,6 +36,7 @@ watch(() => route.fullPath, () => closeDrawer())
         <RouterLink v-if="isAdmin" to="/admin/students" @click="closeDrawer()">学生管理</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/teaching" @click="closeDrawer()">教学管理</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/files" @click="closeDrawer()">文件中心</RouterLink>
+        <RouterLink v-if="isAdmin" to="/admin/questions" @click="closeDrawer()">问题答疑</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student/learning" @click="closeDrawer()">课程学习</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student/questions" @click="closeDrawer()">老师答疑</RouterLink>

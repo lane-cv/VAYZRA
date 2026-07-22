@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const backing = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }))
 vi.mock('../teaching/uploadManager', async (original) => ({ ...(await original<typeof import('../teaching/uploadManager')>()), createIndexedDBUploadSessionStore: vi.fn(() => backing) }))
-import { createStudentQuestionSessionStore, studentQuestionUploadTransport } from './questionUpload'
+import { adminQuestionUploadTransport, createAdminQuestionSessionStore, createStudentQuestionSessionStore, studentQuestionUploadTransport } from './questionUpload'
 
 describe('student question upload adapters', () => {
   beforeEach(() => { vi.clearAllMocks(); document.cookie = 'hl_csrf=csrf; path=/'; vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { id: 'upload-1', parts: [] } })))) })
@@ -17,4 +17,5 @@ describe('student question upload adapters', () => {
     await studentQuestionUploadTransport.create({ displayName: 'x.pdf', declaredMime: 'application/pdf', expectedSize: 1, expectedSha256: 'a'.repeat(64) })
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/student/question-uploads')
   })
+  it('uses a distinct admin endpoint and session namespace',async()=>{const store=createAdminQuestionSessionStore('teacher:1');await store.set('file:4:2','upload-2');expect(backing.set).toHaveBeenCalledWith('qa:admin:teacher:1:file:4:2','upload-2');await adminQuestionUploadTransport.create({displayName:'x.pdf',declaredMime:'application/pdf',expectedSize:1,expectedSha256:'a'.repeat(64)});expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/question-uploads')})
 })
