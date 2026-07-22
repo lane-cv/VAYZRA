@@ -1,0 +1,9 @@
+export type QuestionStatus = 'pending' | 'in_progress' | 'waiting_student' | 'completed'
+export type QuestionAttachment = { fileVersionId: string; sortPosition: number; displayName: string }
+export type QuestionMessage = { id: string; senderRole: 'admin' | 'student'; kind: 'initial' | 'student_follow_up' | 'admin_reply'; body: string; createdAt: string; attachments: QuestionAttachment[] }
+export type QuestionThread = { id: string; title: string; status: QuestionStatus; version: number; lastMessageAt: string; createdAt: string; updatedAt: string; completedAt?: string }
+export type AttachmentInput = { fileVersionId: string; sortPosition: number }
+export type QuestionDetail = { thread: QuestionThread; messages: QuestionMessage[]; nextMessageCursor?: string }
+export type ThreadPage = { items: QuestionThread[]; nextCursor?: string }
+export type MessagePage = { items: QuestionMessage[]; nextCursor?: string }
+export type QAFileStatus = { fileVersionId: string; processingState: string; failureCategory?: string; detectedMime?: string; size: number; previewAvailable: boolean }

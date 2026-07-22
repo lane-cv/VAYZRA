@@ -9,6 +9,9 @@ import TeachingManagerView from '../features/teaching/TeachingManagerView.vue'
 import FileCenterView from '../features/files/FileCenterView.vue'
 import LessonEditorView from '../features/teaching/LessonEditorView.vue'
 import LearningView from '../features/learning/LearningView.vue'
+import StudentQuestionListView from '../features/questions/StudentQuestionListView.vue'
+import NewQuestionView from '../features/questions/NewQuestionView.vue'
+import StudentQuestionDetailView from '../features/questions/StudentQuestionDetailView.vue'
 import { useSessionStore } from '../stores/session'
 import type { Role } from '../api/client'
 
@@ -19,16 +22,26 @@ const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: LoginView },
   { path: '/change-password', name: 'change-password', component: ChangePasswordView, meta: { requiresAuth: true, allowDuringPasswordChange: true } },
   { path: '/admin', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['admin'] }, children: [{ path: '', name: 'admin-home', component: AdminHomeView }, { path: 'students', name: 'admin-students', component: StudentListView }, { path: 'teaching', name: 'admin-teaching', component: TeachingManagerView }, { path: 'teaching/lessons/:lessonId', name: 'admin-lesson-editor', component: LessonEditorView, props: true }, { path: 'files', name: 'admin-files', component: FileCenterView }] },
-  { path: '/student', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['student'] }, children: [{ path: '', name: 'student-home', component: StudentHomeView }, { path: 'learning', name: 'student-learning', component: LearningView }, { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true }] },
+  { path: '/student', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['student'] }, children: [
+    { path: '', name: 'student-home', component: StudentHomeView },
+    { path: 'learning', name: 'student-learning', component: LearningView },
+    { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true },
+    { path: 'questions', name: 'student-questions', component: StudentQuestionListView },
+    { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
+    { path: 'questions/:questionId', name: 'student-question-detail', component: StudentQuestionDetailView, props: true },
+    { path: 'notifications', redirect: { name: 'student-questions' } },
+  ] },
   { path: '/:pathMatch(.*)*', redirect: '/login' },
 ]
 
 const homeFor = (role: Role) => role === 'admin' ? '/admin' : '/student'
+const canonicalUUID = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 
 export function createAppRouter(history: RouterHistory = createWebHistory()) {
   const router = createRouter({ history, routes })
   let skipBootstrapForLogin = false
   router.beforeEach(async (to) => {
+    if (to.name === 'student-question-detail' && !canonicalUUID(String(to.params.questionId))) return { name: 'student-questions' }
     const session = useSessionStore()
     if (to.name === 'login' && skipBootstrapForLogin) { skipBootstrapForLogin = false; return true }
     try { await session.bootstrap() } catch {
