@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 sanitizer="$repo_root/scripts/sanitize-e2e-artifacts.sh"
+publisher="$repo_root/scripts/publish-e2e-diagnostics.sh"
+test -x "$publisher"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/nested"
@@ -40,5 +42,56 @@ while IFS= read -r line; do
   esac
 done < "$tmpdir/containers.log"
 grep -Fq 'log_lines_omitted=' "$tmpdir/containers.log"
+
+assert_no_publish_residue() {
+  local artifact_dir="$1"
+  test ! -e "$artifact_dir/containers.log"
+  test -z "$(find "$artifact_dir" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit)"
+  ! grep -R -Fq 'raw-private-value' "$artifact_dir" 2>/dev/null
+}
+
+exercise_publish() {
+  local scenario="$1" publish_dir="$tmpdir/publish-$1" command_dir="$tmpdir/commands-$1" status=0
+  mkdir -p "$publish_dir" "$command_dir"
+  cp "$tmpdir/containers.log" "$publish_dir/sanitized.log"
+  printf '%s\n' raw-private-value > "$tmpdir/raw-$scenario.log"
+  case "$scenario" in
+    success) ;;
+    install_fail)
+      cat > "$command_dir/install" <<'MOCK_INSTALL'
+#!/bin/sh
+exit 73
+MOCK_INSTALL
+      chmod +x "$command_dir/install"
+      ;;
+    mv_fail)
+      cat > "$command_dir/install" <<'MOCK_INSTALL'
+#!/bin/sh
+exec /usr/bin/install "$@"
+MOCK_INSTALL
+      cat > "$command_dir/mv" <<'MOCK_MV'
+#!/bin/sh
+exit 74
+MOCK_MV
+      chmod +x "$command_dir/install" "$command_dir/mv"
+      ;;
+  esac
+  PATH="$command_dir:$PATH" "$publisher" "$publish_dir/sanitized.log" "$publish_dir" "$scenario" || status=$?
+  if [[ "$scenario" == success ]]; then
+    test "$status" -eq 0
+    test -f "$publish_dir/containers.log"
+    test ! -e "$publish_dir/.containers.log.$scenario.tmp"
+    mode="$(stat -f '%Lp' "$publish_dir/containers.log" 2>/dev/null || stat -c '%a' "$publish_dir/containers.log")"
+    test "$mode" = 600
+    cmp -s "$publish_dir/sanitized.log" "$publish_dir/containers.log"
+  else
+    test "$status" -ne 0
+    assert_no_publish_residue "$publish_dir"
+  fi
+}
+
+exercise_publish success
+exercise_publish install_fail
+exercise_publish mv_fail
 
 echo 'E2E artifact sanitization contract: PASS'

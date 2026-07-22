@@ -22,7 +22,7 @@ test -x "$artifact_init_script"
 grep -Fq 'artifact_init="${prefix}_artifact_init"' "$script"
 grep -Fq '"$artifact_init"' "$script"
 grep -Fq 'docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0' "$script"
-grep -Fq -- '--cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges' "$script"
+grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges' "$script"
 grep -Fq '"$fixture_runner" --network none --read-only --user 1000:1000' "$script"
 grep -Fq -- '--tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=1000,gid=1000,mode=0700' "$script"
 grep -Fq -- '-w /tmp --entrypoint /bin/bash' "$script"
@@ -48,10 +48,10 @@ run_ownership_case() {
   local seed="${volume}_seed" init="${volume}_init" probe="${volume}_probe" verify="${volume}_verify"
   ownership_resources+=("$seed" "$init" "$probe" "$verify")
   docker_bounded 60 volume create "$volume" >/dev/null
-  docker_bounded 60 run --rm --name "$seed" --network none --read-only --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
+  docker_bounded 60 run --rm --name "$seed" --network none --read-only --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges \
     --tmpfs /tmp:rw,noexec,nosuid,size=4m -v "$volume:/artifacts" "$ownership_image" /bin/sh -c \
-    'mkdir -p /artifacts/results && : > /artifacts/containers.log && chown 0:0 /artifacts /artifacts/results /artifacts/containers.log && chmod 0700 /artifacts /artifacts/results'
-  docker_bounded 60 run --rm --name "$init" --network none --read-only --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges \
+    'mkdir -p /artifacts/results && : > /artifacts/containers.log && chmod 0700 /artifacts /artifacts/results && chown 1001:1001 /artifacts/results /artifacts/containers.log /artifacts'
+  docker_bounded 60 run --rm --name "$init" --network none --read-only --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
     --tmpfs /tmp:rw,noexec,nosuid,size=4m -v "$artifact_init_script:/init-e2e-artifacts.sh:ro" -v "$volume:/artifacts" \
     "$ownership_image" /bin/sh /init-e2e-artifacts.sh /artifacts
   docker_bounded 60 run --rm --name "$probe" --network none --read-only --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \

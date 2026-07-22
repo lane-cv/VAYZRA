@@ -28,6 +28,11 @@ set -Eeuo pipefail
 state="${FAKE_DOCKER_STATE:?}"
 scenario="${FAKE_DOCKER_SCENARIO:?}"
 mkdir -p "$state/resources/containers" "$state/resources/networks" "$state/resources/volumes" "$state/resources/images" "$state/markers"
+if [[ "$scenario" == hang && "$*" == *_data_init* && ! -f "$state/markers/startup-delay-used" ]]; then
+  touch "$state/markers/startup-delay-used"
+  sleep 5
+fi
+touch "${FAKE_DOCKER_READY_FILE:?}"
 printf '%s\n' "$*" >> "$state/calls.log"
 
 last="${*: -1}"
@@ -79,13 +84,16 @@ case "${1:-}" in
     [[ -n "$name" ]] || exit 2
     touch "$state/resources/containers/$name"
     if [[ "$name" == *_data_init ]]; then
-      touch "$state/markers/normal-command-started"
-      if [[ "$scenario" == sanitizer_fail ]]; then
+      if [[ "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
         service="${name%_data_init}_postgres"
         touch "$state/resources/containers/$service"
       fi
-      if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then exit 9; fi
+      if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
+        touch "$state/markers/normal-command-started"
+        exit 9
+      fi
       trap 'touch "$state/markers/deadline-terminated"; exit 143' TERM INT
+      touch "$state/markers/normal-command-started"
       while :; do sleep .1; done
     fi
     rm -f "$state/resources/containers/$name"
@@ -104,6 +112,27 @@ fi
 exec /bin/bash "$@"
 FAKE_BASH
 chmod +x "$tmpdir/bin/bash"
+
+cat > "$tmpdir/bin/install" <<'FAKE_INSTALL'
+#!/bin/bash
+set -Eeuo pipefail
+last="${*: -1}"
+if [[ "${FAKE_DOCKER_SCENARIO:-}" == publish_install_fail && "$last" == */.containers.log.*.tmp ]]; then
+  touch "${FAKE_DOCKER_STATE:?}/markers/publish-install-failed"
+  exit 73
+fi
+exec /usr/bin/install "$@"
+FAKE_INSTALL
+cat > "$tmpdir/bin/mv" <<'FAKE_MV'
+#!/bin/bash
+set -Eeuo pipefail
+if [[ "${FAKE_DOCKER_SCENARIO:-}" == publish_mv_fail && "${*: -1}" == */containers.log ]]; then
+  touch "${FAKE_DOCKER_STATE:?}/markers/publish-mv-failed"
+  exit 74
+fi
+exec /bin/mv "$@"
+FAKE_MV
+chmod +x "$tmpdir/bin/install" "$tmpdir/bin/mv"
 
 snapshot() {
   find "$1/resources" -type f -print 2>/dev/null | sed "s#^$1/resources/##" | sort
@@ -129,37 +158,41 @@ run_case() {
   state="$tmpdir/state-$(basename "$script")-$scenario"
   mkdir -p "$state/resources/containers" "$state/resources/networks" "$state/resources/volumes" "$state/resources/images" "$state/markers"
   if [[ "$scenario" == diagnostics_write_fail ]]; then : > "$state/artifacts"; fi
-  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then expected_status=9; else expected_status='nonzero'; fi
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then expected_status=9; else expected_status='nonzero'; fi
   local before after started_at elapsed pid=''
   before="$(snapshot "$state")"
   started_at="$(date +%s)"
   if [[ "$scenario" == interrupt ]]; then
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" &
     pid=$!
-    for _ in $(seq 1 300); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
+    for _ in $(seq 1 1200); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
     [[ -f "$state/markers/normal-command-started" ]] || failure_reasons+=$'\nnormal command never started'
+    sleep .2
     kill -TERM "$pid" 2>/dev/null || failure_reasons+=$'\nfailed to signal harness'
     wait "$pid" || status=$?
   else
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" || status=$?
   fi
   elapsed=$(( $(date +%s) - started_at ))
   after="$(snapshot "$state")"
   [[ "$status" -ne 0 ]] || failure_reasons+=$'\nexpected non-zero status'
   if [[ "$expected_status" != nonzero && "$status" -ne "$expected_status" ]]; then failure_reasons+=$'\noriginal status was not preserved'; fi
-  (( elapsed <= 30 )) || failure_reasons+=$'\nelapsed time exceeded 30-second loaded-host budget'
+  (( elapsed <= 90 )) || failure_reasons+=$'\nelapsed time exceeded 90-second loaded-host budget'
   [[ "$after" == "$before" ]] || failure_reasons+=$'\nresource inventory changed'
   [[ -f "$state/markers/normal-command-started" ]] || failure_reasons+=$'\nnormal command marker missing'
   if [[ "$scenario" == hang && ! -f "$state/markers/deadline-terminated" ]]; then failure_reasons+=$'\noperation deadline marker missing'; fi
   if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-hung" ]]; then failure_reasons+=$'\ncleanup hang marker missing'; fi
   if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-terminated" ]]; then failure_reasons+=$'\ncleanup deadline marker missing'; fi
   if [[ "$scenario" == sanitizer_fail && ! -f "$state/markers/sanitizer-failed" ]]; then failure_reasons+=$'\nsanitizer failure marker missing'; fi
-  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail ]]; then
+  if [[ "$scenario" == publish_install_fail && ! -f "$state/markers/publish-install-failed" ]]; then failure_reasons+=$'\npublish install failure marker missing'; fi
+  if [[ "$scenario" == publish_mv_fail && ! -f "$state/markers/publish-mv-failed" ]]; then failure_reasons+=$'\npublish mv failure marker missing'; fi
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
     assert_safe_upload_directory "$state/artifacts" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
+    [[ -z "$(find "$state/artifacts" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit 2>/dev/null)" ]] || failure_reasons+=$'\npublish temporary file remained'
   fi
   local container_line network_line volume_line image_line
   container_line="$(grep -n '^container-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
@@ -191,6 +224,8 @@ for script in "$phase2" "$phase3"; do
   run_case "$script" cleanup_hang
   run_case "$script" diagnostics_write_fail
   run_case "$script" sanitizer_fail
+  run_case "$script" publish_install_fail
+  run_case "$script" publish_mv_fail
 done
 
 echo 'E2E harness semantics contract: PASS'

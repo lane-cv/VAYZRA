@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Shared deadline primitives for disposable E2E harnesses. The optional test
-# cap can only shorten deadlines, so it cannot turn a failed operation into a
-# successful bypass of production work.
+# controls only apply with the deadline cap enabled, so production deadlines
+# cannot be postponed or bypassed through the readiness handshake.
 E2E_ACTIVE_COMMAND_PID=''
 E2E_ACTIVE_TIMER_PID=''
 
@@ -33,10 +33,31 @@ cancel_bounded_command() {
 }
 
 run_bounded() {
-  local seconds grace command_status=0
+  local seconds grace command_status=0 ready_file='' ready_attempt
   seconds="$(bounded_seconds "${1:?deadline required}")"; shift
   grace="$(bounded_grace_seconds)"
+  if [[ -n "${HAPPYLEARN_E2E_TEST_READY_FILE:-}" ]]; then
+    [[ -n "${HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS:-}" ]] || { echo 'test readiness requires the test deadline cap' >&2; return 2; }
+    ready_file="$HAPPYLEARN_E2E_TEST_READY_FILE"
+    [[ "$ready_file" == /* ]] || { echo 'HAPPYLEARN_E2E_TEST_READY_FILE must be absolute' >&2; return 2; }
+    rm -f "$ready_file" || return 2
+  fi
   "$@" & E2E_ACTIVE_COMMAND_PID=$!
+  if [[ -n "$ready_file" ]]; then
+    for ready_attempt in $(seq 1 600); do
+      [[ -e "$ready_file" ]] && break
+      if ! kill -0 "$E2E_ACTIVE_COMMAND_PID" 2>/dev/null; then
+        wait "$E2E_ACTIVE_COMMAND_PID" || command_status=$?
+        E2E_ACTIVE_COMMAND_PID=''
+        return "$command_status"
+      fi
+      sleep .1
+    done
+    if [[ ! -e "$ready_file" ]]; then
+      cancel_bounded_command
+      return 124
+    fi
+  fi
   (
     sleep "$seconds"
     kill -TERM "$E2E_ACTIVE_COMMAND_PID" 2>/dev/null || exit 0

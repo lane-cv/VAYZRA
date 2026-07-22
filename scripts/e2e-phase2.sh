@@ -67,7 +67,7 @@ diagnostics() {
     rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
     return 0
   fi
-  if ! install -m 0600 "$staging_log" "$publish_tmp" || ! mv -f "$publish_tmp" "$final_log"; then
+  if ! "$script_dir/publish-e2e-diagnostics.sh" "$staging_log" "$artifact_dir" "$nonce"; then
     rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
   fi
 }
@@ -90,7 +90,7 @@ trap cleanup EXIT INT TERM
 
 install -d -m 0700 "$artifact_dir" || true
 docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0 \
-  --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=4m \
+  --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=4m \
   -v "$artifact_init_script:/init-e2e-artifacts.sh:ro" -v "$artifact_dir:/artifacts" \
   "$artifact_init_image" /bin/sh /init-e2e-artifacts.sh /artifacts
 
