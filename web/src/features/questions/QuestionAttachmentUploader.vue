@@ -94,7 +94,7 @@ function abortableDelay(milliseconds: number, signal: AbortSignal) {
 function invalidate(clear: boolean) {
   generation += 1
   activeControllers.forEach((controller) => controller.abort()); activeControllers.clear()
-  const managers = [...activeManagers]; activeManagers.clear(); managers.forEach((manager) => { try { const cancellation=manager.cancel();if(cancellation)void cancellation.catch(()=>undefined) } catch { /* Teardown remains best-effort. */ } })
+  const managers = [...activeManagers]; activeManagers.clear(); managers.forEach((manager) => { try { const cancellation=manager.cancel();if(cancellation !== undefined)void cancellation.catch(()=>undefined) } catch { /* Teardown remains best-effort. */ } })
   if (clear && !destroyed) { items.value = []; error.value = '';if(inputRef.value)inputRef.value.value='';emit('pending-change', false); emit('update:attachments', []) }
 }
 watch(() => props.userId || session?.user?.id || '', (next, previous) => { if (next !== previous) invalidate(true) })

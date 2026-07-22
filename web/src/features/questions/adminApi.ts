@@ -1,4 +1,5 @@
 import { request, requestWithMeta } from '../../api/client'
+import { uuidV4 } from '../../utils/uuid'
 import type { AttachmentInput, QuestionDetail, QuestionMessage, QuestionStatus, QuestionThread } from './types'
 
 export type AdminQuestionThread = QuestionThread & { studentId: string }
@@ -23,4 +24,4 @@ export function getAdminQuestion(id:string,options:{cursor?:string;limit?:number
 export function replyToQuestion(id:string,body:string,attachments:AttachmentInput[],key:string,expectedVersion:number,signal?:AbortSignal):Promise<AdminMutationResult>{return request(`/admin/questions/${encodeURIComponent(id)}/messages`,{method:'POST',headers:{'Idempotency-Key':key},json:{body,attachments,expectedVersion},signal})}
 export function changeQuestionStatus(id:string,status:QuestionStatus,expectedVersion:number,signal?:AbortSignal):Promise<AdminQuestionThread>{return request(`/admin/questions/${encodeURIComponent(id)}/status`,{method:'POST',json:{status,expectedVersion},signal})}
 export function addTeacherNote(id:string,body:string,signal?:AbortSignal):Promise<TeacherNote>{return request(`/admin/questions/${encodeURIComponent(id)}/notes`,{method:'POST',json:{body},signal})}
-export function newAdminIdempotencyKey():string{return crypto.randomUUID()}
+export function newAdminIdempotencyKey():string{return uuidV4()}

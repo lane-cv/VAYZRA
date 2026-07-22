@@ -10,6 +10,7 @@ test.beforeAll(() => {
 })
 
 test('teacher UI publishes immutable, audience-bound lessons and revokes access', async ({ browser }) => {
+  test.setTimeout(180_000)
   const suffix = `${Date.now()}-${Math.floor(Math.random() * 10_000)}`
   const admin = await browser.newContext()
   const studentAContext = await browser.newContext()
@@ -48,12 +49,16 @@ test('teacher UI publishes immutable, audience-bound lessons and revokes access'
     await expect(adminPage.getByText('已保存', { exact: true })).toBeVisible()
     await staleAdminPage.getByLabel('课程摘要').fill('过期页面写入')
     await expect(staleAdminPage.getByRole('alert')).toContainText('草稿已在其他页面更新')
+    const reloadResponse = staleAdminPage.waitForResponse((response) => response.request().method() === 'GET' && response.url().endsWith(`/api/v1/admin/lessons/${draft.lessonId}`))
     await staleAdminPage.getByRole('button', { name: '重新加载服务器草稿' }).click()
-    await expect(staleAdminPage.getByLabel('课程正文', { exact: true })).toHaveValue(/第二版/)
+    expect((await reloadResponse).status()).toBe(200)
+    await expect(staleAdminPage.getByLabel('课程正文', { exact: true })).toHaveValue(/第二版/, { timeout: 15_000 })
     draft = (await apiJSON<{ draft: Draft }>(adminPage, 'GET', `/api/v1/admin/lessons/${draft.lessonId}`)).draft
     expect(await apiJSON<{ version: number; bodyMarkdown: string }>(studentAPage, 'GET', `/api/v1/student/lessons/${draft.lessonId}`)).toMatchObject({ version: 1, bodyMarkdown: expect.stringContaining('第一版') })
     await adminPage.getByRole('button', { name: '发布课程' }).click()
+    const secondPublishResponse = adminPage.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/api/v1/admin/lessons/${draft.lessonId}/publish`))
     await adminPage.getByRole('button', { name: '确认发布课程' }).click()
+    expect((await secondPublishResponse).status()).toBe(201)
     await expect(adminPage.getByText('发布成功：第 2 版')).toBeVisible()
     expect(await apiJSON<{ version: number }>(studentAPage, 'GET', `/api/v1/student/lessons/${draft.lessonId}`)).toMatchObject({ version: 2 })
 

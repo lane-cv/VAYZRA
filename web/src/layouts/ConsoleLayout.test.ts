@@ -28,6 +28,8 @@ describe('ConsoleLayout drawer', () => {
     const trigger = wrapper.get('button[aria-label="打开导航"]')
     expect(trigger.attributes('aria-expanded')).toBe('false')
     expect(trigger.attributes('aria-controls')).toBe('console-navigation')
+    expect(wrapper.get('nav').attributes('id')).toBe('console-navigation')
+    expect(wrapper.get('nav').attributes('aria-label')).toBe('主导航')
     expect(wrapper.get('aside').attributes('aria-hidden')).toBe('true')
     await trigger.trigger('click'); await flushPromises()
     expect(document.activeElement).toBe(wrapper.get('nav a').element)

@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3
 
 test-go:
 	$(GO) test ./...
@@ -11,6 +11,7 @@ test-go:
 test-web:
 	$(PNPM) test
 	$(PNPM) typecheck
+	$(PNPM) lint
 	$(PNPM) build
 
 tools: $(GOVULNCHECK)
@@ -25,6 +26,7 @@ verify: tools
 	$(GOVULNCHECK) ./...
 	$(PNPM) test
 	$(PNPM) typecheck
+	$(PNPM) lint
 	$(PNPM) build
 	docker compose -f deploy/compose.dev.yml config --quiet
 
@@ -33,3 +35,6 @@ e2e:
 
 e2e-phase2:
 	bash scripts/e2e-phase2.sh
+
+e2e-phase3:
+	bash scripts/e2e-phase3.sh

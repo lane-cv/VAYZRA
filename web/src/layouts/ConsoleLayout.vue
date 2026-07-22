@@ -34,7 +34,7 @@ watch(() => session.user?.id, (userId) => { if (userId) notifications.start(user
     <aside id="console-navigation" class="sidebar" aria-label="主导航" :aria-hidden="isMobile && !drawerOpen ? 'true' : undefined" :inert="isMobile && !drawerOpen || undefined">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>HappyLearn</span></div>
       <p class="role-label">{{ isAdmin ? '教师空间' : '学生空间' }}</p>
-      <nav ref="navigation">
+      <nav id="console-navigation" ref="navigation" aria-label="主导航">
         <RouterLink v-if="isAdmin" to="/admin" @click="closeDrawer()">仪表盘</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/students" @click="closeDrawer()">学生管理</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/teaching" @click="closeDrawer()">教学管理</RouterLink>

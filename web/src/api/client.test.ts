@@ -65,7 +65,7 @@ describe('request', () => {
 
   it('rejects malformed percent-encoded CSRF values before fetch', async () => {
     document.cookie = 'hl_csrf=%E0%A4%A; path=/'
-    const cookie = vi.spyOn(document, 'cookie', 'get').mockReturnValue('hl_csrf=%E0%A4%A')
+    vi.spyOn(document, 'cookie', 'get').mockReturnValue('hl_csrf=%E0%A4%A')
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     await expect(request('/auth/logout', { method: 'POST' })).rejects.toEqual(expect.objectContaining({ code: 'csrf_missing' }))
     expect(fetchMock).not.toHaveBeenCalled()

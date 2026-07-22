@@ -46,6 +46,7 @@ jobs:
       - run: govulncheck ./...
       - run: pnpm --dir web test
       - run: pnpm --dir web typecheck
+      - run: pnpm lint
       - run: pnpm --dir web build
       - run: pnpm audit --prod
       - run: docker compose -f deploy/compose.dev.yml config --quiet
@@ -82,5 +83,29 @@ jobs:
         with:
           name: phase2-failure-${{ github.run_id }}
           path: test-results/phase2
+          if-no-files-found: ignore
+          retention-days: 7
+
+  phase3-e2e:
+    runs-on: ubuntu-24.04
+    needs: verify
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Configure disposable AIStor license
+        env:
+          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
+        run: |
+          test -n "$AISTOR_LICENSE"
+          umask 077
+          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+      - name: Run isolated Phase 3 acceptance
+        run: bash scripts/e2e-phase3.sh
+      - name: Upload sanitized disposable failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: phase3-failure-${{ github.run_id }}
+          path: test-results/phase3/containers.log
           if-no-files-found: ignore
           retention-days: 7

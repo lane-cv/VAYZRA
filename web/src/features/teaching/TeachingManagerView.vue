@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeMount, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeMount, onBeforeUnmount, ref } from 'vue'
 import { APIError } from '../../api/client'
 import { useSessionStore } from '../../stores/session'
 import CatalogTree from './CatalogTree.vue'

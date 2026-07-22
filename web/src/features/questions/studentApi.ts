@@ -1,4 +1,5 @@
 import { APIError, request, requestWithMeta } from '../../api/client'
+import { uuidV4 } from '../../utils/uuid'
 import type { AttachmentInput, MessagePage, QAFileStatus, QuestionDetail, QuestionMessage, QuestionStatus, QuestionThread, ThreadPage } from './types'
 
 type MutationResult = { thread: QuestionThread; message: QuestionMessage }
@@ -51,4 +52,4 @@ export async function questionFileStatus(fileVersionId: string, signal?: AbortSi
   return payload as QAFileStatus
 }
 
-export function newIdempotencyKey(): string { return crypto.randomUUID() }
+export function newIdempotencyKey(): string { return uuidV4() }

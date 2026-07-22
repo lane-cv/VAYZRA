@@ -1,6 +1,7 @@
 {
   "name": "happylearn-workspace",
   "private": true,
+  "type": "module",
   "engines": {
     "node": ">=24 <25",
     "pnpm": ">=11 <12"
@@ -9,9 +10,17 @@
   "scripts": {
     "test": "pnpm --dir web test",
     "typecheck": "pnpm --dir web typecheck",
+    "lint": "eslint web/src tests/e2e playwright.config.ts --max-warnings=0",
     "build": "pnpm --dir web build"
   },
   "devDependencies": {
-    "@playwright/test": "1.57.0"
+    "@eslint/js": "9.39.2",
+    "@playwright/test": "1.57.0",
+    "@types/node": "24.10.1",
+    "eslint": "9.39.2",
+    "eslint-plugin-vue": "10.8.0",
+    "globals": "17.3.0",
+    "typescript-eslint": "8.56.1",
+    "vue-eslint-parser": "10.4.0"
   }
 }

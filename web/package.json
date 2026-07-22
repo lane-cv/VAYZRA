@@ -6,10 +6,11 @@
     "dev": "vite",
     "test": "vitest run",
     "typecheck": "vue-tsc --noEmit",
+    "lint": "eslint src --max-warnings=0",
     "build": "vue-tsc --noEmit && vite build"
   },
   "dependencies": {
-    "dompurify": "3.4.11",
+    "dompurify": "3.4.12",
     "element-plus": "2.14.3",
     "katex": "0.16.22",
     "markdown-it": "14.3.0",

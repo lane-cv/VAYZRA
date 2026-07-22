@@ -31,6 +31,7 @@ const statusText = computed(() => {
     case 'processing': return processingText(state.value.result.processingState)
     case 'cancelled': return '上传已取消'
     case 'failed': return `上传失败：${state.value.message}`
+    default: return '文件状态未知'
   }
 })
 

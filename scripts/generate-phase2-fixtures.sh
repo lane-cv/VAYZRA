@@ -20,13 +20,16 @@ export XDG_CACHE_HOME="$work/cache"
 
 printf '%s\n' '<html><body><h1>HappyLearn lesson</h1><p>Safe DOCX preview fixture.</p></body></html>' > "$work/lesson.html"
 printf '%s\n' '<html><body><h1>HappyLearn replacement</h1><p>Second safe version.</p></body></html>' > "$work/replacement.html"
+printf '%s\n' '<html><body><h1>Question attachment</h1><p>Safe disposable PDF fixture.</p></body></html>' > "$work/question.html"
 profile_url="file://$work/libreoffice-profile"
 soffice --headless --nologo --nodefault --nofirststartwizard "-env:UserInstallation=$profile_url" --convert-to 'docx:Office Open XML Text' --outdir "$destination" "$work/lesson.html" >/dev/null
 soffice --headless --nologo --nodefault --nofirststartwizard "-env:UserInstallation=$profile_url" --convert-to 'docx:Office Open XML Text' --outdir "$destination" "$work/replacement.html" >/dev/null
+soffice --headless --nologo --nodefault --nofirststartwizard "-env:UserInstallation=$profile_url" --convert-to pdf --outdir "$destination" "$work/question.html" >/dev/null
 
 ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=30:duration=30 -f lavfi -i sine=frequency=440:duration=30 \
   -c:v libx264 -preset ultrafast -b:v 4M -maxrate 4M -bufsize 8M -pix_fmt yuv420p -c:a aac -movflags +faststart -y "$destination/lesson.mp4"
 ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=red:s=160x90:d=1 -c:v ffv1 -y "$destination/unsupported.mkv"
+ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=blue:s=320x180:d=1 -frames:v 1 -y "$destination/question.png"
 
 dd if=/dev/zero of="$destination/resume.pdf" bs=1M count=9 status=none
 cp "$destination/lesson.docx" "$destination/archive.zip"
@@ -39,5 +42,7 @@ probe_a='X5O!P%@AP[4\PZX54(P^)7CC)7}'
 probe_b='$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
 printf '%s%s' "$probe_a" "$probe_b" > "$destination/eicar.txt"
 
-chmod 0600 "$destination"/*
+# The volume is private and mounted read-only by the non-root browser runner.
+chmod 0644 "$destination"/*
+chmod 0755 "$destination"
 test "$(wc -c < "$destination/resume.pdf")" -gt 8388608

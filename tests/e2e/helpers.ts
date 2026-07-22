@@ -120,4 +120,45 @@ export async function waitForFileState(page: Page, fileId: string, accepted: str
   throw new Error(`file ${fileId} did not reach ${accepted.join('/')} (last=${JSON.stringify(last)})`)
 }
 
-export async function expectStatus(response: APIResponse, status: number) { expect(response.status()).toBe(status) }
+export async function uploadQuestionFixture(page: Page, role: 'student' | 'admin', path: string, declaredMime: string): Promise<UploadedFile> {
+  const bytes = await readFile(path)
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  const prefix = role === 'admin' ? '/api/v1/admin/question-uploads' : '/api/v1/student/question-uploads'
+  const session = await apiJSON<{ id: string }>(page, 'POST', prefix, { displayName: basename(path), declaredMime, expectedSize: bytes.length, expectedSha256: sha256 })
+  const partSize = 8 * 1024 * 1024
+  for (let offset = 0, number = 1; offset < bytes.length; offset += partSize, number += 1) {
+    const part = bytes.subarray(offset, Math.min(offset + partSize, bytes.length))
+    const response = await page.request.put(`${prefix}/${session.id}/parts/${number}`, { data: part, headers: { ...(await csrfHeader(page)), 'Content-Type': 'application/octet-stream', 'X-Part-SHA256': createHash('sha256').update(part).digest('hex') } })
+    await expect(response, `question upload part ${number}`).toBeOK()
+  }
+  return apiJSON<UploadedFile>(page, 'POST', `${prefix}/${session.id}/complete`, {})
+}
+
+export async function waitForQuestionFile(page: Page, fileVersionId: string, timeout = 120_000) {
+  const deadline = Date.now() + timeout
+  let last: { processingState: string; previewAvailable: boolean } | undefined
+  while (Date.now() < deadline) {
+    const response = await page.request.get(`/api/v1/question-files/${fileVersionId}/status`)
+    if (response.ok()) {
+      last = await response.json() as { processingState: string; previewAvailable: boolean }
+      if (last.processingState === 'ready') return last
+      if (last.processingState === 'rejected' || last.processingState === 'failed') break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  throw new Error(`question file ${fileVersionId} did not become ready (last=${JSON.stringify(last)})`)
+}
+
+export type NotificationRecord = { id: string; kind: string; targetId: string; targetPath: string; readAt?: string }
+export async function waitForNotifications(page: Page, predicate: (items: NotificationRecord[]) => boolean, timeout = 20_000) {
+  const deadline = Date.now() + timeout
+  let items: NotificationRecord[] = []
+  while (Date.now() < deadline) {
+    items = await apiJSON<NotificationRecord[]>(page, 'GET', '/api/v1/notifications?limit=100')
+    if (predicate(items)) return items
+    await new Promise((resolve) => setTimeout(resolve, 300))
+  }
+  throw new Error(`notifications did not reach expected state (count=${items.length})`)
+}
+
+export function expectStatus(response: APIResponse, status: number) { expect(response.status()).toBe(status) }

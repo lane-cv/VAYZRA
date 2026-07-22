@@ -66,8 +66,9 @@ function trapCatalog(event: KeyboardEvent) {
 watch(query, () => {
   clearTimeout(searchTimer); searchController?.abort(); results.value=[]
   if (query.value.trim().length < 2) return
-  searchTimer=setTimeout(async()=>{const controller=new AbortController();searchController=controller;searching.value=true;try{const found=await searchLessons(query.value,controller.signal);if(searchController!==controller)return;results.value=found.filter((item)=>!gradeId.value||item.gradeId===gradeId.value).filter((item)=>!termId.value||item.termId===termId.value).filter((item)=>!subjectId.value||item.subjectId===subjectId.value).filter((item)=>!chapterId.value||item.chapterId===chapterId.value)}catch(cause){if(searchController===controller&&!controller.signal.aborted)error.value=cause instanceof APIError?cause.message:'搜索失败'}finally{if(searchController===controller)searching.value=false}},250)
+  searchTimer=setTimeout(()=>{void runSearch()},250)
 })
+async function runSearch() { const controller=new AbortController();searchController=controller;searching.value=true;try{const found=await searchLessons(query.value,controller.signal);if(searchController!==controller)return;results.value=found.filter((item)=>!gradeId.value||item.gradeId===gradeId.value).filter((item)=>!termId.value||item.termId===termId.value).filter((item)=>!subjectId.value||item.subjectId===subjectId.value).filter((item)=>!chapterId.value||item.chapterId===chapterId.value)}catch(cause){if(searchController===controller&&!controller.signal.aborted)error.value=cause instanceof APIError?cause.message:'搜索失败'}finally{if(searchController===controller)searching.value=false} }
 async function restoreCatalog() {
   const params = new URLSearchParams(window.location.search)
   const requested = { gradeId: params.get('gradeId') ?? '', termId: params.get('termId') ?? '', subjectId: params.get('subjectId') ?? '', chapterId: params.get('chapterId') ?? '' }

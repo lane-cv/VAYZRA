@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ExternalVideo } from './types'
+import { uuidV4 } from '../../utils/uuid'
 
 const props = defineProps<{ modelValue: ExternalVideo[] }>()
 const emit = defineEmits<{ 'update:modelValue': [value: ExternalVideo[]] }>()
@@ -7,7 +8,7 @@ function update(index: number, field: keyof Pick<ExternalVideo, 'url' | 'title' 
   emit('update:modelValue', props.modelValue.map((video, current) => current === index ? { ...video, [field]: value } : video))
 }
 function add() {
-  emit('update:modelValue', [...props.modelValue, { id: crypto.randomUUID(), url: '', title: '', description: '', sortKey: (props.modelValue.length + 1) * 10 }])
+  emit('update:modelValue', [...props.modelValue, { id: uuidV4(), url: '', title: '', description: '', sortKey: (props.modelValue.length + 1) * 10 }])
 }
 function remove(index: number) { emit('update:modelValue', props.modelValue.filter((_, current) => current !== index)) }
 </script>

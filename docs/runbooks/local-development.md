@@ -92,6 +92,12 @@ Complete Phase 2 acceptance requires the AIStor Free license path and uses uniqu
 HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license" make e2e
 ```
 
+Phase 3 acceptance also runs all earlier suites plus Q&A, attachment privacy, notification audience/deduplication/read state, disabled-student revocation, and desktop/mobile keyboard scenarios. It stores only sanitized container diagnostics on failure; see [phase3-qa-notifications.md](phase3-qa-notifications.md).
+
+```bash
+HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license" make e2e-phase3
+```
+
 For manual diagnosis only, start the server as above and use new test-only passwords (never production values):
 
 ```bash
