@@ -49,7 +49,7 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,$2,'backfill.pdf','application/pdf',1,$3,'pending_scan',$4) RETURNING id`, fileID, objectKey, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", actor).Scan(&versionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
+	if _, err := provider.UpTo(ctx, 7); err != nil {
 		t.Fatal(err)
 	}
 	var versionSevenApplied bool
