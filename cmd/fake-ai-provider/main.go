@@ -36,15 +36,17 @@ var allowedCases = []string{
 }
 
 type providerOptions struct {
-	slowDelay time.Duration
-	logger    *log.Logger
+	slowDelay      time.Duration
+	logger         *log.Logger
+	requiredBearer string
 }
 
 type provider struct {
-	slowDelay time.Duration
-	logger    *log.Logger
-	mu        sync.Mutex
-	counts    map[string]int
+	slowDelay      time.Duration
+	logger         *log.Logger
+	requiredBearer string
+	mu             sync.Mutex
+	counts         map[string]int
 }
 
 func main() {
@@ -52,9 +54,13 @@ func main() {
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "fake-ai-provider: ", log.LstdFlags)
+	bearer := requiredBearer
+	if generatedKey := os.Getenv("E2E_AI_PROVIDER_KEY"); generatedKey != "" {
+		bearer = "Bearer " + generatedKey
+	}
 	server := &http.Server{
 		Addr:              *listen,
-		Handler:           newProviderHandler(providerOptions{logger: logger}),
+		Handler:           newProviderHandler(providerOptions{logger: logger, requiredBearer: bearer}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
@@ -83,9 +89,13 @@ func newProviderHandler(options providerOptions) http.Handler {
 		logger = log.New(io.Discard, "", 0)
 	}
 	instance := &provider{
-		slowDelay: delay,
-		logger:    logger,
-		counts:    make(map[string]int),
+		slowDelay:      delay,
+		logger:         logger,
+		requiredBearer: options.requiredBearer,
+		counts:         make(map[string]int),
+	}
+	if instance.requiredBearer == "" {
+		instance.requiredBearer = requiredBearer
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", instance.health)
@@ -124,7 +134,7 @@ func (p *provider) responses(writer http.ResponseWriter, request *http.Request) 
 type streamWriter func(context.Context, http.ResponseWriter, http.Flusher, string, time.Duration)
 
 func (p *provider) serveProtocol(writer http.ResponseWriter, request *http.Request, protocol string, stream streamWriter) {
-	if request.Header.Get("Authorization") != requiredBearer {
+	if request.Header.Get("Authorization") != p.requiredBearer {
 		p.logger.Print("request rejected category=auth")
 		writeError(writer, http.StatusUnauthorized, "fixture_unauthorized")
 		return

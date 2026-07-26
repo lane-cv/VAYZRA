@@ -184,6 +184,21 @@ func TestRequestBodyIsBoundedAndAuthorizationIsRequired(t *testing.T) {
 	}
 }
 
+func TestGeneratedHarnessBearerCanReplaceTheSafeDefault(t *testing.T) {
+	const generated = "bW9yZS10aGFuLXRoaXJ0eS10d28tcmFuZG9tLWJ5dGVzISE="
+	handler := newProviderHandler(providerOptions{requiredBearer: "Bearer " + generated})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"prompt":"[case:success]"}`))
+	request.Header.Set("Authorization", "Bearer "+generated)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("generated harness bearer status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestCountsAndLogsNeverExposeAuthorizationOrRequestContent(t *testing.T) {
 	t.Parallel()
 	var logs bytes.Buffer

@@ -14,8 +14,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     diagnostics_version=1|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|oom_killed=true|oom_killed=false)
       printf '%s\n' "$line" >> "$temporary"
       ;;
-    container=happylearn_phase2_*|container=happylearn_phase3_*)
-      if [[ "$line" =~ ^container=happylearn_phase[23]_[A-Za-z0-9_-]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
+    container=happylearn_phase2_*|container=happylearn_phase3_*|container=happylearn_phase4_*)
+      if [[ "$line" =~ ^container=happylearn_phase[234]_[A-Za-z0-9_-]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
       ;;
     exit_code=*)
       if [[ "$line" =~ ^exit_code=[0-9]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi

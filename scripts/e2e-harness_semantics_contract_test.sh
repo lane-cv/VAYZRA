@@ -4,13 +4,18 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 phase2="$repo_root/scripts/e2e-phase2.sh"
 phase3="$repo_root/scripts/e2e-phase3.sh"
+phase4="$repo_root/scripts/e2e-phase4.sh"
 library="$repo_root/scripts/e2e-harness-lib.sh"
 
-for file in "$library" "$phase2" "$phase3"; do bash -n "$file"; done
-for script in "$phase2" "$phase3"; do
+for file in "$library" "$phase2" "$phase3" "$phase4"; do bash -n "$file"; done
+for script in "$phase2" "$phase3" "$phase4"; do
   ! grep -Fq 'HAPPYLEARN_E2E_CONTRACT_MODE' "$script"
   ! grep -Eq '^[[:space:]]*docker[[:space:]]' "$script"
-  test "$(grep -Ec 'docker_bounded [0-9]+ build' "$script")" -eq 2
+  if [[ "$script" == "$phase4" ]]; then
+    test "$(grep -Ec 'docker_bounded [0-9]+ build' "$script")" -eq 4
+  else
+    test "$(grep -Ec 'docker_bounded [0-9]+ build' "$script")" -eq 2
+  fi
   grep -Fq 'cancel_bounded_command' "$script"
 done
 grep -Fq -- '--read-only --user 1000:1000' "$phase2"
@@ -218,7 +223,7 @@ run_case() {
   fi
 }
 
-for script in "$phase2" "$phase3"; do
+for script in "$phase2" "$phase3" "$phase4"; do
   run_case "$script" interrupt
   run_case "$script" hang
   run_case "$script" cleanup_hang

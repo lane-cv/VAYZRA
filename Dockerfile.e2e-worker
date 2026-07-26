@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1.7
+ARG WORKER_IMAGE
+FROM golang:1.26.5-bookworm AS supervisor-build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY cmd/e2e-processing-supervisor cmd/e2e-processing-supervisor
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/e2e-processing-supervisor ./cmd/e2e-processing-supervisor
+
+ARG WORKER_IMAGE
+FROM ${WORKER_IMAGE}
+COPY --from=supervisor-build --chown=10002:10002 /out/e2e-processing-supervisor /app/e2e-processing-supervisor
+ENTRYPOINT ["/app/e2e-processing-supervisor"]

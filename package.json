@@ -12,7 +12,8 @@
     "typecheck": "pnpm --dir web typecheck",
     "lint": "eslint web/src tests/e2e playwright.config.ts --max-warnings=0",
     "build": "pnpm --dir web build",
-    "e2e-contracts": "make e2e-contracts"
+    "e2e-contracts": "make e2e-contracts",
+    "e2e-phase4": "make e2e-phase4"
   },
   "devDependencies": {
     "@eslint/js": "9.39.2",

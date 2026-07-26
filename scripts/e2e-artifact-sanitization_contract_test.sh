@@ -11,6 +11,7 @@ mkdir -p "$tmpdir/nested"
 cat > "$tmpdir/containers.log" <<'MALICIOUS_LOG'
 diagnostics_version=1
 container=happylearn_phase3_123_app
+container=happylearn_phase4_123_fake_ai
 state_status=running
 exit_code=0
 oom_killed=false
@@ -26,6 +27,17 @@ postgres://db-user:db-password@db/private?token=query-token&password=query-passw
 redis://:redis-password@redis/0
 https://url-user:url-password@example.test/path?access_token=url-token&secret=url-secret
 password%3Dencoded-password%26token%3Dencoded-token
+HAPPYLEARN_AI_MASTER_KEY=master-key-material
+provider_key=provider-key-material
+encrypted_api_key=provider-ciphertext-material
+prompt_text=[case:success] synthetic-prompt-content
+message_text=synthetic-message-content
+answer_text=synthetic-answer-content
+object_key=ai-questions/student/private-object
+MINIO_ROOT_USER=object-user
+MINIO_ROOT_PASSWORD=object-password
+HAPPYLEARN_DATABASE_URL=postgres://ai:db-secret@postgres/private
+HAPPYLEARN_REDIS_URL=redis://:cache-secret@redis/0
 MALICIOUS_LOG
 touch "$tmpdir/nested/trace.zip" "$tmpdir/nested/failure.png" "$tmpdir/nested/video.webm" "$tmpdir/nested/report.html"
 
@@ -34,10 +46,10 @@ test "$(find "$tmpdir" -type f | wc -l | tr -d ' ')" -eq 1
 test -f "$tmpdir/containers.log"
 mode="$(stat -f '%Lp' "$tmpdir/containers.log" 2>/dev/null || stat -c '%a' "$tmpdir/containers.log")"
 test "$mode" = 600
-! grep -Eqi 'private|json-token|json-password|header-secret|header-cookie|header-csrf|csrf-header-secret|colon-password|quoted-secret|equals-token|db-user|db-password|query-token|query-password|redis-password|url-user|url-password|url-token|url-secret|encoded-password|encoded-token|authorization|cookie|x-csrf|bearer|postgres://|redis://|https://' "$tmpdir/containers.log"
+! grep -Eqi 'private|json-token|json-password|header-secret|header-cookie|header-csrf|csrf-header-secret|colon-password|quoted-secret|equals-token|db-user|db-password|query-token|query-password|redis-password|url-user|url-password|url-token|url-secret|encoded-password|encoded-token|authorization|cookie|x-csrf|bearer|postgres://|redis://|https://|master-key-material|provider-key-material|provider-ciphertext-material|synthetic-prompt|synthetic-message|synthetic-answer|private-object|object-user|object-password|db-secret|cache-secret' "$tmpdir/containers.log"
 while IFS= read -r line; do
   case "$line" in
-    diagnostics_version=1|container=happylearn_phase2_[A-Za-z0-9_-]*|container=happylearn_phase3_[A-Za-z0-9_-]*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
+    diagnostics_version=1|container=happylearn_phase2_[A-Za-z0-9_-]*|container=happylearn_phase3_[A-Za-z0-9_-]*|container=happylearn_phase4_[A-Za-z0-9_-]*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
     *) echo "unexpected sanitizer output: $line" >&2; exit 1 ;;
   esac
 done < "$tmpdir/containers.log"

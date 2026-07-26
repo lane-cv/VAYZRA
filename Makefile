@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-contracts
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts
 
 test-go:
 	$(GO) test ./...
@@ -39,9 +39,13 @@ e2e-phase2:
 e2e-phase3:
 	bash scripts/e2e-phase3.sh
 
+e2e-phase4:
+	bash scripts/e2e-phase4.sh
+
 e2e-contracts:
 	bash scripts/copy-e2e-workspace_test.sh
 	bash scripts/e2e-phase2_contract_test.sh
 	bash scripts/e2e-phase3_contract_test.sh
+	bash scripts/e2e-phase4_contract_test.sh
 	bash scripts/e2e-harness_semantics_contract_test.sh
 	bash scripts/e2e-artifact-sanitization_contract_test.sh

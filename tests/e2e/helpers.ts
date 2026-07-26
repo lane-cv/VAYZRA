@@ -346,9 +346,12 @@ export async function waitForAIFileState(
  */
 export async function setAIProcessingHeld(page: Page, held: boolean): Promise<void> {
   const controlURL = process.env.E2E_AI_PROCESSING_CONTROL_URL
+  const controlToken = process.env.E2E_AI_PROCESSING_CONTROL_TOKEN
   if (!controlURL) throw new Error('E2E_AI_PROCESSING_CONTROL_URL is required for deterministic pending-file acceptance')
+  if (!controlToken) throw new Error('E2E_AI_PROCESSING_CONTROL_TOKEN is required for deterministic pending-file acceptance')
   const response = await page.request.post(`${controlURL.replace(/\/$/, '')}/${held ? 'hold' : 'release'}`, {
     data: {},
+    headers: { 'X-E2E-Control-Token': controlToken },
   })
   await expect(response, `AI processing ${held ? 'hold' : 'release'}`).toBeOK()
 }
