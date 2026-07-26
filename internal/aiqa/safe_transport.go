@@ -86,8 +86,7 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	dialer := net.Dialer{Timeout: s.timeouts.Connect}
 	transport := &http.Transport{
-		Proxy:             nil,
-		DisableKeepAlives: true,
+		Proxy: nil,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].String(), port))
 		},
@@ -101,6 +100,10 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		scrubRequestURL(req)
 		return nil, err
 	}
+	response.Body = &transportLifecycleBody{
+		body:      newIdleTimeoutBody(response.Body, s.timeouts.IdleStream),
+		transport: transport,
+	}
 	if isRedirect(response.StatusCode) {
 		if err := s.validateRedirect(req, response); err != nil {
 			_ = response.Body.Close()
@@ -108,8 +111,37 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
-	response.Body = newIdleTimeoutBody(response.Body, s.timeouts.IdleStream)
 	return response, nil
+}
+
+type transportLifecycleBody struct {
+	mu        sync.Mutex
+	body      io.ReadCloser
+	transport *http.Transport
+	once      sync.Once
+	err       error
+}
+
+func (b *transportLifecycleBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	body := b.body
+	b.mu.Unlock()
+	if body == nil {
+		return 0, net.ErrClosed
+	}
+	return body.Read(p)
+}
+
+func (b *transportLifecycleBody) Close() error {
+	b.once.Do(func() {
+		b.mu.Lock()
+		body, transport := b.body, b.transport
+		b.body, b.transport = nil, nil
+		b.mu.Unlock()
+		b.err = body.Close()
+		transport.CloseIdleConnections()
+	})
+	return b.err
 }
 
 func (s safeRoundTripper) validateRedirect(req *http.Request, response *http.Response) error {
