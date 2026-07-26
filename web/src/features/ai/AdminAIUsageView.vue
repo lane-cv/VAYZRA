@@ -18,8 +18,10 @@ export function shanghaiDateBounds(fromDate: string, toDate: string): { from?: s
   const from = midnight(fromDate)
   const to = midnight(toDate)
   return {
-    from: from === undefined ? undefined : new Date(from).toISOString(),
-    to: to === undefined ? undefined : new Date(to + DAY_MS - 1).toISOString(),
+    from: from === undefined ? undefined : new Date(from).toISOString().replace('.000Z', 'Z'),
+    to: to === undefined
+      ? undefined
+      : new Date(to + DAY_MS - 1000).toISOString().replace('.000Z', '.999999Z'),
   }
 }
 </script>
@@ -91,6 +93,17 @@ function failure(reason: unknown): { message: string; requestId: string } {
     : { message: '用量统计加载失败，请稍后重试', requestId: '' }
 }
 
+function mergeUsageRuns(existing: UsageRun[], incoming: UsageRun[]): UsageRun[] {
+  const seen = new Set(existing.map((item) => item.id))
+  const merged = [...existing]
+  for (const item of incoming) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    merged.push(item)
+  }
+  return merged
+}
+
 async function loadAllStudents(signal: AbortSignal): Promise<AIConfigStudent[]> {
   const result: AIConfigStudent[] = []
   let cursor: string | undefined
@@ -132,7 +145,7 @@ async function replaceUsage(restoreFocus = false) {
     ])
     if (current !== generation || signal.aborted) return
     summary.value = summaryResult
-    items.value = page.items
+    items.value = mergeUsageRuns([], page.items)
     nextCursor.value = page.nextCursor ?? ''
   } catch (reason) {
     if (current !== generation || signal.aborted) return
@@ -160,7 +173,7 @@ async function loadMore() {
   try {
     const page = await listUsageRuns(usageFilters(cursor), signal)
     if (current !== generation || signal.aborted) return
-    items.value = [...items.value, ...page.items]
+    items.value = mergeUsageRuns(items.value, page.items)
     nextCursor.value = page.nextCursor ?? ''
   } catch (reason) {
     if (current !== generation || signal.aborted) return
@@ -174,6 +187,7 @@ async function loadMore() {
 
 async function initialize(restoreFocus = false) {
   if (!isAdmin.value) return
+  filterOptionsLoaded.value = false
   optionsController?.abort()
   optionsController = new AbortController()
   const signal = optionsController.signal
@@ -206,6 +220,11 @@ function retry() {
   else void initialize(true)
 }
 
+function filterChanged() {
+  if (!filterOptionsLoaded.value) return
+  void replaceUsage()
+}
+
 onBeforeMount(() => { void initialize() })
 onBeforeUnmount(() => { generation++; controller?.abort(); optionsController?.abort() })
 </script>
@@ -222,27 +241,27 @@ onBeforeUnmount(() => { generation++; controller?.abort(); optionsController?.ab
       <p>按安全元数据查看 AI 请求、Token、费用与运行状态；不展示学生问题或回答正文。</p>
     </header>
 
-    <form class="filters" aria-label="用量筛选" @submit.prevent="replaceUsage()">
+    <form class="filters" aria-label="用量筛选" @submit.prevent="filterChanged">
       <label>开始日期（上海）
-        <input v-model="filters.fromDate" name="fromDate" type="date" @change="replaceUsage()">
+        <input v-model="filters.fromDate" name="fromDate" type="date" :disabled="!filterOptionsLoaded" @change="filterChanged">
       </label>
       <label>结束日期（上海）
-        <input v-model="filters.toDate" name="toDate" type="date" @change="replaceUsage()">
+        <input v-model="filters.toDate" name="toDate" type="date" :disabled="!filterOptionsLoaded" @change="filterChanged">
       </label>
       <label>学生
-        <select v-model="filters.studentId" name="studentId" @change="replaceUsage()">
+        <select v-model="filters.studentId" name="studentId" :disabled="!filterOptionsLoaded" @change="filterChanged">
           <option value="">全部学生</option>
           <option v-for="student in students" :key="student.id" :value="student.id">{{ student.displayName }}（{{ student.username }}）</option>
         </select>
       </label>
       <label>模型
-        <select v-model="filters.modelId" name="modelId" @change="replaceUsage()">
+        <select v-model="filters.modelId" name="modelId" :disabled="!filterOptionsLoaded" @change="filterChanged">
           <option value="">全部模型</option>
           <option v-for="model in models" :key="model.id" :value="model.id">{{ model.upstreamModelId }} · {{ model.modality === 'vision' ? '视觉' : '文本' }}</option>
         </select>
       </label>
       <label>状态
-        <select v-model="filters.status" name="status" @change="replaceUsage()">
+        <select v-model="filters.status" name="status" :disabled="!filterOptionsLoaded" @change="filterChanged">
           <option value="">全部状态</option>
           <option value="queued">排队中</option>
           <option value="streaming">生成中</option>

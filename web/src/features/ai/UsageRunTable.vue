@@ -13,9 +13,20 @@ export function formatMicroUSD(raw: string): string {
 </script>
 
 <script setup lang="ts">
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { UsageRun } from './adminApi'
 
 defineProps<{ items: UsageRun[] }>()
+
+const mediaQuery = typeof window === 'undefined' || typeof window.matchMedia !== 'function'
+  ? undefined
+  : window.matchMedia('(max-width: 899px)')
+const compact = ref(mediaQuery?.matches ?? false)
+function updateLayout(event: MediaQueryListEvent) {
+  compact.value = event.matches
+}
+onMounted(() => mediaQuery?.addEventListener('change', updateLayout))
+onBeforeUnmount(() => mediaQuery?.removeEventListener('change', updateLayout))
 
 const statusLabels: Record<UsageRun['status'], string> = {
   queued: '排队中',
@@ -56,7 +67,7 @@ function timeLabel(value: string): string {
 </script>
 
 <template>
-  <div class="desktop-table">
+  <div v-if="!compact" class="desktop-table">
     <table aria-label="AI 用量运行记录">
       <thead>
         <tr>
@@ -80,7 +91,7 @@ function timeLabel(value: string): string {
       </tbody>
     </table>
   </div>
-  <div class="mobile-cards" aria-label="AI 用量运行记录（移动版）">
+  <div v-else class="mobile-cards" aria-label="AI 用量运行记录（移动版）">
     <article v-for="item in items" :key="item.id" class="mobile-run-card">
       <h3>{{ statusLabel(item.status) }} · {{ timeLabel(item.createdAt) }}</h3>
       <dl>
@@ -98,5 +109,5 @@ function timeLabel(value: string): string {
 </template>
 
 <style scoped>
-.desktop-table{overflow-x:auto;border:1px solid #dbe4f0;border-radius:12px;background:#fff}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:12px;text-align:left;vertical-align:top;border-bottom:1px solid #e7edf4;font-size:.86rem}th{color:#50657a;background:#f7f9fc;white-space:nowrap}tbody tr:last-child td{border-bottom:0}code{overflow-wrap:anywhere;font-size:.78rem}.status{font-weight:700}.status[data-status=succeeded]{color:#237344}.status[data-status=failed],.status[data-status=cancelled]{color:#a3473d}.mobile-cards{display:none}.mobile-run-card{padding:16px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.mobile-run-card h3{margin:0 0 12px;font-size:1rem}.mobile-run-card dl{display:grid;gap:8px;margin:0}.mobile-run-card dl div{display:grid;grid-template-columns:7rem 1fr;gap:8px}.mobile-run-card dt{color:#63758a}.mobile-run-card dd{min-width:0;margin:0;overflow-wrap:anywhere}@media(max-width:899px){.desktop-table{display:none}.mobile-cards{display:grid;gap:12px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+.desktop-table{overflow-x:auto;border:1px solid #dbe4f0;border-radius:12px;background:#fff}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:12px;text-align:left;vertical-align:top;border-bottom:1px solid #e7edf4;font-size:.86rem}th{color:#50657a;background:#f7f9fc;white-space:nowrap}tbody tr:last-child td{border-bottom:0}code{overflow-wrap:anywhere;font-size:.78rem}.status{font-weight:700}.status[data-status=succeeded]{color:#237344}.status[data-status=failed],.status[data-status=cancelled]{color:#a3473d}.mobile-cards{display:grid;gap:12px}.mobile-run-card{padding:16px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.mobile-run-card h3{margin:0 0 12px;font-size:1rem}.mobile-run-card dl{display:grid;gap:8px;margin:0}.mobile-run-card dl div{display:grid;grid-template-columns:7rem 1fr;gap:8px}.mobile-run-card dt{color:#63758a}.mobile-run-card dd{min-width:0;margin:0;overflow-wrap:anywhere}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 </style>

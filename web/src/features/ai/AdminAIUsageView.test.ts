@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
-import AdminAIUsageView from './AdminAIUsageView.vue'
+import AdminAIUsageView, { shanghaiDateBounds } from './AdminAIUsageView.vue'
 import { useSessionStore } from '../../stores/session'
 import { APIError } from '../../api/client'
 import {
@@ -101,6 +101,13 @@ describe('AdminAIUsageView', () => {
     vi.mocked(listUsageRuns).mockResolvedValue({ items: [run], nextCursor: 'equal-time-cursor' })
   })
 
+  it('uses canonical UTC bounds through the final PostgreSQL microsecond of a Shanghai day', () => {
+    expect(shanghaiDateBounds('2026-07-01', '2026-07-26')).toEqual({
+      from: '2026-06-30T16:00:00Z',
+      to: '2026-07-26T15:59:59.999999Z',
+    })
+  })
+
   it('is admin-only even when mounted directly', async () => {
     const wrapper = mountView('student')
     await flushPromises()
@@ -127,8 +134,8 @@ describe('AdminAIUsageView', () => {
       studentId: run.studentId,
       modelId: run.modelId,
       status: 'failed',
-      from: '2026-06-30T16:00:00.000Z',
-      to: '2026-07-26T15:59:59.999Z',
+      from: '2026-06-30T16:00:00Z',
+      to: '2026-07-26T15:59:59.999999Z',
       limit: 25,
     }
     expect(readUsageSummary).toHaveBeenLastCalledWith(expected, expect.any(AbortSignal))
@@ -192,6 +199,25 @@ describe('AdminAIUsageView', () => {
     expect(listUsageRuns).not.toHaveBeenCalled()
   })
 
+  it('keeps filters disabled and issues no partial usage reads while metadata is pending then fails', async () => {
+    let rejectProviders!: (reason: unknown) => void
+    vi.mocked(listProviders).mockReturnValueOnce(new Promise((_, reject) => {
+      rejectProviders = reject
+    }))
+    const wrapper = mountView()
+    const status = wrapper.get<HTMLSelectElement>('select[name="status"]')
+    expect(status.element.disabled).toBe(true)
+    await status.setValue('failed')
+    expect(readUsageSummary).not.toHaveBeenCalled()
+    expect(listUsageRuns).not.toHaveBeenCalled()
+
+    rejectProviders(new APIError(503, 'unavailable', '筛选元数据加载失败', 'req-meta-deferred'))
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('req-meta-deferred')
+    expect(readUsageSummary).not.toHaveBeenCalled()
+    expect(listUsageRuns).not.toHaveBeenCalled()
+  })
+
   it('keeps loaded rows visible and retries an append failure with the same cursor', async () => {
     const wrapper = mountView()
     await flushPromises()
@@ -212,5 +238,38 @@ describe('AdminAIUsageView', () => {
     )
     expect(wrapper.text()).toContain('run-1')
     expect(wrapper.text()).toContain('run-2')
+  })
+
+  it('deduplicates overlapping equal-time pages and retries in stable server order', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    vi.mocked(listUsageRuns).mockResolvedValueOnce({
+      items: [run, { ...run, id: 'run-2' }],
+      nextCursor: 'equal-time-cursor-2',
+    })
+    await wrapper.get('button[data-action="load-more"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('tbody code').map((node) => node.text())).toEqual(['run-1', 'run-2'])
+
+    vi.mocked(listUsageRuns).mockRejectedValueOnce(
+      new APIError(503, 'unavailable', '下一页加载失败', 'req-overlap'),
+    )
+    await wrapper.get('button[data-action="load-more"]').trigger('click')
+    await flushPromises()
+    vi.mocked(listUsageRuns).mockResolvedValueOnce({
+      items: [{ ...run, id: 'run-2' }, { ...run, id: 'run-3' }],
+    })
+    await wrapper.get('button[data-action="retry-more"]').trigger('click')
+    await flushPromises()
+
+    expect(listUsageRuns).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'equal-time-cursor-2' }),
+      expect.any(AbortSignal),
+    )
+    expect(wrapper.findAll('tbody code').map((node) => node.text())).toEqual([
+      'run-1',
+      'run-2',
+      'run-3',
+    ])
   })
 })

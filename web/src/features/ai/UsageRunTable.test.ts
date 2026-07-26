@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import UsageRunTable from './UsageRunTable.vue'
 import type { UsageRun } from './adminApi'
@@ -53,12 +53,21 @@ const rows: UsageRun[] = [
 ]
 
 describe('UsageRunTable', () => {
-  it('renders safe run metadata in both desktop rows and labelled mobile cards', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('renders a desktop table at 900px without a duplicate accessible mobile copy', () => {
+    const matchMedia = vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }))
+    vi.stubGlobal('matchMedia', matchMedia)
     const wrapper = mount(UsageRunTable, { props: { items: rows } })
 
+    expect(matchMedia).toHaveBeenCalledWith('(max-width: 899px)')
     expect(wrapper.get('table').attributes('aria-label')).toBe('AI 用量运行记录')
     expect(wrapper.findAll('tbody tr')).toHaveLength(3)
-    expect(wrapper.findAll('.mobile-run-card')).toHaveLength(3)
+    expect(wrapper.find('.mobile-cards').exists()).toBe(false)
     expect(wrapper.text()).toContain('成功')
     expect(wrapper.text()).toContain('失败')
     expect(wrapper.text()).toContain('已取消')
@@ -72,6 +81,22 @@ describe('UsageRunTable', () => {
     expect(wrapper.html()).not.toContain('prompt')
     expect(wrapper.html()).not.toContain('messageBody')
 
+  })
+
+  it('renders labelled cards below 900px with the same rows and no duplicate table', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })))
+    const wrapper = mount(UsageRunTable, { props: { items: rows } })
+    expect(wrapper.find('table').exists()).toBe(false)
+    expect(wrapper.findAll('.mobile-run-card')).toHaveLength(3)
+    expect(wrapper.findAll('.mobile-run-card code').map((node) => node.text())).toEqual([
+      'run-success',
+      'run-failed',
+      'run-cancelled',
+    ])
     const card = wrapper.findAll('.mobile-run-card')[1]
     expect(card.text()).toContain('学生：周同学（zhou02）')
     expect(card.text()).toContain('模型：physics-vision')
