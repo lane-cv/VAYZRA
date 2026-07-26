@@ -74,6 +74,23 @@ export type ConnectivityResult = {
   errorCategory?: string
 }
 
+const MAX_CONNECTIVITY_RESPONSE_BYTES = 16 * 1024
+const CONNECTIVITY_RESULT_KEYS = new Set(['ok', 'protocol', 'latencyMs', 'errorCategory'])
+const CONNECTIVITY_CATEGORIES = new Set([
+  '',
+  'auth',
+  'busy',
+  'cancelled',
+  'malformed_stream',
+  'rate_limited',
+  'response_too_large',
+  'stream_interrupted',
+  'timeout',
+  'unavailable',
+  'upstream_4xx',
+  'upstream_5xx',
+])
+
 export type UsageFilters = {
   studentId?: string
   modelId?: string
@@ -168,6 +185,7 @@ export function activateProvider(
 }
 
 export async function testProvider(providerId: string, signal?: AbortSignal): Promise<ConnectivityResult> {
+  signal?.throwIfAborted()
   const token = csrfCookie()
   if (!token) throw new APIError(0, 'csrf_missing', '安全校验已失效，请刷新页面后重试', '')
   let response: Response
@@ -186,10 +204,20 @@ export async function testProvider(providerId: string, signal?: AbortSignal): Pr
     if (signal?.aborted) throw error
     throw new APIError(0, 'network_error', '网络连接异常，请稍后重试', '')
   }
-  const payload = await response.json().catch(() => undefined) as unknown
-  if (payload && typeof payload === 'object' && typeof (payload as { ok?: unknown }).ok === 'boolean') {
-    return payload as ConnectivityResult
+
+  const headerCode = providerTestHeaderErrorCode(response)
+  const headerRequestId = providerTestRequestId(response.headers.get('X-Request-ID'))
+  if (!response.ok && headerCode) {
+    await response.body?.cancel().catch(() => undefined)
+    throw new APIError(
+      response.status,
+      headerCode,
+      'AI 服务暂不可用，请稍后重试',
+      headerRequestId,
+    )
   }
+
+  const payload = await readBoundedConnectivityJSON(response, signal)
   const error = payload && typeof payload === 'object'
     ? (payload as { error?: unknown }).error
     : undefined
@@ -199,10 +227,98 @@ export async function testProvider(providerId: string, signal?: AbortSignal): Pr
       response.status,
       typeof details.code === 'string' ? details.code : 'request_failed',
       typeof details.message === 'string' ? details.message : '请求未能完成，请稍后重试',
-      typeof details.requestId === 'string' ? details.requestId : '',
+      headerRequestId || providerTestRequestId(details.requestId),
     )
   }
-  throw new APIError(response.status, 'invalid_response', '服务响应异常，请稍后重试', '')
+
+  const result = connectivityResult(payload)
+  if (!result) throw new APIError(response.status, 'invalid_response', '服务响应异常，请稍后重试', '')
+  return result
+}
+
+function providerTestHeaderErrorCode(response: Response): 'PROVIDER_UNAVAILABLE' | undefined {
+  const code = response.headers.get('X-Error-Code')?.trim().toUpperCase()
+  return code === 'PROVIDER_UNAVAILABLE' ? code : undefined
+}
+
+function providerTestRequestId(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const normalized = value.trim()
+  return /^[A-Za-z0-9_-]{8,64}$/.test(normalized) ? normalized : ''
+}
+
+async function readBoundedConnectivityJSON(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (!response.body) return undefined
+  const declaredSize = Number(response.headers.get('Content-Length'))
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_CONNECTIVITY_RESPONSE_BYTES) {
+    await response.body.cancel().catch(() => undefined)
+    return undefined
+  }
+
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  const cancelForAbort = () => { void reader.cancel(signal?.reason) }
+  signal?.addEventListener('abort', cancelForAbort, { once: true })
+  try {
+    while (true) {
+      signal?.throwIfAborted()
+      const { done, value } = await reader.read()
+      signal?.throwIfAborted()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_CONNECTIVITY_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        return undefined
+      }
+      chunks.push(value)
+    }
+  } catch {
+    if (signal?.aborted) signal.throwIfAborted()
+    return undefined
+  } finally {
+    signal?.removeEventListener('abort', cancelForAbort)
+    reader.releaseLock()
+  }
+
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
+  } catch {
+    return undefined
+  }
+}
+
+function connectivityResult(payload: unknown): ConnectivityResult | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined
+  const record = payload as Record<string, unknown>
+  const keys = Object.keys(record)
+  if (keys.length !== 4 || keys.some((key) => !CONNECTIVITY_RESULT_KEYS.has(key))) return undefined
+  if (
+    record.ok !== true
+    || record.protocol !== 'chat_completions' && record.protocol !== 'responses'
+    || !Number.isSafeInteger(record.latencyMs)
+    || (record.latencyMs as number) < 0
+    || typeof record.errorCategory !== 'string'
+    || !CONNECTIVITY_CATEGORIES.has(record.errorCategory)
+    || record.errorCategory !== ''
+  ) {
+    return undefined
+  }
+  return {
+    ok: true,
+    protocol: record.protocol,
+    latencyMs: record.latencyMs as number,
+    errorCategory: record.errorCategory,
+  }
 }
 
 export function listModels(providerId: string, signal?: AbortSignal): Promise<ModelView[]> {

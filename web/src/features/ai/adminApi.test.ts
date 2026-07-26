@@ -185,4 +185,136 @@ describe('admin AI api', () => {
       requestId: 'req-test',
     })
   })
+
+  it.each([
+    {
+      status: 409,
+      category: 'busy',
+      requestId: 'req-busy',
+    },
+    {
+      status: 503,
+      category: 'auth',
+      requestId: 'req-unavailable',
+    },
+  ])('rejects raw provider test failure status $status using only normalized headers', async ({
+    status,
+    category,
+    requestId,
+  }) => {
+    const secret = 'raw-provider-secret'
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      ok: false,
+      protocol: 'responses',
+      latencyMs: 12,
+      errorCategory: category,
+      apiKey: secret,
+      rawDetail: secret,
+    }), {
+      status,
+      headers: {
+        'X-Error-Code': ' provider_unavailable ',
+        'X-Request-ID': requestId,
+      },
+    }))
+
+    const error = await testProvider('provider-id').catch((reason: unknown) => reason)
+
+    expect(error).toMatchObject({
+      status,
+      code: 'PROVIDER_UNAVAILABLE',
+      requestId,
+    })
+    expect(String(error)).not.toContain(secret)
+    expect(JSON.stringify(error)).not.toContain(secret)
+  })
+
+  it('checks failure status and allowlisted headers before attempting JSON parsing', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response('not-json', {
+      status: 503,
+      headers: {
+        'X-Error-Code': 'PROVIDER_UNAVAILABLE',
+        'X-Request-ID': 'req-header',
+      },
+    }))
+
+    await expect(testProvider('provider-id')).rejects.toMatchObject({
+      status: 503,
+      code: 'PROVIDER_UNAVAILABLE',
+      requestId: 'req-header',
+    })
+  })
+
+  it('projects a valid success into an exact redacted connectivity DTO', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      ok: true,
+      protocol: 'chat_completions',
+      latencyMs: 17,
+      errorCategory: '',
+    }), { status: 200 }))
+
+    await expect(testProvider('provider-id')).resolves.toStrictEqual({
+      ok: true,
+      protocol: 'chat_completions',
+      latencyMs: 17,
+      errorCategory: '',
+    })
+  })
+
+  it('rejects successful connectivity payloads with extra secret-bearing fields', async () => {
+    const secret = 'must-not-survive'
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      ok: true,
+      protocol: 'responses',
+      latencyMs: 9,
+      errorCategory: '',
+      encryptedApiKey: secret,
+      nonce: secret,
+    }), { status: 200 }))
+
+    const error = await testProvider('provider-id').catch((reason: unknown) => reason)
+    expect(error).toMatchObject({ status: 200, code: 'invalid_response' })
+    expect(JSON.stringify(error)).not.toContain(secret)
+  })
+
+  it.each([
+    ['unknown protocol', { ok: true, protocol: 'legacy', latencyMs: 1, errorCategory: '' }],
+    ['fractional latency', { ok: true, protocol: 'responses', latencyMs: 1.5, errorCategory: '' }],
+    ['negative latency', { ok: true, protocol: 'responses', latencyMs: -1, errorCategory: '' }],
+    ['unknown category', { ok: true, protocol: 'responses', latencyMs: 1, errorCategory: 'raw-upstream' }],
+    ['failure on 2xx', { ok: false, protocol: 'responses', latencyMs: 1, errorCategory: 'auth' }],
+    ['missing field', { ok: true, protocol: 'responses', latencyMs: 1 }],
+  ])('rejects invalid successful connectivity payload: %s', async (_name, payload) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 200 }))
+
+    await expect(testProvider('provider-id')).rejects.toMatchObject({
+      status: 200,
+      code: 'invalid_response',
+    })
+  })
+
+  it('bounds successful raw JSON and rejects an oversized response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      ok: true,
+      protocol: 'responses',
+      latencyMs: 1,
+      errorCategory: '',
+      padding: 'x'.repeat(20_000),
+    }), { status: 200 }))
+
+    await expect(testProvider('provider-id')).rejects.toMatchObject({
+      status: 200,
+      code: 'invalid_response',
+    })
+  })
+
+  it('honors an already-aborted connectivity request without fetching', async () => {
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(testProvider('provider-id', controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(fetch).not.toHaveBeenCalled()
+  })
 })
