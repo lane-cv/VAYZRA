@@ -32,6 +32,15 @@ let restoreTargetCursor = initialCursor
 let originFocusPending = Boolean(initialFocus)
 let searchEpoch = 0
 let routeRetryPending = false
+interface DetailNavigation {
+  key: string
+  path: string
+  query: Record<string, string>
+}
+const detailRouteError = ref('')
+let pendingDetailNavigation: DetailNavigation | undefined
+let openingDetailKey = ''
+let detailEpoch = 0
 
 const statusLabels: Record<QuestionSummaryChannel, Record<string, string>> = {
   ai: {
@@ -63,9 +72,45 @@ async function openDetail(event: MouseEvent, item: QuestionSummary): Promise<voi
   if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
   event.preventDefault()
   const query = canonicalQuery()
-  query.focus = `${item.channel}:${item.id}`
-  await router.replace({ query })
-  await router.push(detailPath(item))
+  const key = `${item.channel}:${item.id}`
+  query.focus = key
+  await navigateToDetail({ key, path: detailPath(item), query })
+}
+
+async function navigateToDetail(navigation: DetailNavigation): Promise<void> {
+  if (openingDetailKey === navigation.key) return
+  const epoch = ++detailEpoch
+  openingDetailKey = navigation.key
+  pendingDetailNavigation = undefined
+  detailRouteError.value = ''
+  const committed = await commitQuery(navigation.query)
+  if (epoch !== detailEpoch) return
+  if (!committed) {
+    openingDetailKey = ''
+    pendingDetailNavigation = navigation
+    detailRouteError.value = '无法打开问题，请重试'
+    return
+  }
+  try {
+    await router.push(navigation.path)
+  } catch {
+    if (epoch !== detailEpoch) return
+    pendingDetailNavigation = navigation
+    detailRouteError.value = '无法打开问题，请重试'
+  } finally {
+    if (epoch === detailEpoch) openingDetailKey = ''
+  }
+}
+
+function retryOpenDetail(): void {
+  if (pendingDetailNavigation) void navigateToDetail(pendingDetailNavigation)
+}
+
+function cancelDetailNavigation(): void {
+  detailEpoch += 1
+  openingDetailKey = ''
+  pendingDetailNavigation = undefined
+  detailRouteError.value = ''
 }
 
 function canonicalQuery(): Record<string, string> {
@@ -84,8 +129,7 @@ function routeQueryEquals(target: Record<string, string>): boolean {
     && targetKeys.every((key) => route.query[key] === target[key])
 }
 
-async function updateQuery(): Promise<boolean> {
-  const target = canonicalQuery()
+async function commitQuery(target: Record<string, string>): Promise<boolean> {
   try {
     const failure = await router.replace({ query: target })
     if (!failure) return routeQueryEquals(target)
@@ -94,6 +138,10 @@ async function updateQuery(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+async function updateQuery(): Promise<boolean> {
+  return commitQuery(canonicalQuery())
 }
 
 function invalidateActiveRequest(): void {
@@ -245,6 +293,7 @@ async function restoreOriginFocus(): Promise<void> {
 }
 
 async function changeChannel(): Promise<void> {
+  cancelDetailNavigation()
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = undefined
   const epoch = ++searchEpoch
@@ -266,6 +315,7 @@ async function commitFilterAndLoad(epoch: number): Promise<void> {
 }
 
 function changeSearch(): void {
+  cancelDetailNavigation()
   if (searchTimer) clearTimeout(searchTimer)
   const epoch = ++searchEpoch
   restoreTargetCursor = undefined
@@ -284,6 +334,7 @@ function changeSearch(): void {
 
 onMounted(() => void restoreThrough(activeCursor.value))
 onBeforeUnmount(() => {
+  cancelDetailNavigation()
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = undefined
   searchEpoch += 1
@@ -341,6 +392,10 @@ onBeforeUnmount(() => {
         </a>
       </li>
     </ul>
+    <div v-if="detailRouteError" role="alert">
+      <p>{{ detailRouteError }}</p>
+      <button type="button" aria-label="重试打开问题" @click="retryOpenDetail">重试</button>
+    </div>
     <div v-if="error && errorMode === 'append' && items.length" role="alert">
       <p>{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
       <button type="button" aria-label="重试加载更多问答" @click="retry">重试</button>

@@ -228,6 +228,153 @@ describe('StudentQuestionListView', () => {
     wrapper.unmount()
   })
 
+  it.each([
+    { channel: 'ai' as const, outcome: 'reject' as const },
+    { channel: 'teacher' as const, outcome: 'aborted' as const },
+    { channel: 'ai' as const, outcome: 'cancelled' as const },
+  ])('does not open a $channel detail after a $outcome focus-route commit and retries safely', async ({ channel, outcome }) => {
+    const failure = outcome === 'reject' ? undefined : await realNavigationFailure(outcome)
+    api.list.mockResolvedValue({ items: mixed, nextCursor: undefined })
+    const { wrapper, route, replace, push } = mountList()
+    await flushPromises()
+    if (outcome === 'reject') replace.mockRejectedValueOnce(new Error('secret detail guard failure'))
+    else replace.mockResolvedValueOnce(failure)
+    const item = wrapper.get(`[data-question-key="${channel}:${channel === 'ai' ? 'a1' : 't1'}"]`)
+
+    await item.trigger('click')
+    await flushPromises()
+
+    expect(push).not.toHaveBeenCalled()
+    expect(route.query).toEqual({})
+    expect(wrapper.get('[role="alert"]').text()).toContain('无法打开问题')
+    expect(wrapper.text()).not.toContain('secret detail guard failure')
+
+    await wrapper.get('[aria-label="重试打开问题"]').trigger('click')
+    await flushPromises()
+
+    expect(route.query).toEqual({ focus: `${channel}:${channel === 'ai' ? 'a1' : 't1'}` })
+    expect(push).toHaveBeenCalledTimes(1)
+    expect(push).toHaveBeenLastCalledWith(expect.stringContaining(`/student/questions/${channel}/`))
+    wrapper.unmount()
+  })
+
+  it('opens a detail after an exact-equivalent duplicated focus-route commit but rejects a non-equivalent duplicate', async () => {
+    const duplicated = await realNavigationFailure('duplicated')
+    api.list.mockResolvedValue({ items: mixed, nextCursor: undefined })
+    const equivalent = mountList({ focus: 'teacher:t1' })
+    await flushPromises()
+    equivalent.replace.mockResolvedValueOnce(duplicated)
+
+    await equivalent.wrapper.get('[data-question-key="teacher:t1"]').trigger('click')
+    await flushPromises()
+
+    expect(equivalent.push).toHaveBeenCalledTimes(1)
+    expect(equivalent.wrapper.find('[role="alert"]').exists()).toBe(false)
+    equivalent.wrapper.unmount()
+
+    const different = mountList()
+    await flushPromises()
+    different.replace.mockResolvedValueOnce(duplicated)
+    await different.wrapper.get('[data-question-key="ai:a1"]').trigger('click')
+    await flushPromises()
+
+    expect(different.push).not.toHaveBeenCalled()
+    expect(different.wrapper.get('[role="alert"]').text()).toContain('无法打开问题')
+    different.wrapper.unmount()
+  })
+
+  it('does not push a detail twice while the same focus-route transaction is pending', async () => {
+    let commit!: (value?: void) => void
+    api.list.mockResolvedValue({ items: mixed, nextCursor: undefined })
+    const { wrapper, route, replace, push } = mountList()
+    await flushPromises()
+    replace.mockImplementationOnce((target: { query: Record<string, unknown> }) => new Promise<void>((resolve) => {
+      commit = () => {
+        route.query = target.query
+        resolve()
+      }
+    }))
+    const link = wrapper.get('[data-question-key="ai:a1"]')
+
+    await link.trigger('click')
+    await link.trigger('click')
+    expect(replace).toHaveBeenCalledTimes(1)
+    commit()
+    await flushPromises()
+
+    expect(push).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('does not let a stale detail transaction push after a newer row opens', async () => {
+    let commitOld!: (value?: void) => void
+    api.list.mockResolvedValue({ items: mixed, nextCursor: undefined })
+    const { wrapper, route, replace, push } = mountList()
+    await flushPromises()
+    replace.mockImplementationOnce((target: { query: Record<string, unknown> }) => new Promise<void>((resolve) => {
+      commitOld = () => {
+        route.query = target.query
+        resolve()
+      }
+    }))
+
+    await wrapper.get('[data-question-key="ai:a1"]').trigger('click')
+    await wrapper.get('[data-question-key="teacher:t1"]').trigger('click')
+    await flushPromises()
+    expect(push).toHaveBeenCalledTimes(1)
+    expect(push).toHaveBeenLastCalledWith(expect.stringContaining('/student/questions/teacher/t1?'))
+
+    commitOld()
+    await flushPromises()
+    expect(push).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('keeps the focused list history entry so Back restores the teacher origin after a successful retry', async () => {
+    api.list.mockResolvedValue({ items: mixed, nextCursor: undefined })
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/student/questions', component: routeComponent },
+        { path: '/student/questions/:channel/:id', component: routeComponent },
+      ],
+    })
+    await router.push('/student/questions?channel=teacher')
+    const originalReplace = router.replace.bind(router)
+    vi.spyOn(router, 'replace')
+      .mockRejectedValueOnce(new Error('private guard detail'))
+      .mockImplementation(originalReplace)
+    const wrapper = mount(StudentQuestionListView, {
+      attachTo: document.body,
+      global: {
+        plugins: [router],
+        stubs: {
+          RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-question-key="teacher:t1"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[aria-label="重试打开问题"]').trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/student/questions/teacher/t1')
+
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/student/questions')
+    expect(router.currentRoute.value.query).toEqual({ channel: 'teacher', focus: 'teacher:t1' })
+
+    const returnedQuery = { ...router.currentRoute.value.query }
+    wrapper.unmount()
+    const { wrapper: returned } = mountList(returnedQuery)
+    document.body.appendChild(returned.element)
+    await flushPromises()
+    expect(document.activeElement).toBe(returned.get('[data-question-key="teacher:t1"]').element)
+    returned.unmount()
+  })
+
   it('continues rebuilding through the saved cursor after an intermediate page retry', async () => {
     const pageTwo = { ...mixed[0], id: 'a2', title: '恢复中的第二页' }
     const origin = { ...mixed[1], id: 't3', title: '恢复焦点来源' }
