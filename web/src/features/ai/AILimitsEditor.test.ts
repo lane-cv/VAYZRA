@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { APIError } from '../../api/client'
 import AILimitsEditor from './AILimitsEditor.vue'
 import * as api from './adminApi'
 
@@ -80,6 +81,35 @@ describe('AILimitsEditor', () => {
       monthlyRequests: { mode: 'disabled' },
       dailyTokens: { mode: 'limit', value: 300 },
       expectedVersion: 2,
+    }))
+  })
+
+  it('preserves a global conflict and rebases the form on the latest limits', async () => {
+    const latestGlobal: api.LimitView = {
+      ...globalLimits,
+      dailyRequests: { mode: 'limit', value: 99 },
+      version: 6,
+    }
+    vi.mocked(api.readLimits)
+      .mockResolvedValueOnce({ global: globalLimits, students: {} })
+      .mockResolvedValue({ global: latestGlobal, students: {} })
+    vi.mocked(api.putGlobalLimits)
+      .mockRejectedValueOnce(new APIError(409, 'config_conflict', '配置已更新', 'req-limits-conflict'))
+      .mockResolvedValue({ ...latestGlobal, version: 7 })
+    const wrapper = mount(AILimitsEditor)
+    await flushPromises()
+    await wrapper.get('input[aria-label="全局每日请求上限"]').setValue('12')
+    await wrapper.get('button[aria-label="保存全局额度"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-limits-conflict')
+    expect(wrapper.get('input[aria-label="全局每日请求上限"]').element).toHaveProperty('value', '99')
+
+    await wrapper.get('button[aria-label="保存全局额度"]').trigger('click')
+    await flushPromises()
+    expect(api.putGlobalLimits).toHaveBeenLastCalledWith(expect.objectContaining({
+      dailyRequests: { mode: 'limit', value: 99 },
+      expectedVersion: 6,
     }))
   })
 })

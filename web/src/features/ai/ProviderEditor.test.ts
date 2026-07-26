@@ -112,4 +112,85 @@ describe('ProviderEditor', () => {
     expect(wrapper.text()).toContain('支持编号：req-conflict')
     expect(api.listProviders).toHaveBeenCalledTimes(2)
   })
+
+  it('rebases an edit conflict on the latest server record before another save', async () => {
+    const latest = {
+      ...provider,
+      name: '其他管理员的新名称',
+      baseUrl: 'https://latest-provider.example/v1',
+      protocolMode: 'chat_completions' as const,
+      version: 4,
+    }
+    vi.mocked(api.listProviders)
+      .mockResolvedValueOnce([provider])
+      .mockResolvedValue([latest])
+    vi.mocked(api.updateProvider)
+      .mockRejectedValueOnce(new APIError(409, 'config_conflict', '配置已更新', 'req-edit-conflict'))
+      .mockResolvedValue(latest)
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get(`button[aria-label="编辑 ${provider.name}"]`).trigger('click')
+    await wrapper.get('input[aria-label="供应商名称"]').setValue('我的过期草稿')
+    await wrapper.get('input[aria-label="供应商地址"]').setValue('https://stale-draft.example/v1')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-edit-conflict')
+    expect(wrapper.get('input[aria-label="供应商名称"]').element).toHaveProperty(
+      'value',
+      latest.name,
+    )
+    expect(wrapper.get('input[aria-label="供应商地址"]').element).toHaveProperty(
+      'value',
+      latest.baseUrl,
+    )
+
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(api.updateProvider).toHaveBeenLastCalledWith(provider.id, expect.objectContaining({
+      name: latest.name,
+      baseUrl: latest.baseUrl,
+      protocolMode: latest.protocolMode,
+      expectedVersion: latest.version,
+    }))
+  })
+
+  it('also rebases an open edit form when an activation conflict reloads providers', async () => {
+    const latest = { ...provider, name: '激活冲突后的名称', version: 4 }
+    vi.mocked(api.listProviders)
+      .mockResolvedValueOnce([provider])
+      .mockResolvedValue([latest])
+    vi.mocked(api.activateProvider).mockRejectedValue(
+      new APIError(409, 'config_conflict', '配置已更新', 'req-activate-edit'),
+    )
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get(`button[aria-label="编辑 ${provider.name}"]`).trigger('click')
+    await wrapper.get('input[aria-label="供应商名称"]').setValue('激活前的过期草稿')
+    await wrapper.get(`button[aria-label="启用 ${provider.name}"]`).trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-activate-edit')
+    expect(wrapper.get('input[aria-label="供应商名称"]').element).toHaveProperty(
+      'value',
+      latest.name,
+    )
+  })
+
+  it('keeps the original conflict request ID when the rebase reload also fails', async () => {
+    vi.mocked(api.listProviders)
+      .mockResolvedValueOnce([provider])
+      .mockRejectedValue(new APIError(503, 'unavailable', '重新加载失败', 'req-reload'))
+    vi.mocked(api.updateProvider).mockRejectedValue(
+      new APIError(409, 'config_conflict', '配置已更新', 'req-original-conflict'),
+    )
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get(`button[aria-label="编辑 ${provider.name}"]`).trigger('click')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-original-conflict')
+    expect(wrapper.text()).not.toContain('支持编号：req-reload')
+  })
 })

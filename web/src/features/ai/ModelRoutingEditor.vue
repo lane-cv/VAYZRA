@@ -104,9 +104,11 @@ function failure(reason: unknown, fallback: string) {
     : { message: fallback, requestId: '', conflict: false }
 }
 
-async function loadModels() {
-  error.value = ''
-  requestId.value = ''
+async function loadModels(preserveFailure = false) {
+  if (!preserveFailure) {
+    error.value = ''
+    requestId.value = ''
+  }
   if (!providerId.value) {
     setForm('text')
     setForm('vision')
@@ -124,6 +126,11 @@ async function loadModels() {
   } finally {
     loading.value = false
   }
+}
+
+function retryLoad() {
+  if (providerId.value) void loadModels()
+  else void initialize()
 }
 
 async function initialize() {
@@ -203,7 +210,7 @@ async function save(modality: Modality) {
     const details = failure(reason, '模型路由保存失败，请稍后重试')
     error.value = details.message
     requestId.value = details.requestId
-    if (details.conflict) await loadModels()
+    if (details.conflict) await loadModels(true)
   } finally {
     pending.value = undefined
   }
@@ -216,12 +223,12 @@ onBeforeMount(() => { void initialize() })
   <section class="editor" aria-labelledby="routing-heading">
     <h2 id="routing-heading">模型路由</h2>
     <label class="provider-select">供应商
-      <select v-model="providerId" aria-label="模型供应商" :disabled="loading || !!pending" @change="loadModels">
+      <select v-model="providerId" aria-label="模型供应商" :disabled="loading || !!pending" @change="loadModels()">
         <option v-for="provider in providers" :key="provider.id" :value="provider.id">{{ provider.name }}</option>
       </select>
     </label>
     <p v-if="loading" role="status">正在加载模型路由…</p>
-    <div v-if="error" role="alert"><p>{{ error }}<span v-if="requestId"> 支持编号：{{ requestId }}</span></p><button type="button" aria-label="重新加载模型路由" :disabled="loading || !!pending" @click="loadModels">重新加载</button></div>
+    <div v-if="error" role="alert"><p>{{ error }}<span v-if="requestId"> 支持编号：{{ requestId }}</span></p><button type="button" aria-label="重新加载模型路由" :disabled="loading || !!pending" @click="retryLoad">重新加载</button></div>
     <p v-if="notice" role="status">{{ notice }}</p>
     <div class="route-grid">
       <form v-for="modality in (['text', 'vision'] as const)" :key="modality" :data-modality="modality" @submit.prevent="save(modality)">

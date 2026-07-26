@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { APIError } from '../../api/client'
 import ModelRoutingEditor, {
   dollarsPerMillionToMicroUSD,
   microUSDToDollarsPerMillion,
@@ -19,6 +20,23 @@ const provider = {
   active: true,
   hasKey: true,
   keyUpdatedAt: '2026-07-27T00:00:00Z',
+  version: 1,
+}
+const textModel: api.ModelView = {
+  id: '22222222-2222-4222-8222-222222222222',
+  providerId: provider.id,
+  upstreamModelId: 'text-v1',
+  modality: 'text',
+  contextTokens: 100,
+  maxOutputTokens: 50,
+  imageQuotaTokens: 1,
+  inputPriceMicroUsd: 100000,
+  outputPriceMicroUsd: 200000,
+  connectTimeoutMs: 5000,
+  responseHeaderTimeoutMs: 30000,
+  idleStreamTimeoutMs: 30000,
+  totalTimeoutMs: 120000,
+  enabled: true,
   version: 1,
 }
 
@@ -80,6 +98,57 @@ describe('ModelRoutingEditor', () => {
         idleStreamTimeoutMs: 9000,
         totalTimeoutMs: 10000,
       }),
+    )
+
+    const vision = wrapper.get('[data-modality="vision"]')
+    await vision.get('input[aria-label="视觉模型 UUID"]').setValue('33333333-3333-4333-8333-333333333333')
+    await vision.get('input[aria-label="视觉上游模型"]').setValue('vision-model')
+    await vision.get('button[type="submit"]').trigger('click')
+    await flushPromises()
+    expect(api.putModel).toHaveBeenLastCalledWith(
+      provider.id,
+      '33333333-3333-4333-8333-333333333333',
+      expect.objectContaining({ modality: 'vision', upstreamModelId: 'vision-model' }),
+    )
+  })
+
+  it('preserves conflict feedback while replacing a stale model form with the latest version', async () => {
+    const latest = { ...textModel, upstreamModelId: 'text-v2', version: 2 }
+    vi.mocked(api.listModels)
+      .mockResolvedValueOnce([textModel])
+      .mockResolvedValue([latest])
+    vi.mocked(api.putModel).mockRejectedValue(
+      new APIError(409, 'config_conflict', '配置已更新', 'req-model-conflict'),
+    )
+    const wrapper = mount(ModelRoutingEditor)
+    await flushPromises()
+    await wrapper.get('[data-modality="text"] button[type="submit"]').trigger('click')
+    await flushPromises()
+
+    expect(api.listModels).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('支持编号：req-model-conflict')
+    expect(wrapper.get('input[aria-label="文本上游模型"]').element).toHaveProperty(
+      'value',
+      latest.upstreamModelId,
+    )
+  })
+
+  it('retries provider discovery after the initial provider list fails', async () => {
+    vi.mocked(api.listProviders)
+      .mockRejectedValueOnce(new APIError(503, 'unavailable', '供应商加载失败', 'req-provider-load'))
+      .mockResolvedValue([provider])
+    vi.mocked(api.listModels).mockResolvedValue([textModel])
+    const wrapper = mount(ModelRoutingEditor)
+    await flushPromises()
+    expect(wrapper.text()).toContain('支持编号：req-provider-load')
+
+    await wrapper.get('button[aria-label="重新加载模型路由"]').trigger('click')
+    await flushPromises()
+    expect(api.listProviders).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('select[aria-label="模型供应商"] option').text()).toBe(provider.name)
+    expect(wrapper.get('input[aria-label="文本上游模型"]').element).toHaveProperty(
+      'value',
+      textModel.upstreamModelId,
     )
   })
 })

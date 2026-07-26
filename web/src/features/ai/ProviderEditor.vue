@@ -41,10 +41,14 @@ async function load(preserveFailure = false) {
   if (!preserveFailure) clearFeedback()
   try {
     providers.value = await listProviders()
+    return true
   } catch (reason) {
-    const failure = details(reason, '供应商配置加载失败，请稍后重试')
-    error.value = failure.message
-    requestId.value = failure.requestId
+    if (!preserveFailure) {
+      const failure = details(reason, '供应商配置加载失败，请稍后重试')
+      error.value = failure.message
+      requestId.value = failure.requestId
+    }
+    return false
   } finally {
     loading.value = false
   }
@@ -68,6 +72,31 @@ function beginEdit(provider: ProviderView) {
   protocolMode.value = provider.protocolMode
   apiKey.value = ''
   clearFeedback()
+}
+
+function rebaseEdit(provider: ProviderView) {
+  editingId.value = provider.id
+  replaceKey.value = false
+  name.value = provider.name
+  baseUrl.value = provider.baseUrl
+  protocolMode.value = provider.protocolMode
+  apiKey.value = ''
+}
+
+async function reloadAfterConflict() {
+  if (!await load(true)) return
+  const latest = providers.value.find((provider) => provider.id === editingId.value)
+  if (latest) {
+    rebaseEdit(latest)
+    return
+  }
+  if (editingId.value) {
+    editingId.value = undefined
+    replaceKey.value = true
+    name.value = ''
+    baseUrl.value = ''
+    protocolMode.value = 'responses'
+  }
 }
 
 function validHTTPS(value: string) {
@@ -134,7 +163,7 @@ async function save() {
     const failure = details(reason, '供应商保存失败，请稍后重试')
     error.value = failure.message
     requestId.value = failure.requestId
-    if (failure.conflict) await load(true)
+    if (failure.conflict) await reloadAfterConflict()
   } finally {
     pending.value = false
   }
@@ -154,7 +183,7 @@ async function activate(provider: ProviderView) {
     const failure = details(reason, '启用供应商失败，请稍后重试')
     error.value = failure.message
     requestId.value = failure.requestId
-    if (failure.conflict) await load(true)
+    if (failure.conflict) await reloadAfterConflict()
   } finally {
     pending.value = false
   }
