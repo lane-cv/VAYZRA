@@ -73,7 +73,7 @@ func TestURLPolicyValidateResolvedRejectsForbiddenAddresses(t *testing.T) {
 		"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254", "100.64.0.1",
 		"224.0.0.1", "0.0.0.0", "192.0.2.1", "198.51.100.1", "203.0.113.1", "::ffff:127.0.0.1",
 		"0.1.2.3", "240.0.0.1", "64:ff9b::a00:1", "64:ff9b:1::a00:1", "2002:0a00:0001::1", "2001:0000::1",
-		"192.88.99.1", "3fff::1",
+		"192.88.99.1", "192.31.196.1", "192.52.193.1", "192.175.48.1", "2001:3::1", "3fff::1",
 	} {
 		t.Run(address, func(t *testing.T) {
 			policy := URLPolicy{Resolver: &fakeResolver{answers: map[string][]netip.Addr{"blocked.test": {netip.MustParseAddr(address)}}}}

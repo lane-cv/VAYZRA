@@ -149,6 +149,26 @@ func TestSafeTransportDoesNotLeakQueryInRedirectError(t *testing.T) {
 	}
 }
 
+func TestSafeTransportDoesNotLeakMalformedRedirectLocation(t *testing.T) {
+	t.Parallel()
+	const secret = "malformed-location-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://[::1?token="+secret)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+	policy := URLPolicy{DevelopmentAllowPrivate: true, Resolver: &fakeResolver{answers: map[string][]netip.Addr{"supplier.test": {netip.MustParseAddr("127.0.0.1")}}}}
+	client := NewSafeHTTPClient(policy, GatewayTimeouts{Total: time.Second})
+	port := strings.TrimPrefix(server.URL, "http://127.0.0.1:")
+	_, err := client.Get("http://supplier.test:" + port + "/v1")
+	if err == nil {
+		t.Fatal("expected malformed redirect error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("malformed redirect leaked secret: %v", err)
+	}
+}
+
 func TestIdleTimeoutBodyIgnoresStaleTimerGeneration(t *testing.T) {
 	body := newIdleTimeoutBody(io.NopCloser(strings.NewReader("active")), time.Hour)
 	defer body.Close()

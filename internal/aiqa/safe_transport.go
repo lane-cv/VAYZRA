@@ -2,6 +2,7 @@ package aiqa
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 )
+
+var errInvalidProviderRedirect = errors.New("invalid provider redirect")
 
 // GatewayTimeouts bounds supplier connections and streaming responses.
 type GatewayTimeouts struct {
@@ -115,7 +118,7 @@ func (s safeRoundTripper) validateRedirect(req *http.Request, response *http.Res
 	}
 	next, err := req.URL.Parse(location)
 	if err != nil {
-		return fmt.Errorf("invalid provider redirect: %w", err)
+		return errInvalidProviderRedirect
 	}
 	if _, err := s.policy.validateRequestURL(req.Context(), next); err != nil {
 		return err
