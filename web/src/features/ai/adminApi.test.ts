@@ -12,6 +12,7 @@ import {
   putPrompt,
   putGlobalLimits,
   putStudentLimits,
+  listAIConfigStudents,
 } from './adminApi'
 
 type ForbiddenProviderReadKey = Extract<
@@ -112,6 +113,10 @@ describe('admin AI api', () => {
       imageQuotaTokens: 4,
       inputPriceMicroUsd: 9,
       outputPriceMicroUsd: 12,
+      connectTimeoutMs: 5000,
+      responseHeaderTimeoutMs: 30000,
+      idleStreamTimeoutMs: 30000,
+      totalTimeoutMs: 120000,
       enabled: true,
       clearQuotaBlock: false,
       expectedVersion: 2,
@@ -136,6 +141,10 @@ describe('admin AI api', () => {
         imageQuotaTokens: 4,
         inputPriceMicroUsd: 9,
         outputPriceMicroUsd: 12,
+        connectTimeoutMs: 5000,
+        responseHeaderTimeoutMs: 30000,
+        idleStreamTimeoutMs: 30000,
+        totalTimeoutMs: 120000,
         enabled: true,
         clearQuotaBlock: false,
         expectedVersion: 2,
@@ -144,6 +153,21 @@ describe('admin AI api', () => {
       limits,
       limits,
     ])
+  })
+
+  it('pages student selection through the typed admin client', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{ id: 'student-1', username: 'lin01', displayName: '林同学' }],
+      meta: { nextCursor: 'next /?' },
+    })))
+
+    await expect(listAIConfigStudents('cursor /?')).resolves.toEqual({
+      items: [{ id: 'student-1', username: 'lin01', displayName: '林同学' }],
+      nextCursor: 'next /?',
+    })
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+      '/api/v1/admin/students?cursor=cursor%20%2F%3F',
+    )
   })
 
   it('strictly encodes usage filters and keeps micro-USD cost as a string', async () => {

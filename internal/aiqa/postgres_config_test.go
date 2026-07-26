@@ -133,7 +133,7 @@ func TestPostgresConfigRuntimeDecryptsAndCopiesSecret(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM ai_models WHERE provider_id=$1 AND modality='text'`, id).Scan(&textID); err != nil {
 		t.Fatal(err)
 	}
-	disable := PutModelInput{ProviderID: id, ID: textID, UpstreamModelID: "text", Modality: ModalityText, ContextTokens: 8192, MaxOutputTokens: 1024, ImageQuotaTokens: 1000, Enabled: false, ExpectedVersion: 1}
+	disable := PutModelInput{ProviderID: id, ID: textID, UpstreamModelID: "text", Modality: ModalityText, ContextTokens: 8192, MaxOutputTokens: 1024, ImageQuotaTokens: 1000, Enabled: false, ExpectedVersion: 1, ConnectTimeoutMS: 5000, ResponseHeaderTimeoutMS: 30000, IdleStreamTimeoutMS: 30000, TotalTimeoutMS: 120000}
 	if _, err := store.PutModel(ctx, actor, disable); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("disable sole active text=%v", err)
 	}
@@ -313,10 +313,14 @@ func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {
 	store := NewPostgresConfigStore(pool)
 	one, two := seedProvider(t, ctx, pool, admin, "one"), seedProvider(t, ctx, pool, admin, "two")
 	model := uuid.New()
-	in := PutModelInput{ProviderID: one, ID: model, UpstreamModelID: "model", Modality: ModalityText, ContextTokens: 100, MaxOutputTokens: 50, ImageQuotaTokens: 10, Enabled: true, ExpectedVersion: 0}
+	in := PutModelInput{ProviderID: one, ID: model, UpstreamModelID: "model", Modality: ModalityText, ContextTokens: 100, MaxOutputTokens: 50, ImageQuotaTokens: 10, Enabled: true, ExpectedVersion: 0, ConnectTimeoutMS: 700, ResponseHeaderTimeoutMS: 8000, IdleStreamTimeoutMS: 9000, TotalTimeoutMS: 10000}
 	first, err := store.PutModel(ctx, actor, in)
-	if err != nil || first.Version != 1 {
+	if err != nil || first.Version != 1 || first.ConnectTimeoutMS != 700 || first.ResponseHeaderTimeoutMS != 8000 || first.IdleStreamTimeoutMS != 9000 || first.TotalTimeoutMS != 10000 {
 		t.Fatalf("create=%#v err=%v", first, err)
+	}
+	listed, err := store.ListModels(ctx, one)
+	if err != nil || len(listed) != 1 || listed[0].ConnectTimeoutMS != 700 || listed[0].TotalTimeoutMS != 10000 {
+		t.Fatalf("listed=%#v err=%v", listed, err)
 	}
 	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrConfigConflict) {
 		t.Fatalf("duplicate create=%v", err)
@@ -340,8 +344,12 @@ func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {
 		t.Fatalf("clear unchanged=%v", err)
 	}
 	in.ImageQuotaTokens = 11
+	in.ConnectTimeoutMS = 900
+	in.ResponseHeaderTimeoutMS = 11000
+	in.IdleStreamTimeoutMS = 12000
+	in.TotalTimeoutMS = 13000
 	updated, err := store.PutModel(ctx, actor, in)
-	if err != nil || updated.QuotaBlockedAt != nil {
+	if err != nil || updated.QuotaBlockedAt != nil || updated.ConnectTimeoutMS != 900 || updated.ResponseHeaderTimeoutMS != 11000 || updated.IdleStreamTimeoutMS != 12000 || updated.TotalTimeoutMS != 13000 {
 		t.Fatalf("clear=%#v err=%v", updated, err)
 	}
 	prompt, err := store.PutPrompt(ctx, actor, PutPromptInput{Subject: SubjectMath, Body: "one", ExpectedVersion: 0})

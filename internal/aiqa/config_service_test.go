@@ -84,3 +84,31 @@ func TestConfigServiceAllowsInitialPromptVersion(t *testing.T) {
 		t.Fatalf("initial prompt=%v", err)
 	}
 }
+
+func TestConfigServiceEnforcesModelTimeoutBounds(t *testing.T) {
+	svc := NewAdminConfigService(&memoryConfigStore{}, URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}, testSecretBox{})
+	actor := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}
+	valid := PutModelInput{
+		ProviderID: uuid.New(), ID: uuid.New(), UpstreamModelID: "model", Modality: ModalityText,
+		ContextTokens: 100, MaxOutputTokens: 50, ImageQuotaTokens: 1,
+		ConnectTimeoutMS: 100, ResponseHeaderTimeoutMS: 1000, IdleStreamTimeoutMS: 1000, TotalTimeoutMS: 1000,
+	}
+	if _, err := svc.PutModel(context.Background(), actor, valid); err != nil {
+		t.Fatalf("valid timeouts=%v", err)
+	}
+	for name, mutate := range map[string]func(*PutModelInput){
+		"connect too low":    func(in *PutModelInput) { in.ConnectTimeoutMS = 99 },
+		"headers too high":   func(in *PutModelInput) { in.ResponseHeaderTimeoutMS = 120001 },
+		"idle too low":       func(in *PutModelInput) { in.IdleStreamTimeoutMS = 999 },
+		"total below header": func(in *PutModelInput) { in.TotalTimeoutMS = 999 },
+		"total too high":     func(in *PutModelInput) { in.TotalTimeoutMS = 600001 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := valid
+			mutate(&in)
+			if _, err := svc.PutModel(context.Background(), actor, in); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}

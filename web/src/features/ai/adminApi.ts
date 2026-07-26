@@ -32,6 +32,10 @@ export type ModelView = {
   imageQuotaTokens: number
   inputPriceMicroUsd: number
   outputPriceMicroUsd: number
+  connectTimeoutMs: number
+  responseHeaderTimeoutMs: number
+  idleStreamTimeoutMs: number
+  totalTimeoutMs: number
   enabled: boolean
   quotaBlockedAt?: string
   quotaBlockReason?: string
@@ -55,7 +59,7 @@ export type PromptView = {
 }
 export type PromptWriteInput = { body: string; expectedVersion: number }
 
-export type LimitMode = 'disabled' | 'inherit' | 'value'
+export type LimitMode = 'disabled' | 'inherit' | 'limit'
 export type LimitValue = { mode: LimitMode; value?: number }
 export type LimitView = {
   dailyRequests: LimitValue
@@ -66,6 +70,8 @@ export type LimitView = {
 }
 export type LimitWriteInput = Omit<LimitView, 'version'> & { expectedVersion: number }
 export type LimitViews = { global: LimitView; students: Record<string, LimitView> }
+export type AIConfigStudent = { id: string; username: string; displayName: string }
+export type AIConfigStudentPage = { items: AIConfigStudent[]; nextCursor?: string }
 
 export type ConnectivityResult = {
   ok: boolean
@@ -371,6 +377,20 @@ export function putStudentLimits(
     json: input,
     signal,
   })
+}
+
+export async function listAIConfigStudents(
+  cursor?: string,
+  signal?: AbortSignal,
+): Promise<AIConfigStudentPage> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  const result = await requestWithMeta<AIConfigStudent[]>(`/admin/students${query}`, { signal })
+  return {
+    items: result.data,
+    nextCursor: typeof result.meta?.nextCursor === 'string' && result.meta.nextCursor
+      ? result.meta.nextCursor
+      : undefined,
+  }
 }
 
 function usageQuery(filters: UsageFilters): string {

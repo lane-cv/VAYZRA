@@ -42,6 +42,18 @@ describe('console router guards', () => {
   it('allows an admin to open the student management route', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; const router = createAppRouter(); await router.push('/admin/students'); expect(router.currentRoute.value.fullPath).toBe('/admin/students')
   })
+  it('exposes AI management only inside the admin route tree', async () => {
+    const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'a1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }
+    const router = createAppRouter()
+    await router.push('/admin/ai')
+    expect(router.currentRoute.value.name).toBe('admin-ai')
+    session.user = { id: 's1', username: 'student', displayName: '林同学', role: 'student', mustChangePassword: false }
+    await router.push('/student')
+    await router.push('/admin/ai')
+    expect(router.currentRoute.value.fullPath).toBe('/student')
+    const studentRoot = router.getRoutes().find((route) => route.path === '/student')
+    expect(JSON.stringify(studentRoot?.children)).not.toContain('/admin/ai')
+  })
   it('allows only admins to open canonical teacher question routes in one persistent workspace',async()=>{const session=useSessionStore();session.bootstrapStatus='ready';session.user={id:'a1',username:'teacher',displayName:'张老师',role:'admin',mustChangePassword:false};const router=createAppRouter();await router.push('/admin/questions');expect(router.currentRoute.value.name).toBe('admin-questions');const workspace=router.currentRoute.value.matched[1].components?.default;await router.push('/admin/questions/not-a-uuid');expect(router.currentRoute.value.name).toBe('admin-questions');await router.push('/admin/questions/11111111-1111-4111-8111-111111111111');expect(router.currentRoute.value.name).toBe('admin-question-detail');expect(router.currentRoute.value.matched[1].components?.default).toBe(workspace);session.user={id:'s1',username:'student',displayName:'学生',role:'student',mustChangePassword:false};await router.push('/admin/questions');expect(router.currentRoute.value.fullPath).toBe('/student')})
   it('allows either authenticated role on the role-neutral notification route',async()=>{const session=useSessionStore();session.bootstrapStatus='ready';session.user={id:'a1',username:'teacher',displayName:'张老师',role:'admin',mustChangePassword:false};const router=createAppRouter();await router.push('/notifications');expect(router.currentRoute.value.name).toBe('notifications');session.user={id:'s1',username:'student',displayName:'学生',role:'student',mustChangePassword:false};await router.push('/student');await router.push('/notifications');expect(router.currentRoute.value.name).toBe('notifications')})
   it('allows an admin to open teaching management and rejects a student', async () => {

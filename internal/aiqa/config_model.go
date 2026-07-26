@@ -50,19 +50,23 @@ type ProviderView struct {
 	Version      int64        `json:"version"`
 }
 type ModelView struct {
-	ID                  uuid.UUID  `json:"id"`
-	ProviderID          uuid.UUID  `json:"providerId"`
-	UpstreamModelID     string     `json:"upstreamModelId"`
-	Modality            Modality   `json:"modality"`
-	ContextTokens       int64      `json:"contextTokens"`
-	MaxOutputTokens     int64      `json:"maxOutputTokens"`
-	ImageQuotaTokens    int64      `json:"imageQuotaTokens"`
-	InputPriceMicroUSD  int64      `json:"inputPriceMicroUsd"`
-	OutputPriceMicroUSD int64      `json:"outputPriceMicroUsd"`
-	Enabled             bool       `json:"enabled"`
-	QuotaBlockedAt      *time.Time `json:"quotaBlockedAt,omitempty"`
-	QuotaBlockReason    string     `json:"quotaBlockReason,omitempty"`
-	Version             int64      `json:"version"`
+	ID                      uuid.UUID  `json:"id"`
+	ProviderID              uuid.UUID  `json:"providerId"`
+	UpstreamModelID         string     `json:"upstreamModelId"`
+	Modality                Modality   `json:"modality"`
+	ContextTokens           int64      `json:"contextTokens"`
+	MaxOutputTokens         int64      `json:"maxOutputTokens"`
+	ImageQuotaTokens        int64      `json:"imageQuotaTokens"`
+	InputPriceMicroUSD      int64      `json:"inputPriceMicroUsd"`
+	OutputPriceMicroUSD     int64      `json:"outputPriceMicroUsd"`
+	ConnectTimeoutMS        int64      `json:"connectTimeoutMs"`
+	ResponseHeaderTimeoutMS int64      `json:"responseHeaderTimeoutMs"`
+	IdleStreamTimeoutMS     int64      `json:"idleStreamTimeoutMs"`
+	TotalTimeoutMS          int64      `json:"totalTimeoutMs"`
+	Enabled                 bool       `json:"enabled"`
+	QuotaBlockedAt          *time.Time `json:"quotaBlockedAt,omitempty"`
+	QuotaBlockReason        string     `json:"quotaBlockReason,omitempty"`
+	Version                 int64      `json:"version"`
 }
 type PromptView struct {
 	ID      uuid.UUID `json:"id"`
@@ -102,6 +106,7 @@ type PutModelInput struct {
 	UpstreamModelID                                                                           string
 	Modality                                                                                  Modality
 	ContextTokens, MaxOutputTokens, ImageQuotaTokens, InputPriceMicroUSD, OutputPriceMicroUSD int64
+	ConnectTimeoutMS, ResponseHeaderTimeoutMS, IdleStreamTimeoutMS, TotalTimeoutMS            int64
 	Enabled, ClearQuotaBlock                                                                  bool
 	ExpectedVersion                                                                           int64
 }

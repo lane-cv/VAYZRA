@@ -144,7 +144,7 @@ func (s *configService) PutModel(c context.Context, p Principal, in PutModelInpu
 	if e := admin(p); e != nil {
 		return ModelView{}, e
 	}
-	if in.ProviderID == uuid.Nil || in.ID == uuid.Nil || in.ExpectedVersion < 0 || strings.TrimSpace(in.UpstreamModelID) == "" || !modalityOK(in.Modality) || in.ContextTokens < 1 || in.MaxOutputTokens < 1 || in.MaxOutputTokens > in.ContextTokens || in.ImageQuotaTokens < 1 || in.InputPriceMicroUSD < 0 || in.OutputPriceMicroUSD < 0 {
+	if in.ProviderID == uuid.Nil || in.ID == uuid.Nil || in.ExpectedVersion < 0 || strings.TrimSpace(in.UpstreamModelID) == "" || !modalityOK(in.Modality) || in.ContextTokens < 1 || in.MaxOutputTokens < 1 || in.MaxOutputTokens > in.ContextTokens || in.ImageQuotaTokens < 1 || in.InputPriceMicroUSD < 0 || in.OutputPriceMicroUSD < 0 || !modelTimeoutsOK(in) {
 		return ModelView{}, ErrInvalidInput
 	}
 	in.UpstreamModelID = strings.TrimSpace(in.UpstreamModelID)
@@ -255,9 +255,17 @@ func (s *configService) recordProviderTest(p Principal, result providerTestAudit
 	defer cancel()
 	return s.connectivity.RecordProviderTest(auditCtx, p, result)
 }
-func protocolOK(v ProtocolMode) bool     { return v == ProtocolChatCompletions || v == ProtocolResponses }
-func modalityOK(v Modality) bool         { return v == ModalityText || v == ModalityVision }
-func subjectOK(v Subject) bool           { return v == SubjectMath || v == SubjectPhysics }
+func protocolOK(v ProtocolMode) bool { return v == ProtocolChatCompletions || v == ProtocolResponses }
+func modalityOK(v Modality) bool     { return v == ModalityText || v == ModalityVision }
+func subjectOK(v Subject) bool       { return v == SubjectMath || v == SubjectPhysics }
+func modelTimeoutsOK(in PutModelInput) bool {
+	return in.ConnectTimeoutMS >= 100 && in.ConnectTimeoutMS <= 30000 &&
+		in.ResponseHeaderTimeoutMS >= 1000 && in.ResponseHeaderTimeoutMS <= 120000 &&
+		in.IdleStreamTimeoutMS >= 1000 && in.IdleStreamTimeoutMS <= 120000 &&
+		in.TotalTimeoutMS >= in.ResponseHeaderTimeoutMS &&
+		in.TotalTimeoutMS >= in.IdleStreamTimeoutMS &&
+		in.TotalTimeoutMS <= 600000
+}
 func canonicalBaseURL(raw string) string { return strings.TrimSuffix(raw, "/") }
 func limitsOK(in PutLimitsInput) bool {
 	for _, v := range []LimitValue{in.DailyRequests, in.MonthlyRequests, in.DailyTokens, in.MonthlyTokens} {
