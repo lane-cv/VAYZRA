@@ -73,6 +73,31 @@ func TestPostgresRuntimeConcurrentQuotaAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestPostgresRuntimeThreadDetailReturnsLatestTerminalRun(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	store := NewPostgresRuntimeStore(pool)
+	_, run, err := store.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.CancelRun(ctx, fixture.student, run.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := store.GetThread(ctx, fixture.student, run.ThreadID, MessageCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.ActiveRun == nil || detail.ActiveRun.ID != cancelled.ID || detail.ActiveRun.Status != RunCancelled {
+		t.Fatalf("latest run=%+v want cancelled=%s", detail.ActiveRun, cancelled.ID)
+	}
+}
+
 func TestPostgresRuntimeSynchronizedSameKeyReturnsOneRun(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

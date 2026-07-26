@@ -2,11 +2,12 @@
 import { computed } from 'vue'
 import type { AIRun } from './types'
 
-const props = withDefaults(defineProps<{ run: AIRun; requestId?: string; pending?: boolean }>(), {
+const props = withDefaults(defineProps<{ run: AIRun; requestId?: string; subscriptionErrorCode?: string; pending?: boolean }>(), {
   requestId: '',
+  subscriptionErrorCode: '',
   pending: false,
 })
-defineEmits<{ cancel: []; retry: [] }>()
+defineEmits<{ cancel: []; retry: []; reconnect: [] }>()
 
 const labels = {
   queued: '等待生成',
@@ -16,6 +17,11 @@ const labels = {
   cancelled: '已停止',
 } as const
 const action = computed(() => {
+  if (props.subscriptionErrorCode) {
+    return props.subscriptionErrorCode === 'forbidden' || props.subscriptionErrorCode === 'unauthorized'
+      ? '登录状态已失效，请重新登录。'
+      : '回答连接已中断，请重新连接。'
+  }
   switch (props.run.errorCode) {
     case 'QUOTA_EXCEEDED': return '今日或本月额度已用完，请稍后再试。'
     case 'CONTEXT_TOO_LARGE': return '问题内容过长，请精简后重新提问。'
@@ -27,12 +33,13 @@ const action = computed(() => {
 </script>
 
 <template>
-  <section class="status-card" :aria-label="`生成状态：${labels[run.status]}`">
-    <div><strong>{{ labels[run.status] }}</strong><small>第 {{ run.attemptNo }} 次尝试</small></div>
+  <section class="status-card" :aria-label="`生成状态：${subscriptionErrorCode ? '连接中断' : labels[run.status]}`">
+    <div><strong>{{ subscriptionErrorCode ? '连接中断' : labels[run.status] }}</strong><small>第 {{ run.attemptNo }} 次尝试</small></div>
     <p v-if="action">{{ action }}</p>
     <p v-if="run.usage">本次用量：输入 {{ run.usage.inputTokens }}，输出 {{ run.usage.outputTokens }} tokens</p>
     <p v-if="requestId" class="support">支持编号：{{ requestId }}</p>
-    <button v-if="run.status==='queued'||run.status==='streaming'" type="button" aria-label="停止生成" :disabled="pending" @click="$emit('cancel')">停止生成</button>
+    <button v-if="subscriptionErrorCode" type="button" aria-label="重新连接回答" :disabled="pending" @click="$emit('reconnect')">重新连接</button>
+    <button v-else-if="run.status==='queued'||run.status==='streaming'" type="button" aria-label="停止生成" :disabled="pending" @click="$emit('cancel')">停止生成</button>
     <button v-else-if="run.status==='failed'||run.status==='cancelled'" type="button" aria-label="重试生成" :disabled="pending" @click="$emit('retry')">重新生成</button>
   </section>
 </template>

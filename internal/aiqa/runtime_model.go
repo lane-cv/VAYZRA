@@ -47,6 +47,10 @@ type Run struct {
 	ErrorCode          string
 	Modality           Modality
 	ReservedTokenCount int64
+	InputTokens        int64
+	OutputTokens       int64
+	CostMicroUSD       int64
+	UsageSource        string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }

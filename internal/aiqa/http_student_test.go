@@ -20,6 +20,7 @@ type studentHTTPStub struct {
 	retryKey  string
 	cancelled int
 	err       error
+	detail    *ThreadDetail
 }
 
 type summaryHTTPStub struct {
@@ -60,6 +61,9 @@ func (s *studentHTTPStub) ListThreads(context.Context, Principal, ThreadCursor) 
 	return []Thread{studentHTTPDetail().Thread}, ThreadCursor{}, s.err
 }
 func (s *studentHTTPStub) GetThread(context.Context, Principal, uuid.UUID, MessageCursor) (ThreadDetail, error) {
+	if s.detail != nil {
+		return *s.detail, s.err
+	}
 	return studentHTTPDetail(), s.err
 }
 func (s *studentHTTPStub) AddMessage(_ context.Context, p Principal, in AddMessageInput) (ThreadDetail, Run, error) {
@@ -94,6 +98,29 @@ func studentHTTPDetail() ThreadDetail {
 }
 func studentHTTPRun() Run {
 	return Run{ID: studentHTTPRunID, ThreadID: studentHTTPThreadID, TriggerMessageID: studentHTTPMessageID, Status: RunQueued, AttemptNo: 1, CreatedAt: studentHTTPTime, UpdatedAt: studentHTTPTime}
+}
+
+func TestStudentHTTPDetailReturnsLatestTerminalRunAndSafeUsage(t *testing.T) {
+	detail := studentHTTPDetail()
+	run := studentHTTPRun()
+	run.Status = RunSucceeded
+	run.LastSequence = 9
+	run.InputTokens = 8
+	run.OutputTokens = 3
+	run.CostMicroUSD = 19
+	run.UsageSource = "estimated"
+	detail.ActiveRun = &run
+	service := &studentHTTPStub{detail: &detail}
+	w := studentHTTPRequest(t, NewStudentHandler(service, nil).Routes(), http.MethodGet, "/threads/"+studentHTTPThreadID.String(), "", nil, auth.RoleStudent)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, required := range []string{`"status":"succeeded"`, `"lastSequence":9`, `"usage"`, `"costMicroUSD":"19"`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("missing %s: %s", required, body)
+		}
+	}
 }
 
 func studentHTTPRequest(t *testing.T, h http.Handler, method, path, body string, headers map[string]string, role auth.Role) *httptest.ResponseRecorder {

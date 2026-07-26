@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { reactive } from 'vue'
 import { subscribeRun } from '../features/ai/eventStream'
 import type { AIRunStatus, StreamEvent } from '../features/ai/types'
+import { APIError } from '../api/client'
 
 export type AIRunLiveState = {
   id: string
@@ -10,6 +11,7 @@ export type AIRunLiveState = {
   text: string
   errorCode?: string
   requestId?: string
+  subscriptionErrorCode?: string
 }
 
 type Subscription = {
@@ -64,6 +66,7 @@ export const useAIRunStore = defineStore('ai-runs', () => {
         onEvent(event) {
           if (subscriptions.get(runId) !== subscription || subscription.generation !== generation) return
           subscription.retryIndex = 0
+          state.subscriptionErrorCode = undefined
           applyFor(runId, event)
         },
         onRequestId(requestId) {
@@ -73,7 +76,7 @@ export const useAIRunStore = defineStore('ai-runs', () => {
       controller.signal,
     ).then(
       () => settled(runId, subscription, generation, controller),
-      () => settled(runId, subscription, generation, controller),
+      (error: unknown) => settled(runId, subscription, generation, controller, error),
     )
   }
 
@@ -82,6 +85,7 @@ export const useAIRunStore = defineStore('ai-runs', () => {
     subscription: Subscription,
     generation: number,
     controller: AbortController,
+    error?: unknown,
   ): void {
     if (subscription.controller === controller) subscription.controller = undefined
     if (
@@ -90,6 +94,15 @@ export const useAIRunStore = defineStore('ai-runs', () => {
       || subscription.generation !== generation
       || TERMINAL.has(runs[runId]?.status)
     ) return
+    if (permanentStreamError(error)) {
+      const state = runs[runId]
+      if (state) {
+        state.subscriptionErrorCode = safeStreamErrorCode(error)
+        if (error instanceof APIError && error.requestId) state.requestId = error.requestId
+      }
+      stopConnection(runId, false)
+      return
+    }
     if (subscription.timer) return
     const delay = RECONNECT_DELAYS[Math.min(subscription.retryIndex, RECONNECT_DELAYS.length - 1)]
     subscription.retryIndex += 1
@@ -140,6 +153,7 @@ export const useAIRunStore = defineStore('ai-runs', () => {
   function retrySubscription(runId: string): void {
     const state = ensure(runId)
     stopConnection(runId, false)
+    state.subscriptionErrorCode = undefined
     if (TERMINAL.has(state.status)) state.status = 'queued'
     start(runId, state.lastSequence)
   }
@@ -154,15 +168,28 @@ export const useAIRunStore = defineStore('ai-runs', () => {
     runId: string,
     status: AIRunStatus,
     lastSequence: number,
-    text = '',
+    text?: string,
     errorCode?: string,
   ): AIRunLiveState {
     const state = ensure(runId, lastSequence)
     state.status = status
-    state.text = text
+    if (text !== undefined) state.text = text
     state.errorCode = errorCode
     return state
   }
 
   return { runs, start, stopSubscription, apply, retrySubscription, clearAll, seed }
 })
+
+function permanentStreamError(error: unknown): boolean {
+  if (!(error instanceof APIError)) return false
+  if (error.code === 'network_error') return false
+  if (error.status === 408 || error.status === 429 || error.status >= 500) return false
+  return true
+}
+
+function safeStreamErrorCode(error: unknown): string {
+  if (!(error instanceof APIError)) return 'stream_unavailable'
+  const safe = new Set(['not_found', 'forbidden', 'invalid_stream', 'unauthorized'])
+  return safe.has(error.code) ? error.code : 'stream_unavailable'
+}

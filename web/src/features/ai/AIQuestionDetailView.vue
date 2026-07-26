@@ -51,6 +51,7 @@ const streamingText = computed(() => {
     : ''
 })
 const streamRequestId = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.requestId ?? '' : '')
+const streamErrorCode = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.subscriptionErrorCode ?? '' : '')
 
 function isCurrent(token: number, id: string): boolean {
   return token === generation && id === props.threadId
@@ -108,8 +109,16 @@ async function load(): Promise<void> {
 
 function beginActiveRun(run?: AIRun): void {
   if (!run) return
-  aiRuns.seed(run.id, run.status, run.lastSequence, '', run.errorCode)
-  if (run.status === 'queued' || run.status === 'streaming') aiRuns.start(run.id, run.lastSequence)
+  const existing = aiRuns.runs[run.id]
+  const active = run.status === 'queued' || run.status === 'streaming'
+  const afterSequence = existing?.lastSequence ?? (active ? 0 : run.lastSequence)
+  aiRuns.seed(run.id, run.status, afterSequence, existing?.text, run.errorCode)
+  if (active) aiRuns.start(run.id, afterSequence)
+}
+
+function reconnect(): void {
+  const runId = currentRun.value?.id
+  if (runId) aiRuns.retrySubscription(runId)
 }
 
 async function refreshAfterSuccess(runId: string): Promise<void> {
@@ -277,9 +286,11 @@ onBeforeUnmount(() => {
         v-if="currentRun"
         :run="currentRun"
         :request-id="streamRequestId"
+        :subscription-error-code="streamErrorCode"
         :pending="actionPending"
         @cancel="cancel"
         @retry="retry"
+        @reconnect="reconnect"
       />
       <AIMessageTimeline :messages="detail.messages" :streaming-text="streamingText" />
       <section class="followup" aria-labelledby="ai-followup-title">

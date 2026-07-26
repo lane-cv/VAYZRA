@@ -50,13 +50,21 @@ type studentMessageDTO struct {
 }
 
 type studentRunDTO struct {
-	ID           uuid.UUID `json:"id"`
-	Status       RunStatus `json:"status"`
-	AttemptNo    int       `json:"attemptNo"`
-	LastSequence int64     `json:"lastSequence"`
-	ErrorCode    string    `json:"errorCode,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	ID           uuid.UUID           `json:"id"`
+	Status       RunStatus           `json:"status"`
+	AttemptNo    int                 `json:"attemptNo"`
+	LastSequence int64               `json:"lastSequence"`
+	ErrorCode    string              `json:"errorCode,omitempty"`
+	Usage        *studentRunUsageDTO `json:"usage,omitempty"`
+	CreatedAt    time.Time           `json:"createdAt"`
+	UpdatedAt    time.Time           `json:"updatedAt"`
+}
+
+type studentRunUsageDTO struct {
+	InputTokens  int64  `json:"inputTokens"`
+	OutputTokens int64  `json:"outputTokens"`
+	CostMicroUSD string `json:"costMicroUSD"`
+	Source       string `json:"source"`
 }
 
 type studentThreadDetailDTO struct {
@@ -87,9 +95,20 @@ func studentMessageView(v Message) studentMessageDTO {
 }
 
 func studentRunView(v Run) studentRunDTO {
+	var usage *studentRunUsageDTO
+	if v.UsageSource == "upstream" || v.UsageSource == "estimated" {
+		source := v.UsageSource
+		if source == "upstream" {
+			source = "provider"
+		}
+		usage = &studentRunUsageDTO{
+			InputTokens: v.InputTokens, OutputTokens: v.OutputTokens,
+			CostMicroUSD: strconv.FormatInt(v.CostMicroUSD, 10), Source: source,
+		}
+	}
 	return studentRunDTO{
 		ID: v.ID, Status: v.Status, AttemptNo: v.AttemptNo, LastSequence: v.LastSequence,
-		ErrorCode: v.ErrorCode, CreatedAt: v.CreatedAt, UpdatedAt: v.UpdatedAt,
+		ErrorCode: v.ErrorCode, Usage: usage, CreatedAt: v.CreatedAt, UpdatedAt: v.UpdatedAt,
 	}
 }
 

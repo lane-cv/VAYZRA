@@ -10,10 +10,13 @@ const props = withDefaults(defineProps<{
 
 const announcedText = ref(props.streamingText)
 let announcementTimer: ReturnType<typeof setTimeout> | undefined
+let pendingAnnouncement = props.streamingText
 watch(() => props.streamingText, (value) => {
+  if (!value) return
+  pendingAnnouncement = value
   if (announcementTimer) return
   announcementTimer = setTimeout(() => {
-    announcedText.value = value
+    announcedText.value = pendingAnnouncement
     announcementTimer = undefined
   }, 500)
 })
@@ -36,8 +39,8 @@ onBeforeUnmount(() => {
     <li v-if="streamingText" class="assistant streaming">
       <strong>AI 助教</strong>
       <pre data-testid="streaming-answer">{{ streamingText }}</pre>
-      <span class="sr-only" aria-live="polite" aria-atomic="true">{{ announcedText }}</span>
     </li>
+    <li class="sr-only" aria-live="polite" aria-atomic="true">{{ announcedText }}</li>
   </ol>
 </template>
 

@@ -12,8 +12,10 @@ describe('renderMarkdown', () => {
   })
 
   it('renders inline and display math with KaTeX trust disabled', () => {
-    const html = renderMarkdown('$x^2$\n\n$$F=ma$$')
+    const html = renderMarkdown('$x^2$\n\n$$\\frac{x^2}{y}$$')
     expect(html.match(/class="katex/g)?.length).toBeGreaterThanOrEqual(2)
+    expect(html).toMatch(/style="[^"]*(?:height|top|vertical-align):[-0-9.]+em/)
+    expect(html).toContain('class="mfrac"')
   })
 
   it('hardens external links', () => {
@@ -28,6 +30,7 @@ describe('renderMarkdown', () => {
     expect(html).not.toContain('<img')
     expect(html).not.toContain('style=')
     expect(html).not.toContain('onerror')
+    expect(renderMarkdown('$\\rule{999999em}{1em}$')).not.toContain('999999em')
   })
 
   it('rejects oversized source before parsing', () => {

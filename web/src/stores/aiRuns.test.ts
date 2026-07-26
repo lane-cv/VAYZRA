@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { StreamCallbacks } from '../features/ai/types'
+import { APIError } from '../api/client'
 
 const stream = vi.hoisted(() => ({ subscribe: vi.fn() }))
 vi.mock('../features/ai/eventStream', () => ({ subscribeRun: stream.subscribe }))
@@ -87,5 +88,33 @@ describe('useAIRunStore', () => {
     await vi.runAllTimersAsync()
     expect(store.runs).toEqual({})
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([
+    new APIError(404, 'not_found', 'missing', 'req-404'),
+    new APIError(403, 'forbidden', 'forbidden', 'req-403'),
+    new APIError(0, 'invalid_stream', 'invalid', 'req-invalid'),
+  ])('stops reconnecting after permanent stream error %#', async (cause) => {
+    const store = useAIRunStore()
+    store.start('run-1', 0)
+    pending[0].reject(cause)
+    await Promise.resolve()
+    await vi.runAllTimersAsync()
+    expect(stream.subscribe).toHaveBeenCalledOnce()
+    expect(store.runs['run-1']).toMatchObject({
+      subscriptionErrorCode: cause.code,
+      requestId: cause.requestId,
+    })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('allows an explicit subscription retry after a permanent stream error', async () => {
+    const store = useAIRunStore()
+    store.start('run-1', 3)
+    pending[0].reject(new APIError(0, 'invalid_stream', 'invalid', 'req-invalid'))
+    await Promise.resolve()
+    store.retrySubscription('run-1')
+    expect(pending).toHaveLength(2)
+    expect(pending[1].after).toBe(3)
   })
 })

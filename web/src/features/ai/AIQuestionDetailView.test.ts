@@ -71,7 +71,37 @@ describe('AIQuestionDetailView', () => {
     expect(wrapper.text()).toContain('受力分析')
     expect(wrapper.text()).toContain('物理')
     expect(wrapper.text()).toContain('请分析')
-    expect(stream.subscribe).toHaveBeenCalledWith('r1', 4, expect.any(Object), expect.any(AbortSignal))
+    expect(stream.subscribe).toHaveBeenCalledWith('r1', 0, expect.any(Object), expect.any(AbortSignal))
+    const callbacks = (stream.subscribe.mock.calls as unknown as Array<[string, number, { onEvent(event: unknown): void }]>)[0][2]
+    callbacks.onEvent({ sequence: 1, kind: 'delta', delta: '已持久化' })
+    callbacks.onEvent({ sequence: 2, kind: 'delta', delta: '的部分回答' })
+    await nextTick()
+    expect(wrapper.get('[data-testid="streaming-answer"]').text()).toBe('已持久化的部分回答')
+  })
+
+  it('preserves matching in-memory partial text and resumes it on route re-entry', async () => {
+    const pinia = createPinia()
+    const first = mount(AIQuestionDetailView, {
+      props: { threadId: detail.thread.id, userId: 'u1' },
+      global: { plugins: [pinia], stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+    const firstCallbacks = (stream.subscribe.mock.calls as unknown as Array<[string, number, { onEvent(event: unknown): void }]>)[0][2]
+    for (let sequence = 1; sequence <= 4; sequence += 1) {
+      firstCallbacks.onEvent({ sequence, kind: 'delta', delta: String(sequence) })
+    }
+    await nextTick()
+    expect(first.get('[data-testid="streaming-answer"]').text()).toBe('1234')
+    first.unmount()
+
+    const second = mount(AIQuestionDetailView, {
+      props: { threadId: detail.thread.id, userId: 'u1' },
+      global: { plugins: [pinia], stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+    expect(second.get('[data-testid="streaming-answer"]').text()).toBe('1234')
+    const calls = stream.subscribe.mock.calls as unknown as Array<[string, number]>
+    expect(calls[calls.length - 1][1]).toBe(4)
   })
 
   it('renders request-ID errors, focuses them, and retries a failed load', async () => {
@@ -115,13 +145,22 @@ describe('AIQuestionDetailView', () => {
   })
 
   it('reuses a retry key for an unchanged failed intent and starts the new run', async () => {
-    api.get.mockResolvedValue({ ...detail, activeRun: { ...detail.activeRun, status: 'failed', errorCode: 'PROVIDER_UNAVAILABLE' } })
+    api.get.mockResolvedValue({
+      ...detail,
+      activeRun: {
+        ...detail.activeRun,
+        status: 'failed',
+        errorCode: 'PROVIDER_UNAVAILABLE',
+        usage: { inputTokens: 8, outputTokens: 3, costMicroUSD: '19', source: 'estimated' },
+      },
+    })
     api.retry.mockRejectedValueOnce(new Error('网络连接异常')).mockResolvedValueOnce({
       run: { id: 'r2', status: 'queued', attemptNo: 2, lastSequence: 0 },
       eventsUrl: '/events/r2',
     })
     const wrapper = mountDetail()
     await flushPromises()
+    expect(wrapper.text()).toContain('本次用量：输入 8，输出 3 tokens')
     await wrapper.get('[aria-label="重试生成"]').trigger('click')
     await flushPromises()
     await wrapper.get('[aria-label="重试生成"]').trigger('click')

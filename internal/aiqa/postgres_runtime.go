@@ -576,11 +576,11 @@ type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-const runSelect = `SELECT r.id,r.thread_id,r.trigger_message_id,m.body_text,r.status,r.attempt_no,r.last_sequence,coalesce(r.error_code,''),r.modality,r.reserved_token_count,r.created_at,r.updated_at FROM ai_runs r JOIN ai_messages m ON m.id=r.trigger_message_id`
+const runSelect = `SELECT r.id,r.thread_id,r.trigger_message_id,m.body_text,r.status,r.attempt_no,r.last_sequence,coalesce(r.error_code,''),r.modality,r.reserved_token_count,coalesce(r.input_tokens,0),coalesce(r.output_tokens,0),coalesce(r.cost_micro_usd,0),coalesce(r.usage_source,''),r.created_at,r.updated_at FROM ai_runs r JOIN ai_messages m ON m.id=r.trigger_message_id`
 
 func scanRun(row pgx.Row) (Run, error) {
 	var run Run
-	err := row.Scan(&run.ID, &run.ThreadID, &run.TriggerMessageID, &run.TriggerBody, &run.Status, &run.AttemptNo, &run.LastSequence, &run.ErrorCode, &run.Modality, &run.ReservedTokenCount, &run.CreatedAt, &run.UpdatedAt)
+	err := row.Scan(&run.ID, &run.ThreadID, &run.TriggerMessageID, &run.TriggerBody, &run.Status, &run.AttemptNo, &run.LastSequence, &run.ErrorCode, &run.Modality, &run.ReservedTokenCount, &run.InputTokens, &run.OutputTokens, &run.CostMicroUSD, &run.UsageSource, &run.CreatedAt, &run.UpdatedAt)
 	return run, err
 }
 
@@ -643,7 +643,7 @@ ORDER BY m.created_at,m.id LIMIT $5`, threadID, studentID, nullableTime(cursor.C
 		}
 		detail.Messages[i].Attachments = attachments
 	}
-	active, e := scanRun(q.QueryRow(ctx, runSelect+` WHERE r.thread_id=$1 AND r.student_id=$2 AND r.status IN ('queued','streaming')`, threadID, studentID))
+	active, e := scanRun(q.QueryRow(ctx, runSelect+` WHERE r.thread_id=$1 AND r.student_id=$2 ORDER BY r.attempt_no DESC,r.created_at DESC,r.id DESC LIMIT 1`, threadID, studentID))
 	if e == nil {
 		detail.ActiveRun = &active
 	} else if !errors.Is(e, pgx.ErrNoRows) {
