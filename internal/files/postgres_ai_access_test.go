@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,15 @@ import (
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
+
+type failingAIResolveStore struct {
+	*PostgresStore
+	err error
+}
+
+func (s failingAIResolveStore) ResolveAIAccess(context.Context, Principal, uuid.UUID) (AIDelivery, error) {
+	return AIDelivery{}, s.err
+}
 
 func TestPostgresAIAccessRequiresBoundCleanOwnerFileAndLogsAITarget(t *testing.T) {
 	ctx := context.Background()
@@ -144,6 +154,21 @@ FROM file_access_logs WHERE request_id=$1`, logRequestID).Scan(&loggedMessage, &
 	if _, err := service.Status(ctx, otherActor, bound); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("status denial err=%v", err)
 	}
+	otherActor.RequestID = "ai-file-review-preview-deny"
+	if _, err := service.Open(ctx, otherActor, AIOpenInput{VersionID: bound}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("preview denial err=%v", err)
+	}
+	ownerActor.RequestID = "ai-file-review-preview-store-failure"
+	failingService := NewAIAccessService(failingAIResolveStore{PostgresStore: store, err: errors.New("authorization database unavailable")}, nil, nil)
+	if _, err := failingService.Open(ctx, ownerActor, AIOpenInput{VersionID: bound}); !errors.Is(err, ErrAccessUnavailable) {
+		t.Fatalf("preview store failure err=%v", err)
+	}
+	invalidActor := ownerActor
+	invalidActor.User.Role = auth.RoleAdmin
+	invalidActor.RequestID = "ai-file-review-invalid-actor"
+	if err := service.Reject(ctx, invalidActor, bound, "invalid_actor"); err != nil {
+		t.Fatal(err)
+	}
 	ownerActor.RequestID = "ai-file-review-unexpected-query"
 	if err := service.Reject(ctx, ownerActor, bound, "unexpected_query"); err != nil {
 		t.Fatal(err)
@@ -162,6 +187,29 @@ SELECT
 	}
 	if allowedTarget != message || deniedTarget != uuid.Nil || malformedTarget != uuid.Nil {
 		t.Fatalf("allow=%s deny=%s malformed=%s", allowedTarget, deniedTarget, malformedTarget)
+	}
+	for _, tc := range []struct {
+		requestID  string
+		wantResult string
+		wantReason string
+	}{
+		{"ai-file-review-preview-deny", "deny", "not_found"},
+		{"ai-file-review-preview-store-failure", "fail", "storage"},
+		{"ai-file-review-invalid-actor", "deny", "policy"},
+		{"ai-file-review-unexpected-query", "malformed", "policy"},
+	} {
+		var result, reason string
+		var resolvedNull, messageNull bool
+		if err := pool.QueryRow(ctx, `SELECT result,reason_code,file_version_id IS NULL,ai_message_id IS NULL
+FROM file_access_logs WHERE request_id=$1`, tc.requestID).Scan(&result, &reason, &resolvedNull, &messageNull); err != nil {
+			t.Fatal(err)
+		}
+		if result != tc.wantResult || reason != tc.wantReason || !resolvedNull || !messageNull {
+			t.Fatalf("%s result=%q reason=%q resolvedNull=%v messageNull=%v", tc.requestID, result, reason, resolvedNull, messageNull)
+		}
+		if strings.Contains(reason, "authorization database unavailable") || strings.Contains(reason, bound.String()) {
+			t.Fatalf("%s raw detail persisted in %q", tc.requestID, reason)
+		}
 	}
 	var action, targetType, targetID, reason string
 	if err := pool.QueryRow(ctx, `SELECT action,target_type,target_id,metadata->>'reason'

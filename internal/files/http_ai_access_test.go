@@ -73,17 +73,40 @@ func TestAIAccessPreviewIsControlledAndAudited(t *testing.T) {
 	}
 }
 
-func TestAIAccessDeniedAndFailureAre404AndAudited(t *testing.T) {
+func TestAIAccessPreviewAuthorizationErrorsAreExactlyClassifiedAndAudited(t *testing.T) {
 	version := uuid.MustParse("30000000-0000-4000-8000-000000000001")
 	user := auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}
-	store := &aiAccessStoreStub{err: ErrNotFound}
-	h := NewAIAccessHandler(NewAIAccessService(store, &accessObjectsStub{}, &accessObjectsStub{}), nil).Routes()
-	r := httptest.NewRequest(http.MethodGet, "/"+version.String()+"/preview", nil)
-	r = r.WithContext(auth.ContextWithUser(r.Context(), user))
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	if w.Code != http.StatusNotFound || len(store.logs) != 1 || store.logs[0].Result != AccessDenied {
-		t.Fatalf("status=%d logs=%+v body=%s", w.Code, store.logs, w.Body)
+	for _, tc := range []struct {
+		name       string
+		resolveErr error
+		logErr     error
+		wantStatus int
+		wantResult AccessResult
+		wantReason string
+	}{
+		{"owner scoped miss", ErrNotFound, nil, http.StatusNotFound, AccessDenied, "not_found"},
+		{"authorization store failure", errors.New("database unavailable"), nil, http.StatusInternalServerError, AccessFailed, "storage"},
+		{"audit failure fails closed", ErrNotFound, errors.New("audit unavailable"), http.StatusInternalServerError, AccessDenied, "not_found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &aiAccessStoreStub{
+				delivery: AIDelivery{
+					Delivery:  Delivery{VersionID: uuid.New(), ObjectKey: "must-not-persist"},
+					MessageID: uuid.New(),
+				},
+				err: tc.resolveErr, logErr: tc.logErr,
+			}
+			h := NewAIAccessHandler(NewAIAccessService(store, &accessObjectsStub{}, &accessObjectsStub{}), nil).Routes()
+			r := httptest.NewRequest(http.MethodGet, "/"+version.String()+"/preview", nil)
+			r = r.WithContext(auth.ContextWithUser(r.Context(), user))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.wantStatus || len(store.logs) != 1 || store.logs[0].Result != tc.wantResult ||
+				store.logs[0].Reason != tc.wantReason || store.logs[0].VersionID != uuid.Nil ||
+				store.logs[0].AIMessageID != uuid.Nil {
+				t.Fatalf("status=%d logs=%+v body=%s", w.Code, store.logs, w.Body)
+			}
+		})
 	}
 }
 
@@ -174,7 +197,7 @@ func TestAIAccessHandlerDurablyAuditsEarlyDenialsWithoutRawInput(t *testing.T) {
 				}
 			} else if len(store.logs) != 1 || store.logs[0].RequestedVersionID != version ||
 				store.logs[0].VersionID != uuid.Nil || store.logs[0].AIMessageID != uuid.Nil ||
-				store.logs[0].Result != AccessMalformed {
+				store.logs[0].Result != AccessMalformed || store.logs[0].Reason != "policy" {
 				t.Fatalf("security=%+v fileLogs=%+v", security.events, store.logs)
 			}
 		})
@@ -191,7 +214,8 @@ func TestAIAccessHandlerDurablyAuditsInvalidActor(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden || len(security.events) != 0 || len(store.logs) != 1 ||
 		store.logs[0].RequestedVersionID != version || store.logs[0].VersionID != uuid.Nil ||
-		store.logs[0].AIMessageID != uuid.Nil || store.logs[0].Result != AccessMalformed {
+		store.logs[0].AIMessageID != uuid.Nil || store.logs[0].Result != AccessDenied ||
+		store.logs[0].Reason != "policy" {
 		t.Fatalf("status=%d security=%+v fileLogs=%+v body=%s", w.Code, security.events, store.logs, w.Body)
 	}
 }

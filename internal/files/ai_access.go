@@ -73,9 +73,13 @@ func (s *AIAccessService) Reject(ctx context.Context, actor Principal, version u
 		if s.store == nil {
 			return ErrAccessUnavailable
 		}
+		result := AccessMalformed
+		if reason == "invalid_actor" {
+			result = AccessDenied
+		}
 		return s.store.WriteAccessLog(ctx, AccessLog{
 			ActorUserID: actor.User.ID, RequestedVersionID: version, Action: ActionPreview,
-			Result: AccessMalformed, Reason: "policy", RequestID: actor.RequestID, IP: actor.IP,
+			Result: result, Reason: "policy", RequestID: actor.RequestID, IP: actor.IP,
 		})
 	}
 	if s.security == nil {
@@ -103,10 +107,13 @@ func (s *AIAccessService) Open(ctx context.Context, actor Principal, in AIOpenIn
 		return fail(AccessDenied, "not_found", ErrNotFound)
 	}
 	delivery, err := s.store.ResolveAIAccess(ctx, actor, in.VersionID)
-	log.VersionID, log.AIMessageID = delivery.VersionID, delivery.MessageID
 	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return fail(AccessFailed, "storage", ErrAccessUnavailable)
+		}
 		return fail(AccessDenied, "not_found", ErrNotFound)
 	}
+	log.VersionID, log.AIMessageID = delivery.VersionID, delivery.MessageID
 	rng, err := parseByteRange(in.Range, delivery.Size, delivery.Playable)
 	if err != nil {
 		return fail(AccessMalformed, "invalid_range", err)
