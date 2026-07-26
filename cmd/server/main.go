@@ -77,33 +77,34 @@ func newServer(address string, handler http.Handler) *http.Server {
 }
 
 type applicationDependencies struct {
-	open               func(context.Context, string) (*pgxpool.Pool, error)
-	migrate            func(context.Context, *pgxpool.Pool) error
-	newAuth            func(*pgxpool.Pool) (auth.HTTPService, error)
-	newStudents        func(*pgxpool.Pool) students.HTTPService
-	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
-	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newQAUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newAIUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
-	newQAFileAccess    func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
-	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
-	newFileCenter      func(*pgxpool.Pool) files.FileCenterHTTPService
-	startUploadCleanup func(files.ExpiredUploadCleaner) func()
-	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
-	newQuestions       func(*pgxpool.Pool) qanda.HTTPServices
-	newAdminAI         func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
-	newNotifications   func(*pgxpool.Pool) notifications.HTTPService
-	startOutbox        func(*pgxpool.Pool) func()
-	ready              func(*pgxpool.Pool) func(context.Context) error
-	objectReady        func(context.Context, config.Config) (func(context.Context) error, error)
-	readinessTimeout   time.Duration
-	close              func(*pgxpool.Pool)
-	openRedis          func(string) (*redis.Client, error)
-	newThrottle        func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
-	newProgressLimiter func(*redis.Client, config.Config) redisx.ProgressWriteLimiter
-	newSearchLimiter   func(*redis.Client, config.Config) redisx.SearchRateLimiter
-	closeRedis         func(*redis.Client)
+	open                   func(context.Context, string) (*pgxpool.Pool, error)
+	migrate                func(context.Context, *pgxpool.Pool) error
+	newAuth                func(*pgxpool.Pool) (auth.HTTPService, error)
+	newStudents            func(*pgxpool.Pool) students.HTTPService
+	newTeaching            func(*pgxpool.Pool) teaching.AdminHTTPService
+	newUploads             func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newQAUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newAIUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newFileAccess          func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
+	newQAFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
+	newFileBindings        func(*pgxpool.Pool) files.BindingHTTPService
+	newFileCenter          func(*pgxpool.Pool) files.FileCenterHTTPService
+	startUploadCleanup     func(files.ExpiredUploadCleaner) func()
+	newStudentTeaching     func(*pgxpool.Pool) teaching.StudentHTTPService
+	newQuestions           func(*pgxpool.Pool) qanda.HTTPServices
+	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
+	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
+	startOutbox            func(*pgxpool.Pool) func()
+	ready                  func(*pgxpool.Pool) func(context.Context) error
+	objectReady            func(context.Context, config.Config) (func(context.Context) error, error)
+	readinessTimeout       time.Duration
+	close                  func(*pgxpool.Pool)
+	openRedis              func(string) (*redis.Client, error)
+	newThrottle            func(*redis.Client, config.Config) (redisx.Limiter, redisx.CaptchaService)
+	newProgressLimiter     func(*redis.Client, config.Config) redisx.ProgressWriteLimiter
+	newSearchLimiter       func(*redis.Client, config.Config) redisx.SearchRateLimiter
+	newProviderTestLimiter func(*redis.Client, config.Config) redisx.ProviderTestRateLimiter
+	closeRedis             func(*redis.Client)
 }
 
 func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
@@ -141,6 +142,9 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		},
 		newSearchLimiter: func(client *redis.Client, cfg config.Config) redisx.SearchRateLimiter {
 			return redisx.NewSearchLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 30})
+		},
+		newProviderTestLimiter: func(client *redis.Client, cfg config.Config) redisx.ProviderTestRateLimiter {
+			return redisx.NewProviderTestLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 5})
 		},
 		closeRedis: func(client *redis.Client) { _ = client.Close() },
 	})
@@ -255,6 +259,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	var captchas redisx.CaptchaService
 	var progressLimiter redisx.ProgressWriteLimiter
 	var searchLimiter redisx.SearchRateLimiter
+	var providerTestLimiter redisx.ProviderTestRateLimiter
 	closeResources := closePool
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
@@ -274,6 +279,9 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if deps.newSearchLimiter != nil {
 			searchLimiter = deps.newSearchLimiter(client, cfg)
 		}
+		if deps.newProviderTestLimiter != nil {
+			providerTestLimiter = deps.newProviderTestLimiter(client, cfg)
+		}
 		closeResources = func() {
 			deps.closeRedis(client)
 			closePool()
@@ -288,30 +296,31 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		}
 	}
 	handler := app.New(app.Dependencies{
-		Ready:             ready,
-		Auth:              service,
-		Students:          studentService,
-		Teaching:          teachingService,
-		Uploads:           uploadService,
-		QAUploads:         qaUploadService,
-		AIUploads:         aiUploadService,
-		FileAccess:        fileAccessService,
-		QAFileAccess:      qaFileAccessService,
-		FileBindings:      fileBindingService,
-		FileCenter:        fileCenterService,
-		StudentTeaching:   studentTeachingService,
-		StudentQuestions:  questionServices.Student,
-		AdminQuestions:    questionServices.Admin,
-		AdminAI:           adminAI,
-		Notifications:     notificationService,
-		PublicOrigin:      cfg.PublicOrigin,
-		CookieSecure:      cfg.CookieSecure,
-		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
-		Limiter:           limiter,
-		ProgressLimiter:   progressLimiter,
-		SearchLimiter:     searchLimiter,
-		Captchas:          captchas,
-		StaticFiles:       os.DirFS("web/dist"),
+		Ready:               ready,
+		Auth:                service,
+		Students:            studentService,
+		Teaching:            teachingService,
+		Uploads:             uploadService,
+		QAUploads:           qaUploadService,
+		AIUploads:           aiUploadService,
+		FileAccess:          fileAccessService,
+		QAFileAccess:        qaFileAccessService,
+		FileBindings:        fileBindingService,
+		FileCenter:          fileCenterService,
+		StudentTeaching:     studentTeachingService,
+		StudentQuestions:    questionServices.Student,
+		AdminQuestions:      questionServices.Admin,
+		AdminAI:             adminAI,
+		Notifications:       notificationService,
+		PublicOrigin:        cfg.PublicOrigin,
+		CookieSecure:        cfg.CookieSecure,
+		TrustedProxyCIDRs:   cfg.TrustedProxyCIDRs,
+		Limiter:             limiter,
+		ProgressLimiter:     progressLimiter,
+		SearchLimiter:       searchLimiter,
+		ProviderTestLimiter: providerTestLimiter,
+		Captchas:            captchas,
+		StaticFiles:         os.DirFS("web/dist"),
 	})
 	if deps.startOutbox != nil {
 		stopOutbox := deps.startOutbox(pool)

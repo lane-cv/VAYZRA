@@ -2,13 +2,16 @@ package aiqa
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/platform/redisx"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type httpConfigService struct {
@@ -16,6 +19,7 @@ type httpConfigService struct {
 	err        error
 	testResult ConnectivityResult
 	testErr    error
+	testCalls  int
 }
 
 func (s *httpConfigService) ListProviders(context.Context, Principal) ([]ProviderView, error) {
@@ -97,6 +101,7 @@ func (*httpConfigService) PutStudentLimits(context.Context, Principal, uuid.UUID
 	return LimitView{}, nil
 }
 func (s *httpConfigService) TestProvider(context.Context, Principal, uuid.UUID) (ConnectivityResult, error) {
+	s.testCalls++
 	return s.testResult, s.testErr
 }
 
@@ -125,13 +130,83 @@ func TestProviderTestHTTPSuccessAndFailureAreSanitized(t *testing.T) {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
 			body := w.Body.String()
-			if tc.code != "" && !strings.Contains(body, `"code":"`+tc.code+`"`) {
-				t.Fatalf("missing code: %s", body)
+			var decoded map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &decoded); err != nil {
+				t.Fatalf("decode response: %v body=%s", err, body)
+			}
+			if len(decoded) != 4 {
+				t.Fatalf("response keys=%v", decoded)
+			}
+			for _, key := range []string{"ok", "protocol", "latencyMs", "errorCategory"} {
+				if _, ok := decoded[key]; !ok {
+					t.Fatalf("missing %q: %v", key, decoded)
+				}
+			}
+			if decoded["ok"] != tc.result.OK || decoded["protocol"] != string(tc.result.Protocol) ||
+				decoded["latencyMs"] != float64(tc.result.LatencyMS) || decoded["errorCategory"] != tc.result.ErrorCategory {
+				t.Fatalf("response=%v want=%#v", decoded, tc.result)
+			}
+			if tc.code != "" && w.Header().Get("X-Error-Code") != tc.code {
+				t.Fatalf("error code header=%q body=%s", w.Header().Get("X-Error-Code"), body)
 			}
 			for _, secret := range []string{"Authorization", "apiKey", "encrypted", "raw-upstream", "requestBody"} {
 				if strings.Contains(body, secret) {
 					t.Fatalf("response leaked %q: %s", secret, body)
 				}
+			}
+		})
+	}
+}
+
+type fakeProviderTestLimiter struct {
+	decision redisx.ResourceDecision
+	err      error
+	calls    int
+}
+
+func (l *fakeProviderTestLimiter) AllowProviderTest(context.Context, uuid.UUID) (redisx.ResourceDecision, error) {
+	l.calls++
+	return l.decision, l.err
+}
+
+func TestProviderTestHTTPRateLimitRejectsBeforeService(t *testing.T) {
+	service := &httpConfigService{}
+	limiter := &fakeProviderTestLimiter{decision: redisx.ResourceDecision{RetryAfter: 3 * time.Second}}
+	h := NewAdminConfigHandlerWithConfig(service, AdminConfigHTTPConfig{ProviderTestLimiter: limiter}).Routes()
+	r := httptest.NewRequest(http.MethodPost, "/providers/"+uuid.NewString()+"/test", nil)
+	r.RemoteAddr = "192.0.2.1:1234"
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "3" || !strings.Contains(w.Body.String(), `"code":"rate_limited"`) {
+		t.Fatalf("status=%d retry=%q body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	if limiter.calls != 1 || service.testCalls != 0 {
+		t.Fatalf("limiter calls=%d service calls=%d", limiter.calls, service.testCalls)
+	}
+}
+
+func TestProviderTestHTTPMapsMissingAndNonAdmin(t *testing.T) {
+	id := uuid.NewString()
+	for _, tc := range []struct {
+		name   string
+		role   auth.Role
+		err    error
+		status int
+	}{
+		{"missing", auth.RoleAdmin, ErrNotFound, http.StatusNotFound},
+		{"non-admin", auth.RoleStudent, nil, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &httpConfigService{testErr: tc.err}
+			h := NewAdminConfigHandler(service, nil).Routes()
+			r := httptest.NewRequest(http.MethodPost, "/providers/"+id+"/test", nil)
+			r.RemoteAddr = "192.0.2.1:1234"
+			r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: tc.role, Status: auth.StatusActive}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 			}
 		})
 	}

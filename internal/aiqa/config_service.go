@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
 	"strings"
+	"time"
 )
 
 type AdminConfigService interface {
@@ -36,6 +37,8 @@ type providerConnectivityStore interface {
 	AcquireProviderTest(context.Context, uuid.UUID) (RuntimeProviderConfig, func(), error)
 	RecordProviderTest(context.Context, Principal, providerTestAudit) error
 }
+
+const providerTestAuditTimeout = 2 * time.Second
 
 type configService struct {
 	store        ConfigStore
@@ -202,7 +205,7 @@ func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.U
 	cfg, release, err := s.connectivity.AcquireProviderTest(ctx, id)
 	if errors.Is(err, ErrProviderTestBusy) {
 		result := ConnectivityResult{Protocol: cfg.ProtocolMode, ErrorCategory: "busy"}
-		auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+		auditErr := s.recordProviderTest(p, providerTestAudit{
 			providerID: id, protocol: result.Protocol, category: result.ErrorCategory,
 		})
 		if auditErr != nil {
@@ -215,7 +218,7 @@ func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.U
 			return ConnectivityResult{}, err
 		}
 		result := ConnectivityResult{Protocol: cfg.ProtocolMode, ErrorCategory: "unavailable"}
-		auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+		auditErr := s.recordProviderTest(p, providerTestAudit{
 			providerID: id, protocol: result.Protocol, category: result.ErrorCategory,
 		})
 		if auditErr != nil {
@@ -226,6 +229,7 @@ func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.U
 	defer release()
 
 	result, testErr := s.tester.Test(ctx, cfg)
+	release()
 	result.Protocol = cfg.ProtocolMode
 	if testErr != nil {
 		result.OK = false
@@ -233,7 +237,7 @@ func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.U
 			result.ErrorCategory = "unavailable"
 		}
 	}
-	auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+	auditErr := s.recordProviderTest(p, providerTestAudit{
 		providerID: id, protocol: result.Protocol, ok: result.OK,
 		category: result.ErrorCategory, latencyMS: result.LatencyMS,
 	})
@@ -244,6 +248,12 @@ func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.U
 		return result, ErrProviderUnavailable
 	}
 	return result, nil
+}
+
+func (s *configService) recordProviderTest(p Principal, result providerTestAudit) error {
+	auditCtx, cancel := context.WithTimeout(context.Background(), providerTestAuditTimeout)
+	defer cancel()
+	return s.connectivity.RecordProviderTest(auditCtx, p, result)
 }
 func protocolOK(v ProtocolMode) bool     { return v == ProtocolChatCompletions || v == ProtocolResponses }
 func modalityOK(v Modality) bool         { return v == ModalityText || v == ModalityVision }

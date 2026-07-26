@@ -36,7 +36,7 @@ func (t *providerConnectivityTester) Test(ctx context.Context, cfg RuntimeProvid
 		Turns:           []GatewayTurn{{Role: "student", Text: "x"}},
 		MaxOutputTokens: 1,
 	}, func(GatewayEvent) error {
-		return nil
+		return errGatewayConsumerComplete
 	})
 	if err == nil {
 		result.OK = true

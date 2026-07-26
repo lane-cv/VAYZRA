@@ -9,19 +9,34 @@ import (
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/httpx"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
+
+	"happylearn.local/app/internal/platform/redisx"
 )
 
 type AdminConfigHTTPService = AdminConfigService
+
+type AdminConfigHTTPConfig struct {
+	TrustedProxyCIDRs   []netip.Prefix
+	ProviderTestLimiter redisx.ProviderTestRateLimiter
+}
+
 type AdminConfigHandler struct {
-	service AdminConfigHTTPService
-	trusted []netip.Prefix
+	service             AdminConfigHTTPService
+	trusted             []netip.Prefix
+	providerTestLimiter redisx.ProviderTestRateLimiter
 }
 
 func NewAdminConfigHandler(s AdminConfigHTTPService, trusted []netip.Prefix) *AdminConfigHandler {
-	return &AdminConfigHandler{s, trusted}
+	return NewAdminConfigHandlerWithConfig(s, AdminConfigHTTPConfig{TrustedProxyCIDRs: trusted})
+}
+
+func NewAdminConfigHandlerWithConfig(s AdminConfigHTTPService, cfg AdminConfigHTTPConfig) *AdminConfigHandler {
+	return &AdminConfigHandler{service: s, trusted: append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...), providerTestLimiter: cfg.ProviderTestLimiter}
 }
 func (h *AdminConfigHandler) Routes() http.Handler {
 	r := chi.NewRouter()
@@ -52,13 +67,31 @@ func (h *AdminConfigHandler) testProvider(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	if h.providerTestLimiter != nil {
+		decision, err := h.providerTestLimiter.AllowProviderTest(r.Context(), p.User.ID)
+		if err != nil {
+			httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
+			return
+		}
+		if !decision.Allowed {
+			seconds := int(math.Ceil(decision.RetryAfter.Seconds()))
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			httpx.Error(w, r, http.StatusTooManyRequests, "rate_limited", "请求过于频繁，请稍后重试")
+			return
+		}
+	}
 	result, err := h.service.TestProvider(r.Context(), p, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrProviderTestBusy):
-			httpx.Error(w, r, http.StatusConflict, "PROVIDER_UNAVAILABLE", "供应商测试正在进行")
+			w.Header().Set("X-Error-Code", "PROVIDER_UNAVAILABLE")
+			httpx.JSON(w, http.StatusConflict, result)
 		case errors.Is(err, ErrProviderUnavailable):
-			httpx.Error(w, r, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE", "供应商暂不可用")
+			w.Header().Set("X-Error-Code", "PROVIDER_UNAVAILABLE")
+			httpx.JSON(w, http.StatusServiceUnavailable, result)
 		default:
 			configError(w, r, err)
 		}

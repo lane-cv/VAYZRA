@@ -27,6 +27,10 @@ type SearchRateLimiter interface {
 	AllowSearch(context.Context, uuid.UUID) (ResourceDecision, error)
 }
 
+type ProviderTestRateLimiter interface {
+	AllowProviderTest(context.Context, uuid.UUID) (ResourceDecision, error)
+}
+
 type ResourceLimitPolicy struct {
 	Secret       []byte
 	Window       time.Duration
@@ -58,6 +62,10 @@ func NewSearchLimiter(rdb *redis.Client, policy ResourceLimitPolicy) *SearchLimi
 	return &SearchLimiter{rdb: rdb, policy: policy, local: newBoundedCounterLRU(policy.LocalMaxKeys)}
 }
 
+func NewProviderTestLimiter(rdb *redis.Client, policy ResourceLimitPolicy) ProviderTestRateLimiter {
+	return NewSearchLimiter(rdb, policy)
+}
+
 var resourceCounterScript = redis.NewScript(`
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
@@ -67,16 +75,24 @@ return {1, ttl}
 `)
 
 func (l *SearchLimiter) AllowSearch(ctx context.Context, accountID uuid.UUID) (ResourceDecision, error) {
+	return l.allowResource(ctx, "search-account", "search", accountID)
+}
+
+func (l *SearchLimiter) AllowProviderTest(ctx context.Context, accountID uuid.UUID) (ResourceDecision, error) {
+	return l.allowResource(ctx, "provider-test-account", "provider_test", accountID)
+}
+
+func (l *SearchLimiter) allowResource(ctx context.Context, keyKind, operation string, accountID uuid.UUID) (ResourceDecision, error) {
 	if accountID == uuid.Nil {
 		return ResourceDecision{}, nil
 	}
-	key := resourceKey(l.policy.Secret, "search-account", accountID)
+	key := resourceKey(l.policy.Secret, keyKind, accountID)
 	if l.rdb != nil {
 		result, err := resourceCounterScript.Run(ctx, l.rdb, []string{key}, l.policy.Window.Milliseconds(), l.policy.MaxRequests).Int64Slice()
 		if err == nil && len(result) == 2 && result[1] >= 0 {
 			return resourceResult(result), nil
 		}
-		l.degraded("search")
+		l.degraded(operation)
 	}
 	return l.allowLocal(key), nil
 }

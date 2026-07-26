@@ -102,6 +102,103 @@ func TestConnectivityHonorsTotalTimeout(t *testing.T) {
 	}
 }
 
+func TestConnectivityCompletesOnFirstMappedEventAndClosesStream(t *testing.T) {
+	for _, protocol := range []ProtocolMode{ProtocolChatCompletions, ProtocolResponses} {
+		t.Run(string(protocol), func(t *testing.T) {
+			closed := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher := w.(http.Flusher)
+				if protocol == ProtocolChatCompletions {
+					_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+				} else {
+					_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\n")
+				}
+				flusher.Flush()
+				<-r.Context().Done()
+				close(closed)
+			}))
+			defer server.Close()
+			cfg := connectivityRuntimeConfig(t, server, protocol)
+			cfg.Timeouts.Total = time.Second
+			started := time.Now()
+			result, err := NewProviderConnectivityTester(URLPolicy{
+				DevelopmentAllowPrivate: true,
+				Resolver:                connectivityResolver{address: netip.MustParseAddr("127.0.0.1")},
+			}).Test(context.Background(), cfg)
+			if err != nil || !result.OK || time.Since(started) > 500*time.Millisecond {
+				t.Fatalf("result=%#v err=%v elapsed=%s", result, err, time.Since(started))
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("probe response body was not closed")
+			}
+		})
+	}
+}
+
+func TestConnectivityIgnoresMalformedTailAfterFirstMappedEvent(t *testing.T) {
+	for _, protocol := range []ProtocolMode{ProtocolChatCompletions, ProtocolResponses} {
+		t.Run(string(protocol), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if protocol == ProtocolChatCompletions {
+					_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: not-json\n\n")
+				} else {
+					_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\nevent: response.output_text.delta\ndata: not-json\n\n")
+				}
+			}))
+			defer server.Close()
+			result, err := NewProviderConnectivityTester(URLPolicy{
+				DevelopmentAllowPrivate: true,
+				Resolver:                connectivityResolver{address: netip.MustParseAddr("127.0.0.1")},
+			}).Test(context.Background(), connectivityRuntimeConfig(t, server, protocol))
+			if err != nil || !result.OK {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestConnectivityZerosSourceKeyBeforeWaitingForUpstream(t *testing.T) {
+	requestArrived := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestArrived)
+		<-release
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+	}))
+	defer server.Close()
+	cfg := connectivityRuntimeConfig(t, server, ProtocolChatCompletions)
+	sourceKey := cfg.APIKey
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewProviderConnectivityTester(URLPolicy{
+			DevelopmentAllowPrivate: true,
+			Resolver:                connectivityResolver{address: netip.MustParseAddr("127.0.0.1")},
+		}).Test(context.Background(), cfg)
+		done <- err
+	}()
+	select {
+	case <-requestArrived:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not arrive")
+	}
+	for i, value := range sourceKey {
+		if value != 0 {
+			close(release)
+			<-done
+			t.Fatalf("source API key byte %d remained live while upstream was blocked", i)
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type connectivityResolver struct {
 	address netip.Addr
 }

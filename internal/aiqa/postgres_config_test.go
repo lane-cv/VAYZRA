@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -210,6 +211,90 @@ func TestPostgresConnectivityLeaseExcludesOtherStoreInstancesAndAudits(t *testin
 			t.Fatalf("audit leaked %q: %s", forbidden, metadata)
 		}
 	}
+}
+
+func TestConnectivityServiceReleasesLeaseBeforeAuditWithSingleConnection(t *testing.T) {
+	ctx, pool, box, policy, actor, providerID := connectivityPostgresFixture(t)
+	cfg := pool.Config().Copy()
+	cfg.MaxConns = 1
+	cfg.MinConns = 0
+	single, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(single.Close)
+	store := NewPostgresConfigStoreWithSecurity(single, box, policy)
+	svc := NewAdminConfigServiceWithConnectivity(store, policy, box, &blockingConnectivityTester{
+		result: ConnectivityResult{OK: true, Protocol: ProtocolResponses, LatencyMS: 2},
+	})
+	callCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	result, err := svc.TestProvider(callCtx, actor, providerID)
+	if err != nil || !result.OK {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='ai.provider_tested' AND target_id=$1`, providerID.String()).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("audit count=%d err=%v", count, err)
+	}
+}
+
+func TestConnectivityServiceDurablyAuditsCancellationAfterLeaseRelease(t *testing.T) {
+	ctx, pool, box, policy, actor, providerID := connectivityPostgresFixture(t)
+	store := NewPostgresConfigStoreWithSecurity(pool, box, policy)
+	tester := &blockingConnectivityTester{started: make(chan struct{}, 1), release: make(chan struct{})}
+	svc := NewAdminConfigServiceWithConnectivity(store, policy, box, tester)
+	callCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.TestProvider(callCtx, actor, providerID)
+		done <- err
+	}()
+	select {
+	case <-tester.started:
+	case <-time.After(time.Second):
+		t.Fatal("connectivity probe did not start")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("cancelled call error=%v", err)
+	}
+	var category string
+	if err := pool.QueryRow(ctx, `SELECT metadata->>'errorCategory' FROM audit_logs WHERE action='ai.provider_tested' AND target_id=$1 ORDER BY id DESC LIMIT 1`, providerID.String()).Scan(&category); err != nil || category != "cancelled" {
+		t.Fatalf("audit category=%q err=%v", category, err)
+	}
+}
+
+func connectivityPostgresFixture(t *testing.T) (context.Context, *pgxpool.Pool, SecretBox, URLPolicy, Principal, uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAIConfig(t, ctx, pool)
+	admin := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'connectivity_service_admin','Connectivity Service Admin','admin','x',false)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	providerID := uuid.New()
+	box, err := NewAESGCMSecretBox(bytes.Repeat([]byte{8}, 32), 1, bytes.NewReader(bytes.Repeat([]byte{4}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := box.Seal(providerID, []byte("service-connectivity-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_providers(id,name,base_url,protocol_mode,encrypted_api_key,key_version,key_updated_at,created_by) VALUES($1,'service connectivity','http://api.example.test','responses',$2,$3,now(),$4)`, providerID, sealed.Blob, sealed.KeyVersion, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,created_by,updated_by) VALUES($1,$2,'probe-model','text',8192,32,1000,0,0,$3,$3)`, uuid.New(), providerID, admin); err != nil {
+		t.Fatal(err)
+	}
+	policy := URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "provider-test-service", IP: net.ParseIP("192.0.2.28")}
+	return ctx, pool, box, policy, actor, providerID
 }
 
 func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {

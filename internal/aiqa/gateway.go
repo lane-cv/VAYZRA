@@ -23,6 +23,8 @@ const (
 	maxUpstreamErrorBytes = 4 << 10
 )
 
+var errGatewayConsumerComplete = errors.New("gateway consumer complete")
+
 type GatewayRequest struct {
 	RunID           uuid.UUID
 	Model           string
@@ -99,6 +101,9 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 	default:
 		return gatewayError("upstream_4xx", nil)
 	}
+	authorization := "Bearer " + string(cfg.APIKey)
+	zeroBytes(cfg.APIKey)
+	defer func() { authorization = "" }()
 
 	observed := false
 	for attempt := 0; attempt < 2; attempt++ {
@@ -107,11 +112,12 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 			written.Store(true)
 		}}
 		attemptCtx := httptrace.WithClientTrace(ctx, trace)
-		httpRequest, body, err := newStreamingRequest(attemptCtx, cfg, request, adapter)
+		httpRequest, body, err := newStreamingRequest(attemptCtx, cfg, request, adapter, authorization)
 		if err != nil {
 			return err
 		}
 		response, doErr := g.client.Do(httpRequest)
+		httpRequest.Header.Del("Authorization")
 		if doErr != nil {
 			_ = body.Close()
 			if attempt == 0 && !written.Load() && !observed && ctx.Err() == nil {
@@ -120,6 +126,7 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 			return classifyTransportError(callerCtx, ctx, doErr)
 		}
 		observed = true
+		authorization = ""
 		err = g.consumeResponse(callerCtx, ctx, cfg, response, adapter, callback)
 		if err != nil {
 			return err
@@ -148,7 +155,7 @@ func validateGatewayRequest(cfg RuntimeProviderConfig, request GatewayRequest, c
 	return nil
 }
 
-func newStreamingRequest(ctx context.Context, cfg RuntimeProviderConfig, request GatewayRequest, adapter protocolAdapter) (*http.Request, *io.PipeReader, error) {
+func newStreamingRequest(ctx context.Context, cfg RuntimeProviderConfig, request GatewayRequest, adapter protocolAdapter, authorization string) (*http.Request, *io.PipeReader, error) {
 	endpoint := *cfg.BaseURL
 	endpoint.RawQuery = ""
 	endpoint.Fragment = ""
@@ -165,7 +172,7 @@ func newStreamingRequest(ctx context.Context, cfg RuntimeProviderConfig, request
 		_ = reader.Close()
 		return nil, nil, gatewayError("upstream_4xx", nil)
 	}
-	httpRequest.Header.Set("Authorization", "Bearer "+string(cfg.APIKey))
+	httpRequest.Header.Set("Authorization", authorization)
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Accept", "text/event-stream")
 	return httpRequest, reader, nil
@@ -230,6 +237,9 @@ func (g *compatibleGateway) consumeResponse(callerCtx, ctx context.Context, cfg 
 			return nil
 		})
 	})
+	if errors.Is(err, errGatewayConsumerComplete) {
+		return nil
+	}
 	if err == nil {
 		if !terminal {
 			return gatewayError("stream_interrupted", nil)

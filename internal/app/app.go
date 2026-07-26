@@ -23,30 +23,31 @@ import (
 )
 
 type Dependencies struct {
-	Ready             func(context.Context) error
-	Auth              auth.HTTPService
-	Students          students.HTTPService
-	Teaching          teaching.AdminHTTPService
-	Uploads           files.UploadHTTPService
-	QAUploads         files.UploadHTTPService
-	AIUploads         files.UploadHTTPService
-	FileAccess        files.AccessHTTPService
-	QAFileAccess      files.QAAccessHTTPService
-	FileBindings      files.BindingHTTPService
-	FileCenter        files.FileCenterHTTPService
-	StudentTeaching   teaching.StudentHTTPService
-	StudentQuestions  qanda.StudentHTTPService
-	AdminQuestions    qanda.AdminHTTPService
-	AdminAI           aiqa.AdminConfigHTTPService
-	Notifications     notifications.HTTPService
-	PublicOrigin      string
-	CookieSecure      bool
-	TrustedProxyCIDRs []netip.Prefix
-	Limiter           redisx.Limiter
-	ProgressLimiter   redisx.ProgressWriteLimiter
-	SearchLimiter     redisx.SearchRateLimiter
-	Captchas          redisx.CaptchaService
-	StaticFiles       fs.FS
+	Ready               func(context.Context) error
+	Auth                auth.HTTPService
+	Students            students.HTTPService
+	Teaching            teaching.AdminHTTPService
+	Uploads             files.UploadHTTPService
+	QAUploads           files.UploadHTTPService
+	AIUploads           files.UploadHTTPService
+	FileAccess          files.AccessHTTPService
+	QAFileAccess        files.QAAccessHTTPService
+	FileBindings        files.BindingHTTPService
+	FileCenter          files.FileCenterHTTPService
+	StudentTeaching     teaching.StudentHTTPService
+	StudentQuestions    qanda.StudentHTTPService
+	AdminQuestions      qanda.AdminHTTPService
+	AdminAI             aiqa.AdminConfigHTTPService
+	Notifications       notifications.HTTPService
+	PublicOrigin        string
+	CookieSecure        bool
+	TrustedProxyCIDRs   []netip.Prefix
+	Limiter             redisx.Limiter
+	ProgressLimiter     redisx.ProgressWriteLimiter
+	SearchLimiter       redisx.SearchRateLimiter
+	ProviderTestLimiter redisx.ProviderTestRateLimiter
+	Captchas            redisx.CaptchaService
+	StaticFiles         fs.FS
 }
 
 func New(d Dependencies) http.Handler {
@@ -116,7 +117,9 @@ func New(d Dependencies) http.Handler {
 					private.Mount("/admin/questions", qanda.NewAdminHandlerWithConfig(d.AdminQuestions, qanda.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
 				}
 				if d.AdminAI != nil {
-					private.Mount("/admin/ai", aiqa.NewAdminConfigHandler(d.AdminAI, d.TrustedProxyCIDRs).Routes())
+					private.Mount("/admin/ai", aiqa.NewAdminConfigHandlerWithConfig(d.AdminAI, aiqa.AdminConfigHTTPConfig{
+						TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProviderTestLimiter: d.ProviderTestLimiter,
+					}).Routes())
 				}
 				if d.Notifications != nil {
 					private.Mount("/notifications", notifications.NewHandler(d.Notifications).Routes())
