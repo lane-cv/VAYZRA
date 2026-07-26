@@ -57,6 +57,7 @@ func TestLoadParsesAIConfiguration(t *testing.T) {
 
 func TestLoadUsesDevelopmentOnlyAIConfigurationDefaults(t *testing.T) {
 	cfg, err := Load(mapEnv(map[string]string{
+		"HAPPYLEARN_ENV":                   "development",
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
 		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
@@ -68,6 +69,35 @@ func TestLoadUsesDevelopmentOnlyAIConfigurationDefaults(t *testing.T) {
 	if len(cfg.AIMasterKey) != 32 || cfg.AIMasterKeyVersion != 1 || cfg.AIBusinessTimezone != "Asia/Shanghai" || cfg.AIGlobalConcurrency != 2 || cfg.AIPerStudentConcurrency != 1 || cfg.AIAllowPrivateProvider {
 		t.Fatalf("unexpected development AI configuration: %#v", cfg)
 	}
+}
+
+func TestLoadRequiresExplicitDevelopmentEnvironmentForAIExceptions(t *testing.T) {
+	base := map[string]string{
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
+	}
+
+	t.Run("fallback master key", func(t *testing.T) {
+		_, err := Load(mapEnv(base))
+		if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_MASTER_KEY") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+
+	t.Run("private provider", func(t *testing.T) {
+		env := make(map[string]string, len(base)+2)
+		for key, value := range base {
+			env[key] = value
+		}
+		env["HAPPYLEARN_AI_MASTER_KEY"] = base64.StdEncoding.EncodeToString(make([]byte, 32))
+		env["HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER"] = "true"
+		_, err := Load(mapEnv(env))
+		if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER") {
+			t.Fatalf("error=%v", err)
+		}
+	})
 }
 
 func TestLoadRejectsInvalidAIConfiguration(t *testing.T) {
@@ -112,6 +142,7 @@ func TestLoadAllowsPrivateAIProvidersOnlyInDevelopment(t *testing.T) {
 	}
 
 	development := map[string]string{
+		"HAPPYLEARN_ENV":                        "development",
 		"HAPPYLEARN_DATABASE_URL":               "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":                  "redis://localhost:6379/0",
 		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":      "test-login-throttle-secret-0123456789",
@@ -191,7 +222,12 @@ func TestLoadParsesMinIOConfiguration(t *testing.T) {
 	}
 }
 func TestLoadRejectsMissingRequiredValues(t *testing.T) {
-	_, err := Load(func(string) string { return "" })
+	_, err := Load(func(key string) string {
+		if key == "HAPPYLEARN_ENV" {
+			return "development"
+		}
+		return ""
+	})
 	if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_DATABASE_URL") {
 		t.Fatalf("expected missing database URL error, got %v", err)
 	}
@@ -199,6 +235,7 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 
 func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 	env := map[string]string{
+		"HAPPYLEARN_ENV":                   "development",
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
 		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
@@ -216,6 +253,7 @@ func TestLoadUsesSessionDurationsFromSpec(t *testing.T) {
 
 func TestLoadParsesTrustedProxyCIDRs(t *testing.T) {
 	env := map[string]string{
+		"HAPPYLEARN_ENV":                   "development",
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
 		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
@@ -235,6 +273,7 @@ func TestLoadParsesTrustedProxyCIDRs(t *testing.T) {
 func TestLoadRejectsInvalidTrustedProxyCIDRs(t *testing.T) {
 	for _, raw := range []string{"not-a-cidr", "10.0.0.0/8,"} {
 		env := map[string]string{
+			"HAPPYLEARN_ENV":                   "development",
 			"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 			"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
 			"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
@@ -263,7 +302,7 @@ func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 }
 
 func TestLoadValidatesAndNormalizesPublicOrigin(t *testing.T) {
-	base := map[string]string{"HAPPYLEARN_DATABASE_URL": "postgres://app:test@localhost/app", "HAPPYLEARN_REDIS_URL": "redis://localhost:6379/0", "HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789"}
+	base := map[string]string{"HAPPYLEARN_ENV": "development", "HAPPYLEARN_DATABASE_URL": "postgres://app:test@localhost/app", "HAPPYLEARN_REDIS_URL": "redis://localhost:6379/0", "HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789"}
 	for _, raw := range []string{"", "/relative", "https://user@learn.example.com", "ftp://learn.example.com", "https://learn.example.com/path", "https://learn.example.com?q=1", "https://learn.example.com#fragment", "https://one.example,https://two.example"} {
 		env := make(map[string]string, len(base)+1)
 		for k, v := range base {
@@ -307,6 +346,7 @@ func TestLoadRequiresHTTPSPublicOriginInProduction(t *testing.T) {
 
 func TestLoadPreservesIPv6BracketsWhenNormalizingPublicOrigin(t *testing.T) {
 	base := map[string]string{
+		"HAPPYLEARN_ENV":                   "development",
 		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
 		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
 		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",

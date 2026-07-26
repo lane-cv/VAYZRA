@@ -50,8 +50,10 @@ func Load(getenv func(string) string) (Config, error) {
 		AIGlobalConcurrency:     2,
 		AIPerStudentConcurrency: 1,
 	}
-	if v := getenv("HAPPYLEARN_ENV"); v != "" {
-		c.Environment = v
+	environment := getenv("HAPPYLEARN_ENV")
+	explicitDevelopment := strings.TrimSpace(environment) == "development"
+	if environment != "" {
+		c.Environment = environment
 	}
 	if v := getenv("HAPPYLEARN_LISTEN"); v != "" {
 		c.ListenAddress = v
@@ -65,10 +67,12 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY must be standard base64 of exactly 32 bytes")
 		}
 		c.AIMasterKey = key
-	} else if c.Environment == "development" {
+	} else if explicitDevelopment {
 		c.AIMasterKey = []byte(developmentAIMasterKey)
-	} else {
+	} else if c.Environment == "production" {
 		return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY is required in production")
+	} else {
+		return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY requires HAPPYLEARN_ENV=development when omitted")
 	}
 	if raw := getenv("HAPPYLEARN_AI_MASTER_KEY_VERSION"); raw != "" {
 		version, err := strconv.ParseInt(raw, 10, 16)
@@ -101,7 +105,7 @@ func Load(getenv func(string) string) (Config, error) {
 		switch raw {
 		case "false":
 		case "true":
-			if c.Environment != "development" {
+			if !explicitDevelopment {
 				return Config{}, fmt.Errorf("HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER may only be true in development")
 			}
 			c.AIAllowPrivateProvider = true
