@@ -173,16 +173,49 @@ func TestStudentServiceRetryEligibilityAndAttemptDelegation(t *testing.T) {
 		},
 	}
 	cfg := &fakeRuntimeConfig{contextTokens: 5000, imageQuota: 900}
-	svc := NewStudentService(store, cfg, fakeAttachmentContextStore{text: map[uuid.UUID]string{textID: "doc-text"}}, time.Now)
+	var validated []AttachmentInput
+	svc := NewStudentService(store, cfg, fakeAttachmentContextStore{
+		metadata: source.TriggerAttachments, text: map[uuid.UUID]string{textID: "doc-text"}, validated: &validated,
+	}, time.Now)
 	got, err := svc.RetryRun(context.Background(), student, source.ID, "retry-service-key-0001")
 	wantTokens := int64(len([]byte("sysprior-uprior-aretry-currentdoc-text")) + 900 + 10)
 	if err != nil || got.ID == uuid.Nil || store.retry.SourceRunID != source.ID || store.retry.Reservation.TokenCount != wantTokens || cfg.lastModality != ModalityVision {
 		t.Fatalf("got=%+v retry=%+v err=%v", got, store.retry, err)
 	}
+	if len(validated) != 2 || validated[0].FileVersionID != imageID || validated[0].SortPosition != 0 ||
+		validated[1].FileVersionID != textID || validated[1].SortPosition != 1 {
+		t.Fatalf("ordered retry bindings=%+v", validated)
+	}
 	source.Status = RunSucceeded
 	store.sourceRun = source
 	if _, err = svc.RetryRun(context.Background(), student, source.ID, "retry-service-key-0002"); !errors.Is(err, ErrRunConflict) {
 		t.Fatalf("succeeded retry=%v", err)
+	}
+}
+
+func TestStudentServiceRetryRevalidatesVisionBeforeMutation(t *testing.T) {
+	student := studentPrincipal()
+	triggerID, imageID := uuid.New(), uuid.New()
+	source := Run{
+		ID: uuid.New(), ThreadID: uuid.New(), TriggerMessageID: triggerID, Status: RunFailed,
+		TriggerAttachments: []AttachmentMetadata{{FileVersionID: imageID, Modality: ModalityVision}},
+	}
+	store := &fakeRuntimeStore{
+		sourceRun: source, thread: Thread{ID: source.ThreadID, StudentID: student.User.ID, Subject: SubjectMath},
+		context: []Message{{ID: triggerID, Role: "student", Body: "retry"}},
+	}
+	svc := NewStudentService(store, &fakeRuntimeConfig{}, fakeAttachmentContextStore{err: ErrAttachmentNotReady}, time.Now)
+	if _, err := svc.RetryRun(context.Background(), student, source.ID, "retry-unready-image1"); !errors.Is(err, ErrAttachmentNotReady) {
+		t.Fatalf("unready retry=%v", err)
+	}
+	if store.retry.RunID != uuid.Nil {
+		t.Fatalf("retry mutated store before validation: %+v", store.retry)
+	}
+
+	existing := Run{ID: uuid.New(), ThreadID: source.ThreadID, TriggerMessageID: triggerID, Status: RunQueued}
+	store.existingRun = &existing
+	if got, err := svc.RetryRun(context.Background(), student, source.ID, "retry-idempotent-img"); err != nil || got.ID != existing.ID {
+		t.Fatalf("idempotent replay must precede validation: got=%+v err=%v", got, err)
 	}
 }
 
@@ -263,12 +296,16 @@ func (f *fakeRuntimeConfig) ForRun(_ context.Context, subject Subject, modality 
 }
 
 type fakeAttachmentContextStore struct {
-	metadata []AttachmentMetadata
-	text     map[uuid.UUID]string
-	err      error
+	metadata  []AttachmentMetadata
+	text      map[uuid.UUID]string
+	err       error
+	validated *[]AttachmentInput
 }
 
-func (f fakeAttachmentContextStore) ValidateForAI(context.Context, uuid.UUID, uuid.UUID, []AttachmentInput) ([]AttachmentMetadata, error) {
+func (f fakeAttachmentContextStore) ValidateForAI(_ context.Context, _, _ uuid.UUID, inputs []AttachmentInput) ([]AttachmentMetadata, error) {
+	if f.validated != nil {
+		*f.validated = append([]AttachmentInput(nil), inputs...)
+	}
 	if f.err != nil {
 		return nil, f.err
 	}

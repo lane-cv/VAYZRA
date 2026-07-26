@@ -181,6 +181,14 @@ func (s *studentService) RetryRun(ctx context.Context, principal Principal, sour
 	} else if !errors.Is(existingErr, ErrNotFound) {
 		return Run{}, existingErr
 	}
+	inputs := make([]AttachmentInput, len(source.TriggerAttachments))
+	for i := range source.TriggerAttachments {
+		inputs[i] = AttachmentInput{FileVersionID: source.TriggerAttachments[i].FileVersionID, SortPosition: i}
+	}
+	currentAttachments, err := s.attachments.ValidateForAI(ctx, principal.User.ID, source.ThreadID, inputs)
+	if err != nil {
+		return Run{}, err
+	}
 	detail, err := s.store.GetThread(ctx, principal.User.ID, source.ThreadID, MessageCursor{Limit: 1})
 	if err != nil {
 		return Run{}, err
@@ -188,7 +196,7 @@ func (s *studentService) RetryRun(ctx context.Context, principal Principal, sour
 	modality := ModalityText
 	imageCount := 0
 	var extracted strings.Builder
-	for _, attachment := range source.TriggerAttachments {
+	for _, attachment := range currentAttachments {
 		if attachment.Modality == ModalityVision {
 			modality = ModalityVision
 			imageCount++

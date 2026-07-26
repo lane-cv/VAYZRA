@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
@@ -211,6 +212,107 @@ func TestPostgresRuntimeOneActiveOwnerAndTerminalIdempotency(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT quota_blocked_at IS NOT NULL FROM ai_models WHERE id=$1`, fixture.model).Scan(&blocked); err != nil || blocked {
 		t.Fatalf("retry falsely blocked model=%v err=%v", blocked, err)
 	}
+}
+
+func TestPostgresRuntimeServiceRetryRevalidatesPersistedVision(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	var adminID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT created_by FROM ai_providers WHERE id=$1`, fixture.provider).Scan(&adminID); err != nil {
+		t.Fatal(err)
+	}
+	visionModelID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,created_by,updated_by)
+VALUES($1,$2,'runtime-vision','vision',8192,1024,1000,2,3,true,1000,5000,5000,30000,$3,$3)`, visionModelID, fixture.provider, adminID); err != nil {
+		t.Fatal(err)
+	}
+	visionConfig := fixture.cfg
+	visionConfig.Model.ID = visionModelID
+	visionConfig.Model.UpstreamModelID = "runtime-vision"
+	visionConfig.Model.Modality = ModalityVision
+	imageID := insertAttachmentVersion(t, ctx, pool, fixture.student, "ai_attachment", "ready", "image/png", "retry.png")
+	store := NewPostgresRuntimeStore(pool)
+	in := fixture.admission()
+	in.Snapshot.Provider = visionConfig
+	in.Attachments = []AttachmentMetadata{{
+		FileVersionID: imageID, DisplayName: "retry.png", DetectedMIME: "image/png", Modality: ModalityVision, Size: 1,
+	}}
+	_, source, err := store.AdmitRun(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CancelRun(ctx, fixture.student, source.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	attachments := NewPostgresAttachmentStore(pool, nil, nil)
+	service := NewStudentService(store, fixedRuntimeConfigSource{text: fixture.cfg, vision: visionConfig}, attachments, time.Now)
+	principal := Principal{User: auth.User{ID: fixture.student, Role: auth.RoleStudent, Status: auth.StatusActive}}
+	const readyKey = "retry-ready-vision-01"
+	readyRetry, err := service.RetryRun(ctx, principal, source.ID, readyKey)
+	if err != nil || readyRetry.AttemptNo != 2 {
+		t.Fatalf("ready retry=%+v err=%v", readyRetry, err)
+	}
+	if _, err = store.CancelRun(ctx, fixture.student, readyRetry.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='failed' WHERE id=$1`, imageID); err != nil {
+		t.Fatal(err)
+	}
+	// Exact replay remains fast and does not revalidate a now-stale attachment.
+	replayed, err := service.RetryRun(ctx, principal, source.ID, readyKey)
+	if err != nil || replayed.ID != readyRetry.ID {
+		t.Fatalf("stale idempotent replay=%+v err=%v", replayed, err)
+	}
+	var beforeRuns, beforeLedger int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_runs WHERE student_id=$1`, fixture.student).Scan(&beforeRuns); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE student_id=$1`, fixture.student).Scan(&beforeLedger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.RetryRun(ctx, principal, source.ID, "retry-unready-vis-01"); !errors.Is(err, ErrAttachmentNotReady) {
+		t.Fatalf("unready vision retry=%v", err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET processing_state='ready',purged_at=now() WHERE id=$1`, imageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.RetryRun(ctx, principal, source.ID, "retry-purged-vis-001"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("purged vision retry=%v", err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE file_versions SET purged_at=NULL WHERE id=$1`, imageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE users SET status='disabled' WHERE id=$1`, fixture.student); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.RetryRun(ctx, principal, source.ID, "retry-disabled-owner1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("inactive owner vision retry=%v", err)
+	}
+	var afterRuns, afterLedger int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_runs WHERE student_id=$1`, fixture.student).Scan(&afterRuns); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE student_id=$1`, fixture.student).Scan(&afterLedger); err != nil {
+		t.Fatal(err)
+	}
+	if afterRuns != beforeRuns || afterLedger != beforeLedger {
+		t.Fatalf("rejected retry mutated state: runs %d->%d ledger %d->%d", beforeRuns, afterRuns, beforeLedger, afterLedger)
+	}
+}
+
+type fixedRuntimeConfigSource struct {
+	text, vision RuntimeProviderConfig
+}
+
+func (f fixedRuntimeConfigSource) ForRun(_ context.Context, _ Subject, modality Modality) (RuntimeProviderConfig, error) {
+	if modality == ModalityVision {
+		return f.vision, nil
+	}
+	return f.text, nil
 }
 
 func TestPostgresRuntimeConcurrentSettleWritesOneTerminalSet(t *testing.T) {
