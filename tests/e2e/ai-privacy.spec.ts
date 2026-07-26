@@ -26,6 +26,11 @@ type AIMutation = {
   eventsUrl: string
 }
 
+function hasRestrictedSerialization(serialized: string, secret: string, teacherNote: string): boolean {
+  if (serialized.includes(secret) || serialized.includes(teacherNote)) return true
+  return /(api[-_]?key|encrypted[-_]?api[-_]?key|cipher[-_]?text|object[-_]?key)/i.test(serialized)
+}
+
 test.beforeAll(() => {
   if (!adminPassword || !studentPassword || !studentNewPassword) {
     throw new Error('Phase 4 E2E credentials are required.')
@@ -135,9 +140,7 @@ test('two students receive uniform 404s and AI data never enters teacher queue o
       if (!contentType.includes('json') && !contentType.includes('html')) return
       inspections.push(response.body().then((body) => {
         const serialized = body.toString('utf8')
-        leaked ||= serialized.includes(syntheticSecret)
-          || serialized.includes(syntheticTeacherNote)
-          || /encryptedApiKey|ciphertext|objectKey/i.test(serialized)
+        leaked ||= hasRestrictedSerialization(serialized, syntheticSecret, syntheticTeacherNote)
       }).catch(() => undefined))
     })
     await pageA.goto(`/student/questions/teacher/${teacher.thread.id}`)
@@ -146,9 +149,7 @@ test('two students receive uniform 404s and AI data never enters teacher queue o
     await expect(pageA.getByRole('heading', { name: `合成私有 AI 问题-${suffix}` })).toBeVisible()
     await Promise.all(inspections)
     const html = await pageA.content()
-    leaked ||= html.includes(syntheticSecret)
-      || html.includes(syntheticTeacherNote)
-      || /encryptedApiKey|ciphertext|objectKey/i.test(html)
+    leaked ||= hasRestrictedSerialization(html, syntheticSecret, syntheticTeacherNote)
     expect(leaked).toBe(false)
   } finally {
     await studentBContext.close()

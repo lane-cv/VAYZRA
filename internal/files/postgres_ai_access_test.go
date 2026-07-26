@@ -24,7 +24,7 @@ func (s failingAIResolveStore) ResolveAIAccess(context.Context, Principal, uuid.
 	return AIDelivery{}, s.err
 }
 
-func TestPostgresAIAccessRequiresBoundCleanOwnerFileAndLogsAITarget(t *testing.T) {
+func TestPostgresAIAccessRequiresBindingWhileStatusAllowsOwnerPreBind(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
 	if err := database.Migrate(ctx, pool); err != nil {
@@ -66,6 +66,7 @@ VALUES($1,1,$2,$3,'question.txt','text/plain','text/plain',5,$4,$5,$6,$7,$8) RET
 	}
 	bound := makeVersion("ai_attachment", "ready", "clean", true)
 	unbound := makeVersion("ai_attachment", "ready", "clean", true)
+	pending := makeVersion("ai_attachment", "processing", "clean", false)
 	qaPurpose := makeVersion("qa_attachment", "ready", "clean", true)
 	notClean := makeVersion("ai_attachment", "ready", "rejected", true)
 	if _, err := pool.Exec(ctx, `INSERT INTO ai_message_files(message_id,file_version_id,sort_position,display_name)
@@ -79,7 +80,7 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE audit_logs ENABLE TRIGGER audit_logs_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE file_access_logs DISABLE TRIGGER file_access_logs_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM file_access_logs WHERE ai_message_id=$1 OR requested_file_version_id=ANY($2)`,
-			message, []uuid.UUID{bound, unbound, qaPurpose, notClean})
+			message, []uuid.UUID{bound, unbound, pending, qaPurpose, notClean})
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE file_access_logs ENABLE TRIGGER file_access_logs_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE ai_message_files DISABLE TRIGGER ai_message_files_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE ai_messages DISABLE TRIGGER ai_messages_immutable`)
@@ -88,7 +89,7 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE ai_messages ENABLE TRIGGER ai_messages_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE ai_message_files ENABLE TRIGGER ai_message_files_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM ai_threads WHERE id=$1`, thread)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM file_versions WHERE id=ANY($1)`, []uuid.UUID{bound, unbound, qaPurpose, notClean})
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM file_versions WHERE id=ANY($1)`, []uuid.UUID{bound, unbound, pending, qaPurpose, notClean})
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM files WHERE created_by=$1`, owner)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id=ANY($1)`, []uuid.UUID{owner, other})
 	})
@@ -104,12 +105,22 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 	if err != nil || status.FileVersionID != bound || status.ProcessingState != "ready" {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
+	for version, wantState := range map[uuid.UUID]string{
+		unbound: "ready",
+		pending: "processing",
+	} {
+		status, err = store.ResolveAIStatus(ctx, principal(owner), version)
+		if err != nil || status.FileVersionID != version || status.ProcessingState != wantState || status.MessageID != uuid.Nil {
+			t.Fatalf("pre-bind status=%+v err=%v wantState=%q", status, err, wantState)
+		}
+	}
 	for name, tc := range map[string]struct {
 		actor   uuid.UUID
 		version uuid.UUID
 	}{
 		"foreign":    {other, bound},
 		"unbound":    {owner, unbound},
+		"pending":    {owner, pending},
 		"qa purpose": {owner, qaPurpose},
 		"not clean":  {owner, notClean},
 	} {
@@ -121,8 +132,10 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 			if name == "foreign" && (denied.MessageID != uuid.Nil || denied.VersionID != uuid.Nil || denied.ObjectKey != "") {
 				t.Fatalf("foreign identifiers escaped SQL owner scope: %+v", denied)
 			}
-			if _, err := store.ResolveAIStatus(ctx, principal(tc.actor), tc.version); !errors.Is(err, ErrNotFound) {
-				t.Fatalf("status err=%v", err)
+			if name != "unbound" && name != "pending" && name != "not clean" {
+				if _, err := store.ResolveAIStatus(ctx, principal(tc.actor), tc.version); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("status err=%v", err)
+				}
 			}
 		})
 	}

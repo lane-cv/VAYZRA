@@ -12,6 +12,19 @@ const adminPassword = process.env.E2E_ADMIN_PASSWORD
 const studentPassword = process.env.E2E_STUDENT_PASSWORD
 const providerBaseURL = process.env.E2E_AI_PROVIDER_BASE_URL ?? 'http://fake-ai:8090/v1'
 const providerKey = process.env.E2E_AI_PROVIDER_KEY ?? 'e2e-provider-key'
+const providerKeys = ['id', 'name', 'baseUrl', 'protocolMode', 'active', 'hasKey', 'keyUpdatedAt', 'version'].sort()
+
+function safeProviderEnvelope(payload: unknown, secret: string): boolean {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
+  const envelope = payload as Record<string, unknown>
+  if (Object.keys(envelope).length !== 1 || !('data' in envelope)) return false
+  if (!envelope.data || typeof envelope.data !== 'object' || Array.isArray(envelope.data)) return false
+  const data = envelope.data as Record<string, unknown>
+  if (Object.keys(data).sort().join('|') !== providerKeys.join('|')) return false
+  const normalized = Object.keys(data).map((key) => key.toLowerCase().replace(/[-_]/g, ''))
+  if (normalized.some((key) => ['apikey', 'encryptedapikey', 'ciphertext', 'objectkey'].includes(key))) return false
+  return !Object.values(data).some((value) => typeof value === 'string' && value.includes(secret))
+}
 
 test.beforeAll(() => {
   if (!adminPassword || !studentPassword) {
@@ -36,8 +49,7 @@ test('admin creates, tests, and switches a provider without secret readback', as
   await page.getByRole('button', { name: '保存供应商' }).click()
   await expect(page.getByRole('status')).toContainText('已安全保存')
   const savedPayload = await (await savedResponse).json()
-  expect(JSON.stringify(savedPayload)).not.toContain(providerKey)
-  expect(JSON.stringify(savedPayload)).not.toMatch(/encrypted|ciphertext/i)
+  expect(safeProviderEnvelope(savedPayload, providerKey)).toBe(true)
 
   await page.reload()
   const card = page.locator('article').filter({ hasText: name })
@@ -74,10 +86,24 @@ test('admin saves text/vision routing, subject prompts, global/student limits, a
   await login(page, 'admin', adminPassword!)
   const student = await createStudentAPI(page, `ai-config-${suffix}`, '额度验收学生', studentPassword!)
   await configureAIProvider(page, 'responses')
+  await configureAIProvider(page, 'chat_completions')
+  const providers = await apiJSON<AIProvider[]>(page, 'GET', '/api/v1/admin/ai/providers')
+  const responsesProvider = providers.find((provider) => provider.name.includes('E2E AI responses'))!
 
   await page.goto('/admin/ai')
-  await expect(page.locator('article').filter({ hasText: 'E2E AI responses' })).toContainText('当前使用')
+  const responsesCard = page.locator('article').filter({ hasText: responsesProvider.name })
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('设为当前供应商')
+    await dialog.accept()
+  })
+  const activationResponse = page.waitForResponse((response) =>
+    response.request().method() === 'PUT' && response.url().endsWith('/api/v1/admin/ai/active-provider'))
+  await responsesCard.getByLabel(`启用 ${responsesProvider.name}`).click()
+  expect((await activationResponse).status()).toBe(200)
+  await expect(responsesCard).toContainText('当前使用')
+
   await page.getByRole('tab', { name: '模型路由' }).click()
+  await page.getByLabel('模型供应商').selectOption(responsesProvider.id)
   await expect(page.getByLabel('文本上游模型')).toHaveValue(/fixture-text-/)
   await expect(page.getByLabel('视觉上游模型')).toHaveValue(/fixture-vision-/)
   await page.getByLabel('文本输入价格').fill('0.001234')
@@ -86,6 +112,18 @@ test('admin saves text/vision routing, subject prompts, global/student limits, a
   await page.getByLabel('保存文本模型路由').click()
   expect((await textRoute).status()).toBe(200)
   await expect(page.getByRole('status')).toContainText('文本模型路由已保存')
+  const visionValue = `fixture-vision-ui-${suffix}`
+  await page.getByLabel('视觉上游模型').fill(visionValue)
+  const visionRoute = page.waitForResponse((response) =>
+    response.request().method() === 'PUT' && response.url().includes('/models/'))
+  await page.getByLabel('保存视觉模型路由').click()
+  expect((await visionRoute).status()).toBe(200)
+  await expect(page.getByRole('status')).toContainText('视觉模型路由已保存')
+  await page.reload()
+  await page.getByRole('tab', { name: '模型路由' }).click()
+  await page.getByLabel('模型供应商').selectOption(responsesProvider.id)
+  await expect(page.getByLabel('文本输入价格')).toHaveValue('0.001234')
+  await expect(page.getByLabel('视觉上游模型')).toHaveValue(visionValue)
 
   await page.getByRole('tab', { name: '提示词' }).click()
   await page.getByLabel('数学提示词').fill('数学验收提示词：逐步推导并检查结果。')

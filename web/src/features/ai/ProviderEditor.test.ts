@@ -34,7 +34,7 @@ describe('ProviderEditor', () => {
     vi.stubGlobal('confirm', vi.fn(() => true))
   })
 
-  it('requires HTTPS and a key for create, supports both protocols, and clears the secret after success', async () => {
+  it('warns for HTTP but lets the server enforce environment URL policy', async () => {
     vi.mocked(api.createProvider).mockResolvedValue({ ...provider, id: 'new-provider' })
     const wrapper = mount(ProviderEditor)
     await flushPromises()
@@ -43,20 +43,32 @@ describe('ProviderEditor', () => {
     await wrapper.get('input[aria-label="供应商地址"]').setValue('http://provider.example')
     await wrapper.get('select[aria-label="协议模式"]').setValue('chat_completions')
     await wrapper.get('form').trigger('submit')
-    expect(wrapper.text()).toContain('请使用 HTTPS 地址')
+    expect(wrapper.text()).toContain('HTTP 地址仅可用于受控开发环境')
     expect(api.createProvider).not.toHaveBeenCalled()
-    await wrapper.get('input[aria-label="供应商地址"]').setValue('https://provider.example/v1')
-    await wrapper.get('form').trigger('submit')
-    expect(wrapper.text()).toContain('新建供应商必须填写 API Key')
     await wrapper.get('input[aria-label="API Key"]').setValue('top-secret')
     await wrapper.get('form').trigger('submit')
     await flushPromises()
     expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: 'http://provider.example',
       protocolMode: 'chat_completions',
       apiKey: 'top-secret',
     }))
     expect(wrapper.html()).not.toContain('top-secret')
     expect(wrapper.text()).toContain('已安全保存')
+  })
+
+  it('rejects malformed and non-HTTP provider URLs before submission', async () => {
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get('button[aria-label="新建供应商"]').trigger('click')
+    await wrapper.get('input[aria-label="供应商名称"]').setValue('非法地址供应商')
+    await wrapper.get('input[aria-label="API Key"]').setValue('synthetic-key')
+    for (const value of ['not-a-url', 'file:///tmp/provider', 'javascript:alert(1)']) {
+      await wrapper.get('input[aria-label="供应商地址"]').setValue(value)
+      await wrapper.get('form').trigger('submit')
+      expect(wrapper.text()).toContain('请输入有效的 HTTP(S) 地址')
+    }
+    expect(api.createProvider).not.toHaveBeenCalled()
   })
 
   it('never fills a saved key while editing and only sends a replacement after explicit opt-in', async () => {

@@ -9,8 +9,10 @@ import {
   csrfHeader,
   login,
   providerHitCounts,
+  setAIProcessingHeld,
   uploadAIFixture,
   waitForAIFile,
+  waitForAIFileState,
   waitForRunStatus,
   type AIRun,
 } from './helpers'
@@ -294,7 +296,14 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
         '[case:slow-first-byte] 取消后释放硬额度。',
       )
       await settlementPage.goto(`/student/questions/ai/${cancellable.thread!.id}`)
+      settlementPage.once('dialog', async (dialog) => {
+        expect(dialog.message()).toContain('停止本次生成')
+        await dialog.accept()
+      })
+      const cancelResponsePromise = settlementPage.waitForResponse((response) =>
+        response.request().method() === 'POST' && response.url().endsWith(`/runs/${cancellable.run.id}/cancel`))
       await settlementPage.getByLabel('停止生成').click()
+      expect((await cancelResponsePromise).status()).toBe(200)
       const cancelled = await waitForRunStatus(settlementPage, cancellable.run.id, 'cancelled')
       expect(cancelled.usage).toBeUndefined()
       const retryResponsePromise = settlementPage.waitForResponse((response) =>
@@ -306,6 +315,16 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
       const succeededRetry = await waitForRunStatus(settlementPage, retried.run.id, 'succeeded')
       expect(succeededRetry.usage?.source).toBe('provider')
 
+      await putStudentLimits(admin, settlementStudent.id, {
+        ...inheritedLimits,
+        dailyRequests: { mode: 'limit', value: 2 },
+      })
+      const secondAllowed = await createAIThread(
+        settlementPage,
+        '合成结算边界第二次',
+        '[case:success] 仅当第一次成功恰好结算一次时才允许。',
+      )
+      await waitForRunStatus(settlementPage, secondAllowed.run.id, 'succeeded')
       const exhausted = await settlementPage.request.post('/api/v1/student/ai/threads', {
         headers: { ...(await csrfHeader(settlementPage)), 'Idempotency-Key': randomUUID() },
         data: { title: '合成结算后限额', subject: 'math', body: '成功重试只结算一次。', attachments: [] },
@@ -321,8 +340,72 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
       expect(settledRuns.filter((run) => run.id === retried.run.id)).toEqual([
         expect.objectContaining({ usageSource: 'upstream' }),
       ])
+      expect(settledRuns.filter((run) => run.id === secondAllowed.run.id)).toHaveLength(1)
     } finally {
       await settlementContext.close()
+    }
+
+    const failedReleaseStudent = await createStudentAPI(
+      admin,
+      `ai-failed-release-${randomUUID().slice(0, 8)}`,
+      '失败释放验收学生',
+      studentPassword!,
+    )
+    const failedReleaseContext = await browser.newContext()
+    const failedReleasePage = await failedReleaseContext.newPage()
+    try {
+      await login(failedReleasePage, failedReleaseStudent.username, studentPassword!)
+      await changePassword(
+        failedReleasePage,
+        studentPassword!,
+        `${studentNewPassword!}-failed-release-${randomUUID().slice(0, 8)}`,
+      )
+      await putStudentLimits(admin, failedReleaseStudent.id, {
+        ...inheritedLimits,
+        dailyRequests: { mode: 'limit', value: 1 },
+      })
+      const failed = await createAIThread(failedReleasePage, '合成失败释放', '[case:500] 失败不得占用硬额度。')
+      await waitForRunStatus(failedReleasePage, failed.run.id, 'failed')
+      const allowedAfterFailure = await createAIThread(
+        failedReleasePage,
+        '合成失败后成功',
+        '[case:success] 失败预留释放后应可运行。',
+      )
+      await waitForRunStatus(failedReleasePage, allowedAfterFailure.run.id, 'succeeded')
+      const exhausted = await failedReleasePage.request.post('/api/v1/student/ai/threads', {
+        headers: { ...(await csrfHeader(failedReleasePage)), 'Idempotency-Key': randomUUID() },
+        data: { title: '合成请求限额', subject: 'math', body: '成功后请求额度应耗尽。', attachments: [] },
+      })
+      expect(exhausted.status()).toBe(429)
+      expect((await exhausted.json()).error.code).toBe('QUOTA_EXCEEDED')
+    } finally {
+      await failedReleaseContext.close()
+    }
+
+    const tokenStudent = await createStudentAPI(
+      admin,
+      `ai-token-${randomUUID().slice(0, 8)}`,
+      'Token额度验收学生',
+      studentPassword!,
+    )
+    const tokenContext = await browser.newContext()
+    const tokenPage = await tokenContext.newPage()
+    try {
+      await login(tokenPage, tokenStudent.username, studentPassword!)
+      await changePassword(tokenPage, studentPassword!, `${studentNewPassword!}-token-${randomUUID().slice(0, 8)}`)
+      await putStudentLimits(admin, tokenStudent.id, {
+        ...inheritedLimits,
+        dailyRequests: { mode: 'limit', value: 100 },
+        dailyTokens: { mode: 'limit', value: 1 },
+      })
+      const tokenQuota = await tokenPage.request.post('/api/v1/student/ai/threads', {
+        headers: { ...(await csrfHeader(tokenPage)), 'Idempotency-Key': randomUUID() },
+        data: { title: '合成 Token 限额', subject: 'math', body: 'Token 预留单独超过额度。', attachments: [] },
+      })
+      expect(tokenQuota.status()).toBe(429)
+      expect((await tokenQuota.json()).error.code).toBe('QUOTA_EXCEEDED')
+    } finally {
+      await tokenContext.close()
     }
 
     const busy = await createAIThread(page, '合成并发限制', '[case:slow-first-byte] 保持一次运行占用。')
@@ -334,22 +417,29 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
     expect((await busyResponse.json()).error.code).toBe('AI_BUSY')
     await apiJSON(page, 'POST', `/api/v1/student/ai/runs/${busy.run.id}/cancel`, {})
 
-    const pending = await uploadAIFixture(
-      page,
-      join(fixtureDir, 'lesson.docx'),
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    )
-    const pendingResponse = await page.request.post('/api/v1/student/ai/threads', {
-      headers: { ...(await csrfHeader(page)), 'Idempotency-Key': randomUUID() },
-      data: {
-        title: '合成待处理附件',
-        subject: 'math',
-        body: '附件未完成 ai_text 时不能开始。',
-        attachments: [{ fileVersionId: pending.fileVersionId, sortPosition: 0 }],
-      },
-    })
-    expect(pendingResponse.status()).toBe(409)
-    expect((await pendingResponse.json()).error.code).toBe('ATTACHMENT_NOT_READY')
+    await setAIProcessingHeld(page, true)
+    try {
+      const pending = await uploadAIFixture(
+        page,
+        join(fixtureDir, 'lesson.docx'),
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      )
+      const pendingState = await waitForAIFileState(page, pending.fileVersionId, ['pending_scan', 'processing'])
+      expect(pendingState.previewAvailable).toBe(false)
+      const pendingResponse = await page.request.post('/api/v1/student/ai/threads', {
+        headers: { ...(await csrfHeader(page)), 'Idempotency-Key': randomUUID() },
+        data: {
+          title: '合成待处理附件',
+          subject: 'math',
+          body: '附件未完成 ai_text 时不能开始。',
+          attachments: [{ fileVersionId: pending.fileVersionId, sortPosition: 0 }],
+        },
+      })
+      expect(pendingResponse.status()).toBe(409)
+      expect((await pendingResponse.json()).error.code).toBe('ATTACHMENT_NOT_READY')
+    } finally {
+      await setAIProcessingHeld(page, false)
+    }
 
     const providers = await apiJSON<Array<AIProviderWithVersion>>(admin, 'GET', '/api/v1/admin/ai/providers')
     const active = providers.find((provider) => provider.active)!
@@ -387,18 +477,6 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
     })
     expect(disabled.status()).toBe(503)
     expect((await disabled.json()).error.code).toBe('AI_DISABLED')
-
-    await putStudentLimits(admin, student.id, {
-      ...inheritedLimits,
-      dailyRequests: { mode: 'limit', value: 1 },
-      dailyTokens: { mode: 'limit', value: 1 },
-    })
-    const quota = await page.request.post('/api/v1/student/ai/threads', {
-      headers: { ...(await csrfHeader(page)), 'Idempotency-Key': randomUUID() },
-      data: { title: '合成额度不足', subject: 'math', body: 'Token 预留超过额度。', attachments: [] },
-    })
-    expect(quota.status()).toBe(429)
-    expect((await quota.json()).error.code).toBe('QUOTA_EXCEEDED')
 
     const summary = await apiJSON<{
       succeeded: number

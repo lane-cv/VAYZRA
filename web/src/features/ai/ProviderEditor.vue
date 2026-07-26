@@ -108,11 +108,12 @@ function retryLoad() {
   void load(conflictFeedbackActive.value)
 }
 
-function validHTTPS(value: string) {
+function providerURLProtocol(value: string): 'http:' | 'https:' | '' {
   try {
-    return new URL(value).protocol === 'https:'
+    const protocol = new URL(value).protocol
+    return protocol === 'http:' || protocol === 'https:' ? protocol : ''
   } catch {
-    return false
+    return ''
   }
 }
 
@@ -131,8 +132,8 @@ async function save() {
     error.value = '请填写供应商名称'
     return
   }
-  if (!validHTTPS(normalizedURL)) {
-    error.value = '请使用 HTTPS 地址'
+  if (!providerURLProtocol(normalizedURL)) {
+    error.value = '请输入有效的 HTTP(S) 地址'
     return
   }
   if (!editingId.value && !apiKey.value) {
@@ -248,7 +249,10 @@ onBeforeMount(() => { void load() })
     <form class="form-card" novalidate @submit.prevent="save">
       <h3>{{ editingId ? '编辑供应商' : '新建供应商' }}</h3>
       <label>名称<input v-model="name" aria-label="供应商名称" :disabled="pending" /></label>
-      <label>HTTPS 地址<input v-model="baseUrl" aria-label="供应商地址" inputmode="url" :disabled="pending" /></label>
+      <label>服务地址<input v-model="baseUrl" aria-label="供应商地址" inputmode="url" :disabled="pending" /></label>
+      <p v-if="providerURLProtocol(baseUrl.trim()) === 'http:'" class="transport-warning" role="note">
+        HTTP 地址仅可用于受控开发环境；服务器仍会执行网络与传输安全策略。
+      </p>
       <label>协议模式
         <select v-model="protocolMode" aria-label="协议模式" :disabled="pending">
           <option value="chat_completions">Chat Completions</option>
@@ -267,5 +271,5 @@ onBeforeMount(() => { void load() })
 </template>
 
 <style scoped>
-.editor{display:grid;gap:20px}.section-heading{display:flex;justify-content:space-between;gap:20px;align-items:start}.section-heading h2,.form-card h3{margin-top:0}.section-heading p,.provider-card p{color:#5b6b80}.provider-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.provider-card,.form-card{padding:18px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.provider-card h3 span{margin-left:8px;color:#167244;font-size:.78rem}.actions{display:flex;flex-wrap:wrap;gap:8px}.form-card{display:grid;gap:14px}.form-card label{display:grid;gap:6px;font-weight:650}.form-card input,.form-card select{padding:10px;border:1px solid #b9c9da;border-radius:8px;font:inherit}button{border:1px solid #b8cce0;border-radius:8px;background:#fff;color:#244563;padding:9px 12px;font:inherit;font-weight:650;cursor:pointer}button[type=submit]{justify-self:start;border-color:#166cbb;background:#166cbb;color:#fff}button:disabled{opacity:.6;cursor:wait}@media(max-width:640px){.section-heading{display:grid}}
+.editor{display:grid;gap:20px}.section-heading{display:flex;justify-content:space-between;gap:20px;align-items:start}.section-heading h2,.form-card h3{margin-top:0}.section-heading p,.provider-card p{color:#5b6b80}.provider-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.provider-card,.form-card{padding:18px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.provider-card h3 span{margin-left:8px;color:#167244;font-size:.78rem}.actions{display:flex;flex-wrap:wrap;gap:8px}.form-card{display:grid;gap:14px}.form-card label{display:grid;gap:6px;font-weight:650}.form-card input,.form-card select{padding:10px;border:1px solid #b9c9da;border-radius:8px;font:inherit}.transport-warning{margin:0;color:#805b08}button{border:1px solid #b8cce0;border-radius:8px;background:#fff;color:#244563;padding:9px 12px;font:inherit;font-weight:650;cursor:pointer}button[type=submit]{justify-self:start;border-color:#166cbb;background:#166cbb;color:#fff}button:disabled{opacity:.6;cursor:wait}@media(max-width:640px){.section-heading{display:grid}}
 </style>

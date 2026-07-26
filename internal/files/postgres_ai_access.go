@@ -9,17 +9,23 @@ import (
 func (s *PostgresStore) ResolveAIStatus(ctx context.Context, actor Principal, requestedID uuid.UUID) (AIFileStatus, error) {
 	var out AIFileStatus
 	err := s.pool.QueryRow(ctx, `
-SELECT fv.id,m.id,fv.processing_state,coalesce(fv.failure_category,''),coalesce(fv.detected_mime,''),fv.size_bytes,
+SELECT fv.id,coalesce((
+ SELECT m.id
+ FROM ai_message_files mf
+ JOIN ai_messages m ON m.id=mf.message_id AND m.role='student' AND m.sender_user_id=$1
+ JOIN ai_threads t ON t.id=m.thread_id AND t.student_id=$1
+ WHERE mf.file_version_id=fv.id
+ ORDER BY m.created_at,m.id LIMIT 1
+),'00000000-0000-0000-0000-000000000000'::uuid),
+ fv.processing_state,coalesce(fv.failure_category,''),coalesce(fv.detected_mime,''),fv.size_bytes,
  (fv.browser_playable OR EXISTS(
    SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.processing_state='ready'
  ))
-FROM ai_message_files mf
-JOIN ai_messages m ON m.id=mf.message_id AND m.role='student' AND m.sender_user_id=$1
-JOIN ai_threads t ON t.id=m.thread_id AND t.student_id=$1
-JOIN users actor ON actor.id=t.student_id AND actor.role='student' AND actor.status='active' AND actor.deleted_at IS NULL
-JOIN file_versions fv ON fv.id=mf.file_version_id AND fv.id=$2 AND fv.purpose='ai_attachment'
- AND fv.processing_state='ready' AND fv.scan_result='clean' AND fv.created_by=$1
-JOIN files f ON f.id=fv.file_id AND f.created_by=$1 AND f.deleted_at IS NULL`,
+FROM file_versions fv
+JOIN files f ON f.id=fv.file_id AND f.created_by=$1 AND f.deleted_at IS NULL
+JOIN users actor ON actor.id=fv.created_by AND actor.id=$1
+ AND actor.role='student' AND actor.status='active' AND actor.deleted_at IS NULL
+WHERE fv.id=$2 AND fv.purpose='ai_attachment' AND fv.created_by=$1`,
 		actor.User.ID, requestedID).Scan(
 		&out.FileVersionID, &out.MessageID, &out.ProcessingState, &out.FailureCategory, &out.DetectedMIME, &out.Size, &out.PreviewAvailable)
 	if err != nil {

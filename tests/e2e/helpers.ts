@@ -321,6 +321,38 @@ export async function waitForAIFile(page: Page, fileVersionId: string, timeout =
   throw new Error(`AI file ${fileVersionId} did not become ready (last=${JSON.stringify(last)})`)
 }
 
+export async function waitForAIFileState(
+  page: Page,
+  fileVersionId: string,
+  accepted: string[],
+  timeout = 20_000,
+): Promise<AIFileStatus> {
+  const deadline = Date.now() + timeout
+  let last: AIFileStatus | undefined
+  while (Date.now() < deadline) {
+    const response = await page.request.get(`/api/v1/ai-question-files/${fileVersionId}/status`)
+    await expect(response, 'owner pre-bind AI file status').toBeOK()
+    last = await response.json() as AIFileStatus
+    if (accepted.includes(last.processingState)) return last
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  throw new Error(`AI file did not reach the requested synthetic state (state=${last?.processingState ?? 'unknown'})`)
+}
+
+/**
+ * Task 3 supplies an internal, runner-only processing controller. It holds or
+ * releases the disposable worker without exposing Docker or a production test
+ * endpoint to the browser application.
+ */
+export async function setAIProcessingHeld(page: Page, held: boolean): Promise<void> {
+  const controlURL = process.env.E2E_AI_PROCESSING_CONTROL_URL
+  if (!controlURL) throw new Error('E2E_AI_PROCESSING_CONTROL_URL is required for deterministic pending-file acceptance')
+  const response = await page.request.post(`${controlURL.replace(/\/$/, '')}/${held ? 'hold' : 'release'}`, {
+    data: {},
+  })
+  await expect(response, `AI processing ${held ? 'hold' : 'release'}`).toBeOK()
+}
+
 export async function waitForRunStatus(
   page: Page,
   runId: string,
