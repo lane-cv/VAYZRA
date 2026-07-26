@@ -138,6 +138,7 @@ func (*workerBlobStub) Get(context.Context, string, *objectstore.ByteRange) (io.
 func (*workerBlobStub) Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error) {
 	return objectstore.ObjectInfo{}, nil
 }
+func (*workerBlobStub) Delete(context.Context, string) error { return nil }
 func TestHealthAddressIsLoopbackOnlyAndShutdownBounded(t *testing.T) {
 	if !strings.HasPrefix(workerHealthAddress, "127.0.0.1:") || workerShutdownLimit.String() != "20s" {
 		t.Fatalf("address=%q shutdown=%s", workerHealthAddress, workerShutdownLimit)

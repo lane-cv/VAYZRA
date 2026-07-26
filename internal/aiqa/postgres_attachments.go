@@ -3,6 +3,8 @@ package aiqa
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"sort"
@@ -48,24 +50,24 @@ func (s *PostgresAttachmentStore) ValidateForAI(ctx context.Context, studentID, 
 	ordered := make([]orderedMetadata, 0, len(inputs))
 	for _, input := range inputs {
 		var metadata AttachmentMetadata
-		var state string
+		var state, scanResult string
 		var textReady bool
 		err := s.pool.QueryRow(ctx, `
-SELECT fv.id,fv.display_name,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,
+SELECT fv.id,fv.display_name,COALESCE(fv.detected_mime,''),fv.size_bytes,fv.processing_state,COALESCE(fv.scan_result,''),
  EXISTS(SELECT 1 FROM file_previews fp WHERE fp.file_version_id=fv.id AND fp.preview_kind='ai_text' AND fp.processing_state='ready')
 FROM users u
 JOIN files f ON f.created_by=u.id AND f.deleted_at IS NULL
 JOIN file_versions fv ON fv.file_id=f.id AND fv.created_by=u.id
 WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
  AND fv.id=$2 AND fv.purpose='ai_attachment' AND fv.purged_at IS NULL`, studentID, input.FileVersionID).Scan(
-			&metadata.FileVersionID, &metadata.DisplayName, &metadata.DetectedMIME, &metadata.Size, &state, &textReady)
+			&metadata.FileVersionID, &metadata.DisplayName, &metadata.DetectedMIME, &metadata.Size, &state, &scanResult, &textReady)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		if err != nil {
 			return nil, err
 		}
-		if state != "ready" || metadata.DetectedMIME == "" {
+		if state != "ready" || scanResult != "clean" || metadata.DetectedMIME == "" {
 			return nil, ErrAttachmentNotReady
 		}
 		if isAIImageMIME(metadata.DetectedMIME) {
@@ -90,30 +92,31 @@ func (s *PostgresAttachmentStore) LoadAIText(ctx context.Context, studentID, ver
 	if s == nil || s.pool == nil || s.previews == nil || studentID == uuid.Nil || versionID == uuid.Nil {
 		return "", ErrInvalidInput
 	}
-	var state, mime string
+	var state, scanResult, mime string
 	var objectKey *string
 	var expectedSize *int64
+	var expectedSHA256 *string
 	err := s.pool.QueryRow(ctx, `
-SELECT fv.processing_state,COALESCE(fv.detected_mime,''),fp.object_key,fp.size_bytes
+SELECT fv.processing_state,COALESCE(fv.scan_result,''),COALESCE(fv.detected_mime,''),fp.object_key,fp.size_bytes,fp.sha256
 FROM users u JOIN files f ON f.created_by=u.id AND f.deleted_at IS NULL
 JOIN file_versions fv ON fv.file_id=f.id AND fv.created_by=u.id
 LEFT JOIN file_previews fp ON fp.file_version_id=fv.id AND fp.preview_kind='ai_text' AND fp.processing_state='ready'
 WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
- AND fv.id=$2 AND fv.purpose='ai_attachment' AND fv.purged_at IS NULL`, studentID, versionID).Scan(&state, &mime, &objectKey, &expectedSize)
+ AND fv.id=$2 AND fv.purpose='ai_attachment' AND fv.purged_at IS NULL`, studentID, versionID).Scan(&state, &scanResult, &mime, &objectKey, &expectedSize, &expectedSHA256)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	if state != "ready" || !isAITextMIME(mime) || objectKey == nil || expectedSize == nil {
+	if state != "ready" || scanResult != "clean" || !isAITextMIME(mime) || objectKey == nil || expectedSize == nil || expectedSHA256 == nil {
 		return "", ErrAttachmentNotReady
 	}
-	return s.readTextObject(ctx, *objectKey, *expectedSize)
+	return s.readTextObject(ctx, *objectKey, *expectedSize, *expectedSHA256)
 }
 
-func (s *PostgresAttachmentStore) readTextObject(ctx context.Context, objectKey string, expectedSize int64) (string, error) {
-	if s == nil || s.previews == nil || objectKey == "" || expectedSize < 1 || expectedSize > MaxAttachmentTextBytes {
+func (s *PostgresAttachmentStore) readTextObject(ctx context.Context, objectKey string, expectedSize int64, expectedSHA256 string) (string, error) {
+	if s == nil || s.previews == nil || objectKey == "" || expectedSize < 1 || expectedSize > MaxAttachmentTextBytes || len(expectedSHA256) != sha256.Size*2 {
 		return "", ErrAttachmentNotReady
 	}
 	body, info, err := s.previews.Get(ctx, objectKey, nil)
@@ -126,7 +129,9 @@ func (s *PostgresAttachmentStore) readTextObject(ctx context.Context, objectKey 
 	}
 	raw, err := io.ReadAll(io.LimitReader(body, MaxAttachmentTextBytes+1))
 	closeErr := body.Close()
-	if err != nil || closeErr != nil || len(raw) > MaxAttachmentTextBytes || !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
+	sum := sha256.Sum256(raw)
+	if err != nil || closeErr != nil || int64(len(raw)) != expectedSize || len(raw) > MaxAttachmentTextBytes ||
+		hex.EncodeToString(sum[:]) != expectedSHA256 || !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
 		return "", ErrAttachmentNotReady
 	}
 	return string(raw), nil
@@ -136,21 +141,21 @@ func (s *PostgresAttachmentStore) OpenAIImage(ctx context.Context, studentID, ve
 	if s == nil || s.pool == nil || s.originals == nil || studentID == uuid.Nil || versionID == uuid.Nil {
 		return nil, "", 0, ErrInvalidInput
 	}
-	var objectKey, state, mime string
+	var objectKey, state, scanResult, mime string
 	var size int64
 	err := s.pool.QueryRow(ctx, `
-SELECT fv.object_key,fv.processing_state,COALESCE(fv.detected_mime,''),fv.size_bytes
+SELECT fv.object_key,fv.processing_state,COALESCE(fv.scan_result,''),COALESCE(fv.detected_mime,''),fv.size_bytes
 FROM users u JOIN files f ON f.created_by=u.id AND f.deleted_at IS NULL
 JOIN file_versions fv ON fv.file_id=f.id AND fv.created_by=u.id
 WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
- AND fv.id=$2 AND fv.purpose='ai_attachment' AND fv.purged_at IS NULL`, studentID, versionID).Scan(&objectKey, &state, &mime, &size)
+ AND fv.id=$2 AND fv.purpose='ai_attachment' AND fv.purged_at IS NULL`, studentID, versionID).Scan(&objectKey, &state, &scanResult, &mime, &size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, "", 0, ErrNotFound
 	}
 	if err != nil {
 		return nil, "", 0, err
 	}
-	if state != "ready" || !isAIImageMIME(mime) || size < 1 {
+	if state != "ready" || scanResult != "clean" || !isAIImageMIME(mime) || size < 1 {
 		return nil, "", 0, ErrAttachmentNotReady
 	}
 	body, err := s.openVerifiedImage(ctx, objectKey, size)

@@ -20,6 +20,7 @@ type SourceStore interface {
 type BlobStore interface {
 	Get(context.Context, string, *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error)
 	Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error)
+	Delete(context.Context, string) error
 }
 type Pipeline struct {
 	Sources             SourceStore
@@ -156,6 +157,9 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 	if previewPath != "" {
 		preview, previewErr := p.storePreview(ctx, source.VersionID, previewPath, previewKind, previewType)
 		if previewErr != nil {
+			if result.AIText != nil {
+				p.deletePreview(ctx, result.AIText.ObjectKey)
+			}
 			return Result{}, previewErr
 		}
 		result.Preview = &preview
@@ -185,12 +189,22 @@ func (p *Pipeline) storePreview(ctx context.Context, versionID uuid.UUID, path, 
 	if ext == "" {
 		ext = map[string]string{"pdf": ".pdf", "page": ".bin", "poster": ".bin", "ai_text": ".txt"}[kind]
 	}
-	key := "previews/" + versionID.String() + "/" + uuid.NewString() + ext
+	key := "previews/" + versionID.String() + "/" + kind + ext
 	stored, err := p.Previews.Put(ctx, key, file, info.Size(), objectstore.ObjectMeta{ContentType: contentType, SHA256: sum})
 	if err != nil || stored.Size != 0 && stored.Size != info.Size() {
+		p.deletePreview(ctx, key)
 		return PreviewResult{}, transient("storage_unavailable")
 	}
 	return PreviewResult{Kind: kind, ObjectKey: key, ContentType: contentType, Size: info.Size(), SHA256: sum}, nil
+}
+
+func (p *Pipeline) deletePreview(ctx context.Context, key string) {
+	if p == nil || p.Previews == nil || key == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = p.Previews.Delete(cleanupCtx, key)
 }
 
 var _ Processor = (*Pipeline)(nil)

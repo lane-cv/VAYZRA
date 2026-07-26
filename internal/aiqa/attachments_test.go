@@ -3,6 +3,7 @@ package aiqa
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -12,13 +13,39 @@ import (
 )
 
 func TestAttachmentTextReadCapsTwoMiBAndClosesObject(t *testing.T) {
-	closer := &trackedReadCloser{Reader: bytes.NewReader([]byte(strings.Repeat("x", MaxAttachmentTextBytes+1)))}
+	payload := []byte(strings.Repeat("x", MaxAttachmentTextBytes+1))
+	closer := &trackedReadCloser{Reader: bytes.NewReader(payload)}
 	store := &PostgresAttachmentStore{previews: &attachmentBlobStub{reader: closer, info: objectstore.ObjectInfo{Size: MaxAttachmentTextBytes}}}
-	if _, err := store.readTextObject(context.Background(), "private/key", MaxAttachmentTextBytes); err == nil {
+	if _, err := store.readTextObject(context.Background(), "private/key", MaxAttachmentTextBytes, attachmentDigest(payload[:MaxAttachmentTextBytes])); err == nil {
 		t.Fatal("oversized text accepted")
 	}
 	if !closer.closed {
 		t.Fatal("preview reader was not closed")
+	}
+}
+
+func TestAttachmentTextReadRejectsTruncationAndDigestMismatchAndCloses(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     []byte
+		expected int64
+		digest   string
+	}{
+		{name: "truncated", body: []byte("abc"), expected: 4, digest: attachmentDigest([]byte("abcd"))},
+		{name: "digest mismatch", body: []byte("same"), expected: 4, digest: attachmentDigest([]byte("else"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closer := &trackedReadCloser{Reader: bytes.NewReader(tc.body)}
+			store := &PostgresAttachmentStore{previews: &attachmentBlobStub{
+				reader: closer, info: objectstore.ObjectInfo{Size: tc.expected},
+			}}
+			if _, err := store.readTextObject(context.Background(), "private/key", tc.expected, tc.digest); !errors.Is(err, ErrAttachmentNotReady) {
+				t.Fatalf("err=%v", err)
+			}
+			if !closer.closed {
+				t.Fatal("preview reader was not closed")
+			}
+		})
 	}
 }
 

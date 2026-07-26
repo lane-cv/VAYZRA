@@ -18,7 +18,7 @@ import (
 	"happylearn.local/app/internal/platform/objectstore"
 )
 
-func TestPipelineStreamsVerifiesScansAndCreatesRandomPDFPreview(t *testing.T) {
+func TestPipelineStreamsVerifiesScansAndCreatesRetrySafePDFPreview(t *testing.T) {
 	body := []byte("%PDF-1.7\nlesson\n%%EOF\n")
 	versionID := uuid.New()
 	sources := sourceStub{source: SourceFile{VersionID: versionID, ObjectKey: "originals/private-key", DisplayName: "lesson.pdf", DeclaredMIME: "application/pdf", Size: int64(len(body)), SHA256: hashHex(body)}}
@@ -32,7 +32,8 @@ func TestPipelineStreamsVerifiesScansAndCreatesRandomPDFPreview(t *testing.T) {
 	if result.DetectedMIME != "application/pdf" || result.ScanResult != "clean" || result.Preview == nil || result.Preview.Kind != "pdf" {
 		t.Fatalf("result=%+v", result)
 	}
-	if previews.putKey == "" || previews.putKey == sources.source.ObjectKey || !strings.Contains(previews.putKey, versionID.String()) || !bytes.Equal(previews.putBody, body) {
+	wantKey := "previews/" + versionID.String() + "/pdf.pdf"
+	if previews.putKey != wantKey || previews.putKey == sources.source.ObjectKey || !bytes.Equal(previews.putBody, body) {
 		t.Fatalf("preview key=%q body=%q", previews.putKey, previews.putBody)
 	}
 	if runner.args[len(runner.args)-1] == sources.source.DisplayName || strings.Contains(runner.args[len(runner.args)-1], sources.source.ObjectKey) {
@@ -169,13 +170,36 @@ func TestPipelineAITextExtractsOfficeConvertedPDFAndImagesHaveNoText(t *testing.
 	})
 }
 
+func TestPipelineAITextCleansFirstArtifactWhenSecondPutFails(t *testing.T) {
+	body := []byte("private question")
+	versionID := uuid.New()
+	source := SourceFile{
+		VersionID: versionID, Purpose: "ai_attachment", ObjectKey: "originals/private",
+		DisplayName: "question.txt", DeclaredMIME: "text/plain", Size: int64(len(body)), SHA256: hashHex(body),
+	}
+	previews := &recordingBlobStore{failPutAt: 2}
+	_, err := (&Pipeline{
+		Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: previews,
+		Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+	}).Process(context.Background(), Job{FileVersionID: versionID, Kind: KindProcessFile})
+	if category(err) != "storage_unavailable" {
+		t.Fatalf("err=%v", err)
+	}
+	if len(previews.objects) != 0 {
+		t.Fatalf("orphaned preview objects=%v", previews.objects)
+	}
+}
+
 type recordedPut struct {
 	key  string
 	body []byte
 }
 
 type recordingBlobStore struct {
-	puts map[string]recordedPut
+	puts      map[string]recordedPut
+	objects   map[string][]byte
+	putCalls  int
+	failPutAt int
 }
 
 func (b *recordingBlobStore) Get(context.Context, string, *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
@@ -186,6 +210,9 @@ func (b *recordingBlobStore) Put(_ context.Context, key string, reader io.Reader
 	if b.puts == nil {
 		b.puts = make(map[string]recordedPut)
 	}
+	if b.objects == nil {
+		b.objects = make(map[string][]byte)
+	}
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return objectstore.ObjectInfo{}, err
@@ -195,7 +222,17 @@ func (b *recordingBlobStore) Put(_ context.Context, key string, reader io.Reader
 		kind = "ai_text"
 	}
 	b.puts[kind] = recordedPut{key: key, body: body}
+	b.objects[key] = append([]byte(nil), body...)
+	b.putCalls++
+	if b.putCalls == b.failPutAt {
+		return objectstore.ObjectInfo{}, objectstore.ErrUnavailable
+	}
 	return objectstore.ObjectInfo{Size: size}, nil
+}
+
+func (b *recordingBlobStore) Delete(_ context.Context, key string) error {
+	delete(b.objects, key)
+	return nil
 }
 
 func tinyPNG() []byte {
@@ -231,7 +268,8 @@ func (b *blobStub) Put(_ context.Context, key string, reader io.Reader, size int
 	b.putBody, _ = io.ReadAll(reader)
 	return objectstore.ObjectInfo{Size: size}, b.putErr
 }
-func hashHex(body []byte) string { sum := sha256.Sum256(body); return hex.EncodeToString(sum[:]) }
+func (*blobStub) Delete(context.Context, string) error { return nil }
+func hashHex(body []byte) string                       { sum := sha256.Sum256(body); return hex.EncodeToString(sum[:]) }
 func officeFixture(t *testing.T) []byte {
 	t.Helper()
 	var out bytes.Buffer
