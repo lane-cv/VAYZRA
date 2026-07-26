@@ -2,8 +2,9 @@ package aiqa
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -253,6 +254,9 @@ func (s *PostgresRuntimeStore) GetRun(ctx context.Context, studentID, runID uuid
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNotFound
 	}
+	if err == nil {
+		run.TriggerAttachments, err = loadMessageAttachments(ctx, s.pool, studentID, run.TriggerMessageID)
+	}
 	return run, err
 }
 
@@ -459,19 +463,65 @@ func validateAndLockSnapshot(ctx context.Context, tx pgx.Tx, snapshot RuntimeSna
 	if p.ProviderID == uuid.Nil || p.BaseURL == nil || p.Model.ID == uuid.Nil || p.Prompt.ID == uuid.Nil || len(snapshot.PromptSHA256) != 64 {
 		return ErrAIDisabled
 	}
-	var ok bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS(
-SELECT 1 FROM ai_providers p JOIN ai_models m ON m.provider_id=p.id JOIN prompt_templates t ON t.id=$3
-WHERE p.id=$1 AND p.active AND m.id=$2 AND m.enabled AND m.quota_blocked_at IS NULL AND t.active
-)`, p.ProviderID, p.Model.ID, p.Prompt.ID).Scan(&ok)
+	var providerID uuid.UUID
+	var upstream string
+	var modality Modality
+	var contextTokens, maxOutput, imageQuota, inputPrice, outputPrice int64
+	var enabled bool
+	var blockedAt *time.Time
+	var connectMS, headerMS, idleMS, totalMS int64
+	err := tx.QueryRow(ctx, `SELECT provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,
+input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,quota_blocked_at,
+connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms
+FROM ai_models WHERE id=$1 FOR UPDATE`, p.Model.ID).Scan(
+		&providerID, &upstream, &modality, &contextTokens, &maxOutput, &imageQuota, &inputPrice, &outputPrice, &enabled, &blockedAt,
+		&connectMS, &headerMS, &idleMS, &totalMS)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAIDisabled
+	}
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if providerID != p.ProviderID || upstream != p.Model.UpstreamModelID || modality != p.Model.Modality ||
+		contextTokens != p.Model.ContextTokens || maxOutput != p.Model.MaxOutputTokens || imageQuota != p.Model.ImageQuotaTokens ||
+		inputPrice != p.Model.InputPriceMicroUSD || outputPrice != p.Model.OutputPriceMicroUSD ||
+		enabled != p.Model.Enabled || !enabled || blockedAt != nil || p.Model.QuotaBlockedAt != nil ||
+		connectMS != p.Timeouts.Connect.Milliseconds() || headerMS != p.Timeouts.ResponseHeader.Milliseconds() ||
+		idleMS != p.Timeouts.IdleStream.Milliseconds() || totalMS != p.Timeouts.Total.Milliseconds() {
 		return ErrAIDisabled
 	}
-	_, err = tx.Exec(ctx, `SELECT 1 FROM ai_models WHERE id=$1 FOR UPDATE`, p.Model.ID)
-	return err
+	var baseURL string
+	var protocol ProtocolMode
+	var providerActive bool
+	err = tx.QueryRow(ctx, `SELECT base_url,protocol_mode,active FROM ai_providers WHERE id=$1`, p.ProviderID).
+		Scan(&baseURL, &protocol, &providerActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAIDisabled
+	}
+	if err != nil {
+		return err
+	}
+	if !providerActive || baseURL != p.BaseURL.String() || protocol != p.ProtocolMode {
+		return ErrAIDisabled
+	}
+	var subject Subject
+	var version int64
+	var promptSHA []byte
+	var promptActive bool
+	err = tx.QueryRow(ctx, `SELECT subject,version,digest(system_prompt,'sha256'),active FROM prompt_templates WHERE id=$1`, p.Prompt.ID).
+		Scan(&subject, &version, &promptSHA, &promptActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAIDisabled
+	}
+	if err != nil {
+		return err
+	}
+	expectedSHA := sha256.Sum256([]byte(p.Prompt.Body))
+	if !promptActive || subject != p.Prompt.Subject || version != p.Prompt.Version ||
+		hex.EncodeToString(promptSHA) != snapshot.PromptSHA256 || snapshot.PromptSHA256 != hex.EncodeToString(expectedSHA[:]) {
+		return ErrAIDisabled
+	}
+	return nil
 }
 
 func insertRun(ctx context.Context, tx pgx.Tx, runID, studentID, threadID, messageID uuid.UUID, attempt int, key string, snapshot RuntimeSnapshot, reservation QuotaReservation, now time.Time) error {
@@ -671,7 +721,3 @@ func runtimeDBError(err error) error {
 
 var _ RuntimeStore = (*PostgresRuntimeStore)(nil)
 var _ RunTerminalStore = (*PostgresRuntimeStore)(nil)
-
-func (s *PostgresRuntimeStore) String() string {
-	return fmt.Sprintf("PostgresRuntimeStore(%p)", s.pool)
-}

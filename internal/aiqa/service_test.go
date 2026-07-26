@@ -61,6 +61,67 @@ func TestStudentServiceKeepsCompletePairsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestStudentServiceAttachmentNotReadyAndTextRouting(t *testing.T) {
+	student := studentPrincipal()
+	cfg := &fakeRuntimeConfig{}
+	notReady := NewStudentService(&fakeRuntimeStore{}, cfg, fakeAttachmentContextStore{err: ErrAttachmentNotReady}, time.Now)
+	if _, _, err := notReady.CreateThread(context.Background(), student, CreateThreadInput{
+		Title: "x", Body: "question", Subject: SubjectMath, IdempotencyKey: "attachment-ready-0001",
+	}); !errors.Is(err, ErrAttachmentNotReady) {
+		t.Fatalf("attachment readiness=%v", err)
+	}
+	textID := uuid.New()
+	store := &fakeRuntimeStore{}
+	textService := NewStudentService(store, cfg, fakeAttachmentContextStore{
+		metadata: []AttachmentMetadata{{FileVersionID: textID, Modality: ModalityText}},
+		text:     map[uuid.UUID]string{textID: "extracted"},
+	}, time.Now)
+	if _, _, err := textService.CreateThread(context.Background(), student, CreateThreadInput{
+		Title: "x", Body: "question", Subject: SubjectMath, IdempotencyKey: "text-routing-key-0001",
+		Attachments: []AttachmentInput{{FileVersionID: textID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.lastModality != ModalityText || store.admission.ExtractedText != "extracted" {
+		t.Fatalf("modality=%s extracted=%q", cfg.lastModality, store.admission.ExtractedText)
+	}
+}
+
+func TestStudentServiceIdempotentFollowupCancelAndBusy(t *testing.T) {
+	student := studentPrincipal()
+	threadID := uuid.New()
+	existing := Run{ID: uuid.New(), ThreadID: threadID, TriggerBody: "followup", Status: RunQueued}
+	store := &fakeRuntimeStore{existingRun: &existing, thread: Thread{ID: threadID, StudentID: student.User.ID, Subject: SubjectMath}}
+	svc := NewStudentService(store, &fakeRuntimeConfig{}, fakeAttachmentContextStore{}, time.Now)
+	if _, got, err := svc.AddMessage(context.Background(), student, AddMessageInput{
+		ThreadID: threadID, Body: "followup", IdempotencyKey: "followup-idem-key-01",
+	}); err != nil || got.ID != existing.ID {
+		t.Fatalf("followup=%+v err=%v", got, err)
+	}
+	store.existingRun = nil
+	store.cancelRun = Run{ID: existing.ID, ThreadID: threadID, Status: RunCancelled}
+	if got, err := svc.CancelRun(context.Background(), student, existing.ID); err != nil || got.Status != RunCancelled ||
+		store.cancelStudent != student.User.ID || store.cancelID != existing.ID {
+		t.Fatalf("cancel=%+v err=%v", got, err)
+	}
+	store.admitErr = ErrAIBusy
+	if _, _, err := svc.AddMessage(context.Background(), student, AddMessageInput{
+		ThreadID: threadID, Body: "busy", IdempotencyKey: "active-busy-key-0001",
+	}); !errors.Is(err, ErrAIBusy) {
+		t.Fatalf("busy=%v", err)
+	}
+}
+
+func TestStudentServiceRejectsStreamingRetry(t *testing.T) {
+	student := studentPrincipal()
+	source := Run{ID: uuid.New(), ThreadID: uuid.New(), TriggerMessageID: uuid.New(), Status: RunStreaming}
+	store := &fakeRuntimeStore{sourceRun: source}
+	svc := NewStudentService(store, &fakeRuntimeConfig{}, fakeAttachmentContextStore{}, time.Now)
+	if _, err := svc.RetryRun(context.Background(), student, source.ID, "streaming-retry-key1"); !errors.Is(err, ErrRunConflict) {
+		t.Fatalf("streaming retry=%v", err)
+	}
+}
+
 func TestStudentServiceIdempotencyReturnsBeforeConfigOrAttachments(t *testing.T) {
 	student := studentPrincipal()
 	firstFile, secondFile := uuid.New(), uuid.New()
@@ -99,12 +160,23 @@ func TestStudentServiceIdempotencyReturnsBeforeConfigOrAttachments(t *testing.T)
 
 func TestStudentServiceRetryEligibilityAndAttemptDelegation(t *testing.T) {
 	student := studentPrincipal()
-	source := Run{ID: uuid.New(), ThreadID: uuid.New(), TriggerMessageID: uuid.New(), Status: RunFailed, Modality: ModalityText, ReservedTokenCount: 500}
-	store := &fakeRuntimeStore{sourceRun: source, thread: Thread{ID: source.ThreadID, StudentID: student.User.ID, Subject: SubjectMath}}
-	cfg := &fakeRuntimeConfig{}
-	svc := NewStudentService(store, cfg, fakeAttachmentContextStore{}, time.Now)
+	imageID, textID := uuid.New(), uuid.New()
+	source := Run{
+		ID: uuid.New(), ThreadID: uuid.New(), TriggerMessageID: uuid.New(), Status: RunFailed, Modality: ModalityVision, ReservedTokenCount: 50,
+		TriggerAttachments: []AttachmentMetadata{{FileVersionID: imageID, Modality: ModalityVision}, {FileVersionID: textID, Modality: ModalityText}},
+	}
+	store := &fakeRuntimeStore{
+		sourceRun: source, thread: Thread{ID: source.ThreadID, StudentID: student.User.ID, Subject: SubjectMath},
+		context: []Message{
+			{ID: uuid.New(), Role: "student", Body: "prior-u"}, {ID: uuid.New(), Role: "assistant", Body: "prior-a"},
+			{ID: source.TriggerMessageID, Role: "student", Body: "retry-current"},
+		},
+	}
+	cfg := &fakeRuntimeConfig{contextTokens: 5000, imageQuota: 900}
+	svc := NewStudentService(store, cfg, fakeAttachmentContextStore{text: map[uuid.UUID]string{textID: "doc-text"}}, time.Now)
 	got, err := svc.RetryRun(context.Background(), student, source.ID, "retry-service-key-0001")
-	if err != nil || got.ID == uuid.Nil || store.retry.SourceRunID != source.ID || store.retry.Reservation.TokenCount < source.ReservedTokenCount {
+	wantTokens := int64(len([]byte("sysprior-uprior-aretry-currentdoc-text")) + 900 + 10)
+	if err != nil || got.ID == uuid.Nil || store.retry.SourceRunID != source.ID || store.retry.Reservation.TokenCount != wantTokens || cfg.lastModality != ModalityVision {
 		t.Fatalf("got=%+v retry=%+v err=%v", got, store.retry, err)
 	}
 	source.Status = RunSucceeded
@@ -115,16 +187,23 @@ func TestStudentServiceRetryEligibilityAndAttemptDelegation(t *testing.T) {
 }
 
 type fakeRuntimeStore struct {
-	context     []Message
-	admission   RuntimeAdmission
-	existingRun *Run
-	sourceRun   Run
-	thread      Thread
-	retry       RuntimeRetryAdmission
+	context       []Message
+	admission     RuntimeAdmission
+	existingRun   *Run
+	sourceRun     Run
+	thread        Thread
+	retry         RuntimeRetryAdmission
+	admitErr      error
+	cancelStudent uuid.UUID
+	cancelID      uuid.UUID
+	cancelRun     Run
 }
 
 func (f *fakeRuntimeStore) AdmitRun(_ context.Context, a RuntimeAdmission) (ThreadDetail, Run, error) {
 	f.admission = a
+	if f.admitErr != nil {
+		return ThreadDetail{}, Run{}, f.admitErr
+	}
 	now := time.Now()
 	run := Run{ID: uuid.New(), ThreadID: a.ThreadID, TriggerMessageID: a.MessageID, Status: RunQueued, AttemptNo: a.AttemptNo, CreatedAt: now, UpdatedAt: now}
 	return ThreadDetail{Thread: Thread{ID: a.ThreadID, StudentID: a.StudentID}}, run, nil
@@ -150,8 +229,9 @@ func (f *fakeRuntimeStore) GetRun(context.Context, uuid.UUID, uuid.UUID) (Run, e
 	}
 	return Run{}, ErrNotFound
 }
-func (f *fakeRuntimeStore) CancelRun(context.Context, uuid.UUID, uuid.UUID, time.Time) (Run, error) {
-	return Run{}, nil
+func (f *fakeRuntimeStore) CancelRun(_ context.Context, studentID, runID uuid.UUID, _ time.Time) (Run, error) {
+	f.cancelStudent, f.cancelID = studentID, runID
+	return f.cancelRun, nil
 }
 func (f *fakeRuntimeStore) RetryRun(_ context.Context, retry RuntimeRetryAdmission) (ThreadDetail, Run, error) {
 	f.retry = retry
@@ -161,6 +241,7 @@ func (f *fakeRuntimeStore) RetryRun(_ context.Context, retry RuntimeRetryAdmissi
 type fakeRuntimeConfig struct {
 	lastModality  Modality
 	contextTokens int64
+	imageQuota    int64
 }
 
 func (f *fakeRuntimeConfig) ForRun(_ context.Context, subject Subject, modality Modality) (RuntimeProviderConfig, error) {
@@ -170,16 +251,27 @@ func (f *fakeRuntimeConfig) ForRun(_ context.Context, subject Subject, modality 
 	if n == 0 {
 		n = 1000
 	}
+	imageQuota := f.imageQuota
+	if imageQuota == 0 {
+		imageQuota = 50
+	}
 	return RuntimeProviderConfig{
 		ProviderID: uuid.New(), BaseURL: u, ProtocolMode: ProtocolResponses,
-		Model:  ModelView{ID: uuid.New(), ProviderID: uuid.New(), UpstreamModelID: "model", Modality: modality, ContextTokens: n, MaxOutputTokens: 10, ImageQuotaTokens: 50, Enabled: true},
+		Model:  ModelView{ID: uuid.New(), ProviderID: uuid.New(), UpstreamModelID: "model", Modality: modality, ContextTokens: n, MaxOutputTokens: 10, ImageQuotaTokens: imageQuota, Enabled: true},
 		Prompt: PromptView{ID: uuid.New(), Subject: subject, Version: 1, Body: "sys", Active: true},
 	}, nil
 }
 
-type fakeAttachmentContextStore struct{ metadata []AttachmentMetadata }
+type fakeAttachmentContextStore struct {
+	metadata []AttachmentMetadata
+	text     map[uuid.UUID]string
+	err      error
+}
 
 func (f fakeAttachmentContextStore) ValidateForAI(context.Context, uuid.UUID, uuid.UUID, []AttachmentInput) ([]AttachmentMetadata, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.metadata, nil
 }
 
@@ -200,8 +292,11 @@ func (failingAttachmentStore) LoadAIText(context.Context, uuid.UUID, uuid.UUID) 
 func (failingAttachmentStore) OpenAIImage(context.Context, uuid.UUID, uuid.UUID) (io.ReadCloser, string, int64, error) {
 	return nil, "", 0, errors.New("must not open image")
 }
-func (fakeAttachmentContextStore) LoadAIText(context.Context, uuid.UUID, uuid.UUID) (string, error) {
-	return "", nil
+func (f fakeAttachmentContextStore) LoadAIText(_ context.Context, _ uuid.UUID, id uuid.UUID) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.text[id], nil
 }
 func (fakeAttachmentContextStore) OpenAIImage(context.Context, uuid.UUID, uuid.UUID) (io.ReadCloser, string, int64, error) {
 	return nil, "", 0, nil

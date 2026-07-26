@@ -185,17 +185,53 @@ func (s *studentService) RetryRun(ctx context.Context, principal Principal, sour
 	if err != nil {
 		return Run{}, err
 	}
-	cfg, err := s.config.ForRun(ctx, detail.Thread.Subject, source.Modality)
+	modality := ModalityText
+	imageCount := 0
+	var extracted strings.Builder
+	for _, attachment := range source.TriggerAttachments {
+		if attachment.Modality == ModalityVision {
+			modality = ModalityVision
+			imageCount++
+			continue
+		}
+		text, loadErr := s.attachments.LoadAIText(ctx, principal.User.ID, attachment.FileVersionID)
+		if loadErr != nil {
+			return Run{}, loadErr
+		}
+		extracted.WriteString(text)
+	}
+	history, err := s.store.LoadContext(ctx, principal.User.ID, source.ThreadID)
+	if err != nil {
+		return Run{}, err
+	}
+	triggerIndex := -1
+	for i := range history {
+		if history[i].ID == source.TriggerMessageID {
+			triggerIndex = i
+			break
+		}
+	}
+	if triggerIndex < 0 || history[triggerIndex].Role != "student" {
+		return Run{}, ErrNotFound
+	}
+	current := history[triggerIndex].Body
+	cfg, err := s.config.ForRun(ctx, detail.Thread.Subject, modality)
 	if err != nil {
 		return Run{}, err
 	}
 	defer zeroBytes(cfg.APIKey)
+	turns, err := selectContext(cfg.Prompt.Body, history[:triggerIndex], current, extracted.String(), imageCount, cfg.Model.ImageQuotaTokens, cfg.Model.ContextTokens, cfg.Model.MaxOutputTokens)
+	if err != nil {
+		return Run{}, err
+	}
+	texts := make([]string, 0, len(turns)+1)
+	for i := range turns {
+		texts = append(texts, turns[i].Text)
+	}
+	texts = append(texts, current)
 	sum := sha256.Sum256([]byte(cfg.Prompt.Body))
 	now := s.now()
-	res := EstimateQuotaReservation(cfg.Prompt.Body, nil, "", 0, cfg.Model.ImageQuotaTokens, cfg.Model.MaxOutputTokens, now)
-	if source.ReservedTokenCount > res.TokenCount {
-		res.TokenCount = source.ReservedTokenCount
-	}
+	res := EstimateQuotaReservation(cfg.Prompt.Body, texts, extracted.String(), imageCount, cfg.Model.ImageQuotaTokens, cfg.Model.MaxOutputTokens, now)
 	_, run, err := s.store.RetryRun(ctx, RuntimeRetryAdmission{
 		StudentID: principal.User.ID, SourceRunID: sourceRunID, RunID: uuid.New(), IdempotencyKey: key,
 		Snapshot: RuntimeSnapshot{Provider: cfg, PromptSHA256: hex.EncodeToString(sum[:])}, Reservation: res, Now: now,

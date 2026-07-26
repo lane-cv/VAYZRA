@@ -72,6 +72,76 @@ func TestPostgresRuntimeConcurrentQuotaAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestPostgresRuntimeSynchronizedSameKeyReturnsOneRun(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	store := NewPostgresRuntimeStore(pool)
+	start := make(chan struct{})
+	type result struct {
+		run Run
+		err error
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			in := fixture.admission()
+			in.IdempotencyKey = "same-key-race-00001"
+			<-start
+			_, run, err := store.AdmitRun(ctx, in)
+			results <- result{run, err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil || first.run.ID != second.run.ID {
+		t.Fatalf("first=%+v/%v second=%+v/%v", first.run, first.err, second.run, second.err)
+	}
+	var runs, reserves int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ai_runs WHERE student_id=$1 AND idempotency_key='same-key-race-00001'`, fixture.student).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE run_id=$1 AND action='reserve'`, first.run.ID).Scan(&reserves); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || reserves != 2 {
+		t.Fatalf("runs=%d reserve rows=%d", runs, reserves)
+	}
+}
+
+func TestPostgresRuntimeSynchronizedDistinctKeysHitActiveIndex(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	store := NewPostgresRuntimeStore(pool)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			in := fixture.admission()
+			in.IdempotencyKey = "active-index-race-" + string(rune('a'+i))
+			<-start
+			_, _, err := store.AdmitRun(ctx, in)
+			errs <- err
+		}()
+	}
+	close(start)
+	first, second := <-errs, <-errs
+	if (first == nil) == (second == nil) {
+		t.Fatalf("wanted exactly one success: %v / %v", first, second)
+	}
+	if first != nil && !errors.Is(first, ErrAIBusy) || second != nil && !errors.Is(second, ErrAIBusy) {
+		t.Fatalf("wanted ErrAIBusy: %v / %v", first, second)
+	}
+}
+
 func TestPostgresRuntimeOneActiveOwnerAndTerminalIdempotency(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
@@ -128,6 +198,19 @@ func TestPostgresRuntimeOneActiveOwnerAndTerminalIdempotency(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_messages WHERE trigger_run_id=$1`, retry.ID).Scan(&assistants); err != nil || assistants != 0 {
 		t.Fatalf("queued assistant count=%d err=%v", assistants, err)
 	}
+	streamAt := time.Now().UTC()
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET status='streaming',started_at=$2::timestamptz,updated_at=$2::timestamptz,lease_owner='test',lease_expires_at=$2::timestamptz+interval '1 minute',heartbeat_at=$2::timestamptz WHERE id=$1`, retry.ID, streamAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SucceedRun(ctx, fixture.student, retry.ID, "retry answer", TerminalUsage{
+		InputTokens: 500, OutputTokens: 100, CostMicroUSD: 9, UsageSource: "upstream",
+	}, streamAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var blocked bool
+	if err = pool.QueryRow(ctx, `SELECT quota_blocked_at IS NOT NULL FROM ai_models WHERE id=$1`, fixture.model).Scan(&blocked); err != nil || blocked {
+		t.Fatalf("retry falsely blocked model=%v err=%v", blocked, err)
+	}
 }
 
 func TestPostgresRuntimeConcurrentSettleWritesOneTerminalSet(t *testing.T) {
@@ -171,6 +254,26 @@ func TestPostgresRuntimeConcurrentSettleWritesOneTerminalSet(t *testing.T) {
 	}
 	if settles != 2 || releases != 2 || assistants != 1 {
 		t.Fatalf("settles=%d releases=%d assistants=%d", settles, releases, assistants)
+	}
+	rows, err := pool.Query(ctx, `SELECT period_kind,sum(request_delta),sum(token_delta) FROM ai_usage_ledger WHERE run_id=$1 GROUP BY period_kind ORDER BY period_kind`, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var kind string
+		var requests, tokens int64
+		if err = rows.Scan(&kind, &requests, &tokens); err != nil {
+			t.Fatal(err)
+		}
+		if requests != 1 || tokens != 5 {
+			t.Fatalf("%s net request=%d token=%d", kind, requests, tokens)
+		}
+		count++
+	}
+	if err = rows.Err(); err != nil || count != 2 {
+		t.Fatalf("period count=%d err=%v", count, err)
 	}
 }
 
@@ -268,4 +371,107 @@ func TestPostgresRuntimeAnomalyStoresActualAndBlocksModel(t *testing.T) {
 	if input != 10 || output != 5 || cost != 99 || charged != 4 || reason != "quota_estimation_anomaly" {
 		t.Fatalf("actual=%d/%d cost=%d charged(two periods)=%d reason=%s", input, output, cost, charged, reason)
 	}
+}
+
+func TestPostgresRuntimeAnomalySettlementBlocksCrossStudentAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	store := NewPostgresRuntimeStore(pool)
+	in := fixture.admission()
+	in.Reservation.TokenCount = 2
+	_, run, err := store.AdmitRun(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET status='streaming',started_at=$2::timestamptz,updated_at=$2::timestamptz,lease_owner='test',lease_expires_at=$2::timestamptz+interval '1 minute',heartbeat_at=$2::timestamptz WHERE id=$1`, run.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	studentB := uuid.New()
+	if _, err = pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,status,password_hash) VALUES($1,'runtime-student-b','runtime-student-b','student','active','x')`, studentB); err != nil {
+		t.Fatal(err)
+	}
+	const pauseLock int64 = 77199213
+	if _, err = pool.Exec(ctx, `
+CREATE OR REPLACE FUNCTION aiqa_test_pause_anomaly() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(77199213);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER aiqa_test_pause_anomaly_trigger AFTER UPDATE OF quota_blocked_at ON ai_models
+FOR EACH ROW WHEN (OLD.quota_blocked_at IS NULL AND NEW.quota_blocked_at IS NOT NULL)
+EXECUTE FUNCTION aiqa_test_pause_anomaly()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS aiqa_test_pause_anomaly_trigger ON ai_models; DROP FUNCTION IF EXISTS aiqa_test_pause_anomaly()`)
+	})
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	if _, err = blocker.Exec(ctx, `SELECT pg_advisory_lock($1)`, pauseLock); err != nil {
+		t.Fatal(err)
+	}
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			_, _ = blocker.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, pauseLock)
+		}
+	}()
+
+	settleDone := make(chan error, 1)
+	go func() {
+		_, settleErr := store.SucceedRun(ctx, fixture.student, run.ID, "answer", TerminalUsage{
+			InputTokens: 10, OutputTokens: 5, CostMicroUSD: 99, UsageSource: "upstream",
+		}, now.Add(time.Second))
+		settleDone <- settleErr
+	}()
+	waitForDatabaseWait(t, ctx, pool, "advisory", "UPDATE ai_models SET quota_blocked_at")
+
+	admissionDone := make(chan error, 1)
+	go func() {
+		other := fixture.admission()
+		other.StudentID = studentB
+		other.IdempotencyKey = "cross-student-admit-1"
+		_, _, admissionErr := store.AdmitRun(ctx, other)
+		admissionDone <- admissionErr
+	}()
+	waitForDatabaseWait(t, ctx, pool, "transactionid", "FROM ai_models WHERE id")
+
+	if _, err = blocker.Exec(ctx, `SELECT pg_advisory_unlock($1)`, pauseLock); err != nil {
+		t.Fatal(err)
+	}
+	unlocked = true
+	if err = <-settleDone; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-admissionDone; !errors.Is(err, ErrAIDisabled) {
+		t.Fatalf("cross-student admission after anomaly=%v", err)
+	}
+}
+
+func waitForDatabaseWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, event, queryFragment string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var found bool
+		err := pool.QueryRow(ctx, `SELECT EXISTS(
+SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() AND wait_event=$1 AND query LIKE '%'||$2||'%'
+)`, event, queryFragment).Scan(&found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("database wait not observed: event=%s query=%s", event, queryFragment)
 }
