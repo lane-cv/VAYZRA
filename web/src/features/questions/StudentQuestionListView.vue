@@ -61,28 +61,43 @@ async function updateQuery(): Promise<void> {
   await router.replace({ query: canonicalQuery() })
 }
 
-function beginReplacement(): void {
-  items.value = []
-  nextCursor.value = undefined
+function invalidateActiveRequest(): void {
+  generation += 1
+  controller?.abort()
+  controller = undefined
 }
 
-async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> {
-  const current = ++generation
-  controller?.abort()
-  controller = new AbortController()
-  if (mode === 'replace') beginReplacement()
+function resetRequestFeedback(): void {
   loading.value = true
   error.value = ''
   requestId.value = ''
   errorMode.value = undefined
   retryCursor.value = undefined
+}
+
+function beginReplacement(): void {
+  invalidateActiveRequest()
+  items.value = []
+  nextCursor.value = undefined
+  resetRequestFeedback()
+}
+
+async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> {
+  if (mode === 'replace') beginReplacement()
+  else {
+    invalidateActiveRequest()
+    resetRequestFeedback()
+  }
+  const current = generation
+  const requestController = new AbortController()
+  controller = requestController
   try {
     const page = await listQuestionSummaries({
       channel: channel.value || undefined,
       search: search.value.trim() || undefined,
       ...(cursor ? { cursor } : {}),
       limit: 20,
-    }, controller.signal)
+    }, requestController.signal)
     if (current !== generation) return
     if (mode === 'append') {
       const existing = new Set(items.value.map((item) => `${item.channel}:${item.id}`))
@@ -96,7 +111,7 @@ async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> 
       await updateQuery()
     }
   } catch (cause) {
-    if (controller.signal.aborted || current !== generation) return
+    if (requestController.signal.aborted || current !== generation) return
     error.value = cause instanceof Error ? cause.message : '加载失败'
     errorMode.value = mode
     retryCursor.value = cursor

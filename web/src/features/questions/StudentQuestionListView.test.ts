@@ -233,4 +233,43 @@ describe('StudentQuestionListView', () => {
     await flushPromises()
     expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual(['新的 AI 结果'])
   })
+
+  it('invalidates an old request before awaiting a deferred replacement route commit', async () => {
+    let resolveOld!: (value: unknown) => void
+    let oldSignal: AbortSignal | undefined
+    let releaseRoute!: () => void
+    const aiOnly = [{ ...mixed[0], title: '路由提交后的 AI 结果' }]
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: 'old-cursor' })
+      .mockImplementationOnce((_filters, signal: AbortSignal) => {
+        oldSignal = signal
+        return new Promise((resolve) => { resolveOld = resolve })
+      })
+      .mockResolvedValueOnce({ items: aiOnly, nextCursor: undefined })
+    const { wrapper, route, replace } = mountList()
+    await flushPromises()
+    await wrapper.get('button[aria-label="加载更多问答"]').trigger('click')
+    replace.mockImplementationOnce((target: { query: Record<string, unknown> }) => new Promise<void>((resolve) => {
+      releaseRoute = () => {
+        route.query = target.query
+        resolve()
+      }
+    }))
+
+    const changing = wrapper.get('[aria-label="答疑类型"]').setValue('ai')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('li')).toHaveLength(0)
+    expect(oldSignal?.aborted).toBe(true)
+
+    resolveOld({ items: [{ ...mixed[1], id: 'old', title: '路由等待期间的旧结果' }], nextCursor: undefined })
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('路由等待期间的旧结果')
+    expect(api.list).toHaveBeenCalledTimes(2)
+
+    releaseRoute()
+    await changing
+    await flushPromises()
+    expect(api.list).toHaveBeenCalledTimes(3)
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual(['路由提交后的 AI 结果'])
+  })
 })
