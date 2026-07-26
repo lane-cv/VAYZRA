@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,31 +12,43 @@ import (
 	"time"
 )
 
+const developmentAIMasterKey = "happylearn-dev-ai-master-key-000"
+
 type Config struct {
-	Environment          string
-	ListenAddress        string
-	DatabaseURL          string
-	RedisURL             string
-	LoginThrottleSecret  string
-	TrustedProxyCIDRs    []netip.Prefix
-	PublicOrigin         string
-	SessionIdleTTL       time.Duration
-	SessionAbsoluteTTL   time.Duration
-	CookieSecure         bool
-	MinIOEndpoint        string
-	MinIOAccessKey       string
-	MinIOSecretKey       string
-	MinIOUseTLS          bool
-	MinIOOriginalsBucket string
-	MinIOPreviewsBucket  string
+	Environment             string
+	ListenAddress           string
+	DatabaseURL             string
+	RedisURL                string
+	LoginThrottleSecret     string
+	TrustedProxyCIDRs       []netip.Prefix
+	PublicOrigin            string
+	SessionIdleTTL          time.Duration
+	SessionAbsoluteTTL      time.Duration
+	CookieSecure            bool
+	MinIOEndpoint           string
+	MinIOAccessKey          string
+	MinIOSecretKey          string
+	MinIOUseTLS             bool
+	MinIOOriginalsBucket    string
+	MinIOPreviewsBucket     string
+	AIMasterKey             []byte
+	AIMasterKeyVersion      int16
+	AIBusinessTimezone      string
+	AIGlobalConcurrency     int
+	AIPerStudentConcurrency int
+	AIAllowPrivateProvider  bool
 }
 
 func Load(getenv func(string) string) (Config, error) {
 	c := Config{
-		Environment:        "development",
-		ListenAddress:      ":8080",
-		SessionIdleTTL:     7 * 24 * time.Hour,
-		SessionAbsoluteTTL: 30 * 24 * time.Hour,
+		Environment:             "development",
+		ListenAddress:           ":8080",
+		SessionIdleTTL:          7 * 24 * time.Hour,
+		SessionAbsoluteTTL:      30 * 24 * time.Hour,
+		AIMasterKeyVersion:      1,
+		AIBusinessTimezone:      "Asia/Shanghai",
+		AIGlobalConcurrency:     2,
+		AIPerStudentConcurrency: 1,
 	}
 	if v := getenv("HAPPYLEARN_ENV"); v != "" {
 		c.Environment = v
@@ -45,6 +58,56 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.Environment != "development" && c.Environment != "production" {
 		return Config{}, fmt.Errorf("HAPPYLEARN_ENV must be development or production")
+	}
+	if raw := getenv("HAPPYLEARN_AI_MASTER_KEY"); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 || base64.StdEncoding.EncodeToString(key) != raw {
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY must be standard base64 of exactly 32 bytes")
+		}
+		c.AIMasterKey = key
+	} else if c.Environment == "development" {
+		c.AIMasterKey = []byte(developmentAIMasterKey)
+	} else {
+		return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY is required in production")
+	}
+	if raw := getenv("HAPPYLEARN_AI_MASTER_KEY_VERSION"); raw != "" {
+		version, err := strconv.ParseInt(raw, 10, 16)
+		if err != nil || version < 1 {
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY_VERSION must be between 1 and 32767")
+		}
+		c.AIMasterKeyVersion = int16(version)
+	}
+	if raw := getenv("HAPPYLEARN_AI_BUSINESS_TIMEZONE"); raw != "" {
+		if raw != "Asia/Shanghai" {
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_BUSINESS_TIMEZONE must be Asia/Shanghai")
+		}
+		c.AIBusinessTimezone = raw
+	}
+	if raw := getenv("HAPPYLEARN_AI_GLOBAL_CONCURRENCY"); raw != "" {
+		globalConcurrency, err := strconv.Atoi(raw)
+		if err != nil || globalConcurrency < 1 || globalConcurrency > 8 {
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_GLOBAL_CONCURRENCY must be between 1 and 8")
+		}
+		c.AIGlobalConcurrency = globalConcurrency
+	}
+	if raw := getenv("HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY"); raw != "" {
+		perStudentConcurrency, err := strconv.Atoi(raw)
+		if err != nil || perStudentConcurrency < 1 || perStudentConcurrency > c.AIGlobalConcurrency {
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY must be between 1 and HAPPYLEARN_AI_GLOBAL_CONCURRENCY")
+		}
+		c.AIPerStudentConcurrency = perStudentConcurrency
+	}
+	if raw := getenv("HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER"); raw != "" {
+		switch raw {
+		case "false":
+		case "true":
+			if c.Environment != "development" {
+				return Config{}, fmt.Errorf("HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER may only be true in development")
+			}
+			c.AIAllowPrivateProvider = true
+		default:
+			return Config{}, fmt.Errorf("HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER must be true or false")
+		}
 	}
 	c.DatabaseURL = getenv("HAPPYLEARN_DATABASE_URL")
 	c.RedisURL = getenv("HAPPYLEARN_REDIS_URL")

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,108 @@ func productionConfigEnv() map[string]string {
 		"HAPPYLEARN_MINIO_USE_TLS":          "true",
 		"HAPPYLEARN_MINIO_ORIGINALS_BUCKET": "happylearn-originals",
 		"HAPPYLEARN_MINIO_PREVIEWS_BUCKET":  "happylearn-previews",
+		"HAPPYLEARN_AI_MASTER_KEY":          base64.StdEncoding.EncodeToString(make([]byte, 32)),
+	}
+}
+
+func mapEnv(values map[string]string) func(string) string {
+	return func(key string) string { return values[key] }
+}
+
+func TestProductionRequires32ByteBase64AIMasterKey(t *testing.T) {
+	_, err := Load(mapEnv(map[string]string{
+		"HAPPYLEARN_ENV":           "production",
+		"HAPPYLEARN_AI_MASTER_KEY": base64.StdEncoding.EncodeToString(make([]byte, 31)),
+	}))
+	if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_MASTER_KEY") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLoadParsesAIConfiguration(t *testing.T) {
+	env := productionConfigEnv()
+	env["HAPPYLEARN_AI_MASTER_KEY"] = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
+	env["HAPPYLEARN_AI_MASTER_KEY_VERSION"] = "17"
+	env["HAPPYLEARN_AI_BUSINESS_TIMEZONE"] = "Asia/Shanghai"
+	env["HAPPYLEARN_AI_GLOBAL_CONCURRENCY"] = "8"
+	env["HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY"] = "3"
+	cfg, err := Load(mapEnv(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cfg.AIMasterKey, bytes.Repeat([]byte{9}, 32)) || cfg.AIMasterKeyVersion != 17 || cfg.AIBusinessTimezone != "Asia/Shanghai" || cfg.AIGlobalConcurrency != 8 || cfg.AIPerStudentConcurrency != 3 || cfg.AIAllowPrivateProvider {
+		t.Fatalf("unexpected AI configuration: %#v", cfg)
+	}
+}
+
+func TestLoadUsesDevelopmentOnlyAIConfigurationDefaults(t *testing.T) {
+	cfg, err := Load(mapEnv(map[string]string{
+		"HAPPYLEARN_DATABASE_URL":          "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":             "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET": "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":         "https://learn.example.com",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AIMasterKey) != 32 || cfg.AIMasterKeyVersion != 1 || cfg.AIBusinessTimezone != "Asia/Shanghai" || cfg.AIGlobalConcurrency != 2 || cfg.AIPerStudentConcurrency != 1 || cfg.AIAllowPrivateProvider {
+		t.Fatalf("unexpected development AI configuration: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsInvalidAIConfiguration(t *testing.T) {
+	for name, tc := range map[string]struct {
+		value        string
+		wantVariable string
+	}{
+		"invalid master key encoding": {"not-base64", "HAPPYLEARN_AI_MASTER_KEY"},
+		"short master key":            {base64.StdEncoding.EncodeToString(make([]byte, 31)), "HAPPYLEARN_AI_MASTER_KEY"},
+		"zero key version":            {"0", "HAPPYLEARN_AI_MASTER_KEY_VERSION"},
+		"large key version":           {"32768", "HAPPYLEARN_AI_MASTER_KEY_VERSION"},
+		"wrong timezone":              {"UTC", "HAPPYLEARN_AI_BUSINESS_TIMEZONE"},
+		"zero global concurrency":     {"0", "HAPPYLEARN_AI_GLOBAL_CONCURRENCY"},
+		"large global concurrency":    {"9", "HAPPYLEARN_AI_GLOBAL_CONCURRENCY"},
+		"zero student concurrency":    {"0", "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY"},
+		"large student concurrency":   {"3", "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := productionConfigEnv()
+			switch tc.wantVariable {
+			case "HAPPYLEARN_AI_MASTER_KEY":
+				env[tc.wantVariable] = tc.value
+			case "HAPPYLEARN_AI_MASTER_KEY_VERSION", "HAPPYLEARN_AI_BUSINESS_TIMEZONE", "HAPPYLEARN_AI_GLOBAL_CONCURRENCY", "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY":
+				env[tc.wantVariable] = tc.value
+				if tc.wantVariable == "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY" && tc.value == "3" {
+					env["HAPPYLEARN_AI_GLOBAL_CONCURRENCY"] = "2"
+				}
+			}
+			_, err := Load(mapEnv(env))
+			if err == nil || !strings.Contains(err.Error(), tc.wantVariable) {
+				t.Fatalf("error=%v, want %s validation", err, tc.wantVariable)
+			}
+		})
+	}
+}
+
+func TestLoadAllowsPrivateAIProvidersOnlyInDevelopment(t *testing.T) {
+	production := productionConfigEnv()
+	production["HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER"] = "true"
+	if _, err := Load(mapEnv(production)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER") {
+		t.Fatalf("production error=%v", err)
+	}
+
+	development := map[string]string{
+		"HAPPYLEARN_DATABASE_URL":               "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":                  "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":      "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":              "https://learn.example.com",
+		"HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER":  "true",
+		"HAPPYLEARN_AI_GLOBAL_CONCURRENCY":      "2",
+		"HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY": "1",
+	}
+	cfg, err := Load(mapEnv(development))
+	if err != nil || !cfg.AIAllowPrivateProvider {
+		t.Fatalf("cfg=%#v err=%v", cfg, err)
 	}
 }
 
