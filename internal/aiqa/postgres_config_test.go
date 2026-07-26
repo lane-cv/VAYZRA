@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -148,6 +149,66 @@ func TestPostgresConfigRuntimeDecryptsAndCopiesSecret(t *testing.T) {
 	}
 	if _, err := store.ForRun(ctx, SubjectMath, ModalityText); !errors.Is(err, ErrAIDisabled) {
 		t.Fatalf("ambiguous runtime=%v", err)
+	}
+}
+
+func TestPostgresConnectivityLeaseExcludesOtherStoreInstancesAndAudits(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAIConfig(t, ctx, pool)
+	admin := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'connectivity_admin','Connectivity Admin','admin','x',false)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	providerID := uuid.New()
+	box, err := NewAESGCMSecretBox(bytes.Repeat([]byte{7}, 32), 1, bytes.NewReader(bytes.Repeat([]byte{3}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := box.Seal(providerID, []byte("connectivity-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_providers(id,name,base_url,protocol_mode,encrypted_api_key,key_version,key_updated_at,created_by) VALUES($1,'connectivity','http://api.example.test','responses',$2,$3,now(),$4)`, providerID, sealed.Blob, sealed.KeyVersion, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,created_by,updated_by) VALUES($1,$2,'probe-model','text',8192,32,1000,0,0,$3,$3)`, uuid.New(), providerID, admin); err != nil {
+		t.Fatal(err)
+	}
+	policy := URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}
+	first := NewPostgresConfigStoreWithSecurity(pool, box, policy)
+	second := NewPostgresConfigStoreWithSecurity(pool, box, policy)
+	cfg, release, err := first.AcquireProviderTest(ctx, providerID)
+	if err != nil || string(cfg.APIKey) != "connectivity-secret" || release == nil {
+		t.Fatalf("first cfg=%#v err=%v", cfg, err)
+	}
+	busyCfg, busyRelease, err := second.AcquireProviderTest(ctx, providerID)
+	if !errors.Is(err, ErrProviderTestBusy) || busyRelease != nil || busyCfg.ProtocolMode != ProtocolResponses || len(busyCfg.APIKey) != 0 {
+		t.Fatalf("busy cfg=%#v release=%v err=%v", busyCfg, busyRelease != nil, err)
+	}
+	release()
+	cfg, release, err = second.AcquireProviderTest(ctx, providerID)
+	if err != nil || release == nil {
+		t.Fatalf("after release cfg=%#v err=%v", cfg, err)
+	}
+	zeroBytes(cfg.APIKey)
+	release()
+
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "provider-test", IP: net.ParseIP("192.0.2.18")}
+	if err := first.RecordProviderTest(ctx, actor, providerTestAudit{providerID: providerID, protocol: ProtocolResponses, category: "auth", latencyMS: 12}); err != nil {
+		t.Fatal(err)
+	}
+	var metadata string
+	if err := pool.QueryRow(ctx, `SELECT metadata::text FROM audit_logs WHERE action='ai.provider_tested' AND target_id=$1`, providerID.String()).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"connectivity-secret", "authorization", "requestBody", "upstream"} {
+		if strings.Contains(strings.ToLower(metadata), strings.ToLower(forbidden)) {
+			t.Fatalf("audit leaked %q: %s", forbidden, metadata)
+		}
 	}
 }
 

@@ -97,6 +97,7 @@ func TestAIConfigurationAuditEventsAllowOnlyRedactedMetadata(t *testing.T) {
 	approved := []Event{
 		{Action: "ai.provider_created", TargetType: "ai_provider", TargetID: uuid.NewString(), Metadata: map[string]any{}},
 		{Action: "ai.provider_updated", TargetType: "ai_provider", TargetID: uuid.NewString(), Metadata: map[string]any{"keyChanged": "true"}},
+		{Action: "ai.provider_tested", TargetType: "ai_provider", TargetID: uuid.NewString(), Metadata: map[string]any{"providerId": uuid.NewString(), "protocol": "responses", "ok": "false", "errorCategory": "auth", "latencyMs": "12"}},
 		{Action: "ai.model_put", TargetType: "ai_model", TargetID: uuid.NewString(), Metadata: map[string]any{"providerId": uuid.NewString(), "modality": "vision"}},
 		{Action: "ai.prompt_put", TargetType: "ai_prompt", TargetID: uuid.NewString(), Metadata: map[string]any{"subject": "math", "version": "1"}},
 		{Action: "ai.limits_student_put", TargetType: "ai_limits", TargetID: uuid.NewString(), Metadata: map[string]any{"studentId": uuid.NewString()}},
@@ -113,5 +114,17 @@ func TestAIConfigurationAuditEventsAllowOnlyRedactedMetadata(t *testing.T) {
 	unsafe.Metadata = map[string]any{"keyChanged": "true", "apiKey": "very-secret"}
 	if _, err := validateAndMarshal(unsafe); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("secret metadata accepted: %v", err)
+	}
+	tested := approved[2]
+	for _, metadata := range []map[string]any{
+		{"providerId": uuid.NewString(), "protocol": "responses", "ok": "false", "errorCategory": "raw-upstream-body", "latencyMs": "12"},
+		{"providerId": uuid.NewString(), "protocol": "responses", "ok": "true", "errorCategory": "auth", "latencyMs": "12"},
+		{"providerId": uuid.NewString(), "protocol": "responses", "ok": "false", "errorCategory": "auth", "latencyMs": "-1"},
+		{"providerId": uuid.NewString(), "protocol": "responses", "ok": "false", "errorCategory": "auth", "latencyMs": "12", "authorization": "secret"},
+	} {
+		tested.Metadata = metadata
+		if _, err := validateAndMarshal(tested); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("unsafe provider test metadata accepted: %#v", metadata)
+		}
 	}
 }

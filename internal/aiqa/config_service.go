@@ -3,6 +3,7 @@ package aiqa
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
 	"strings"
@@ -20,15 +21,37 @@ type AdminConfigService interface {
 	GetLimits(context.Context, Principal) (LimitViews, error)
 	PutGlobalLimits(context.Context, Principal, PutLimitsInput) (LimitView, error)
 	PutStudentLimits(context.Context, Principal, uuid.UUID, PutLimitsInput) (LimitView, error)
+	TestProvider(context.Context, Principal, uuid.UUID) (ConnectivityResult, error)
 }
+
+type providerTestAudit struct {
+	providerID uuid.UUID
+	protocol   ProtocolMode
+	ok         bool
+	category   string
+	latencyMS  int64
+}
+
+type providerConnectivityStore interface {
+	AcquireProviderTest(context.Context, uuid.UUID) (RuntimeProviderConfig, func(), error)
+	RecordProviderTest(context.Context, Principal, providerTestAudit) error
+}
+
 type configService struct {
-	store  ConfigStore
-	policy URLPolicy
-	box    SecretBox
+	store        ConfigStore
+	policy       URLPolicy
+	box          SecretBox
+	connectivity providerConnectivityStore
+	tester       ConnectivityTester
 }
 
 func NewAdminConfigService(s ConfigStore, p URLPolicy, b SecretBox) AdminConfigService {
-	return &configService{s, p, b}
+	return NewAdminConfigServiceWithConnectivity(s, p, b, NewProviderConnectivityTester(p))
+}
+
+func NewAdminConfigServiceWithConnectivity(s ConfigStore, p URLPolicy, b SecretBox, tester ConnectivityTester) AdminConfigService {
+	connectivity, _ := s.(providerConnectivityStore)
+	return &configService{store: s, policy: p, box: b, connectivity: connectivity, tester: tester}
 }
 func admin(p Principal) error {
 	if p.User.ID == uuid.Nil || p.User.Role != auth.RoleAdmin || p.User.Status != auth.StatusActive {
@@ -163,6 +186,64 @@ func (s *configService) PutStudentLimits(c context.Context, p Principal, id uuid
 		return LimitView{}, ErrInvalidInput
 	}
 	return s.store.PutStudentLimits(c, p, id, in)
+}
+
+func (s *configService) TestProvider(ctx context.Context, p Principal, id uuid.UUID) (ConnectivityResult, error) {
+	if err := admin(p); err != nil {
+		return ConnectivityResult{}, err
+	}
+	if id == uuid.Nil {
+		return ConnectivityResult{}, ErrInvalidInput
+	}
+	if s.connectivity == nil || s.tester == nil {
+		return ConnectivityResult{}, ErrProviderUnavailable
+	}
+
+	cfg, release, err := s.connectivity.AcquireProviderTest(ctx, id)
+	if errors.Is(err, ErrProviderTestBusy) {
+		result := ConnectivityResult{Protocol: cfg.ProtocolMode, ErrorCategory: "busy"}
+		auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+			providerID: id, protocol: result.Protocol, category: result.ErrorCategory,
+		})
+		if auditErr != nil {
+			return ConnectivityResult{}, auditErr
+		}
+		return result, ErrProviderTestBusy
+	}
+	if err != nil {
+		if errors.Is(err, ErrNotFound) || cfg.ProviderID != id || !protocolOK(cfg.ProtocolMode) {
+			return ConnectivityResult{}, err
+		}
+		result := ConnectivityResult{Protocol: cfg.ProtocolMode, ErrorCategory: "unavailable"}
+		auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+			providerID: id, protocol: result.Protocol, category: result.ErrorCategory,
+		})
+		if auditErr != nil {
+			return ConnectivityResult{}, auditErr
+		}
+		return result, ErrProviderUnavailable
+	}
+	defer release()
+
+	result, testErr := s.tester.Test(ctx, cfg)
+	result.Protocol = cfg.ProtocolMode
+	if testErr != nil {
+		result.OK = false
+		if result.ErrorCategory == "" {
+			result.ErrorCategory = "unavailable"
+		}
+	}
+	auditErr := s.connectivity.RecordProviderTest(ctx, p, providerTestAudit{
+		providerID: id, protocol: result.Protocol, ok: result.OK,
+		category: result.ErrorCategory, latencyMS: result.LatencyMS,
+	})
+	if auditErr != nil {
+		return ConnectivityResult{}, auditErr
+	}
+	if testErr != nil || !result.OK {
+		return result, ErrProviderUnavailable
+	}
+	return result, nil
 }
 func protocolOK(v ProtocolMode) bool     { return v == ProtocolChatCompletions || v == ProtocolResponses }
 func modalityOK(v Modality) bool         { return v == ModalityText || v == ModalityVision }

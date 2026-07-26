@@ -12,8 +12,10 @@ import (
 )
 
 type httpConfigService struct {
-	created CreateProviderInput
-	err     error
+	created    CreateProviderInput
+	err        error
+	testResult ConnectivityResult
+	testErr    error
 }
 
 func (s *httpConfigService) ListProviders(context.Context, Principal) ([]ProviderView, error) {
@@ -93,6 +95,46 @@ func (*httpConfigService) PutGlobalLimits(context.Context, Principal, PutLimitsI
 }
 func (*httpConfigService) PutStudentLimits(context.Context, Principal, uuid.UUID, PutLimitsInput) (LimitView, error) {
 	return LimitView{}, nil
+}
+func (s *httpConfigService) TestProvider(context.Context, Principal, uuid.UUID) (ConnectivityResult, error) {
+	return s.testResult, s.testErr
+}
+
+func TestProviderTestHTTPSuccessAndFailureAreSanitized(t *testing.T) {
+	id := uuid.New()
+	cases := []struct {
+		name   string
+		result ConnectivityResult
+		err    error
+		status int
+		code   string
+	}{
+		{"success", ConnectivityResult{OK: true, Protocol: ProtocolResponses, LatencyMS: 12}, nil, http.StatusOK, ""},
+		{"failed", ConnectivityResult{Protocol: ProtocolResponses, LatencyMS: 15, ErrorCategory: "auth"}, ErrProviderUnavailable, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE"},
+		{"busy", ConnectivityResult{Protocol: ProtocolResponses, ErrorCategory: "busy"}, ErrProviderTestBusy, http.StatusConflict, "PROVIDER_UNAVAILABLE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewAdminConfigHandler(&httpConfigService{testResult: tc.result, testErr: tc.err}, nil).Routes()
+			r := httptest.NewRequest(http.MethodPost, "/providers/"+id.String()+"/test", nil)
+			r.RemoteAddr = "192.0.2.1:1234"
+			r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			if tc.code != "" && !strings.Contains(body, `"code":"`+tc.code+`"`) {
+				t.Fatalf("missing code: %s", body)
+			}
+			for _, secret := range []string{"Authorization", "apiKey", "encrypted", "raw-upstream", "requestBody"} {
+				if strings.Contains(body, secret) {
+					t.Fatalf("response leaked %q: %s", secret, body)
+				}
+			}
+		})
+	}
 }
 func TestAdminConfigHTTPStrictCreateAndRedaction(t *testing.T) {
 	svc := &httpConfigService{}

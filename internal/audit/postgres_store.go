@@ -146,7 +146,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"file.processing_artifact_cleanup_scheduled": {}, "file.processing_artifact_cleanup_completed": {},
 	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
 	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
-	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
+	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.provider_tested": {"providerId": true, "protocol": true, "ok": true, "errorCategory": true, "latencyMs": true}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -157,7 +157,7 @@ var allowedTargetTypes = map[string]string{
 	"file.cleanup_scheduled": "file_version", "file.cleanup_completed": "file_version",
 	"file.processing_artifact_cleanup_scheduled": "file_version", "file.processing_artifact_cleanup_completed": "file_version",
 	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
-	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
+	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
 }
 
 func validAIEvent(e Event) bool {
@@ -167,6 +167,24 @@ func validAIEvent(e Event) bool {
 		return len(e.Metadata) == 0
 	case "ai.provider_updated":
 		return len(e.Metadata) == 1 && (v("keyChanged") == "true" || v("keyChanged") == "false")
+	case "ai.provider_tested":
+		_, providerErr := uuid.Parse(v("providerId"))
+		latency, latencyErr := strconv.ParseInt(v("latencyMs"), 10, 64)
+		protocol := v("protocol")
+		ok := v("ok")
+		category := v("errorCategory")
+		if providerErr != nil || latencyErr != nil || latency < 0 || (protocol != "chat_completions" && protocol != "responses") || (ok != "true" && ok != "false") {
+			return false
+		}
+		if ok == "true" {
+			return len(e.Metadata) == 5 && category == ""
+		}
+		switch category {
+		case "auth", "rate_limited", "upstream_4xx", "upstream_5xx", "timeout", "stream_interrupted", "malformed_stream", "response_too_large", "cancelled", "unavailable", "busy":
+			return len(e.Metadata) == 5
+		default:
+			return false
+		}
 	case "ai.model_put":
 		_, x := uuid.Parse(v("providerId"))
 		m := v("modality")

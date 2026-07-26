@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/audit"
+	"sync"
 	"time"
 )
 
@@ -90,6 +91,100 @@ func (s *PostgresConfigStore) CreateProvider(ctx context.Context, p Principal, i
 func (s *PostgresConfigStore) ActiveRuntimeConfig(ctx context.Context) (RuntimeProviderConfig, error) {
 	return s.ForRun(ctx, SubjectMath, ModalityText)
 }
+
+func (s *PostgresConfigStore) AcquireProviderTest(ctx context.Context, id uuid.UUID) (out RuntimeProviderConfig, release func(), err error) {
+	if s.box == nil || id == uuid.Nil {
+		return RuntimeProviderConfig{}, nil, ErrProviderUnavailable
+	}
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return RuntimeProviderConfig{}, nil, err
+	}
+	releaseConn := true
+	defer func() {
+		if releaseConn {
+			conn.Release()
+		}
+	}()
+
+	var rawBaseURL string
+	var encrypted []byte
+	var keyVersion int16
+	err = conn.QueryRow(ctx, `SELECT id,base_url,protocol_mode,encrypted_api_key,key_version FROM ai_providers WHERE id=$1`, id).
+		Scan(&out.ProviderID, &rawBaseURL, &out.ProtocolMode, &encrypted, &keyVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RuntimeProviderConfig{}, nil, ErrNotFound
+	}
+	if err != nil {
+		return RuntimeProviderConfig{}, nil, err
+	}
+
+	var locked bool
+	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "ai-provider-test:"+id.String()).Scan(&locked); err != nil {
+		return RuntimeProviderConfig{}, nil, err
+	}
+	if !locked {
+		return out, nil, ErrProviderTestBusy
+	}
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var unlocked bool
+			if unlockErr := conn.QueryRow(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, "ai-provider-test:"+id.String()).Scan(&unlocked); unlockErr != nil || !unlocked {
+				raw := conn.Hijack()
+				_ = raw.Close(unlockCtx)
+				return
+			}
+			conn.Release()
+		})
+	}
+	releaseConn = false
+	fail := func(e error) (RuntimeProviderConfig, func(), error) {
+		release()
+		return out, nil, e
+	}
+
+	var timeoutConnect, timeoutHeaders, timeoutIdle, timeoutTotal int
+	err = conn.QueryRow(ctx, `SELECT id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,quota_blocked_at,coalesce(quota_block_reason,''),version,connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms
+		FROM ai_models WHERE provider_id=$1 AND modality='text' AND enabled AND quota_blocked_at IS NULL ORDER BY upstream_model_id,id LIMIT 1`, id).
+		Scan(&out.Model.ID, &out.Model.ProviderID, &out.Model.UpstreamModelID, &out.Model.Modality, &out.Model.ContextTokens, &out.Model.MaxOutputTokens, &out.Model.ImageQuotaTokens, &out.Model.InputPriceMicroUSD, &out.Model.OutputPriceMicroUSD, &out.Model.Enabled, &out.Model.QuotaBlockedAt, &out.Model.QuotaBlockReason, &out.Model.Version, &timeoutConnect, &timeoutHeaders, &timeoutIdle, &timeoutTotal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fail(ErrProviderUnavailable)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	baseURL, err := s.policy.NormalizeBaseURL(ctx, rawBaseURL)
+	if err != nil {
+		return fail(ErrProviderUnavailable)
+	}
+	out.BaseURL = baseURL
+	out.Timeouts = GatewayTimeouts{
+		Connect: time.Duration(timeoutConnect) * time.Millisecond, ResponseHeader: time.Duration(timeoutHeaders) * time.Millisecond,
+		IdleStream: time.Duration(timeoutIdle) * time.Millisecond, Total: time.Duration(timeoutTotal) * time.Millisecond,
+	}
+	key, err := s.box.Open(id, EncryptedSecret{KeyVersion: keyVersion, Blob: encrypted})
+	if err != nil {
+		return fail(ErrProviderUnavailable)
+	}
+	out.APIKey = key
+	return out, release, nil
+}
+
+func (s *PostgresConfigStore) RecordProviderTest(ctx context.Context, p Principal, result providerTestAudit) error {
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		return writeAudit(ctx, tx, p, "ai.provider_tested", "ai_provider", result.providerID.String(), map[string]any{
+			"providerId":    result.providerID.String(),
+			"protocol":      string(result.protocol),
+			"ok":            fmt.Sprint(result.ok),
+			"errorCategory": result.category,
+			"latencyMs":     fmt.Sprint(result.latencyMS),
+		})
+	})
+}
+
 func (s *PostgresConfigStore) ForRun(ctx context.Context, subject Subject, modality Modality) (out RuntimeProviderConfig, err error) {
 	if s.box == nil || !subjectOK(subject) || !modalityOK(modality) {
 		return RuntimeProviderConfig{}, ErrAIDisabled

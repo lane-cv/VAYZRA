@@ -11,11 +11,13 @@ import (
 )
 
 var (
-	ErrForbidden      = errors.New("ai configuration forbidden")
-	ErrInvalidInput   = errors.New("invalid ai configuration input")
-	ErrNotFound       = errors.New("ai configuration not found")
-	ErrConfigConflict = errors.New("ai configuration conflict")
-	ErrAIDisabled     = errors.New("ai disabled")
+	ErrForbidden           = errors.New("ai configuration forbidden")
+	ErrInvalidInput        = errors.New("invalid ai configuration input")
+	ErrNotFound            = errors.New("ai configuration not found")
+	ErrConfigConflict      = errors.New("ai configuration conflict")
+	ErrAIDisabled          = errors.New("ai disabled")
+	ErrProviderUnavailable = errors.New("AI provider unavailable")
+	ErrProviderTestBusy    = errors.New("AI provider test already active")
 )
 
 type ProtocolMode string
@@ -119,6 +121,13 @@ type RuntimeProviderConfig struct {
 	Model        ModelView
 	Prompt       PromptView
 	Timeouts     GatewayTimeouts
+}
+
+type ConnectivityResult struct {
+	OK            bool         `json:"ok"`
+	Protocol      ProtocolMode `json:"protocol"`
+	LatencyMS     int64        `json:"latencyMs"`
+	ErrorCategory string       `json:"errorCategory"`
 }
 type RuntimeConfigSource interface {
 	ForRun(context.Context, Subject, Modality) (RuntimeProviderConfig, error)

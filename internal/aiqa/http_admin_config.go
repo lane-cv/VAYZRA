@@ -30,6 +30,7 @@ func (h *AdminConfigHandler) Routes() http.Handler {
 	r.Get("/providers", h.list)
 	r.Post("/providers", h.create)
 	r.Put("/providers/{id}", h.update)
+	r.Post("/providers/{id}/test", h.testProvider)
 	r.Put("/active-provider", h.activate)
 	r.Get("/providers/{id}/models", h.models)
 	r.Put("/providers/{id}/models/{modelId}", h.putModel)
@@ -40,6 +41,30 @@ func (h *AdminConfigHandler) Routes() http.Handler {
 	r.Put("/limits/students/{studentId}", h.putStudent)
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) { httpx.Error(w, r, 404, "not_found", "资源不存在") })
 	return r
+}
+
+func (h *AdminConfigHandler) testProvider(w http.ResponseWriter, r *http.Request) {
+	id, ok := routeID(w, r, "id")
+	if !ok {
+		return
+	}
+	p, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.service.TestProvider(r.Context(), p, id)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrProviderTestBusy):
+			httpx.Error(w, r, http.StatusConflict, "PROVIDER_UNAVAILABLE", "供应商测试正在进行")
+		case errors.Is(err, ErrProviderUnavailable):
+			httpx.Error(w, r, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE", "供应商暂不可用")
+		default:
+			configError(w, r, err)
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, result)
 }
 func (h *AdminConfigHandler) actor(w http.ResponseWriter, r *http.Request) (Principal, bool) {
 	u, ok := auth.UserFromContext(r.Context())
