@@ -95,7 +95,14 @@ CREATE TABLE ai_runs (
     (status='queued' AND started_at IS NULL AND completed_at IS NULL AND lease_owner IS NULL AND error_code IS NULL)
     OR (status='streaming' AND started_at IS NOT NULL AND completed_at IS NULL AND lease_owner IS NOT NULL AND error_code IS NULL)
     OR (status='succeeded' AND completed_at IS NOT NULL AND lease_owner IS NULL AND usage_source IS NOT NULL AND error_code IS NULL)
-    OR (status IN ('failed','cancelled') AND completed_at IS NOT NULL AND lease_owner IS NULL AND error_code IS NOT NULL)
+    OR (status IN ('failed','cancelled') AND completed_at IS NOT NULL AND lease_owner IS NULL AND usage_source IS NOT NULL AND error_code IS NOT NULL)
+  ),
+  -- `unknown` records an explicitly unavailable upstream usage report and therefore
+  -- stores no synthetic token or cost values; reported/estimated usage is complete.
+  CHECK (
+    (usage_source IS NULL AND input_tokens IS NULL AND output_tokens IS NULL AND cost_micro_usd IS NULL)
+    OR (usage_source='unknown' AND input_tokens IS NULL AND output_tokens IS NULL AND cost_micro_usd IS NULL)
+    OR (usage_source IN ('upstream','estimated') AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND cost_micro_usd IS NOT NULL)
   )
 );
 CREATE UNIQUE INDEX ai_runs_one_active_student_idx ON ai_runs(student_id) WHERE status IN ('queued','streaming');
@@ -194,6 +201,42 @@ CREATE TRIGGER ai_messages_integrity BEFORE INSERT ON ai_messages
 FOR EACH ROW EXECUTE FUNCTION enforce_ai_message_integrity();
 
 -- +goose StatementBegin
+CREATE FUNCTION enforce_ai_run_final_assistant_message() RETURNS trigger AS $$
+DECLARE
+  checked_run_id uuid;
+  run_status text;
+  final_messages integer;
+BEGIN
+  IF TG_TABLE_NAME='ai_runs' THEN
+    checked_run_id := COALESCE(NEW.id,OLD.id);
+  ELSE
+    checked_run_id := COALESCE(NEW.trigger_run_id,OLD.trigger_run_id);
+  END IF;
+  IF checked_run_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+  SELECT status INTO run_status FROM ai_runs WHERE id=checked_run_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  SELECT count(*) INTO final_messages
+  FROM ai_messages WHERE trigger_run_id=checked_run_id AND role='assistant';
+  IF (run_status='succeeded' AND final_messages <> 1)
+     OR (run_status <> 'succeeded' AND final_messages <> 0) THEN
+    RAISE EXCEPTION 'AI succeeded runs require exactly one final assistant message' USING ERRCODE = '23514';
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+CREATE CONSTRAINT TRIGGER ai_runs_final_assistant_message
+  AFTER INSERT OR UPDATE ON ai_runs DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION enforce_ai_run_final_assistant_message();
+CREATE CONSTRAINT TRIGGER ai_messages_final_assistant_message
+  AFTER INSERT OR UPDATE OR DELETE ON ai_messages DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION enforce_ai_run_final_assistant_message();
+
+-- +goose StatementBegin
 CREATE FUNCTION enforce_ai_message_file_integrity() RETURNS trigger AS $$
 BEGIN
   IF NOT EXISTS (
@@ -226,14 +269,30 @@ BEGIN
     RAISE EXCEPTION 'AI run must belong to its student thread and student trigger message' USING ERRCODE = '23514';
   END IF;
   IF NOT EXISTS (
+    SELECT 1 FROM ai_providers p WHERE p.id=NEW.provider_id
+      AND p.base_url=NEW.provider_base_url AND p.protocol_mode=NEW.protocol_mode
+  ) THEN
+    RAISE EXCEPTION 'AI run provider snapshot must match the referenced provider' USING ERRCODE = '23514';
+  END IF;
+  IF NOT EXISTS (
     SELECT 1 FROM prompt_templates p WHERE p.id=NEW.prompt_id
       AND p.subject=NEW.prompt_subject AND p.version=NEW.prompt_version
+      AND encode(digest(p.system_prompt,'sha256'),'hex')=NEW.prompt_sha256
   ) THEN
     RAISE EXCEPTION 'AI run prompt snapshot must match the referenced prompt version' USING ERRCODE = '23514';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM ai_models m WHERE m.id=NEW.model_id AND m.provider_id=NEW.provider_id
       AND m.upstream_model_id=NEW.upstream_model_id AND m.modality=NEW.modality
+      AND m.context_window_tokens=NEW.context_window_tokens
+      AND m.max_output_tokens=NEW.max_output_tokens
+      AND m.image_quota_tokens=NEW.image_quota_tokens
+      AND m.input_price_micro_usd_per_million_tokens=NEW.input_price_micro_usd_per_million_tokens
+      AND m.output_price_micro_usd_per_million_tokens=NEW.output_price_micro_usd_per_million_tokens
+      AND m.connect_timeout_ms=NEW.connect_timeout_ms
+      AND m.response_header_timeout_ms=NEW.response_header_timeout_ms
+      AND m.idle_stream_timeout_ms=NEW.idle_stream_timeout_ms
+      AND m.total_timeout_ms=NEW.total_timeout_ms
   ) THEN
     RAISE EXCEPTION 'AI run model snapshot must match its provider and model' USING ERRCODE = '23514';
   END IF;
@@ -243,6 +302,23 @@ $$ LANGUAGE plpgsql;
 -- +goose StatementEnd
 CREATE TRIGGER ai_runs_insert_integrity BEFORE INSERT ON ai_runs
 FOR EACH ROW EXECUTE FUNCTION enforce_ai_run_integrity();
+
+-- +goose StatementBegin
+CREATE FUNCTION enforce_ai_usage_ledger_integrity() RETURNS trigger AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM ai_runs r WHERE r.id=NEW.run_id AND r.student_id=NEW.student_id
+      AND ((NEW.period_kind='day' AND NEW.period_key=r.quota_day_key)
+        OR (NEW.period_kind='month' AND NEW.period_key=r.quota_month_key))
+  ) THEN
+    RAISE EXCEPTION 'AI usage ledger must use the run student and reserved quota period' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+CREATE TRIGGER ai_usage_ledger_integrity BEFORE INSERT ON ai_usage_ledger
+FOR EACH ROW EXECUTE FUNCTION enforce_ai_usage_ledger_integrity();
 
 -- +goose StatementBegin
 CREATE FUNCTION enforce_ai_run_transition() RETURNS trigger AS $$
@@ -372,10 +448,15 @@ ALTER TABLE upload_sessions DROP CONSTRAINT upload_sessions_purpose_check;
 ALTER TABLE upload_sessions ADD CONSTRAINT upload_sessions_purpose_check
   CHECK (purpose IN ('teaching','qa_attachment'));
 
-DROP TRIGGER ai_runs_transition ON ai_runs;
-DROP FUNCTION enforce_ai_run_transition();
+DROP TRIGGER IF EXISTS ai_runs_transition ON ai_runs;
+DROP FUNCTION IF EXISTS enforce_ai_run_transition();
+DROP TRIGGER IF EXISTS ai_usage_ledger_integrity ON ai_usage_ledger;
+DROP FUNCTION IF EXISTS enforce_ai_usage_ledger_integrity();
 DROP TRIGGER ai_runs_insert_integrity ON ai_runs;
 DROP FUNCTION enforce_ai_run_integrity();
+DROP TRIGGER IF EXISTS ai_messages_final_assistant_message ON ai_messages;
+DROP TRIGGER IF EXISTS ai_runs_final_assistant_message ON ai_runs;
+DROP FUNCTION IF EXISTS enforce_ai_run_final_assistant_message();
 DROP TRIGGER ai_message_files_integrity ON ai_message_files;
 DROP FUNCTION enforce_ai_message_file_integrity();
 DROP TRIGGER ai_messages_integrity ON ai_messages;
