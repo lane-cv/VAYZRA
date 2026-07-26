@@ -1,5 +1,4 @@
 import { createRouter, createWebHistory, type RouterHistory, type RouteRecordRaw } from 'vue-router'
-import { defineComponent, h } from 'vue'
 import ConsoleLayout from '../layouts/ConsoleLayout.vue'
 import LoginView from '../features/auth/LoginView.vue'
 import ChangePasswordView from '../features/auth/ChangePasswordView.vue'
@@ -17,18 +16,11 @@ import TeacherQuestionDetailView from '../features/questions/TeacherQuestionDeta
 import TeacherQuestionWorkspaceView from '../features/questions/TeacherQuestionWorkspaceView.vue'
 import TeacherQuestionPlaceholder from '../features/questions/TeacherQuestionPlaceholder.vue'
 import NotificationCenterView from '../features/notifications/NotificationCenterView.vue'
+import AIQuestionDetailView from '../features/ai/AIQuestionDetailView.vue'
 import { useSessionStore } from '../stores/session'
 import type { Role } from '../api/client'
 
 declare module 'vue-router' { interface RouteMeta { requiresAuth?: boolean; roles?: Role[]; allowDuringPasswordChange?: boolean } }
-
-const AIQuestionPlaceholder = defineComponent({
-  name: 'AIQuestionPlaceholder',
-  setup: () => () => h('section', { 'aria-labelledby': 'ai-question-title' }, [
-    h('h1', { id: 'ai-question-title' }, 'AI 答疑'),
-    h('p', 'AI 会话详情正在准备中。'),
-  ]),
-})
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/login' },
@@ -41,7 +33,7 @@ const routes: RouteRecordRaw[] = [
     { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true },
     { path: 'questions', name: 'student-questions', component: StudentQuestionListView },
     { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
-    { path: 'questions/ai/:threadId', name: 'student-ai-question-detail', component: AIQuestionPlaceholder, props: true },
+    { path: 'questions/ai/:threadId', name: 'student-ai-question-detail', component: AIQuestionDetailView, props: true },
     {
       path: 'questions/teacher/:threadId',
       name: 'student-teacher-question-detail',

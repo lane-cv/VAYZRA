@@ -20,6 +20,14 @@ describe('renderMarkdown', () => {
     const html = renderMarkdown('[资料](https://example.com/reference)')
     expect(html).toContain('rel="noopener noreferrer"')
     expect(html).toContain('referrerpolicy="no-referrer"')
+    expect(html).not.toContain('target=')
+  })
+
+  it('uses a narrow final-answer whitelist without images or unsafe external attributes', () => {
+    const html = renderMarkdown('<img src="https://example.com/x" style="display:none" onerror="alert(1)">\n\n[资料](https://example.com)')
+    expect(html).not.toContain('<img')
+    expect(html).not.toContain('style=')
+    expect(html).not.toContain('onerror')
   })
 
   it('rejects oversized source before parsing', () => {

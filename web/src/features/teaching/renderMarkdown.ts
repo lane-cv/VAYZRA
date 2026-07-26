@@ -74,8 +74,9 @@ export function renderMarkdown(source: string): string {
   const rendered = markdown.render(normalized)
   const sanitized = DOMPurify.sanitize(rendered, {
     USE_PROFILES: { html: true, mathMl: true, svg: true },
-    ADD_ATTR: ['aria-hidden', 'referrerpolicy', 'target'],
-    FORBID_TAGS: ['form', 'iframe', 'object', 'embed', 'style'],
+    ADD_ATTR: ['aria-hidden', 'referrerpolicy'],
+    FORBID_TAGS: ['form', 'iframe', 'object', 'embed', 'style', 'img', 'audio', 'video', 'source'],
+    FORBID_ATTR: ['style', 'target', 'src', 'srcset', 'onerror', 'onclick', 'onload'],
   })
   return hardenLinks(sanitized)
 }

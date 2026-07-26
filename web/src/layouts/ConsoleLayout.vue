@@ -4,9 +4,11 @@ import { useRoute, useRouter } from 'vue-router'
 import { request } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import { useNotificationStore } from '../stores/notifications'
+import { useAIRunStore } from '../stores/aiRuns'
 
 const session = useSessionStore()
 const notifications = useNotificationStore()
+const aiRuns = useAIRunStore()
 const router = useRouter()
 const route = useRoute()
 const drawerOpen = ref(false)
@@ -20,12 +22,15 @@ function closeDrawer(restoreFocus = false) { drawerOpen.value = false; if (resto
 function openDrawer() { drawerOpen.value = true; void nextTick(() => navigation.value?.querySelector<HTMLElement>('a, button')?.focus()) }
 function handleKeydown(event: KeyboardEvent) { if (event.key === 'Escape' && drawerOpen.value) closeDrawer(true) }
 function updateViewport(event: MediaQueryListEvent) { isMobile.value = event.matches; if (!event.matches) drawerOpen.value = false }
-async function logout() { if (logoutPending.value) return; logoutPending.value = true; notifications.stop(); try { await request('/auth/logout', { method: 'POST' }) } catch { /* The server session may already be expired. */ } finally { session.clear(); closeDrawer(); logoutPending.value = false; await router.replace('/login') } }
+async function logout() { if (logoutPending.value) return; logoutPending.value = true; notifications.stop(); try { await request('/auth/logout', { method: 'POST' }) } catch { /* The server session may already be expired. */ } finally { aiRuns.clearAll(); session.clear(); closeDrawer(); logoutPending.value = false; await router.replace('/login') } }
 async function logoutOthers() { try { await request('/auth/logout-others', { method: 'POST' }) } catch { /* The current session remains usable; no secret is displayed. */ } }
 onMounted(() => { document.addEventListener('keydown', handleKeydown); mediaQuery?.addEventListener('change', updateViewport) })
-onBeforeUnmount(() => { notifications.stop(); document.removeEventListener('keydown', handleKeydown); mediaQuery?.removeEventListener('change', updateViewport) })
+onBeforeUnmount(() => { notifications.stop(); aiRuns.clearAll(); document.removeEventListener('keydown', handleKeydown); mediaQuery?.removeEventListener('change', updateViewport) })
 watch(() => route.fullPath, () => closeDrawer())
 watch(() => session.user?.id, (userId) => { if (userId) notifications.start(userId); else notifications.stop() }, { immediate: true })
+watch(() => session.user?.id, (userId, previousUserId) => {
+  if (previousUserId && userId !== previousUserId) aiRuns.clearAll()
+}, { flush: 'pre' })
 </script>
 
 <template>

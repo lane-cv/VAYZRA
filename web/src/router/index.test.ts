@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { createAppRouter } from './index'
 import { useSessionStore } from '../stores/session'
+import AIQuestionDetailView from '../features/ai/AIQuestionDetailView.vue'
 describe('console router guards', () => {
   beforeEach(() => setActivePinia(createPinia()))
   it('forces first-login students to change password', async () => {
@@ -20,7 +21,7 @@ describe('console router guards', () => {
     await router.push('/student/questions/new'); expect(router.currentRoute.value.name).toBe('student-question-new')
     await router.push('/student/questions/ai/11111111-1111-4111-8111-111111111111'); expect(router.currentRoute.value.name).toBe('student-ai-question-detail')
     const matched = router.currentRoute.value.matched
-    expect((matched[matched.length - 1]?.components?.default as { name?: string }).name).toBe('AIQuestionPlaceholder')
+    expect(matched[matched.length - 1]?.components?.default).toBe(AIQuestionDetailView)
     await router.push('/student/questions/teacher/22222222-2222-4222-8222-222222222222'); expect(router.currentRoute.value.name).toBe('student-teacher-question-detail')
     await router.push('/student/questions/teacher/not-a-uuid'); expect(router.currentRoute.value.name).toBe('student-questions')
     await router.push('/student/questions/33333333-3333-4333-8333-333333333333'); expect(router.currentRoute.value.fullPath).toBe('/student/questions/teacher/33333333-3333-4333-8333-333333333333')
