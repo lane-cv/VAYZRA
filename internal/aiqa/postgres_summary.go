@@ -37,7 +37,7 @@ WITH unified AS (
   WHERE q.student_id=$1
   UNION ALL
   SELECT a.id,'ai'::text AS channel,a.title,
-         COALESCE((SELECT r.status FROM ai_runs r WHERE r.thread_id=a.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1),'idle') AS raw_status,
+         COALESCE((SELECT r.status FROM ai_runs r WHERE r.thread_id=a.id ORDER BY r.attempt_no DESC,r.created_at DESC,r.id DESC LIMIT 1),'idle') AS raw_status,
          a.last_message_at,a.created_at
   FROM ai_threads a
   JOIN users u ON u.id=a.student_id AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL

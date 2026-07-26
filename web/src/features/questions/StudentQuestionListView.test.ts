@@ -20,18 +20,19 @@ function mountList(query: Record<string, unknown> = {}) {
   const replace = vi.fn(async (target: { query: Record<string, unknown> }) => {
     route.query = target.query
   })
+  const push = vi.fn(async () => undefined)
   const wrapper = mount(StudentQuestionListView, {
     global: {
       provide: {
         [routeLocationKey as symbol]: route,
-        [routerKey as symbol]: { replace },
+        [routerKey as symbol]: { replace, push },
       },
       stubs: {
         RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' },
       },
     },
   })
-  return { wrapper, route, replace }
+  return { wrapper, route, replace, push }
 }
 
 describe('StudentQuestionListView', () => {
@@ -51,10 +52,10 @@ describe('StudentQuestionListView', () => {
     expect(entries.map((entry) => entry.get('strong').text())).toEqual(['函数题', '受力分析'])
     expect(entries[0].text()).toContain('AI')
     expect(entries[0].text()).toContain('生成中')
-    expect(entries[0].get('a').attributes('href')).toBe('/student/questions/ai/a1')
+    expect(entries[0].get('a').attributes('href')).toBe('/student/questions/ai/a1?focus=ai%3Aa1')
     expect(entries[1].text()).toContain('老师')
     expect(entries[1].text()).toContain('等待我回复')
-    expect(entries[1].get('a').attributes('href')).toBe('/student/questions/teacher/t1')
+    expect(entries[1].get('a').attributes('href')).toBe('/student/questions/teacher/t1?focus=teacher%3At1')
     expect(wrapper.text()).not.toContain('消息正文')
     expect(wrapper.text()).not.toContain('老师备注')
   })
@@ -130,16 +131,86 @@ describe('StudentQuestionListView', () => {
     expect(wrapper.findAll('li a').every((link) => link.element.tagName === 'A')).toBe(true)
   })
 
-  it('restores an opaque cursor from the route without persisting student data', async () => {
-    api.list.mockResolvedValue({ items: [mixed[1]], nextCursor: undefined })
-    mountList({ channel: 'teacher', cursor: 'same-time:teacher:t1', body: 'must-not-survive' })
+  it('rebuilds every page through the route cursor on remount without persisting student data', async () => {
+    const last = { ...mixed[0], id: 'a2', title: '第二页 AI 问题' }
+    api.list
+      .mockResolvedValueOnce({ items: [mixed[1]], nextCursor: 'same-time:teacher:t1' })
+      .mockResolvedValueOnce({ items: [last], nextCursor: 'third-page' })
+    const { wrapper } = mountList({ channel: 'teacher', cursor: 'same-time:teacher:t1', body: 'must-not-survive' })
     await flushPromises()
-    expect(api.list).toHaveBeenCalledWith({
-      channel: 'teacher',
-      search: undefined,
-      cursor: 'same-time:teacher:t1',
-      limit: 20,
-    }, expect.any(AbortSignal))
+    expect(api.list.mock.calls.map((call) => call[0])).toEqual([
+      { channel: 'teacher', search: undefined, limit: 20 },
+      { channel: 'teacher', search: undefined, cursor: 'same-time:teacher:t1', limit: 20 },
+    ])
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual([
+      '受力分析',
+      '第二页 AI 问题',
+    ])
+    expect(wrapper.find('button[aria-label="加载更多问答"]').exists()).toBe(true)
+  })
+
+  it('carries filters to both channel details and restores focus to the originating row after return', async () => {
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: 'page-two' })
+      .mockResolvedValueOnce({
+        items: [{ ...mixed[0], id: 'a2', title: '来源问题' }],
+        nextCursor: undefined,
+      })
+    const { wrapper, replace, push } = mountList({
+      channel: 'ai',
+      search: '函数',
+      cursor: 'page-two',
+      focus: 'ai:a2',
+    })
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+
+    const links = wrapper.findAll('li a')
+    expect(links[0].attributes('href')).toContain('/student/questions/ai/a1?')
+    expect(links[0].attributes('href')).toContain('channel=ai')
+    expect(links[0].attributes('href')).toContain('search=%E5%87%BD%E6%95%B0')
+    expect(links[1].attributes('href')).toContain('/student/questions/teacher/t1?')
+    const origin = links.find((link) => link.text().includes('来源问题'))
+    expect(origin).toBeDefined()
+    expect(document.activeElement).toBe(origin?.element)
+    await origin?.trigger('click')
+    expect(replace).toHaveBeenLastCalledWith({
+      query: { channel: 'ai', search: '函数', cursor: 'page-two', focus: 'ai:a2' },
+    })
+    expect(push).toHaveBeenLastCalledWith(expect.stringContaining('/student/questions/ai/a2?'))
+    wrapper.unmount()
+  })
+
+  it('continues rebuilding through the saved cursor after an intermediate page retry', async () => {
+    const pageTwo = { ...mixed[0], id: 'a2', title: '恢复中的第二页' }
+    const origin = { ...mixed[1], id: 't3', title: '恢复焦点来源' }
+    api.list
+      .mockResolvedValueOnce({ items: [mixed[0]], nextCursor: 'cursor-one' })
+      .mockRejectedValueOnce(Object.assign(new Error('中间页失败'), { requestId: 'req-restore' }))
+      .mockResolvedValueOnce({ items: [pageTwo], nextCursor: 'cursor-two' })
+      .mockResolvedValueOnce({ items: [origin], nextCursor: undefined })
+    const { wrapper } = mountList({ cursor: 'cursor-two', focus: 'teacher:t3' })
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('req-restore')
+    await wrapper.get('[aria-label="重试加载更多问答"]').trigger('click')
+    await flushPromises()
+
+    expect(api.list.mock.calls.map((call) => call[0])).toEqual([
+      { channel: undefined, search: undefined, limit: 20 },
+      { channel: undefined, search: undefined, cursor: 'cursor-one', limit: 20 },
+      { channel: undefined, search: undefined, cursor: 'cursor-one', limit: 20 },
+      { channel: undefined, search: undefined, cursor: 'cursor-two', limit: 20 },
+    ])
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual([
+      '函数题',
+      '恢复中的第二页',
+      '恢复焦点来源',
+    ])
+    const focused = wrapper.find('[data-question-key="teacher:t3"]')
+    expect(document.activeElement).toBe(focused.element)
+    wrapper.unmount()
   })
 
   it.each([

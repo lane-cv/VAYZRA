@@ -6,7 +6,10 @@ import QuestionAttachmentUploader from './QuestionAttachmentUploader.vue'
 import QuestionTimeline from './QuestionTimeline.vue'
 import { addStudentMessage, getStudentQuestion, listStudentMessages, newIdempotencyKey } from './studentApi'
 import type { AttachmentInput, QuestionDetail, QuestionMessage, QuestionStatus } from './types'
-const props = withDefaults(defineProps<{ questionId: string; userId?: string }>(), { userId: '' })
+const props = withDefaults(defineProps<{ questionId: string; userId?: string; backTo?: string }>(), {
+  userId: '',
+  backTo: '/student/questions',
+})
 const session = props.userId ? undefined : useSessionStore(), detail = ref<QuestionDetail>(), loading = ref(false), error = ref(''), requestId = ref(''), reply = ref(''), attachments = ref<AttachmentInput[]>([]), uploadsPending = ref(false), submitting = ref(false), errorBox = ref<HTMLElement>(), uploaderKey = ref(0)
 let controller: AbortController | undefined, moreController: AbortController | undefined, generation = 0, mutationKey = '', mutationFingerprint = ''
 const labels: Record<QuestionStatus,string> = { pending:'待老师处理', in_progress:'老师处理中', waiting_student:'等待我回复', completed:'已完成' }
@@ -42,7 +45,7 @@ onMounted(()=>void load());watch(()=>props.questionId,()=>{resetThread();void lo
 </script>
 <template>
   <section class="detail" aria-labelledby="question-title">
-    <RouterLink to="/student/questions">← 返回我的问题</RouterLink>
+    <RouterLink :to="backTo">← 返回我的问题</RouterLink>
     <p v-if="loading && !detail" role="status">正在加载问题…</p>
     <div v-else-if="error && !detail" role="alert"><p>{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p><button type="button" aria-label="重试加载问题" @click="load">重试</button></div>
     <template v-else-if="detail">

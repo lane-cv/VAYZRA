@@ -29,6 +29,27 @@ describe('console router guards', () => {
     await router.push('/student/questions/not-a-uuid'); expect(router.currentRoute.value.name).toBe('student-questions')
     session.user = { id: 'a1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }; await router.push('/student/questions/new'); expect(router.currentRoute.value.fullPath).toBe('/admin')
   })
+  it('gives AI and teacher details the same filtered list return target', async () => {
+    const session = useSessionStore()
+    session.bootstrapStatus = 'ready'
+    session.user = { id: 'u1', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }
+    const router = createAppRouter()
+    const query = '?channel=ai&search=%E5%87%BD%E6%95%B0&cursor=opaque&focus=ai%3Aorigin&ignored=secret'
+    for (const path of [
+      `/student/questions/ai/11111111-1111-4111-8111-111111111111${query}`,
+      `/student/questions/teacher/22222222-2222-4222-8222-222222222222${query}`,
+    ]) {
+      await router.push(path)
+      const matched = router.currentRoute.value.matched
+      const record = matched[matched.length - 1]
+      const props = typeof record?.props.default === 'function'
+        ? record.props.default(router.currentRoute.value)
+        : record?.props.default
+      expect(props).toMatchObject({
+        backTo: '/student/questions?channel=ai&search=%E5%87%BD%E6%95%B0&cursor=opaque&focus=ai%3Aorigin',
+      })
+    }
+  })
   it('preserves admin question routes while canonicalizing only student detail UUIDs', async () => {
     const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'u1', username: 'student01', displayName: '林同学', role: 'student', mustChangePassword: false }
     const router = createAppRouter()

@@ -35,12 +35,23 @@ const routes: RouteRecordRaw[] = [
     { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true },
     { path: 'questions', name: 'student-questions', component: StudentQuestionListView },
     { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
-    { path: 'questions/ai/:threadId', name: 'student-ai-question-detail', component: AIQuestionDetailView, props: true },
+    {
+      path: 'questions/ai/:threadId',
+      name: 'student-ai-question-detail',
+      component: AIQuestionDetailView,
+      props: (route) => ({
+        threadId: route.params.threadId,
+        backTo: studentQuestionListReturnPath(route.query),
+      }),
+    },
     {
       path: 'questions/teacher/:threadId',
       name: 'student-teacher-question-detail',
       component: StudentQuestionDetailView,
-      props: (route) => ({ questionId: route.params.threadId }),
+      props: (route) => ({
+        questionId: route.params.threadId,
+        backTo: studentQuestionListReturnPath(route.query),
+      }),
     },
     {
       path: 'questions/:questionId',
@@ -56,6 +67,15 @@ const routes: RouteRecordRaw[] = [
 
 const homeFor = (role: Role) => role === 'admin' ? '/admin' : '/student'
 const canonicalUUID = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+
+function studentQuestionListReturnPath(query: Record<string, unknown>): string {
+  const safe = new URLSearchParams()
+  for (const key of ['channel', 'search', 'cursor', 'focus']) {
+    const value = query[key]
+    if (typeof value === 'string' && value) safe.set(key, value)
+  }
+  return `/student/questions${safe.size ? `?${safe.toString()}` : ''}`
+}
 
 export function createAppRouter(history: RouterHistory = createWebHistory()) {
   const router = createRouter({ history, routes })

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { APIError } from '../../api/client'
 import { listQuestionSummaries, parseSummaryChannel } from './summaryApi'
@@ -9,6 +9,10 @@ const route = useRoute()
 const router = useRouter()
 const initialSearch = typeof route.query.search === 'string' ? route.query.search.slice(0, 160) : ''
 const initialCursor = typeof route.query.cursor === 'string' && route.query.cursor ? route.query.cursor : undefined
+const initialFocus = typeof route.query.focus === 'string' && /^(ai|teacher):[a-zA-Z0-9-]+$/.test(route.query.focus)
+  ? route.query.focus
+  : ''
+const listRoot = ref<HTMLElement>()
 const items = ref<QuestionSummary[]>([])
 const channel = ref<QuestionSummaryChannel | ''>(parseSummaryChannel(route.query.channel))
 const search = ref(initialSearch)
@@ -23,6 +27,8 @@ const retryCursor = ref<string>()
 let controller: AbortController | undefined
 let generation = 0
 let searchTimer: ReturnType<typeof setTimeout> | undefined
+let loadedThroughCursor: string | undefined
+let restoreTargetCursor = initialCursor
 
 const statusLabels: Record<QuestionSummaryChannel, Record<string, string>> = {
   ai: {
@@ -45,7 +51,18 @@ function statusLabel(item: QuestionSummary): string {
 }
 
 function detailPath(item: QuestionSummary): string {
-  return `/student/questions/${item.channel}/${encodeURIComponent(item.id)}`
+  const query = new URLSearchParams(canonicalQuery())
+  query.set('focus', `${item.channel}:${item.id}`)
+  return `/student/questions/${item.channel}/${encodeURIComponent(item.id)}?${query.toString()}`
+}
+
+async function openDetail(event: MouseEvent, item: QuestionSummary): Promise<void> {
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+  event.preventDefault()
+  const query = canonicalQuery()
+  query.focus = `${item.channel}:${item.id}`
+  await router.replace({ query })
+  await router.push(detailPath(item))
 }
 
 function canonicalQuery(): Record<string, string> {
@@ -82,7 +99,7 @@ function beginReplacement(): void {
   resetRequestFeedback()
 }
 
-async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> {
+async function load(cursor?: string, mode: LoadMode = 'replace', updateCursor = true): Promise<boolean> {
   if (mode === 'replace') beginReplacement()
   else {
     invalidateActiveRequest()
@@ -98,20 +115,22 @@ async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> 
       ...(cursor ? { cursor } : {}),
       limit: 20,
     }, requestController.signal)
-    if (current !== generation) return
+    if (current !== generation) return false
     if (mode === 'append') {
       const existing = new Set(items.value.map((item) => `${item.channel}:${item.id}`))
       items.value = [...items.value, ...page.items.filter((item) => !existing.has(`${item.channel}:${item.id}`))]
     } else {
       items.value = page.items
     }
+    loadedThroughCursor = mode === 'append' ? cursor : undefined
     nextCursor.value = page.nextCursor
-    if (cursor) {
+    if (cursor && updateCursor) {
       activeCursor.value = cursor
       await updateQuery()
     }
+    return true
   } catch (cause) {
-    if (requestController.signal.aborted || current !== generation) return
+    if (requestController.signal.aborted || current !== generation) return false
     error.value = cause instanceof Error ? cause.message : '加载失败'
     errorMode.value = mode
     retryCursor.value = cursor
@@ -120,16 +139,60 @@ async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> 
       : typeof cause === 'object' && cause && 'requestId' in cause
         ? String(cause.requestId)
         : ''
+    return false
   } finally {
     if (current === generation) loading.value = false
   }
 }
 
 function retry(): void {
-  void load(retryCursor.value, errorMode.value === 'append' ? 'append' : 'replace')
+  const mode = errorMode.value === 'append' ? 'append' : 'replace'
+  const cursor = retryCursor.value
+  void (async () => {
+    const loaded = await load(cursor, mode, !restoreTargetCursor)
+    if (loaded && restoreTargetCursor) await continueRestore()
+  })()
+}
+
+async function restoreThrough(cursor?: string): Promise<void> {
+  const firstLoaded = await load(undefined, 'replace', false)
+  if (!firstLoaded) return
+  if (!cursor) {
+    restoreTargetCursor = undefined
+    await restoreOriginFocus()
+    return
+  }
+  await continueRestore()
+}
+
+async function continueRestore(): Promise<void> {
+  const target = restoreTargetCursor
+  if (!target) return
+  let pageCursor = nextCursor.value
+  const seen = new Set<string>()
+  while (pageCursor && loadedThroughCursor !== target) {
+    if (seen.has(pageCursor)) break
+    seen.add(pageCursor)
+    const loaded = await load(pageCursor, 'append', false)
+    if (!loaded) return
+    pageCursor = nextCursor.value
+  }
+  activeCursor.value = loadedThroughCursor === target ? target : undefined
+  restoreTargetCursor = undefined
+  await updateQuery()
+  await restoreOriginFocus()
+}
+
+async function restoreOriginFocus(): Promise<void> {
+  if (!initialFocus) return
+  await nextTick()
+  const link = [...(listRoot.value?.querySelectorAll<HTMLElement>('[data-question-key]') ?? [])]
+    .find((candidate) => candidate.dataset.questionKey === initialFocus)
+  link?.focus()
 }
 
 async function changeChannel(): Promise<void> {
+  restoreTargetCursor = undefined
   activeCursor.value = undefined
   beginReplacement()
   await updateQuery()
@@ -140,6 +203,7 @@ function changeSearch(): void {
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => {
     void (async () => {
+      restoreTargetCursor = undefined
       activeCursor.value = undefined
       beginReplacement()
       await updateQuery()
@@ -148,7 +212,7 @@ function changeSearch(): void {
   }, 300)
 }
 
-onMounted(() => void load(activeCursor.value))
+onMounted(() => void restoreThrough(activeCursor.value))
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
   controller?.abort()
@@ -156,7 +220,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="questions" aria-labelledby="questions-title">
+  <section ref="listRoot" class="questions" aria-labelledby="questions-title">
     <header>
       <div>
         <p class="eyebrow">答疑中心</p>
@@ -193,12 +257,16 @@ onBeforeUnmount(() => {
     <p v-else-if="!items.length" class="empty">还没有符合条件的问题。</p>
     <ul v-else>
       <li v-for="item in items" :key="`${item.channel}:${item.id}`">
-        <RouterLink :to="detailPath(item)">
+        <a
+          :href="detailPath(item)"
+          :data-question-key="`${item.channel}:${item.id}`"
+          @click="openDetail($event, item)"
+        >
           <strong>{{ item.title }}</strong>
           <span class="channel-badge">{{ item.channel === 'ai' ? 'AI' : '老师' }}</span>
           <span>{{ statusLabel(item) }}</span>
           <time :datetime="item.lastMessageAt">最近更新 {{ new Date(item.lastMessageAt).toLocaleString('zh-CN') }}</time>
-        </RouterLink>
+        </a>
       </li>
     </ul>
     <div v-if="error && errorMode === 'append' && items.length" role="alert">

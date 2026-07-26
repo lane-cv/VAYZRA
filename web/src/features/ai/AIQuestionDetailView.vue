@@ -16,7 +16,10 @@ import {
 } from './studentApi'
 import type { AIThreadDetail, AIRun } from './types'
 
-const props = withDefaults(defineProps<{ threadId: string; userId?: string }>(), { userId: '' })
+const props = withDefaults(defineProps<{ threadId: string; userId?: string; backTo?: string }>(), {
+  userId: '',
+  backTo: '/student/questions',
+})
 const session = props.userId ? undefined : useSessionStore()
 const aiRuns = useAIRunStore()
 const detail = ref<AIThreadDetail>()
@@ -24,7 +27,11 @@ const loading = ref(false)
 const actionPending = ref(false)
 const error = ref('')
 const requestId = ref('')
+const refreshError = ref('')
+const refreshRequestId = ref('')
+const refreshPending = ref(false)
 const errorBox = ref<HTMLElement>()
+const refreshErrorBox = ref<HTMLElement>()
 const followup = ref('')
 const attachments = ref<AttachmentInput[]>([])
 const uploadsPending = ref(false)
@@ -35,7 +42,8 @@ let generation = 0
 let retryKey = ''
 let followupKey = ''
 let followupFingerprint = ''
-let refreshedRunId = ''
+let authoritativeRunId = ''
+let refreshingRunId = ''
 
 const subjectLabel = computed(() => detail.value?.thread.subject === 'physics' ? '物理' : '数学')
 const currentRun = computed<AIRun | undefined>(() => {
@@ -46,9 +54,10 @@ const currentRun = computed<AIRun | undefined>(() => {
 })
 const streamingText = computed(() => {
   const run = currentRun.value
-  return run?.status === 'queued' || run?.status === 'streaming'
-    ? aiRuns.runs[run.id]?.text ?? ''
-    : ''
+  if (!run) return ''
+  const text = aiRuns.runs[run.id]?.text ?? ''
+  if (run.status === 'queued' || run.status === 'streaming') return text
+  return run.status === 'succeeded' && authoritativeRunId !== run.id ? text : ''
 })
 const streamRequestId = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.requestId ?? '' : '')
 const streamErrorCode = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.subscriptionErrorCode ?? '' : '')
@@ -78,8 +87,42 @@ function reset(): void {
   retryKey = ''
   followupKey = ''
   followupFingerprint = ''
-  refreshedRunId = ''
+  authoritativeRunId = ''
+  refreshingRunId = ''
+  refreshError.value = ''
+  refreshRequestId.value = ''
+  refreshPending.value = false
   uploaderKey.value += 1
+}
+
+function mergeMessages(first: AIThreadDetail['messages'], second: AIThreadDetail['messages']): AIThreadDetail['messages'] {
+  const byID = new Map(first.map((message) => [message.id, message]))
+  for (const message of second) {
+    if (!byID.has(message.id)) byID.set(message.id, message)
+  }
+  return [...byID.values()]
+}
+
+async function fetchCompleteThread(
+  id: string,
+  controller: AbortController,
+  token: number,
+): Promise<AIThreadDetail> {
+  let result = await getAIThread(id, { limit: 100 }, controller.signal)
+  let messages = result.messages
+  const seenCursors = new Set<string>()
+  while (result.nextMessageCursor) {
+    if (controller.signal.aborted || !isCurrent(token, id)) throw controller.signal.reason
+    const cursor = result.nextMessageCursor
+    if (seenCursors.has(cursor)) {
+      throw new APIError(0, 'invalid_response', '消息分页响应异常，请稍后重试', '')
+    }
+    seenCursors.add(cursor)
+    const page = await getAIThread(id, { cursor, limit: 100 }, controller.signal)
+    messages = mergeMessages(messages, page.messages)
+    result = { ...result, activeRun: page.activeRun ?? result.activeRun, messages, nextMessageCursor: page.nextMessageCursor }
+  }
+  return { ...result, messages, nextMessageCursor: undefined }
 }
 
 async function load(): Promise<void> {
@@ -92,10 +135,11 @@ async function load(): Promise<void> {
   error.value = ''
   requestId.value = ''
   try {
-    const result = await getAIThread(id, {}, controller.signal)
+    const result = await fetchCompleteThread(id, controller, token)
     if (!isCurrent(token, id)) return
     stopCurrentSubscription()
     detail.value = result
+    authoritativeRunId = result.activeRun?.status === 'succeeded' ? result.activeRun.id : ''
     beginActiveRun(result.activeRun)
   } catch (cause) {
     if (controller.signal.aborted || !isCurrent(token, id)) return
@@ -122,17 +166,34 @@ function reconnect(): void {
 }
 
 async function refreshAfterSuccess(runId: string): Promise<void> {
-  if (refreshedRunId === runId) return
-  refreshedRunId = runId
+  if (authoritativeRunId === runId || refreshingRunId === runId) return
+  refreshingRunId = runId
+  refreshPending.value = true
+  refreshError.value = ''
+  refreshRequestId.value = ''
   const token = generation
   const id = props.threadId
   const controller = new AbortController()
   loadController = controller
   try {
-    const result = await getAIThread(id, {}, controller.signal)
-    if (isCurrent(token, id)) detail.value = result
-  } catch {
-    // The completed answer remains available on a normal manual reload.
+    const result = await fetchCompleteThread(id, controller, token)
+    if (isCurrent(token, id) && currentRun.value?.id === runId) {
+      if (!result.messages.some((message) => message.role === 'assistant' && message.runId === runId)) {
+        throw new APIError(0, 'invalid_response', '完整回答尚未同步，请稍后重试', '')
+      }
+      detail.value = result
+      authoritativeRunId = runId
+    }
+  } catch (cause) {
+    if (!controller.signal.aborted && isCurrent(token, id) && currentRun.value?.id === runId) {
+      refreshError.value = cause instanceof Error ? cause.message : '暂时无法确认完整回答'
+      refreshRequestId.value = cause instanceof APIError ? cause.requestId : ''
+      await nextTick()
+      refreshErrorBox.value?.focus()
+    }
+  } finally {
+    if (refreshingRunId === runId) refreshingRunId = ''
+    if (isCurrent(token, id)) refreshPending.value = false
   }
 }
 
@@ -179,6 +240,9 @@ async function retry(): Promise<void> {
       ...(mutation.message ? { messages: [...detail.value.messages, mutation.message] } : {}),
       activeRun: mutation.run,
     }
+    authoritativeRunId = ''
+    refreshError.value = ''
+    refreshRequestId.value = ''
     beginActiveRun(mutation.run)
   } catch (cause) {
     if (!controller.signal.aborted) {
@@ -228,6 +292,9 @@ async function submitFollowup(): Promise<void> {
       ...(mutation.message ? { messages: [...detail.value.messages, mutation.message] } : {}),
       activeRun: mutation.run,
     }
+    authoritativeRunId = ''
+    refreshError.value = ''
+    refreshRequestId.value = ''
     followup.value = ''
     attachments.value = []
     followupKey = ''
@@ -272,7 +339,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="detail" aria-labelledby="ai-question-title">
-    <RouterLink to="/student/questions">← 返回答疑中心</RouterLink>
+    <RouterLink :to="backTo">← 返回答疑中心</RouterLink>
     <p v-if="loading && !detail" role="status">正在加载 AI 问题…</p>
     <div v-else-if="error && !detail" ref="errorBox" role="alert" tabindex="-1">
       <p>{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
@@ -293,6 +360,23 @@ onBeforeUnmount(() => {
         @reconnect="reconnect"
       />
       <AIMessageTimeline :messages="detail.messages" :streaming-text="streamingText" />
+      <div
+        v-if="refreshError"
+        ref="refreshErrorBox"
+        data-testid="answer-refresh-error"
+        role="alert"
+        tabindex="-1"
+      >
+        <p>{{ refreshError }}<span v-if="refreshRequestId">（支持编号：{{ refreshRequestId }}）</span></p>
+        <button
+          type="button"
+          aria-label="重试确认完整回答"
+          :disabled="refreshPending"
+          @click="currentRun && refreshAfterSuccess(currentRun.id)"
+        >
+          {{ refreshPending ? '正在确认…' : '重试' }}
+        </button>
+      </div>
       <section class="followup" aria-labelledby="ai-followup-title">
         <h2 id="ai-followup-title">继续追问</h2>
         <form @submit.prevent="submitFollowup">
