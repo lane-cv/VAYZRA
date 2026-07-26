@@ -38,6 +38,13 @@ func TestWorkerReadinessRequiresEveryDependency(t *testing.T) {
 	}
 }
 
+func TestRequiredCommandsIncludePDFTextExtractor(t *testing.T) {
+	args, ok := requiredCommands["pdftotext"]
+	if !ok || len(args) == 0 {
+		t.Fatalf("pdftotext readiness command=%v present=%t", args, ok)
+	}
+}
+
 func TestPathOnTmpfsUsesMostSpecificMount(t *testing.T) {
 	mountInfo := "1 0 0:1 / / rw - ext4 disk rw\n2 1 0:2 / /work rw - tmpfs tmpfs rw\n3 2 0:3 / /work/disk rw - ext4 disk rw\n"
 	if !pathOnTmpfs("/work/jobs", strings.NewReader(mountInfo)) {

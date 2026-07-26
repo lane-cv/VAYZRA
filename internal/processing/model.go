@@ -40,6 +40,7 @@ type Result struct {
 	VideoWidth      *int
 	VideoHeight     *int
 	Preview         *PreviewResult
+	AIText          *PreviewResult
 }
 
 type PreviewResult struct {
@@ -57,6 +58,7 @@ type SourceFile struct {
 	DeclaredMIME string
 	Size         int64
 	SHA256       string
+	Purpose      string
 }
 
 type Failure struct {

@@ -47,6 +47,7 @@ type UploadPurpose string
 const (
 	UploadPurposeTeaching UploadPurpose = "teaching"
 	UploadPurposeQA       UploadPurpose = "qa_attachment"
+	UploadPurposeAI       UploadPurpose = "ai_attachment"
 )
 
 const (

@@ -19,7 +19,7 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore { return &PostgresStore
 
 func (s *PostgresStore) LoadSource(ctx context.Context, id uuid.UUID) (SourceFile, error) {
 	var source SourceFile
-	err := s.pool.QueryRow(ctx, `SELECT id,object_key,display_name,declared_mime,size_bytes,sha256 FROM file_versions WHERE id=$1`, id).Scan(&source.VersionID, &source.ObjectKey, &source.DisplayName, &source.DeclaredMIME, &source.Size, &source.SHA256)
+	err := s.pool.QueryRow(ctx, `SELECT id,object_key,display_name,declared_mime,size_bytes,sha256,purpose FROM file_versions WHERE id=$1`, id).Scan(&source.VersionID, &source.ObjectKey, &source.DisplayName, &source.DeclaredMIME, &source.Size, &source.SHA256, &source.Purpose)
 	return source, err
 }
 
@@ -107,7 +107,8 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var versionID uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT file_version_id FROM file_processing_jobs WHERE id=$1 AND state='running' AND lease_owner=$2 AND lease_until>now() FOR UPDATE`, job.ID, job.LeaseOwner).Scan(&versionID); err != nil {
+	var purpose string
+	if err := tx.QueryRow(ctx, `SELECT j.file_version_id,fv.purpose FROM file_processing_jobs j JOIN file_versions fv ON fv.id=j.file_version_id WHERE j.id=$1 AND j.state='running' AND j.lease_owner=$2 AND j.lease_until>now() FOR UPDATE OF j,fv`, job.ID, job.LeaseOwner).Scan(&versionID, &purpose); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrLeaseLost
 		}
@@ -116,6 +117,16 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 	if versionID != job.FileVersionID {
 		return ErrLeaseLost
 	}
+	isImage := result.DetectedMIME == "image/jpeg" || result.DetectedMIME == "image/png" || result.DetectedMIME == "image/webp" || result.DetectedMIME == "image/gif"
+	isAIText := result.DetectedMIME == "application/pdf" ||
+		result.DetectedMIME == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+		result.DetectedMIME == "text/plain" || result.DetectedMIME == "text/markdown"
+	if purpose == "ai_attachment" && ((!isImage && !isAIText) || (isAIText && result.AIText == nil) || (isImage && result.AIText != nil)) {
+		return errors.New("invalid ai attachment completion")
+	}
+	if purpose != "ai_attachment" && result.AIText != nil {
+		return errors.New("unexpected ai text completion")
+	}
 	if _, err := tx.Exec(ctx, `UPDATE file_versions SET processing_state='ready',detected_mime=$2,scan_result=$3,browser_playable=$4,video_container=NULLIF($5,''),video_codec=NULLIF($6,''),video_duration_ms=$7,video_width=$8,video_height=$9,failure_category=NULL WHERE id=$1`, job.FileVersionID, result.DetectedMIME, result.ScanResult, result.BrowserPlayable, result.VideoContainer, result.VideoCodec, result.VideoDurationMS, result.VideoWidth, result.VideoHeight); err != nil {
 		return err
 	}
@@ -123,6 +134,15 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 		preview := result.Preview
 		if preview.Kind == "" || preview.ObjectKey == "" || preview.ContentType == "" || preview.Size < 1 || preview.SHA256 == "" {
 			return errors.New("invalid preview completion")
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,$2,$3,$4,$5,$6,'ready') ON CONFLICT(file_version_id,preview_kind) DO UPDATE SET object_key=EXCLUDED.object_key,content_type=EXCLUDED.content_type,size_bytes=EXCLUDED.size_bytes,sha256=EXCLUDED.sha256,processing_state='ready'`, job.FileVersionID, preview.Kind, preview.ObjectKey, preview.ContentType, preview.Size, preview.SHA256); err != nil {
+			return err
+		}
+	}
+	if result.AIText != nil {
+		preview := result.AIText
+		if preview.Kind != "ai_text" || preview.ObjectKey == "" || preview.ContentType != "text/plain; charset=utf-8" || preview.Size < 1 || preview.Size > MaxAITextBytes || preview.SHA256 == "" {
+			return errors.New("invalid ai text completion")
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO file_previews(file_version_id,preview_kind,object_key,content_type,size_bytes,sha256,processing_state) VALUES($1,$2,$3,$4,$5,$6,'ready') ON CONFLICT(file_version_id,preview_kind) DO UPDATE SET object_key=EXCLUDED.object_key,content_type=EXCLUDED.content_type,size_bytes=EXCLUDED.size_bytes,sha256=EXCLUDED.sha256,processing_state='ready'`, job.FileVersionID, preview.Kind, preview.ObjectKey, preview.ContentType, preview.Size, preview.SHA256); err != nil {
 			return err

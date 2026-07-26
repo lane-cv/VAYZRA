@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -95,6 +96,116 @@ func TestPipelineConvertsOfficeAndProbesVideoWithoutTranscoding(t *testing.T) {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	})
+}
+
+func TestPipelineAITextStoresPrivateNormalizedArtifact(t *testing.T) {
+	body := []byte("first\r\nsecond\r")
+	versionID := uuid.New()
+	source := SourceFile{
+		VersionID: versionID, Purpose: "ai_attachment", ObjectKey: "originals/never-expose",
+		DisplayName: "question.txt", DeclaredMIME: "text/plain", Size: int64(len(body)), SHA256: hashHex(body),
+	}
+	previews := &recordingBlobStore{}
+	result, err := (&Pipeline{
+		Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: previews,
+		Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+	}).Process(context.Background(), Job{FileVersionID: versionID, Kind: KindProcessFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AIText == nil || result.AIText.Kind != "ai_text" || result.AIText.ContentType != "text/plain; charset=utf-8" {
+		t.Fatalf("ai text=%+v", result.AIText)
+	}
+	artifact, ok := previews.puts["ai_text"]
+	if !ok || string(artifact.body) != "first\nsecond\n" || artifact.key == source.ObjectKey {
+		t.Fatalf("artifact=%+v", artifact)
+	}
+}
+
+func TestPipelineAITextExtractsOfficeConvertedPDFAndImagesHaveNoText(t *testing.T) {
+	t.Run("office", func(t *testing.T) {
+		body := officeFixture(t)
+		source := SourceFile{
+			VersionID: uuid.New(), Purpose: "ai_attachment", ObjectKey: "office",
+			DisplayName: "question.docx", DeclaredMIME: allowedTypes[".docx"].mime, Size: int64(len(body)), SHA256: hashHex(body),
+		}
+		var convertedPDF string
+		runner := &runnerStub{hook: func(args []string) {
+			switch {
+			case len(args) > 0 && args[0] == "--headless":
+				out := argAfter(args, "--outdir")
+				input := args[len(args)-1]
+				convertedPDF = filepath.Join(out, strings.TrimSuffix(filepath.Base(input), filepath.Ext(input))+".pdf")
+				_ = os.WriteFile(convertedPDF, []byte("%PDF-1.7\npreview\n%%EOF\n"), 0600)
+			case len(args) == 4 && args[0] == "-layout":
+				if args[2] != convertedPDF {
+					t.Fatalf("pdftotext input=%q converted=%q", args[2], convertedPDF)
+				}
+				_ = os.WriteFile(args[3], []byte("converted text"), 0600)
+			}
+		}}
+		result, err := (&Pipeline{
+			Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: &recordingBlobStore{},
+			Runner: runner, WorkRoot: t.TempDir(),
+		}).Process(context.Background(), Job{FileVersionID: source.VersionID, Kind: KindProcessFile})
+		if err != nil || result.AIText == nil {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	})
+
+	t.Run("image", func(t *testing.T) {
+		body := tinyPNG()
+		source := SourceFile{
+			VersionID: uuid.New(), Purpose: "ai_attachment", ObjectKey: "image",
+			DisplayName: "question.png", DeclaredMIME: "image/png", Size: int64(len(body)), SHA256: hashHex(body),
+		}
+		result, err := (&Pipeline{
+			Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: &recordingBlobStore{},
+			Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+		}).Process(context.Background(), Job{FileVersionID: source.VersionID, Kind: KindProcessFile})
+		if err != nil || result.AIText != nil {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	})
+}
+
+type recordedPut struct {
+	key  string
+	body []byte
+}
+
+type recordingBlobStore struct {
+	puts map[string]recordedPut
+}
+
+func (b *recordingBlobStore) Get(context.Context, string, *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
+	return nil, objectstore.ObjectInfo{}, errors.New("not used")
+}
+
+func (b *recordingBlobStore) Put(_ context.Context, key string, reader io.Reader, size int64, meta objectstore.ObjectMeta) (objectstore.ObjectInfo, error) {
+	if b.puts == nil {
+		b.puts = make(map[string]recordedPut)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return objectstore.ObjectInfo{}, err
+	}
+	kind := "preview"
+	if meta.ContentType == "text/plain; charset=utf-8" {
+		kind = "ai_text"
+	}
+	b.puts[kind] = recordedPut{key: key, body: body}
+	return objectstore.ObjectInfo{Size: size}, nil
+}
+
+func tinyPNG() []byte {
+	return []byte{
+		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+		0, 0, 0, 13, 'I', 'H', 'D', 'R',
+		0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0x90, 0x77, 0x53, 0xde,
+		0, 0, 0, 12, 'I', 'D', 'A', 'T', 8, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0, 0, 4, 0, 1, 0, 0, 0, 0,
+		0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82,
+	}
 }
 
 type sourceStub struct {

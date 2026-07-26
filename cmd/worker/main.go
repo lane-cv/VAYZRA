@@ -33,10 +33,11 @@ const (
 )
 
 var requiredCommands = map[string][]string{
-	"clamscan": {"--version"},
-	"soffice":  {"--version"},
-	"pdfinfo":  {"-v"},
-	"ffprobe":  {"-version"},
+	"clamscan":  {"--version"},
+	"soffice":   {"--version"},
+	"pdfinfo":   {"-v"},
+	"pdftotext": {"-v"},
+	"ffprobe":   {"-version"},
 }
 
 func main() {

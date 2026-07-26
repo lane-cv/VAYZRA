@@ -120,6 +120,39 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if source.Purpose == "ai_attachment" {
+		var text string
+		switch detected.Kind {
+		case KindImage:
+		case KindText:
+			text, err = readAITextFile(inputPath)
+		case KindDocument, KindOffice:
+			extractInput := inputPath
+			if detected.Kind == KindOffice {
+				extractInput = previewPath
+			}
+			text, err = ExtractPDFText(ctx, p.Runner, extractInput, filepath.Join(jobDir, "ai-extracted.txt"))
+		default:
+			err = reject("type_rejected")
+		}
+		if err != nil {
+			return Result{}, err
+		}
+		if detected.Kind != KindImage && text == "" {
+			return Result{}, reject("text_extraction_failed")
+		}
+		if text != "" {
+			normalizedPath := filepath.Join(jobDir, "ai-text.txt")
+			if err = os.WriteFile(normalizedPath, []byte(text), 0600); err != nil {
+				return Result{}, transient("workspace_unavailable")
+			}
+			aiText, storeErr := p.storePreview(ctx, source.VersionID, normalizedPath, "ai_text", "text/plain; charset=utf-8")
+			if storeErr != nil {
+				return Result{}, storeErr
+			}
+			result.AIText = &aiText
+		}
+	}
 	if previewPath != "" {
 		preview, previewErr := p.storePreview(ctx, source.VersionID, previewPath, previewKind, previewType)
 		if previewErr != nil {
@@ -150,7 +183,7 @@ func (p *Pipeline) storePreview(ctx context.Context, versionID uuid.UUID, path, 
 	}
 	ext := filepath.Ext(path)
 	if ext == "" {
-		ext = map[string]string{"pdf": ".pdf", "page": ".bin", "poster": ".bin"}[kind]
+		ext = map[string]string{"pdf": ".pdf", "page": ".bin", "poster": ".bin", "ai_text": ".txt"}[kind]
 	}
 	key := "previews/" + versionID.String() + "/" + uuid.NewString() + ext
 	stored, err := p.Previews.Put(ctx, key, file, info.Size(), objectstore.ObjectMeta{ContentType: contentType, SHA256: sum})

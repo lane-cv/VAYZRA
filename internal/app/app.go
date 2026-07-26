@@ -29,6 +29,7 @@ type Dependencies struct {
 	Teaching          teaching.AdminHTTPService
 	Uploads           files.UploadHTTPService
 	QAUploads         files.UploadHTTPService
+	AIUploads         files.UploadHTTPService
 	FileAccess        files.AccessHTTPService
 	QAFileAccess      files.QAAccessHTTPService
 	FileBindings      files.BindingHTTPService
@@ -98,6 +99,9 @@ func New(d Dependencies) http.Handler {
 				if d.QAUploads != nil {
 					private.Mount("/student/question-uploads", files.NewUploadHandlerWithConfig(d.QAUploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleStudent}}).Routes())
 					private.Mount("/admin/question-uploads", files.NewUploadHandlerWithConfig(d.QAUploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleAdmin}}).Routes())
+				}
+				if d.AIUploads != nil {
+					private.Mount("/student/ai-uploads", files.NewUploadHandlerWithConfig(d.AIUploads, files.UploadHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs, AllowedRoles: []auth.Role{auth.RoleStudent}}).Routes())
 				}
 				if d.FileCenter != nil {
 					private.Mount("/admin/files", files.NewFileCenterHandler(d.FileCenter, d.TrustedProxyCIDRs).Routes())

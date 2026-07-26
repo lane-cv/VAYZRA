@@ -13,9 +13,9 @@ import (
 	"happylearn.local/app/internal/audit"
 )
 
-// qaOrphanRetentionPeriod bounds storage for completed Q&A uploads that are
-// never attached to a message. Binding a version removes it from cleanup.
-const qaOrphanRetentionPeriod = 24 * time.Hour
+// attachmentOrphanRetentionPeriod bounds storage for completed Q&A and AI
+// uploads that are never attached to a message. Binding removes them from cleanup.
+const attachmentOrphanRetentionPeriod = 24 * time.Hour
 
 type PostgresStore struct{ pool *pgxpool.Pool }
 
@@ -184,8 +184,8 @@ func (s *PostgresStore) FinishCompletion(ctx context.Context, u UploadSession, a
 	if err := tx.QueryRow(ctx, `INSERT INTO file_versions
 		(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by,retention_until)
 		VALUES ($1,1,$2,$3,$4,$5,$6,$7,'pending_scan',$8,
-		 CASE WHEN $2='qa_attachment' THEN CURRENT_TIMESTAMP+make_interval(secs=>$9) ELSE NULL END)
-		RETURNING id,processing_state`, completed.FileID, locked.Purpose, locked.ObjectKey, locked.DisplayName, locked.DeclaredMIME, locked.ExpectedSize, locked.ExpectedSHA256, locked.ActorUserID, int(qaOrphanRetentionPeriod/time.Second)).Scan(&completed.FileVersionID, &completed.ProcessingState); err != nil {
+		 CASE WHEN $2 IN ('qa_attachment','ai_attachment') THEN CURRENT_TIMESTAMP+make_interval(secs=>$9) ELSE NULL END)
+		RETURNING id,processing_state`, completed.FileID, locked.Purpose, locked.ObjectKey, locked.DisplayName, locked.DeclaredMIME, locked.ExpectedSize, locked.ExpectedSHA256, locked.ActorUserID, int(attachmentOrphanRetentionPeriod/time.Second)).Scan(&completed.FileVersionID, &completed.ProcessingState); err != nil {
 		return CompletedUpload{}, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO file_processing_jobs (file_version_id,kind) VALUES ($1,'process_file')`, completed.FileVersionID); err != nil {

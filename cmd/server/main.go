@@ -84,6 +84,7 @@ type applicationDependencies struct {
 	newTeaching        func(*pgxpool.Pool) teaching.AdminHTTPService
 	newUploads         func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newQAUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newAIUploads       func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newFileAccess      func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
 	newQAFileAccess    func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
 	newFileBindings    func(*pgxpool.Pool) files.BindingHTTPService
@@ -114,6 +115,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newTeaching:        newProductionTeachingService,
 		newUploads:         newProductionUploadService,
 		newQAUploads:       newProductionQAUploadService,
+		newAIUploads:       newProductionAIUploadService,
 		newFileAccess:      newProductionFileAccessService,
 		newQAFileAccess:    newProductionQAFileAccessService,
 		newFileBindings:    newProductionFileBindingService,
@@ -181,6 +183,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if err != nil {
 			closePool()
 			return nil, nil, errors.New("initialize question upload service")
+		}
+	}
+	var aiUploadService files.UploadHTTPService
+	if deps.newAIUploads != nil {
+		aiUploadService, err = deps.newAIUploads(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize AI upload service")
 		}
 	}
 	var studentTeachingService teaching.StudentHTTPService
@@ -284,6 +294,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Teaching:          teachingService,
 		Uploads:           uploadService,
 		QAUploads:         qaUploadService,
+		AIUploads:         aiUploadService,
 		FileAccess:        fileAccessService,
 		QAFileAccess:      qaFileAccessService,
 		FileBindings:      fileBindingService,
@@ -392,6 +403,10 @@ func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg con
 
 func newProductionQAUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
 	return newProductionUploadServiceWithPolicy(ctx, pool, cfg, files.QAUploadPolicy{})
+}
+
+func newProductionAIUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {
+	return newProductionUploadServiceWithPolicy(ctx, pool, cfg, files.AIUploadPolicy{})
 }
 
 func newProductionUploadServiceWithPolicy(ctx context.Context, pool *pgxpool.Pool, cfg config.Config, policy files.UploadPolicy) (files.UploadHTTPService, error) {

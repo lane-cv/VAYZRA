@@ -7,6 +7,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/files"
+	"happylearn.local/app/internal/platform/config"
 )
 
 func TestNewServerUsesConfiguredAddressAndTimeouts(t *testing.T) {
@@ -71,5 +77,24 @@ func TestCombinedReadinessUsesOneDeadlineAndPropagatesCancellation(t *testing.T)
 	err = combineReadinessWithTimeout(func(ctx context.Context) error { seenCancelled = ctx.Err() != nil; return ctx.Err() }, func(context.Context) error { t.Fatal("object check after database failure"); return nil }, time.Second)(parent)
 	if err == nil || !seenCancelled {
 		t.Fatalf("parent cancellation err=%v seen=%t", err, seenCancelled)
+	}
+}
+
+func TestAIUploadFactoryFailureIsSanitizedAndClosesDatabase(t *testing.T) {
+	closed := false
+	handler, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverStudentAuth{}, nil },
+		newAIUploads: func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error) {
+			return nil, errors.New("secret object endpoint")
+		},
+		close: func(*pgxpool.Pool) { closed = true },
+	})
+	if err == nil || handler != nil || closeResources != nil || !closed {
+		t.Fatalf("handler=%v hasClose=%t err=%v closed=%t", handler, closeResources != nil, err, closed)
+	}
+	if err.Error() != "initialize AI upload service" || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("unsafe error=%q", err)
 	}
 }

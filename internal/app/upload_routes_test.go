@@ -91,3 +91,31 @@ func TestApplicationMountsQuestionUploadsWithExactRoles(t *testing.T) {
 		t.Fatalf("admin crossed student route status=%d creates=%d", w.Code, adminService.creates)
 	}
 }
+
+func TestApplicationMountsAIUploadsForStudentsOnly(t *testing.T) {
+	body := `{"displayName":"question.pdf","declaredMime":"application/pdf","expectedSize":3,"expectedSha256":"4d4b21e9ef71e1291183a46b913ae6f2a0d68f4e83bb5c89ae36c15ebc1cb64f"}`
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/student/ai-uploads", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Origin", "https://learn.example.com")
+		r.Header.Set("X-CSRF-Token", "ai-upload-csrf")
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "token"})
+		r.AddCookie(&http.Cookie{Name: "hl_csrf", Value: "ai-upload-csrf"})
+		return r
+	}
+	studentService := &appUploadService{}
+	studentApp := New(Dependencies{Auth: &appStudentAuth{}, AIUploads: studentService, PublicOrigin: "https://learn.example.com"})
+	w := httptest.NewRecorder()
+	studentApp.ServeHTTP(w, request())
+	if w.Code != http.StatusCreated || studentService.creates != 1 {
+		t.Fatalf("student status=%d creates=%d body=%s", w.Code, studentService.creates, w.Body.String())
+	}
+
+	adminService := &appUploadService{}
+	adminApp := New(Dependencies{Auth: &appAdminAuth{}, AIUploads: adminService, PublicOrigin: "https://learn.example.com"})
+	w = httptest.NewRecorder()
+	adminApp.ServeHTTP(w, request())
+	if w.Code != http.StatusForbidden || adminService.creates != 0 {
+		t.Fatalf("admin status=%d creates=%d body=%s", w.Code, adminService.creates, w.Body.String())
+	}
+}

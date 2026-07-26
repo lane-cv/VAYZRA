@@ -17,6 +17,68 @@ func TestPostgresStoreImplementsLeaseContract(t *testing.T) {
 	var _ Store = NewPostgresStore(nil)
 }
 
+func TestPostgresAITextCompletionRequiresAndPersistsPrivateArtifact(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := func(cleanupCtx context.Context) {
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_previews fp USING file_versions fv,files f,users u WHERE fp.file_version_id=fv.id AND fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup previews: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_processing_jobs j USING file_versions fv,files f,users u WHERE j.file_version_id=fv.id AND fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup jobs: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_versions fv USING files f,users u WHERE fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup versions: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM files f USING users u WHERE f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup files: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM users WHERE username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup users: %v", err)
+		}
+	}
+	cleanup(ctx)
+	t.Cleanup(func() { cleanup(context.Background()) })
+	actor := uuid.New()
+	username := "processing_ai_text_" + uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,status,password_hash) VALUES($1,$2,'AI text student','student','active','hash')`, actor, username); err != nil {
+		t.Fatal(err)
+	}
+	var fileID, versionID, jobID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO files(created_by) VALUES($1) RETURNING id`, actor).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO file_versions(file_id,version,purpose,object_key,display_name,declared_mime,size_bytes,sha256,processing_state,created_by) VALUES($1,1,'ai_attachment',$2,'question.txt','text/plain',1,repeat('a',64),'processing',$3) RETURNING id`, fileID, "test-processing/ai-text/"+uuid.NewString(), actor).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	owner := "ai-text-worker"
+	if err := pool.QueryRow(ctx, `INSERT INTO file_processing_jobs(file_version_id,kind,state,attempts,lease_owner,lease_until) VALUES($1,'process_file','running',1,$2,now()+interval '5 minutes') RETURNING id`, versionID, owner).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	job := Job{ID: jobID, FileVersionID: versionID, Kind: KindProcessFile, State: StateRunning, Attempts: 1, LeaseOwner: owner}
+	result := Result{DetectedMIME: "text/plain", ScanResult: "clean"}
+	if err := NewPostgresStore(pool).Complete(ctx, job, result); err == nil {
+		t.Fatal("AI text attachment completed without extracted artifact")
+	}
+	result.AIText = &PreviewResult{
+		Kind: "ai_text", ObjectKey: "test-processing/ai-text-preview/" + uuid.NewString(),
+		ContentType: "text/plain; charset=utf-8", Size: 4, SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	if err := NewPostgresStore(pool).Complete(ctx, job, result); err != nil {
+		t.Fatal(err)
+	}
+	var state, previewKey string
+	if err := pool.QueryRow(ctx, `SELECT fv.processing_state,fp.object_key FROM file_versions fv JOIN file_previews fp ON fp.file_version_id=fv.id AND fp.preview_kind='ai_text' WHERE fv.id=$1`, versionID).Scan(&state, &previewKey); err != nil {
+		t.Fatal(err)
+	}
+	if state != "ready" || previewKey != result.AIText.ObjectKey {
+		t.Fatalf("state=%q preview=%q", state, previewKey)
+	}
+}
+
 func TestPostgresLeaseIsExclusiveReclaimsExpiredAndRejectsStaleOwner(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

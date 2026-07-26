@@ -26,7 +26,9 @@ func (s *PostgresStore) ClaimFileCleanup(ctx context.Context, now time.Time, own
 	err = tx.QueryRow(ctx, `
 SELECT f.id,fv.id,fv.object_key,fv.created_by
 FROM files f JOIN file_versions fv ON fv.file_id=f.id
-WHERE (f.deleted_at IS NOT NULL OR (fv.purpose='qa_attachment' AND NOT EXISTS(SELECT 1 FROM qa_message_files qmf WHERE qmf.file_version_id=fv.id)))
+WHERE (f.deleted_at IS NOT NULL
+ OR (fv.purpose='qa_attachment' AND NOT EXISTS(SELECT 1 FROM qa_message_files qmf WHERE qmf.file_version_id=fv.id))
+ OR (fv.purpose='ai_attachment' AND NOT EXISTS(SELECT 1 FROM ai_message_files amf WHERE amf.file_version_id=fv.id)))
  AND fv.purged_at IS NULL AND fv.retention_until<=$1
  AND (fv.cleanup_state IS NULL OR fv.cleanup_state='pending' OR (fv.cleanup_state='deleting' AND fv.cleanup_lease_until<$1))
  AND NOT EXISTS(SELECT 1 FROM file_processing_jobs j WHERE j.file_version_id=fv.id AND j.state IN ('queued','running'))
@@ -153,7 +155,8 @@ func fileReferenced(ctx context.Context, tx pgx.Tx, fileID uuid.UUID) (bool, err
 	var referenced bool
 	err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM lesson_draft_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=$1)
 	 OR EXISTS(SELECT 1 FROM lesson_revision_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=$1)
-	 OR EXISTS(SELECT 1 FROM qa_message_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=$1)`, fileID).Scan(&referenced)
+	 OR EXISTS(SELECT 1 FROM qa_message_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=$1)
+	 OR EXISTS(SELECT 1 FROM ai_message_files b JOIN file_versions x ON x.id=b.file_version_id WHERE x.file_id=$1)`, fileID).Scan(&referenced)
 	return referenced, err
 }
 
