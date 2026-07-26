@@ -37,7 +37,9 @@ func TestURLPolicyNormalizeBaseURL(t *testing.T) {
 		{"rejects HTTP in production", "http://api.example.com", "", true},
 		{"rejects credentials", "https://user:pass@api.example.com", "", true},
 		{"rejects fragment", "https://api.example.com/#fragment", "", true},
+		{"rejects empty fragment delimiter", "https://api.example.com/v1#", "", true},
 		{"rejects query", "https://api.example.com/?key=value", "", true},
+		{"rejects empty query delimiter", "https://api.example.com/v1?", "", true},
 		{"rejects scheme relative", "//api.example.com/v1", "", true},
 		{"rejects Unicode host", "https://\u0430pi.example.com", "", true},
 		{"rejects IPv4-in-IPv6", "https://[::ffff:127.0.0.1]", "", true},
@@ -70,6 +72,8 @@ func TestURLPolicyValidateResolvedRejectsForbiddenAddresses(t *testing.T) {
 	for _, address := range []string{
 		"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254", "100.64.0.1",
 		"224.0.0.1", "0.0.0.0", "192.0.2.1", "198.51.100.1", "203.0.113.1", "::ffff:127.0.0.1",
+		"0.1.2.3", "240.0.0.1", "64:ff9b::a00:1", "64:ff9b:1::a00:1", "2002:0a00:0001::1", "2001:0000::1",
+		"192.88.99.1", "3fff::1",
 	} {
 		t.Run(address, func(t *testing.T) {
 			policy := URLPolicy{Resolver: &fakeResolver{answers: map[string][]netip.Addr{"blocked.test": {netip.MustParseAddr(address)}}}}
@@ -77,6 +81,14 @@ func TestURLPolicyValidateResolvedRejectsForbiddenAddresses(t *testing.T) {
 				t.Fatal("expected forbidden address to be rejected")
 			}
 		})
+	}
+}
+
+func TestURLPolicyRejectsIPv6Zone(t *testing.T) {
+	t.Parallel()
+	policy := URLPolicy{Resolver: &fakeResolver{answers: map[string][]netip.Addr{}}}
+	if _, err := policy.NormalizeBaseURL(context.Background(), "https://[fe80::1%25en0]/v1"); err == nil {
+		t.Fatal("expected IPv6 zone identifier to be rejected")
 	}
 }
 

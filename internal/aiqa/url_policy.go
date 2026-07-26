@@ -23,14 +23,14 @@ func (p URLPolicy) NormalizeBaseURL(ctx context.Context, raw string) (*url.URL, 
 	if err != nil {
 		return nil, fmt.Errorf("parse provider URL: %w", err)
 	}
-	if u.Scheme == "" || u.Host == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || u.Opaque != "" {
+	if u.Scheme == "" || u.Host == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || u.ForceQuery || u.Opaque != "" || strings.Contains(raw, "#") {
 		return nil, fmt.Errorf("invalid provider URL")
 	}
 	if u.Scheme != "https" && !(p.DevelopmentAllowPrivate && u.Scheme == "http") {
 		return nil, fmt.Errorf("provider URL must use HTTPS")
 	}
 	host := u.Hostname()
-	if host == "" || strings.ContainsAny(host, "\x00") || !isASCII(host) {
+	if host == "" || strings.ContainsAny(host, "\x00%") || !isASCII(host) {
 		return nil, fmt.Errorf("invalid provider hostname")
 	}
 	if strings.HasSuffix(u.Host, ":") {
@@ -102,13 +102,51 @@ func (p URLPolicy) forbidden(ip netip.Addr) bool {
 }
 
 var forbiddenPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
 	netip.MustParsePrefix("192.0.0.0/24"),
 	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("198.51.100.0/24"),
 	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
 	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3ffe::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
+// validateRequestURL enforces the same authority and network policy for each
+// request while permitting provider API query strings.
+func (p URLPolicy) validateRequestURL(ctx context.Context, u *url.URL) ([]netip.Addr, error) {
+	if u == nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" || strings.Contains(u.String(), "#") {
+		return nil, fmt.Errorf("invalid provider request URL")
+	}
+	if u.Scheme != "https" && !(p.DevelopmentAllowPrivate && u.Scheme == "http") {
+		return nil, fmt.Errorf("provider request URL must use HTTPS")
+	}
+	host := u.Hostname()
+	if host == "" || strings.ContainsAny(host, "\x00%") || !isASCII(host) {
+		return nil, fmt.Errorf("invalid provider request hostname")
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return nil, fmt.Errorf("provider request URL has an empty port")
+	}
+	if port := u.Port(); port != "" && !p.DevelopmentAllowPrivate && port != "443" {
+		return nil, fmt.Errorf("provider request URL has a non-canonical port")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && p.forbidden(ip) {
+		return nil, fmt.Errorf("forbidden provider address %s", ip)
+	} else if err == nil {
+		return nil, fmt.Errorf("provider request URL must use a hostname")
+	}
+	return p.ValidateResolved(ctx, host)
 }
 
 func isASCII(value string) bool {

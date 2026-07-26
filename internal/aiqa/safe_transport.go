@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,10 +41,21 @@ func NewSafeHTTPClient(policy URLPolicy, timeouts GatewayTimeouts) *http.Client 
 		Timeout:   timeouts.Total,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) > 3 {
+				scrubRequestURL(req)
+				scrubRequests(via)
 				return fmt.Errorf("provider redirect limit exceeded")
 			}
-			_, err := policy.NormalizeBaseURL(req.Context(), req.URL.String())
-			return err
+			if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
+				scrubRequestURL(req)
+				scrubRequests(via)
+				return fmt.Errorf("cross-origin provider redirect rejected")
+			}
+			if _, err := policy.validateRequestURL(req.Context(), req.URL); err != nil {
+				scrubRequestURL(req)
+				scrubRequests(via)
+				return err
+			}
+			return nil
 		},
 	}
 }
@@ -53,14 +66,9 @@ type safeRoundTripper struct {
 }
 
 func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL == nil {
-		return nil, fmt.Errorf("provider request has no URL")
-	}
-	if net.ParseIP(req.URL.Hostname()) != nil {
-		return nil, fmt.Errorf("provider request must use a hostname")
-	}
-	addresses, err := s.policy.ValidateResolved(req.Context(), req.URL.Hostname())
+	addresses, err := s.policy.validateRequestURL(req.Context(), req.URL)
 	if err != nil {
+		scrubRequestURL(req)
 		return nil, err
 	}
 	port := req.URL.Port()
@@ -86,23 +94,83 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	response, err := transport.RoundTrip(req)
 	if err != nil {
+		scrubRequestURL(req)
 		return nil, err
+	}
+	if isRedirect(response.StatusCode) {
+		if err := s.validateRedirect(req, response); err != nil {
+			_ = response.Body.Close()
+			scrubRequestURL(req)
+			return nil, err
+		}
 	}
 	response.Body = newIdleTimeoutBody(response.Body, s.timeouts.IdleStream)
 	return response, nil
 }
 
+func (s safeRoundTripper) validateRedirect(req *http.Request, response *http.Response) error {
+	location := response.Header.Get("Location")
+	if location == "" {
+		return nil
+	}
+	next, err := req.URL.Parse(location)
+	if err != nil {
+		return fmt.Errorf("invalid provider redirect: %w", err)
+	}
+	if _, err := s.policy.validateRequestURL(req.Context(), next); err != nil {
+		return err
+	}
+	if !sameOrigin(req.URL, next) {
+		return fmt.Errorf("cross-origin provider redirect rejected")
+	}
+	return nil
+}
+
+func isRedirect(status int) bool {
+	return status == http.StatusMovedPermanently || status == http.StatusFound || status == http.StatusSeeOther || status == http.StatusTemporaryRedirect || status == http.StatusPermanentRedirect
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return left.Scheme == right.Scheme && strings.EqualFold(left.Hostname(), right.Hostname()) && originPort(left) == originPort(right)
+}
+
+func originPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+func scrubRequestURL(req *http.Request) {
+	if req == nil || req.URL == nil {
+		return
+	}
+	req.URL.RawQuery = ""
+	req.URL.ForceQuery = false
+	req.URL.Fragment = ""
+}
+
+func scrubRequests(requests []*http.Request) {
+	for _, req := range requests {
+		scrubRequestURL(req)
+	}
+}
+
 type idleTimeoutBody struct {
-	body    io.ReadCloser
-	timer   *time.Timer
-	timeout time.Duration
-	mu      sync.Mutex
-	done    bool
+	body       io.ReadCloser
+	timer      *time.Timer
+	timeout    time.Duration
+	mu         sync.Mutex
+	done       bool
+	generation uint64
 }
 
 func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration) *idleTimeoutBody {
 	b := &idleTimeoutBody{body: body, timeout: timeout}
-	b.timer = time.AfterFunc(timeout, func() { _ = b.Close() })
+	b.scheduleLocked()
 	return b
 }
 
@@ -114,12 +182,30 @@ func (b *idleTimeoutBody) Read(p []byte) (int, error) {
 		return n, err
 	}
 	if err == nil && n > 0 {
-		b.timer.Reset(b.timeout)
+		b.generation++
+		b.timer.Stop()
+		b.scheduleLocked()
 	} else if err != nil {
 		b.done = true
 		b.timer.Stop()
 	}
 	return n, err
+}
+
+func (b *idleTimeoutBody) scheduleLocked() {
+	generation := b.generation
+	b.timer = time.AfterFunc(b.timeout, func() { b.expire(generation) })
+}
+
+func (b *idleTimeoutBody) expire(generation uint64) {
+	b.mu.Lock()
+	if b.done || generation != b.generation {
+		b.mu.Unlock()
+		return
+	}
+	b.done = true
+	b.mu.Unlock()
+	_ = b.body.Close()
 }
 
 func (b *idleTimeoutBody) Close() error {
