@@ -13,11 +13,84 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/qanda"
 )
+
+type serverStudentAI struct{}
+
+func (*serverStudentAI) CreateThread(context.Context, aiqa.Principal, aiqa.CreateThreadInput) (aiqa.ThreadDetail, aiqa.Run, error) {
+	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) ListThreads(context.Context, aiqa.Principal, aiqa.ThreadCursor) ([]aiqa.Thread, aiqa.ThreadCursor, error) {
+	return []aiqa.Thread{}, aiqa.ThreadCursor{}, nil
+}
+func (*serverStudentAI) GetThread(context.Context, aiqa.Principal, uuid.UUID, aiqa.MessageCursor) (aiqa.ThreadDetail, error) {
+	return aiqa.ThreadDetail{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) AddMessage(context.Context, aiqa.Principal, aiqa.AddMessageInput) (aiqa.ThreadDetail, aiqa.Run, error) {
+	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) CancelRun(context.Context, aiqa.Principal, uuid.UUID) (aiqa.Run, error) {
+	return aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) RetryRun(context.Context, aiqa.Principal, uuid.UUID, string) (aiqa.Run, error) {
+	return aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) RunStreamState(context.Context, aiqa.Principal, uuid.UUID) (aiqa.RunStreamState, error) {
+	return aiqa.RunStreamState{}, aiqa.ErrNotFound
+}
+func (*serverStudentAI) ListRunEvents(context.Context, aiqa.Principal, uuid.UUID, int64, int) ([]aiqa.RunEvent, error) {
+	return nil, aiqa.ErrNotFound
+}
+
+type serverAIFileAccess struct{}
+
+func (*serverAIFileAccess) Status(_ context.Context, _ files.Principal, id uuid.UUID) (files.AIFileStatus, error) {
+	return files.AIFileStatus{FileVersionID: id, ProcessingState: "ready", DetectedMIME: "text/plain", Size: 5, PreviewAvailable: true}, nil
+}
+func (*serverAIFileAccess) Open(context.Context, files.Principal, files.AIOpenInput) (files.OpenedFile, error) {
+	return files.OpenedFile{}, files.ErrNotFound
+}
+
+func TestBuildApplicationWiresStudentAIAndControlledFileFactories(t *testing.T) {
+	studentFactory, fileFactory := false, false
+	h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+		open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+		migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+		newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverStudentAuth{}, nil },
+		newStudentAI: func(context.Context, *pgxpool.Pool, config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error) {
+			studentFactory = true
+			service := &serverStudentAI{}
+			return service, service, nil
+		},
+		newAIFileAccess: func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error) {
+			fileFactory = true
+			return &serverAIFileAccess{}, nil
+		},
+		ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+		close: func(*pgxpool.Pool) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeResources)
+	for _, path := range []string{"/api/v1/student/ai/threads", "/api/v1/ai-question-files/" + uuid.NewString() + "/status"} {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, w.Code, w.Body)
+		}
+	}
+	if !studentFactory || !fileFactory {
+		t.Fatalf("studentFactory=%t fileFactory=%t", studentFactory, fileFactory)
+	}
+}
 
 func TestBuildApplicationWiresAuthRoutesAndConfiguredSecurity(t *testing.T) {
 	var openedURL string

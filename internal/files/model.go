@@ -180,6 +180,7 @@ type AccessLog struct {
 	VersionID           uuid.UUID
 	RevisionID          uuid.UUID
 	QAMessageID         uuid.UUID
+	AIMessageID         uuid.UUID
 	Action              AccessAction
 	Result              AccessResult
 	Reason              string
@@ -210,6 +211,27 @@ type QAFileStatus struct {
 type QADelivery struct {
 	Delivery
 	MessageID uuid.UUID
+}
+
+// AIFileStatus is capability-safe and deliberately contains no object key,
+// owner, provider, model, or run snapshot.
+type AIFileStatus struct {
+	FileVersionID    uuid.UUID `json:"fileVersionId"`
+	ProcessingState  string    `json:"processingState"`
+	FailureCategory  string    `json:"failureCategory,omitempty"`
+	DetectedMIME     string    `json:"detectedMime,omitempty"`
+	Size             int64     `json:"size"`
+	PreviewAvailable bool      `json:"previewAvailable"`
+}
+
+type AIDelivery struct {
+	Delivery
+	MessageID uuid.UUID
+}
+
+type AIOpenInput struct {
+	VersionID uuid.UUID
+	Range     string
 }
 
 type OpenInput struct {

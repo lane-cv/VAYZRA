@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/platform/config"
@@ -96,5 +97,38 @@ func TestAIUploadFactoryFailureIsSanitizedAndClosesDatabase(t *testing.T) {
 	}
 	if err.Error() != "initialize AI upload service" || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("unsafe error=%q", err)
+	}
+}
+
+func TestStudentAIAndFileAccessFactoryFailuresAreSanitized(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		configure  func(*applicationDependencies)
+	}{
+		{"student service", "initialize student AI service", func(deps *applicationDependencies) {
+			deps.newStudentAI = func(context.Context, *pgxpool.Pool, config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error) {
+				return nil, nil, errors.New("secret provider configuration")
+			}
+		}},
+		{"file access", "initialize AI file access service", func(deps *applicationDependencies) {
+			deps.newAIFileAccess = func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error) {
+				return nil, errors.New("secret object coordinates")
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closed := false
+			deps := applicationDependencies{
+				open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+				migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+				newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverStudentAuth{}, nil },
+				close:   func(*pgxpool.Pool) { closed = true },
+			}
+			tc.configure(&deps)
+			handler, cleanup, err := buildApplication(context.Background(), config.Config{}, deps)
+			if handler != nil || cleanup != nil || err == nil || err.Error() != tc.want || !closed || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("handler=%v cleanupPresent=%t err=%v closed=%t", handler, cleanup != nil, err, closed)
+			}
+		})
 	}
 }

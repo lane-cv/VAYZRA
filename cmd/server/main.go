@@ -85,8 +85,10 @@ type applicationDependencies struct {
 	newUploads             func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newQAUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
 	newAIUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newStudentAI           func(context.Context, *pgxpool.Pool, config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error)
 	newFileAccess          func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
 	newQAFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
+	newAIFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error)
 	newFileBindings        func(*pgxpool.Pool) files.BindingHTTPService
 	newFileCenter          func(*pgxpool.Pool) files.FileCenterHTTPService
 	startUploadCleanup     func(files.ExpiredUploadCleaner) func()
@@ -118,8 +120,10 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newUploads:         newProductionUploadService,
 		newQAUploads:       newProductionQAUploadService,
 		newAIUploads:       newProductionAIUploadService,
+		newStudentAI:       newProductionStudentAIService,
 		newFileAccess:      newProductionFileAccessService,
 		newQAFileAccess:    newProductionQAFileAccessService,
+		newAIFileAccess:    newProductionAIFileAccessService,
 		newFileBindings:    newProductionFileBindingService,
 		newFileCenter:      newProductionFileCenterService,
 		startUploadCleanup: files.StartCleanupRunner,
@@ -199,6 +203,15 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			return nil, nil, errors.New("initialize AI upload service")
 		}
 	}
+	var studentAI aiqa.StudentService
+	var studentAIEvents aiqa.StudentEventStore
+	if deps.newStudentAI != nil {
+		studentAI, studentAIEvents, err = deps.newStudentAI(ctx, pool, cfg)
+		if err != nil || studentAI == nil || studentAIEvents == nil {
+			closePool()
+			return nil, nil, errors.New("initialize student AI service")
+		}
+	}
 	var studentTeachingService teaching.StudentHTTPService
 	if deps.newStudentTeaching != nil {
 		studentTeachingService = deps.newStudentTeaching(pool)
@@ -233,6 +246,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if err != nil {
 			closePool()
 			return nil, nil, errors.New("initialize question file access service")
+		}
+	}
+	var aiFileAccessService files.AIAccessHTTPService
+	if deps.newAIFileAccess != nil {
+		aiFileAccessService, err = deps.newAIFileAccess(ctx, pool, cfg)
+		if err != nil || aiFileAccessService == nil {
+			closePool()
+			return nil, nil, errors.New("initialize AI file access service")
 		}
 	}
 	var fileBindingService files.BindingHTTPService
@@ -313,7 +334,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentQuestions:    questionServices.Student,
 		AdminQuestions:      questionServices.Admin,
 		AdminAI:             adminAI,
+		StudentAI:           studentAI,
+		StudentAIEvents:     studentAIEvents,
 		Notifications:       notificationService,
+		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
 		CookieSecure:        cfg.CookieSecure,
 		TrustedProxyCIDRs:   cfg.TrustedProxyCIDRs,
@@ -469,6 +493,38 @@ func newProductionQAFileAccessService(ctx context.Context, pool *pgxpool.Pool, c
 		return nil, err
 	}
 	return files.NewQAAccessService(files.NewPostgresStore(pool), stores.Originals, stores.Previews), nil
+}
+
+func newProductionAIFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.AIAccessHTTPService, error) {
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files.NewAIAccessService(files.NewPostgresStore(pool), stores.Originals, stores.Previews), nil
+}
+
+func newProductionStudentAIService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error) {
+	box, err := aiqa.NewAESGCMSecretBox(cfg.AIMasterKey, cfg.AIMasterKeyVersion, rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	policy := aiqa.URLPolicy{DevelopmentAllowPrivate: cfg.AIAllowPrivateProvider}
+	runtimeStore := aiqa.NewPostgresRuntimeStore(pool)
+	configStore := aiqa.NewPostgresConfigStoreWithSecurity(pool, box, policy)
+	attachments := aiqa.NewPostgresAttachmentStore(pool, stores.Originals, stores.Previews)
+	return aiqa.NewStudentService(runtimeStore, configStore, attachments, time.Now), runtimeStore, nil
 }
 
 func newProductionFileBindingService(pool *pgxpool.Pool) files.BindingHTTPService {

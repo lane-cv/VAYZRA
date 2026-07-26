@@ -35,6 +35,7 @@ const (
 
 type Principal struct {
 	User      auth.User
+	SessionID uuid.UUID
 	RequestID string
 	IP        net.IP
 }

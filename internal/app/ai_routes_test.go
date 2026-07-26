@@ -17,6 +17,27 @@ type appAI struct {
 	testCalls int
 }
 
+type appStudentAI struct{}
+
+func (*appStudentAI) CreateThread(context.Context, aiqa.Principal, aiqa.CreateThreadInput) (aiqa.ThreadDetail, aiqa.Run, error) {
+	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*appStudentAI) ListThreads(context.Context, aiqa.Principal, aiqa.ThreadCursor) ([]aiqa.Thread, aiqa.ThreadCursor, error) {
+	return []aiqa.Thread{}, aiqa.ThreadCursor{}, nil
+}
+func (*appStudentAI) GetThread(context.Context, aiqa.Principal, uuid.UUID, aiqa.MessageCursor) (aiqa.ThreadDetail, error) {
+	return aiqa.ThreadDetail{}, aiqa.ErrNotFound
+}
+func (*appStudentAI) AddMessage(context.Context, aiqa.Principal, aiqa.AddMessageInput) (aiqa.ThreadDetail, aiqa.Run, error) {
+	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*appStudentAI) CancelRun(context.Context, aiqa.Principal, uuid.UUID) (aiqa.Run, error) {
+	return aiqa.Run{}, aiqa.ErrNotFound
+}
+func (*appStudentAI) RetryRun(context.Context, aiqa.Principal, uuid.UUID, string) (aiqa.Run, error) {
+	return aiqa.Run{}, aiqa.ErrNotFound
+}
+
 func (appAI) ListProviders(context.Context, aiqa.Principal) ([]aiqa.ProviderView, error) {
 	return []aiqa.ProviderView{}, nil
 }
@@ -62,6 +83,40 @@ func TestAIRoutes(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
+}
+
+func TestAIRoutesStudentAndAdminWriteSurfacesStayIsolated(t *testing.T) {
+	t.Run("student reaches only student AI", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appStudentAuth{}, StudentAI: &appStudentAI{}})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/student/ai/threads", nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body)
+		}
+	})
+	t.Run("admin cannot create student AI thread", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appAdminAuth{}, StudentAI: &appStudentAI{}, AdminAI: &appAI{}})
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/student/ai/threads", strings.NewReader(`{"title":"x","subject":"math","body":"x","attachments":[]}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body)
+		}
+	})
+	t.Run("student cannot reach admin AI", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appStudentAuth{}, StudentAI: &appStudentAI{}, AdminAI: &appAI{}})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/ai/providers", nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body)
+		}
+	})
 }
 
 type appProviderTestLimiter struct {

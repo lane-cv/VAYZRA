@@ -38,7 +38,10 @@ type Dependencies struct {
 	StudentQuestions    qanda.StudentHTTPService
 	AdminQuestions      qanda.AdminHTTPService
 	AdminAI             aiqa.AdminConfigHTTPService
+	StudentAI           aiqa.StudentService
+	StudentAIEvents     aiqa.StudentEventStore
 	Notifications       notifications.HTTPService
+	AIFileAccess        files.AIAccessHTTPService
 	PublicOrigin        string
 	CookieSecure        bool
 	TrustedProxyCIDRs   []netip.Prefix
@@ -121,6 +124,11 @@ func New(d Dependencies) http.Handler {
 						TrustedProxyCIDRs: d.TrustedProxyCIDRs, ProviderTestLimiter: d.ProviderTestLimiter,
 					}).Routes())
 				}
+				if d.StudentAI != nil {
+					private.Mount("/student/ai", aiqa.NewStudentHandlerWithConfig(d.StudentAI, d.StudentAIEvents, aiqa.StudentHTTPConfig{
+						TrustedProxyCIDRs: d.TrustedProxyCIDRs,
+					}).Routes())
+				}
 				if d.Notifications != nil {
 					private.Mount("/notifications", notifications.NewHandler(d.Notifications).Routes())
 				}
@@ -129,6 +137,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.QAFileAccess != nil {
 					private.Mount("/question-files", files.NewQAAccessHandler(d.QAFileAccess, d.TrustedProxyCIDRs).Routes())
+				}
+				if d.AIFileAccess != nil {
+					private.Mount("/ai-question-files", files.NewAIAccessHandler(d.AIFileAccess, d.TrustedProxyCIDRs).Routes())
 				}
 			})
 		})

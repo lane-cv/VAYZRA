@@ -407,7 +407,7 @@ WHERE u.id=$1 AND u.role='student' AND u.status='active' AND u.deleted_at IS NUL
 }
 
 func (s *PostgresStore) WriteAccessLog(ctx context.Context, l AccessLog) error {
-	var resolved, revision, qaMessage any
+	var resolved, revision, qaMessage, aiMessage any
 	if l.VersionID != uuid.Nil {
 		resolved = l.VersionID
 	}
@@ -417,10 +417,13 @@ func (s *PostgresStore) WriteAccessLog(ctx context.Context, l AccessLog) error {
 	if l.QAMessageID != uuid.Nil {
 		qaMessage = l.QAMessageID
 	}
+	if l.AIMessageID != uuid.Nil {
+		aiMessage = l.AIMessageID
+	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO file_access_logs
-	 (actor_user_id,file_version_id,lesson_revision_id,qa_message_id,access_policy,request_id,range_start,range_end,requested_file_version_id,result,reason_code,ip,playback_session_hash)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`,
-		l.ActorUserID, resolved, revision, qaMessage, l.Action, l.RequestID, l.RangeStart, l.RangeEnd, l.RequestedVersionID, l.Result, l.Reason, l.IP, l.PlaybackSessionHash)
+	 (actor_user_id,file_version_id,lesson_revision_id,qa_message_id,ai_message_id,access_policy,request_id,range_start,range_end,requested_file_version_id,result,reason_code,ip,playback_session_hash)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`,
+		l.ActorUserID, resolved, revision, qaMessage, aiMessage, l.Action, l.RequestID, l.RangeStart, l.RangeEnd, l.RequestedVersionID, l.Result, l.Reason, l.IP, l.PlaybackSessionHash)
 	return err
 }
 
