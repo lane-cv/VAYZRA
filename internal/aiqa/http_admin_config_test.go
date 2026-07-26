@@ -2,6 +2,7 @@ package aiqa
 
 import (
 	"context"
+	"errors"
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
 	"net/http"
@@ -10,10 +11,28 @@ import (
 	"testing"
 )
 
-type httpConfigService struct{ created CreateProviderInput }
+type httpConfigService struct {
+	created CreateProviderInput
+	err     error
+}
 
 func (s *httpConfigService) ListProviders(context.Context, Principal) ([]ProviderView, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	return []ProviderView{{ID: uuid.New(), Name: "P", BaseURL: "https://api.example.test", HasKey: true}}, nil
+}
+
+func TestAdminConfigHTTPMapsUnknownServiceFailureToInternalError(t *testing.T) {
+	h := NewAdminConfigHandler(&httpConfigService{err: errors.New("database secret detail")}, nil).Routes()
+	r := httptest.NewRequest(http.MethodGet, "/providers", nil)
+	r.RemoteAddr = "192.0.2.1:1234"
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 500 || !strings.Contains(w.Body.String(), `"code":"internal_error"`) || strings.Contains(w.Body.String(), "database secret detail") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestAdminConfigHTTPRejectsRoleAndStrictBoundaries(t *testing.T) {

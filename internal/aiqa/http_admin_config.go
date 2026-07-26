@@ -294,8 +294,10 @@ func configError(w http.ResponseWriter, r *http.Request, e error) {
 		httpx.Error(w, r, 409, "config_conflict", "配置已更新")
 	case errors.Is(e, ErrAIDisabled):
 		httpx.Error(w, r, 409, "AI_DISABLED", "AI 未启用")
-	default:
+	case errors.Is(e, ErrInvalidInput):
 		bad(w, r)
+	default:
+		httpx.Error(w, r, 500, "internal_error", "服务暂不可用")
 	}
 }
 func bad(w http.ResponseWriter, r *http.Request) {

@@ -2,6 +2,7 @@ package aiqa
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
@@ -53,10 +54,27 @@ func (s *PostgresConfigStore) CreateProvider(ctx context.Context, p Principal, i
 			if e = tx.QueryRow(ctx, `SELECT request_hash,provider_id FROM ai_config_idempotency WHERE key=$1`, in.IdempotencyKey).Scan(&storedHash, &out.ID); e != nil {
 				return e
 			}
-			if len(storedHash) != len(requestHash) || string(storedHash) != string(requestHash[:]) {
+			if len(storedHash) != len(requestHash) || subtle.ConstantTimeCompare(storedHash, requestHash[:]) != 1 || s.box == nil {
 				return ErrConfigConflict
 			}
-			e = tx.QueryRow(ctx, `SELECT id,name,base_url,protocol_mode,active,key_updated_at,version FROM ai_providers WHERE id=$1`, out.ID).Scan(&out.ID, &out.Name, &out.BaseURL, &out.ProtocolMode, &out.Active, &out.KeyUpdatedAt, &out.Version)
+			var storedSecret EncryptedSecret
+			e = tx.QueryRow(ctx, `SELECT id,name,base_url,protocol_mode,active,key_updated_at,version,encrypted_api_key,key_version FROM ai_providers WHERE id=$1`, out.ID).Scan(&out.ID, &out.Name, &out.BaseURL, &out.ProtocolMode, &out.Active, &out.KeyUpdatedAt, &out.Version, &storedSecret.Blob, &storedSecret.KeyVersion)
+			if e != nil {
+				return e
+			}
+			existingKey, openExistingErr := s.box.Open(out.ID, storedSecret)
+			if openExistingErr != nil {
+				return ErrConfigConflict
+			}
+			defer zeroBytes(existingKey)
+			incomingKey, openIncomingErr := s.box.Open(id, sec)
+			if openIncomingErr != nil {
+				return ErrConfigConflict
+			}
+			defer zeroBytes(incomingKey)
+			if len(existingKey) != len(incomingKey) || subtle.ConstantTimeCompare(existingKey, incomingKey) != 1 {
+				return ErrConfigConflict
+			}
 			out.HasKey = e == nil
 			return e
 		}
@@ -80,7 +98,7 @@ func (s *PostgresConfigStore) ForRun(ctx context.Context, subject Subject, modal
 	var keyVersion int16
 	var timeoutConnect, timeoutHeaders, timeoutIdle, timeoutTotal int
 	var rawBaseURL string
-	err = s.pool.QueryRow(ctx, `SELECT p.id,p.base_url,p.protocol_mode,p.encrypted_api_key,p.key_version,m.id,m.provider_id,m.upstream_model_id,m.modality,m.context_window_tokens,m.max_output_tokens,m.image_quota_tokens,m.input_price_micro_usd_per_million_tokens,m.output_price_micro_usd_per_million_tokens,m.enabled,m.quota_blocked_at,coalesce(m.quota_block_reason,''),m.version,m.connect_timeout_ms,m.response_header_timeout_ms,m.idle_stream_timeout_ms,m.total_timeout_ms,t.id,t.subject,t.version,t.system_prompt,t.active FROM ai_providers p JOIN ai_models m ON m.provider_id=p.id AND m.modality=$1 AND m.enabled AND m.quota_blocked_at IS NULL JOIN prompt_templates t ON t.subject=$2 AND t.active WHERE p.active`, modality, subject).Scan(&out.ProviderID, &rawBaseURL, &out.ProtocolMode, &encrypted, &keyVersion, &out.Model.ID, &out.Model.ProviderID, &out.Model.UpstreamModelID, &out.Model.Modality, &out.Model.ContextTokens, &out.Model.MaxOutputTokens, &out.Model.ImageQuotaTokens, &out.Model.InputPriceMicroUSD, &out.Model.OutputPriceMicroUSD, &out.Model.Enabled, &out.Model.QuotaBlockedAt, &out.Model.QuotaBlockReason, &out.Model.Version, &timeoutConnect, &timeoutHeaders, &timeoutIdle, &timeoutTotal, &out.Prompt.ID, &out.Prompt.Subject, &out.Prompt.Version, &out.Prompt.Body, &out.Prompt.Active)
+	err = s.pool.QueryRow(ctx, `SELECT p.id,p.base_url,p.protocol_mode,p.encrypted_api_key,p.key_version,m.id,m.provider_id,m.upstream_model_id,m.modality,m.context_window_tokens,m.max_output_tokens,m.image_quota_tokens,m.input_price_micro_usd_per_million_tokens,m.output_price_micro_usd_per_million_tokens,m.enabled,m.quota_blocked_at,coalesce(m.quota_block_reason,''),m.version,m.connect_timeout_ms,m.response_header_timeout_ms,m.idle_stream_timeout_ms,m.total_timeout_ms,t.id,t.subject,t.version,t.system_prompt,t.active FROM ai_providers p JOIN ai_models m ON m.provider_id=p.id AND m.modality=$1 AND m.enabled AND m.quota_blocked_at IS NULL JOIN prompt_templates t ON t.subject=$2 AND t.active WHERE p.active AND (SELECT count(*) FROM ai_models mc WHERE mc.provider_id=p.id AND mc.modality=$1 AND mc.enabled AND mc.quota_blocked_at IS NULL)=1`, modality, subject).Scan(&out.ProviderID, &rawBaseURL, &out.ProtocolMode, &encrypted, &keyVersion, &out.Model.ID, &out.Model.ProviderID, &out.Model.UpstreamModelID, &out.Model.Modality, &out.Model.ContextTokens, &out.Model.MaxOutputTokens, &out.Model.ImageQuotaTokens, &out.Model.InputPriceMicroUSD, &out.Model.OutputPriceMicroUSD, &out.Model.Enabled, &out.Model.QuotaBlockedAt, &out.Model.QuotaBlockReason, &out.Model.Version, &timeoutConnect, &timeoutHeaders, &timeoutIdle, &timeoutTotal, &out.Prompt.ID, &out.Prompt.Subject, &out.Prompt.Version, &out.Prompt.Body, &out.Prompt.Active)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return RuntimeProviderConfig{}, ErrAIDisabled
@@ -175,6 +193,10 @@ func (s *PostgresConfigStore) ListModels(ctx context.Context, id uuid.UUID) (out
 }
 func (s *PostgresConfigStore) PutModel(ctx context.Context, p Principal, in PutModelInput) (out ModelView, err error) {
 	err = s.tx(ctx, func(tx pgx.Tx) error {
+		var providerActive bool
+		if e := tx.QueryRow(ctx, `SELECT active FROM ai_providers WHERE id=$1 FOR UPDATE`, in.ProviderID).Scan(&providerActive); e != nil {
+			return configErr(e)
+		}
 		if in.ExpectedVersion == 0 {
 			e := tx.QueryRow(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,created_by,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,quota_blocked_at,coalesce(quota_block_reason,''),version`, in.ID, in.ProviderID, in.UpstreamModelID, in.Modality, in.ContextTokens, in.MaxOutputTokens, in.ImageQuotaTokens, in.InputPriceMicroUSD, in.OutputPriceMicroUSD, in.Enabled, p.User.ID).Scan(&out.ID, &out.ProviderID, &out.UpstreamModelID, &out.Modality, &out.ContextTokens, &out.MaxOutputTokens, &out.ImageQuotaTokens, &out.InputPriceMicroUSD, &out.OutputPriceMicroUSD, &out.Enabled, &out.QuotaBlockedAt, &out.QuotaBlockReason, &out.Version)
 			if e != nil {
@@ -194,6 +216,15 @@ func (s *PostgresConfigStore) PutModel(ctx context.Context, p Principal, in PutM
 			e = tx.QueryRow(ctx, `UPDATE ai_models SET upstream_model_id=$3,modality=$4,context_window_tokens=$5,max_output_tokens=$6,image_quota_tokens=$7,input_price_micro_usd_per_million_tokens=$8,output_price_micro_usd_per_million_tokens=$9,enabled=$10,quota_blocked_at=CASE WHEN $11 THEN NULL ELSE quota_blocked_at END,quota_block_reason=CASE WHEN $11 THEN NULL ELSE quota_block_reason END,updated_by=$12,updated_at=now(),version=version+1 WHERE id=$1 AND provider_id=$2 AND version=$13 RETURNING id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,quota_blocked_at,coalesce(quota_block_reason,''),version`, in.ID, in.ProviderID, in.UpstreamModelID, in.Modality, in.ContextTokens, in.MaxOutputTokens, in.ImageQuotaTokens, in.InputPriceMicroUSD, in.OutputPriceMicroUSD, in.Enabled, clear, p.User.ID, in.ExpectedVersion).Scan(&out.ID, &out.ProviderID, &out.UpstreamModelID, &out.Modality, &out.ContextTokens, &out.MaxOutputTokens, &out.ImageQuotaTokens, &out.InputPriceMicroUSD, &out.OutputPriceMicroUSD, &out.Enabled, &out.QuotaBlockedAt, &out.QuotaBlockReason, &out.Version)
 			if e != nil {
 				return configErr(e)
+			}
+		}
+		if providerActive {
+			var textModels, visionModels int
+			if e := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE modality='text'),count(*) FILTER (WHERE modality='vision') FROM ai_models WHERE provider_id=$1 AND enabled AND quota_blocked_at IS NULL`, in.ProviderID).Scan(&textModels, &visionModels); e != nil {
+				return e
+			}
+			if textModels != 1 || visionModels != 1 {
+				return ErrInvalidInput
 			}
 		}
 		return writeAudit(ctx, tx, p, "ai.model_put", "ai_model", in.ID.String(), map[string]any{"providerId": in.ProviderID.String(), "modality": string(in.Modality)})
@@ -372,4 +403,10 @@ func nullableLimit(v *int64) LimitValue {
 		return LimitValue{Mode: "inherit"}
 	}
 	return numberLimit(*v)
+}
+
+func zeroBytes(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
 }

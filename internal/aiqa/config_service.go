@@ -60,7 +60,7 @@ func (s *configService) CreateProvider(c context.Context, p Principal, in Create
 	if e != nil {
 		return ProviderView{}, e
 	}
-	hash := sha256.Sum256([]byte(in.Name + "\x00" + in.BaseURL + "\x00" + string(in.ProtocolMode) + "\x00" + in.APIKey))
+	hash := sha256.Sum256([]byte(in.Name + "\x00" + in.BaseURL + "\x00" + string(in.ProtocolMode)))
 	v, e := s.store.CreateProvider(c, p, id, in, sec, hash)
 	if v.ID == uuid.Nil {
 		v.ID = id

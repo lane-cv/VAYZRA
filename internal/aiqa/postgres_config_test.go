@@ -3,6 +3,7 @@ package aiqa
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"net"
@@ -28,30 +29,51 @@ func TestPostgresConfigCreateProviderIdempotencyAndSecretAAD(t *testing.T) {
 		t.Fatal(err)
 	}
 	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "provider-create", IP: net.ParseIP("192.0.2.10")}
-	store := NewPostgresConfigStore(pool)
 	id := uuid.New()
 	key := []byte("12345678901234567890123456789012")
-	box, err := NewAESGCMSecretBox(key, 1, bytes.NewReader(bytes.Repeat([]byte{7}, 12)))
+	box, err := NewAESGCMSecretBox(key, 1, rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	store := NewPostgresConfigStoreWithSecurity(pool, box, URLPolicy{})
 	secret, err := box.Seal(id, []byte("provider-secret"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	in := CreateProviderInput{Name: "provider", BaseURL: "https://api.example.test", ProtocolMode: ProtocolResponses, IdempotencyKey: "1234567890abcdef"}
-	hash := sha256.Sum256([]byte("request"))
+	hash := sha256.Sum256([]byte("provider\x00https://api.example.test\x00responses"))
 	first, err := store.CreateProvider(ctx, actor, id, in, secret, hash)
 	if err != nil || first.ID != id {
 		t.Fatalf("first=%#v err=%v", first, err)
 	}
-	again, err := store.CreateProvider(ctx, actor, uuid.New(), in, secret, hash)
+	replayID := uuid.New()
+	replaySecret, err := box.Seal(replayID, []byte("provider-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := store.CreateProvider(ctx, actor, replayID, in, replaySecret, hash)
 	if err != nil || again.ID != id {
 		t.Fatalf("replay=%#v err=%v", again, err)
 	}
-	different := sha256.Sum256([]byte("different"))
-	if _, err := store.CreateProvider(ctx, actor, uuid.New(), in, secret, different); !errors.Is(err, ErrConfigConflict) {
+	differentID := uuid.New()
+	differentSecret, err := box.Seal(differentID, []byte("different-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateProvider(ctx, actor, differentID, in, differentSecret, hash); !errors.Is(err, ErrConfigConflict) {
 		t.Fatalf("different payload=%v", err)
+	}
+	var persistedHash []byte
+	if err := pool.QueryRow(ctx, `SELECT request_hash FROM ai_config_idempotency WHERE key=$1`, in.IdempotencyKey).Scan(&persistedHash); err != nil {
+		t.Fatal(err)
+	}
+	secretDigest := sha256.Sum256([]byte("provider\x00https://api.example.test\x00responses\x00provider-secret"))
+	if bytes.Equal(persistedHash, secretDigest[:]) {
+		t.Fatal("persisted request hash includes API key")
+	}
+	var fingerprintColumns int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_name='ai_config_idempotency' AND column_name ILIKE '%fingerprint%'`).Scan(&fingerprintColumns); err != nil || fingerprintColumns != 0 {
+		t.Fatalf("fingerprint columns=%d err=%v", fingerprintColumns, err)
 	}
 	var blob []byte
 	var version int16
@@ -103,6 +125,29 @@ func TestPostgresConfigRuntimeDecryptsAndCopiesSecret(t *testing.T) {
 	again, err := store.ForRun(ctx, SubjectMath, ModalityText)
 	if err != nil || string(again.APIKey) != "runtime-secret" {
 		t.Fatalf("secret copy=%q err=%v", again.APIKey, err)
+	}
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "runtime-model", IP: net.ParseIP("192.0.2.13")}
+	var textID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM ai_models WHERE provider_id=$1 AND modality='text'`, id).Scan(&textID); err != nil {
+		t.Fatal(err)
+	}
+	disable := PutModelInput{ProviderID: id, ID: textID, UpstreamModelID: "text", Modality: ModalityText, ContextTokens: 8192, MaxOutputTokens: 1024, ImageQuotaTokens: 1000, Enabled: false, ExpectedVersion: 1}
+	if _, err := store.PutModel(ctx, actor, disable); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("disable sole active text=%v", err)
+	}
+	second := disable
+	second.ID = uuid.New()
+	second.UpstreamModelID = "text-second"
+	second.Enabled = true
+	second.ExpectedVersion = 0
+	if _, err := store.PutModel(ctx, actor, second); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("add ambiguous active text=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,created_by,updated_by) VALUES($1,$2,'ambiguous-text','text',8192,1024,1000,0,0,true,$3,$3)`, uuid.New(), id, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ForRun(ctx, SubjectMath, ModalityText); !errors.Is(err, ErrAIDisabled) {
+		t.Fatalf("ambiguous runtime=%v", err)
 	}
 }
 
