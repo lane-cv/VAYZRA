@@ -17,6 +17,9 @@ const nextCursor = ref<string>()
 const loading = ref(true)
 const error = ref('')
 const requestId = ref('')
+type LoadMode = 'replace' | 'append'
+const errorMode = ref<LoadMode>()
+const retryCursor = ref<string>()
 let controller: AbortController | undefined
 let generation = 0
 let searchTimer: ReturnType<typeof setTimeout> | undefined
@@ -58,13 +61,21 @@ async function updateQuery(): Promise<void> {
   await router.replace({ query: canonicalQuery() })
 }
 
-async function load(cursor?: string): Promise<void> {
+function beginReplacement(): void {
+  items.value = []
+  nextCursor.value = undefined
+}
+
+async function load(cursor?: string, mode: LoadMode = 'replace'): Promise<void> {
   const current = ++generation
   controller?.abort()
   controller = new AbortController()
+  if (mode === 'replace') beginReplacement()
   loading.value = true
   error.value = ''
   requestId.value = ''
+  errorMode.value = undefined
+  retryCursor.value = undefined
   try {
     const page = await listQuestionSummaries({
       channel: channel.value || undefined,
@@ -73,7 +84,7 @@ async function load(cursor?: string): Promise<void> {
       limit: 20,
     }, controller.signal)
     if (current !== generation) return
-    if (cursor) {
+    if (mode === 'append') {
       const existing = new Set(items.value.map((item) => `${item.channel}:${item.id}`))
       items.value = [...items.value, ...page.items.filter((item) => !existing.has(`${item.channel}:${item.id}`))]
     } else {
@@ -87,6 +98,8 @@ async function load(cursor?: string): Promise<void> {
   } catch (cause) {
     if (controller.signal.aborted || current !== generation) return
     error.value = cause instanceof Error ? cause.message : '加载失败'
+    errorMode.value = mode
+    retryCursor.value = cursor
     requestId.value = cause instanceof APIError
       ? cause.requestId
       : typeof cause === 'object' && cause && 'requestId' in cause
@@ -97,8 +110,13 @@ async function load(cursor?: string): Promise<void> {
   }
 }
 
+function retry(): void {
+  void load(retryCursor.value, errorMode.value === 'append' ? 'append' : 'replace')
+}
+
 async function changeChannel(): Promise<void> {
   activeCursor.value = undefined
+  beginReplacement()
   await updateQuery()
   await load()
 }
@@ -108,6 +126,7 @@ function changeSearch(): void {
   searchTimer = setTimeout(() => {
     void (async () => {
       activeCursor.value = undefined
+      beginReplacement()
       await updateQuery()
       await load()
     })()
@@ -154,7 +173,7 @@ onBeforeUnmount(() => {
     <p v-if="loading && !items.length" role="status">正在加载问答…</p>
     <div v-else-if="error && !items.length" role="alert">
       <p>{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
-      <button type="button" aria-label="重试加载问答" @click="load(activeCursor)">重试</button>
+      <button type="button" aria-label="重试加载问答" @click="retry">重试</button>
     </div>
     <p v-else-if="!items.length" class="empty">还没有符合条件的问题。</p>
     <ul v-else>
@@ -167,16 +186,16 @@ onBeforeUnmount(() => {
         </RouterLink>
       </li>
     </ul>
-    <div v-if="error && items.length" role="alert">
+    <div v-if="error && errorMode === 'append' && items.length" role="alert">
       <p>{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
-      <button type="button" aria-label="重试加载更多问答" @click="load(nextCursor)">重试</button>
+      <button type="button" aria-label="重试加载更多问答" @click="retry">重试</button>
     </div>
     <button
-      v-if="nextCursor"
+      v-if="nextCursor && !(error && errorMode === 'append')"
       type="button"
       aria-label="加载更多问答"
       :disabled="loading"
-      @click="load(nextCursor)"
+      @click="load(nextCursor, 'append')"
     >
       {{ loading ? '正在加载…' : '加载更多' }}
     </button>

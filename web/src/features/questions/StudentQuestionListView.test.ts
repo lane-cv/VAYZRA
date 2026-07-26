@@ -37,6 +37,7 @@ function mountList(query: Record<string, unknown> = {}) {
 describe('StudentQuestionListView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    api.list.mockReset()
     vi.useFakeTimers()
   })
   afterEach(() => vi.useRealTimers())
@@ -139,5 +140,97 @@ describe('StudentQuestionListView', () => {
       cursor: 'same-time:teacher:t1',
       limit: 20,
     }, expect.any(AbortSignal))
+  })
+
+  it.each([
+    {
+      name: 'channel',
+      change: async (wrapper: ReturnType<typeof mountList>['wrapper']) => {
+        await wrapper.get('[aria-label="答疑类型"]').setValue('ai')
+      },
+      expected: { channel: 'ai', search: undefined, limit: 20 },
+    },
+    {
+      name: 'search',
+      change: async (wrapper: ReturnType<typeof mountList>['wrapper']) => {
+        await wrapper.get('[aria-label="搜索问题标题"]').setValue('圆锥')
+        await vi.advanceTimersByTimeAsync(300)
+      },
+      expected: { channel: undefined, search: '圆锥', limit: 20 },
+    },
+  ])('clears stale rows when a $name replacement fails and retries page one without a cursor', async ({ change, expected }) => {
+    const replacement = [{ ...mixed[0], title: '圆锥新题' }]
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: 'old-next' })
+      .mockRejectedValueOnce(Object.assign(new Error('筛选暂不可用'), { requestId: 'req-replace' }))
+      .mockResolvedValueOnce({ items: replacement, nextCursor: undefined })
+    const { wrapper } = mountList()
+    await flushPromises()
+    expect(wrapper.text()).toContain('受力分析')
+
+    await change(wrapper)
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('函数题')
+    expect(wrapper.text()).not.toContain('受力分析')
+    expect(wrapper.get('[role=alert]').text()).toContain('req-replace')
+    expect(wrapper.find('button[aria-label="重试加载更多问答"]').exists()).toBe(false)
+    await wrapper.get('button[aria-label="重试加载问答"]').trigger('click')
+    await flushPromises()
+
+    expect(api.list).toHaveBeenLastCalledWith(expected, expect.any(AbortSignal))
+    expect(wrapper.text()).toContain('圆锥新题')
+  })
+
+  it('retains rows and the failed cursor for a load-more error, then retries the append exactly', async () => {
+    const nextItem = { ...mixed[0], id: 'a2', title: '追加页' }
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: 'append-cursor' })
+      .mockRejectedValueOnce(Object.assign(new Error('下一页暂不可用'), { requestId: 'req-more' }))
+      .mockResolvedValueOnce({ items: [nextItem], nextCursor: undefined })
+    const { wrapper } = mountList()
+    await flushPromises()
+
+    await wrapper.get('button[aria-label="加载更多问答"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('函数题')
+    expect(wrapper.text()).toContain('受力分析')
+    expect(wrapper.get('[role=alert]').text()).toContain('req-more')
+    expect(wrapper.find('button[aria-label="重试加载问答"]').exists()).toBe(false)
+    expect(wrapper.find('button[aria-label="加载更多问答"]').exists()).toBe(false)
+
+    await wrapper.get('button[aria-label="重试加载更多问答"]').trigger('click')
+    await flushPromises()
+    expect(api.list).toHaveBeenLastCalledWith({
+      channel: undefined,
+      search: undefined,
+      cursor: 'append-cursor',
+      limit: 20,
+    }, expect.any(AbortSignal))
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual(['函数题', '受力分析', '追加页'])
+  })
+
+  it('discards an aborted late load-more response after a newer replacement succeeds', async () => {
+    let resolveLate!: (value: unknown) => void
+    let lateSignal: AbortSignal | undefined
+    const aiOnly = [{ ...mixed[0], title: '新的 AI 结果' }]
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: 'late-cursor' })
+      .mockImplementationOnce((_filters, signal: AbortSignal) => {
+        lateSignal = signal
+        return new Promise((resolve) => { resolveLate = resolve })
+      })
+      .mockResolvedValueOnce({ items: aiOnly, nextCursor: undefined })
+    const { wrapper } = mountList()
+    await flushPromises()
+    await wrapper.get('button[aria-label="加载更多问答"]').trigger('click')
+    await wrapper.get('[aria-label="答疑类型"]').setValue('ai')
+    await flushPromises()
+
+    expect(lateSignal?.aborted).toBe(true)
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual(['新的 AI 结果'])
+    resolveLate({ items: [{ ...mixed[1], id: 'late', title: '迟到旧结果' }], nextCursor: undefined })
+    await flushPromises()
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual(['新的 AI 结果'])
   })
 })
