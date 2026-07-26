@@ -2,10 +2,12 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"happylearn.local/app/internal/platform/database"
@@ -55,9 +57,13 @@ func TestAISchemaHistoryAndRunConstraints(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, aiRunTerminalInsertSQL, uuid.New(), threadID, student, studentMessage, 2, "ai-run-key-00000001", "failed", config.providerID, config.modelID, config.promptID, config.promptSHA256); err == nil {
 		t.Fatal("duplicate student idempotency key succeeded")
+	} else {
+		assertUniqueConstraint(t, err, "ai_runs_student_id_idempotency_key_key")
 	}
 	if _, err := pool.Exec(ctx, aiRunTerminalInsertSQL, uuid.New(), threadID, student, studentMessage, 1, "ai-run-key-00000003", "failed", config.providerID, config.modelID, config.promptID, config.promptSHA256); err == nil {
 		t.Fatal("duplicate trigger attempt succeeded")
+	} else {
+		assertUniqueConstraint(t, err, "ai_runs_trigger_message_id_attempt_no_key")
 	}
 
 	if _, err := pool.Exec(ctx, `INSERT INTO ai_run_events(run_id,sequence,kind,payload_text) VALUES($1,0,'delta','x')`, runID); err == nil {
@@ -362,6 +368,17 @@ func aiStudent(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	return id
 }
 
+func assertUniqueConstraint(t *testing.T, err error, constraint string) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected PostgreSQL unique violation %q, got %T: %v", constraint, err, err)
+	}
+	if pgErr.Code != "23505" || pgErr.ConstraintName != constraint {
+		t.Fatalf("expected unique constraint %q, got code=%q constraint=%q", constraint, pgErr.Code, pgErr.ConstraintName)
+	}
+}
+
 func aiThread(t *testing.T, pool *pgxpool.Pool, student uuid.UUID) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
@@ -414,13 +431,13 @@ INSERT INTO ai_runs(
   prompt_id,prompt_subject,prompt_version,prompt_sha256,
   connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,
   reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,estimator_version,
-  completed_at,error_code
+  completed_at,error_code,usage_source
 ) VALUES(
   $1,$2,$3,$4,$5,$6,$7,
   $8,'https://provider.invalid','chat_completions',$9,'model','text',1000,100,10,0,0,
 	$10,'math',1,$11,
   1000,2000,2000,3000,1,100,'2026-07-26','2026-07',1,
-  now(),'upstream_failed'
+  now(),'upstream_failed','unknown'
 )`
 
 type aiConfigIDs struct {
