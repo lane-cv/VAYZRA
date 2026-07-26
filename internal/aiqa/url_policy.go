@@ -121,6 +121,7 @@ var forbiddenPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("2001::/20"),
 	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2620:4f:8000::/48"),
 	netip.MustParsePrefix("3ffe::/16"),
 	netip.MustParsePrefix("3fff::/20"),
 	netip.MustParsePrefix("5f00::/16"),
