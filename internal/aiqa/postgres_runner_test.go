@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -374,33 +373,51 @@ VALUES($1,$2,$2,'student','active','x')`, secondStudent, "runner-second-"+uuid.N
 	if err != nil {
 		t.Fatal(err)
 	}
-	box := &barrierRunnerSecretBox{ready: make(chan struct{}), release: make(chan struct{})}
-	store := NewPostgresRunnerStore(pool, box, nil)
-	results := make(chan LeasedRun, 2)
-	errs := make(chan error, 2)
-	for _, owner := range []string{"skip-a", "skip-b"} {
-		owner := owner
-		go func() {
-			leased, leaseErr := store.LeaseNext(ctx, owner, time.Now().UTC(), time.Minute)
-			results <- leased
-			errs <- leaseErr
-		}()
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	blockerOpen := true
+	defer func() {
+		if blockerOpen {
+			_ = blocker.Rollback(context.Background())
+		}
+	}()
+	var lockedID uuid.UUID
+	if err = blocker.QueryRow(ctx, `SELECT id FROM ai_runs WHERE status='queued' ORDER BY created_at,id FOR UPDATE LIMIT 1`).Scan(&lockedID); err != nil {
+		t.Fatal(err)
+	}
+	if lockedID != first.ID {
+		t.Fatalf("locked=%s want oldest=%s", lockedID, first.ID)
+	}
+
+	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
+	result := make(chan struct {
+		leased LeasedRun
+		err    error
+	}, 1)
+	go func() {
+		leased, leaseErr := store.LeaseNext(ctx, "skip-second", time.Now().UTC(), time.Minute)
+		result <- struct {
+			leased LeasedRun
+			err    error
+		}{leased, leaseErr}
+	}()
 	select {
-	case <-box.ready:
-	case <-time.After(time.Second):
-		t.Fatal("both concurrent claims did not reach post-claim preparation")
+	case got := <-result:
+		if got.err != nil || got.leased.Run.ID != second.ID {
+			t.Fatalf("claim while oldest locked=%s err=%v want=%s", got.leased.Run.ID, got.err, second.ID)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("LeaseNext blocked on oldest row instead of using SKIP LOCKED")
 	}
-	close(box.release)
-	a, b := <-results, <-results
-	if err = <-errs; err != nil {
+	if err = blocker.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err = <-errs; err != nil {
-		t.Fatal(err)
-	}
-	if a.Run.ID == b.Run.ID || (a.Run.ID != first.ID && a.Run.ID != second.ID) || (b.Run.ID != first.ID && b.Run.ID != second.ID) {
-		t.Fatalf("claims=%s,%s want=%s,%s", a.Run.ID, b.Run.ID, first.ID, second.ID)
+	blockerOpen = false
+	oldest, err := store.LeaseNext(ctx, "claim-oldest", time.Now().UTC(), time.Minute)
+	if err != nil || oldest.Run.ID != first.ID {
+		t.Fatalf("oldest after unlock=%s err=%v want=%s", oldest.Run.ID, err, first.ID)
 	}
 }
 
@@ -517,22 +534,4 @@ func (s *blockingRunnerAttachmentStore) LoadAIText(ctx context.Context, _, _ uui
 }
 func (s *blockingRunnerAttachmentStore) OpenAIImage(context.Context, uuid.UUID, uuid.UUID) (io.ReadCloser, string, int64, error) {
 	return nil, "", 0, errors.New("unused")
-}
-
-type barrierRunnerSecretBox struct {
-	count   atomic.Int32
-	ready   chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (b *barrierRunnerSecretBox) Seal(uuid.UUID, []byte) (EncryptedSecret, error) {
-	return EncryptedSecret{}, errors.New("unused")
-}
-func (b *barrierRunnerSecretBox) Open(uuid.UUID, EncryptedSecret) ([]byte, error) {
-	if b.count.Add(1) == 2 {
-		b.once.Do(func() { close(b.ready) })
-	}
-	<-b.release
-	return []byte("runner-secret"), nil
 }
