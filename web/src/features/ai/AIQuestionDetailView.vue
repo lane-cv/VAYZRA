@@ -59,6 +59,10 @@ const streamingText = computed(() => {
   if (run.status === 'queued' || run.status === 'streaming') return text
   return run.status === 'succeeded' && authoritativeRunId !== run.id ? text : ''
 })
+const awaitingAuthoritativeAnswer = computed(() => {
+  const run = currentRun.value
+  return run?.status === 'succeeded' && authoritativeRunId !== run.id
+})
 const streamRequestId = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.requestId ?? '' : '')
 const streamErrorCode = computed(() => currentRun.value ? aiRuns.runs[currentRun.value.id]?.subscriptionErrorCode ?? '' : '')
 
@@ -255,7 +259,7 @@ async function retry(): Promise<void> {
 }
 
 async function submitFollowup(): Promise<void> {
-  if (actionPending.value) return
+  if (actionPending.value || awaitingAuthoritativeAnswer.value) return
   error.value = ''
   requestId.value = ''
   const body = followup.value.trim()
@@ -379,19 +383,36 @@ onBeforeUnmount(() => {
       </div>
       <section class="followup" aria-labelledby="ai-followup-title">
         <h2 id="ai-followup-title">继续追问</h2>
+        <p v-if="awaitingAuthoritativeAnswer && !refreshError" role="status">
+          正在确认完整回答，确认后可继续追问…
+        </p>
         <form @submit.prevent="submitFollowup">
-          <label>追问内容<textarea v-model="followup" aria-label="AI 追问内容" maxlength="20000" rows="6"></textarea></label>
+          <label>
+            追问内容
+            <textarea
+              v-model="followup"
+              aria-label="AI 追问内容"
+              maxlength="20000"
+              rows="6"
+              :disabled="awaitingAuthoritativeAnswer"
+            ></textarea>
+          </label>
           <small>{{ Array.from(followup).length }}/20000</small>
           <QuestionAttachmentUploader
             :key="uploaderKey"
             :user-id="props.userId || session?.user?.id || ''"
             purpose="ai"
-            :disabled="actionPending"
+            :disabled="actionPending || awaitingAuthoritativeAnswer"
             @update:attachments="attachments=$event"
             @pending-change="uploadsPending=$event"
           />
           <p v-if="error" ref="errorBox" role="alert" tabindex="-1">{{ error }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
-          <button type="submit" :disabled="actionPending||uploadsPending">{{ actionPending ? '正在提交…' : '提交追问' }}</button>
+          <button
+            type="submit"
+            :disabled="actionPending || uploadsPending || awaitingAuthoritativeAnswer"
+          >
+            {{ actionPending ? '正在提交…' : '提交追问' }}
+          </button>
         </form>
       </section>
     </template>

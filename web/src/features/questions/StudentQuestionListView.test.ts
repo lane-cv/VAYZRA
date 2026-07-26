@@ -213,6 +213,57 @@ describe('StudentQuestionListView', () => {
     wrapper.unmount()
   })
 
+  it('restores origin focus after a no-cursor first-page failure and successful retry', async () => {
+    api.list
+      .mockRejectedValueOnce(Object.assign(new Error('首次返回失败'), { requestId: 'req-first' }))
+      .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+    const { wrapper } = mountList({ focus: 'teacher:t1' })
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('req-first')
+    await wrapper.get('[aria-label="重试加载问答"]').trigger('click')
+    await flushPromises()
+
+    const origin = wrapper.find('[data-question-key="teacher:t1"]')
+    expect(origin.exists()).toBe(true)
+    expect(document.activeElement).toBe(origin.element)
+    wrapper.unmount()
+  })
+
+  it('reports a repeated restore cursor, retains the saved route state, and safely retries', async () => {
+    const pageTwo = { ...mixed[0], id: 'a2', title: '重复游标页' }
+    const origin = { ...mixed[1], id: 't3', title: '循环恢复后的来源' }
+    api.list
+      .mockResolvedValueOnce({ items: [mixed[0]], nextCursor: 'cursor-repeat' })
+      .mockResolvedValueOnce({ items: [pageTwo], nextCursor: 'cursor-repeat' })
+      .mockResolvedValueOnce({ items: [pageTwo], nextCursor: 'cursor-target' })
+      .mockResolvedValueOnce({ items: [origin], nextCursor: undefined })
+    const { wrapper, route } = mountList({
+      cursor: 'cursor-target',
+      focus: 'teacher:t3',
+    })
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[role="alert"]').text()).toContain('分页响应异常')
+    expect(route.query).toMatchObject({ cursor: 'cursor-target', focus: 'teacher:t3' })
+
+    await wrapper.get('[aria-label="重试加载更多问答"]').trigger('click')
+    await flushPromises()
+
+    expect(api.list).toHaveBeenCalledTimes(4)
+    expect(wrapper.findAll('li').map((entry) => entry.get('strong').text())).toEqual([
+      '函数题',
+      '重复游标页',
+      '循环恢复后的来源',
+    ])
+    expect(route.query).toMatchObject({ cursor: 'cursor-target' })
+    expect(document.activeElement).toBe(wrapper.get('[data-question-key="teacher:t3"]').element)
+    wrapper.unmount()
+  })
+
   it.each([
     {
       name: 'channel',

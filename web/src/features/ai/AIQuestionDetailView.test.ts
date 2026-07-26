@@ -190,6 +190,17 @@ describe('AIQuestionDetailView', () => {
   })
 
   it('keeps a completed partial answer visible when authoritative refresh fails, then retries and replaces it', async () => {
+    api.add.mockResolvedValue({
+      run: { id: 'r2', status: 'queued', attemptNo: 2, lastSequence: 0 },
+      message: {
+        id: 'm3',
+        role: 'student',
+        body: '确认后追问',
+        createdAt: '2026-07-27T00:02:00Z',
+        attachments: [],
+      },
+      eventsUrl: '/events/r2',
+    })
     api.get
       .mockResolvedValueOnce(detail)
       .mockRejectedValueOnce(new APIError(503, 'request_failed', '暂时无法确认完整回答', 'req-refresh'))
@@ -210,6 +221,7 @@ describe('AIQuestionDetailView', () => {
       })
     const wrapper = mountDetail()
     await flushPromises()
+    await wrapper.get('[aria-label="AI 追问内容"]').setValue('确认后追问')
     const callbacks = (stream.subscribe.mock.calls as unknown as Array<
       [string, number, { onEvent(event: unknown): void }]
     >)[0][2]
@@ -222,6 +234,9 @@ describe('AIQuestionDetailView', () => {
     const refreshAlert = wrapper.get('[data-testid="answer-refresh-error"]')
     expect(refreshAlert.text()).toContain('暂时无法确认完整回答')
     expect(refreshAlert.text()).toContain('req-refresh')
+    await wrapper.get('form').trigger('submit')
+    expect(api.add).not.toHaveBeenCalled()
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
 
     await wrapper.get('[aria-label="重试确认完整回答"]').trigger('click')
     await flushPromises()
@@ -229,11 +244,55 @@ describe('AIQuestionDetailView', () => {
     expect(wrapper.find('[data-testid="streaming-answer"]').exists()).toBe(false)
     expect(wrapper.text()).toContain('权威完整回答')
     expect(wrapper.find('[data-testid="answer-refresh-error"]').exists()).toBe(false)
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(api.add).toHaveBeenCalledOnce()
     expect(api.get).toHaveBeenLastCalledWith(
       detail.thread.id,
       { limit: 100 },
       expect.any(AbortSignal),
     )
+  })
+
+  it('blocks follow-up while authoritative refresh is still in flight', async () => {
+    let resolveRefresh!: (value: AIThreadDetail) => void
+    api.get
+      .mockResolvedValueOnce(detail)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve }))
+    const wrapper = mountDetail()
+    await flushPromises()
+    await wrapper.get('[aria-label="AI 追问内容"]').setValue('等待确认的追问')
+    const callbacks = (stream.subscribe.mock.calls as unknown as Array<
+      [string, number, { onEvent(event: unknown): void }]
+    >)[0][2]
+
+    callbacks.onEvent({ sequence: 1, kind: 'delta', delta: '待确认回答' })
+    callbacks.onEvent({ sequence: 2, kind: 'status', status: 'succeeded' })
+    await nextTick()
+
+    expect(wrapper.text()).toContain('正在确认完整回答')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('form').trigger('submit')
+    expect(api.add).not.toHaveBeenCalled()
+
+    resolveRefresh({
+      ...detail,
+      messages: [
+        ...detail.messages,
+        {
+          id: 'm2',
+          role: 'assistant',
+          body: '权威回答',
+          runId: 'r1',
+          createdAt: '2026-07-27T00:01:00Z',
+          attachments: [],
+        },
+      ],
+      activeRun: { ...detail.activeRun!, status: 'succeeded', lastSequence: 2 },
+    })
+    await flushPromises()
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeUndefined()
   })
 
   it('loads every message page after refresh with stable de-duplication so the newest follow-up remains visible', async () => {

@@ -29,6 +29,7 @@ let generation = 0
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 let loadedThroughCursor: string | undefined
 let restoreTargetCursor = initialCursor
+let originFocusPending = Boolean(initialFocus)
 
 const statusLabels: Record<QuestionSummaryChannel, Record<string, string>> = {
   ai: {
@@ -151,6 +152,7 @@ function retry(): void {
   void (async () => {
     const loaded = await load(cursor, mode, !restoreTargetCursor)
     if (loaded && restoreTargetCursor) await continueRestore()
+    else if (loaded && mode === 'replace') await restoreOriginFocus()
   })()
 }
 
@@ -171,7 +173,13 @@ async function continueRestore(): Promise<void> {
   let pageCursor = nextCursor.value
   const seen = new Set<string>()
   while (pageCursor && loadedThroughCursor !== target) {
-    if (seen.has(pageCursor)) break
+    if (seen.has(pageCursor)) {
+      error.value = '问答分页响应异常，请重试'
+      requestId.value = ''
+      errorMode.value = 'append'
+      retryCursor.value = pageCursor
+      return
+    }
     seen.add(pageCursor)
     const loaded = await load(pageCursor, 'append', false)
     if (!loaded) return
@@ -184,15 +192,19 @@ async function continueRestore(): Promise<void> {
 }
 
 async function restoreOriginFocus(): Promise<void> {
-  if (!initialFocus) return
+  if (!originFocusPending) return
   await nextTick()
   const link = [...(listRoot.value?.querySelectorAll<HTMLElement>('[data-question-key]') ?? [])]
     .find((candidate) => candidate.dataset.questionKey === initialFocus)
-  link?.focus()
+  if (link) {
+    link.focus()
+    originFocusPending = false
+  }
 }
 
 async function changeChannel(): Promise<void> {
   restoreTargetCursor = undefined
+  originFocusPending = false
   activeCursor.value = undefined
   beginReplacement()
   await updateQuery()
@@ -204,6 +216,7 @@ function changeSearch(): void {
   searchTimer = setTimeout(() => {
     void (async () => {
       restoreTargetCursor = undefined
+      originFocusPending = false
       activeCursor.value = undefined
       beginReplacement()
       await updateQuery()
