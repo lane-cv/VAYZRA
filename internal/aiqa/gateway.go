@@ -81,6 +81,12 @@ type protocolAdapter interface {
 }
 
 func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfig, request GatewayRequest, callback func(GatewayEvent) error) error {
+	callerCtx := ctx
+	if cfg.Timeouts.Total > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.Timeouts.Total)
+		defer cancel()
+	}
 	if err := validateGatewayRequest(cfg, request, callback); err != nil {
 		return err
 	}
@@ -111,10 +117,10 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 			if attempt == 0 && !written.Load() && !observed && ctx.Err() == nil {
 				continue
 			}
-			return classifyTransportError(ctx, doErr)
+			return classifyTransportError(callerCtx, ctx, doErr)
 		}
 		observed = true
-		err = g.consumeResponse(ctx, cfg, response, adapter, callback)
+		err = g.consumeResponse(callerCtx, ctx, cfg, response, adapter, callback)
 		if err != nil {
 			return err
 		}
@@ -135,9 +141,7 @@ func validateGatewayRequest(cfg RuntimeProviderConfig, request GatewayRequest, c
 		}
 	}
 	for _, image := range request.Images {
-		mediaType, parameters, err := mime.ParseMediaType(image.MediaType)
-		if err != nil || mediaType != image.MediaType || len(parameters) != 0 ||
-			!strings.HasPrefix(mediaType, "image/") || image.Size < 0 || image.Open == nil {
+		if !isAllowedGatewayImageType(image.MediaType) || image.Size <= 0 || image.Open == nil {
 			return gatewayError("upstream_4xx", nil)
 		}
 	}
@@ -167,7 +171,16 @@ func newStreamingRequest(ctx context.Context, cfg RuntimeProviderConfig, request
 	return httpRequest, reader, nil
 }
 
-func (g *compatibleGateway) consumeResponse(ctx context.Context, cfg RuntimeProviderConfig, response *http.Response, adapter protocolAdapter, callback func(GatewayEvent) error) error {
+func isAllowedGatewayImageType(mediaType string) bool {
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *compatibleGateway) consumeResponse(callerCtx, ctx context.Context, cfg RuntimeProviderConfig, response *http.Response, adapter protocolAdapter, callback func(GatewayEvent) error) error {
 	if response == nil || response.Body == nil {
 		return gatewayError("stream_interrupted", nil)
 	}
@@ -184,6 +197,10 @@ func (g *compatibleGateway) consumeResponse(ctx context.Context, cfg RuntimeProv
 		default:
 			return gatewayError("upstream_4xx", nil)
 		}
+	}
+	if !isEventStreamContentType(response.Header.Get("Content-Type")) {
+		_ = response.Body.Close()
+		return gatewayError("malformed_stream", nil)
 	}
 
 	body := response.Body
@@ -223,11 +240,14 @@ func (g *compatibleGateway) consumeResponse(ctx context.Context, cfg RuntimeProv
 	if errors.As(err, &safe) {
 		return safe
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+	if errors.Is(callerCtx.Err(), context.Canceled) {
 		return gatewayError("cancelled", nil)
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(callerCtx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return gatewayError("timeout", nil)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return gatewayError("cancelled", nil)
 	}
 	if errors.Is(err, errGatewayIdleTimeout) {
 		return gatewayError("timeout", nil)
@@ -241,18 +261,34 @@ func (g *compatibleGateway) consumeResponse(ctx context.Context, cfg RuntimeProv
 	return gatewayError("malformed_stream", nil)
 }
 
-func classifyTransportError(ctx context.Context, err error) error {
-	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+func classifyTransportError(callerCtx, streamCtx context.Context, err error) error {
+	if errors.Is(callerCtx.Err(), context.Canceled) {
 		return gatewayError("cancelled", nil)
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(callerCtx.Err(), context.DeadlineExceeded) || errors.Is(streamCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return gatewayError("timeout", nil)
+	}
+	if errors.Is(streamCtx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return gatewayError("cancelled", nil)
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return gatewayError("timeout", nil)
 	}
 	return gatewayError("stream_interrupted", nil)
+}
+
+func isEventStreamContentType(header string) bool {
+	mediaType, parameters, err := mime.ParseMediaType(header)
+	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+		return false
+	}
+	for name, value := range parameters {
+		if name != "charset" || !strings.EqualFold(value, "utf-8") {
+			return false
+		}
+	}
+	return true
 }
 
 func gatewayError(category string, cause error) error {
