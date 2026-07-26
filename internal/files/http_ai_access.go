@@ -17,6 +17,7 @@ import (
 type AIAccessHTTPService interface {
 	Status(context.Context, Principal, uuid.UUID) (AIFileStatus, error)
 	Open(context.Context, Principal, AIOpenInput) (OpenedFile, error)
+	Reject(context.Context, Principal, uuid.UUID, string) error
 }
 
 type AIAccessHandler struct {
@@ -35,7 +36,7 @@ func (h *AIAccessHandler) Routes() http.Handler {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			next.ServeHTTP(w, r)
 		})
-	}, auth.RequireRole(auth.RoleStudent))
+	}, h.requireStudent)
 	r.Get("/{fileVersionId}/status", h.status)
 	r.Get("/{fileVersionId}/preview", h.preview)
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) { fileError(w, r, ErrNotFound) })
@@ -45,22 +46,58 @@ func (h *AIAccessHandler) Routes() http.Handler {
 	return r
 }
 
-func (h *AIAccessHandler) actor(w http.ResponseWriter, r *http.Request) (Principal, bool) {
-	if r.URL.RawQuery != "" {
-		fileError(w, r, ErrNotFound)
-		return Principal{}, false
-	}
+func (h *AIAccessHandler) requireStudent(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, ok := auth.UserFromContext(r.Context())
+		if !ok {
+			httpx.Error(w, r, http.StatusUnauthorized, "unauthenticated", "请先登录")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *AIAccessHandler) actorAndVersion(w http.ResponseWriter, r *http.Request) (Principal, uuid.UUID, bool) {
 	user, ok := auth.UserFromContext(r.Context())
+	actor := Principal{User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: net.IPv4zero}
+	addr, ipErr := httpx.ClientIP(r, h.trusted)
+	if ipErr == nil {
+		actor.IP = net.IP(addr.AsSlice())
+	}
+	id, idErr := aiFileVersionID(r)
 	if !ok || user.ID == uuid.Nil || user.Role != auth.RoleStudent || user.Status != auth.StatusActive {
-		httpx.Error(w, r, http.StatusForbidden, "forbidden", "无权访问")
-		return Principal{}, false
+		if user.ID != uuid.Nil && h.service.Reject(r.Context(), actor, id, "invalid_actor") != nil {
+			fileError(w, r, ErrAccessUnavailable)
+		} else {
+			httpx.Error(w, r, http.StatusForbidden, "forbidden", "无权访问")
+		}
+		return Principal{}, uuid.Nil, false
 	}
-	addr, err := httpx.ClientIP(r, h.trusted)
-	if err != nil {
-		fileError(w, r, ErrNotFound)
-		return Principal{}, false
+	if idErr != nil {
+		if h.service.Reject(r.Context(), actor, uuid.Nil, "malformed_id") != nil {
+			fileError(w, r, ErrAccessUnavailable)
+		} else {
+			fileError(w, r, ErrNotFound)
+		}
+		return Principal{}, uuid.Nil, false
 	}
-	return Principal{User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: net.IP(addr.AsSlice())}, true
+	if r.URL.RawQuery != "" {
+		if h.service.Reject(r.Context(), actor, id, "unexpected_query") != nil {
+			fileError(w, r, ErrAccessUnavailable)
+		} else {
+			fileError(w, r, ErrNotFound)
+		}
+		return Principal{}, uuid.Nil, false
+	}
+	if ipErr != nil {
+		if h.service.Reject(r.Context(), actor, id, "invalid_ip") != nil {
+			fileError(w, r, ErrAccessUnavailable)
+		} else {
+			fileError(w, r, ErrNotFound)
+		}
+		return Principal{}, uuid.Nil, false
+	}
+	return actor, id, true
 }
 
 func aiFileVersionID(r *http.Request) (uuid.UUID, error) {
@@ -73,13 +110,8 @@ func aiFileVersionID(r *http.Request) (uuid.UUID, error) {
 }
 
 func (h *AIAccessHandler) status(w http.ResponseWriter, r *http.Request) {
-	actor, ok := h.actor(w, r)
+	actor, id, ok := h.actorAndVersion(w, r)
 	if !ok {
-		return
-	}
-	id, err := aiFileVersionID(r)
-	if err != nil {
-		fileError(w, r, ErrNotFound)
 		return
 	}
 	out, err := h.service.Status(r.Context(), actor, id)
@@ -91,13 +123,8 @@ func (h *AIAccessHandler) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AIAccessHandler) preview(w http.ResponseWriter, r *http.Request) {
-	actor, ok := h.actor(w, r)
+	actor, id, ok := h.actorAndVersion(w, r)
 	if !ok {
-		return
-	}
-	id, err := aiFileVersionID(r)
-	if err != nil {
-		fileError(w, r, ErrNotFound)
 		return
 	}
 	ranges := r.Header.Values("Range")

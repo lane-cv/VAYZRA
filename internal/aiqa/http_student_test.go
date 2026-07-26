@@ -18,6 +18,7 @@ type studentHTTPStub struct {
 	create    CreateThreadInput
 	add       AddMessageInput
 	retryKey  string
+	cancelled int
 	err       error
 }
 
@@ -36,6 +37,7 @@ func (s *studentHTTPStub) AddMessage(_ context.Context, p Principal, in AddMessa
 	return studentHTTPDetail(), studentHTTPRun(), s.err
 }
 func (s *studentHTTPStub) CancelRun(context.Context, Principal, uuid.UUID) (Run, error) {
+	s.cancelled++
 	return studentHTTPRun(), s.err
 }
 func (s *studentHTTPStub) RetryRun(_ context.Context, _ Principal, _ uuid.UUID, key string) (Run, error) {
@@ -147,6 +149,9 @@ func TestStudentHTTPEnforcesTwentyThousandRuneBodyAndRole(t *testing.T) {
 	}{
 		{"maximum accepted", auth.RoleStudent, strings.Repeat("界", 20000), http.StatusCreated},
 		{"over maximum", auth.RoleStudent, strings.Repeat("界", 20001), http.StatusBadRequest},
+		{"Unicode whitespace counts toward maximum", auth.RoleStudent, "\u3000" + strings.Repeat("界", 20000), http.StatusBadRequest},
+		{"Unicode whitespace within maximum", auth.RoleStudent, "\u3000" + strings.Repeat("界", 19998) + "\u2003", http.StatusCreated},
+		{"Unicode whitespace only is empty", auth.RoleStudent, "\u3000\u2003", http.StatusBadRequest},
 		{"admin isolated", auth.RoleAdmin, "ok", http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

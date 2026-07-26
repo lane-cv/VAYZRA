@@ -217,6 +217,7 @@ type QADelivery struct {
 // owner, provider, model, or run snapshot.
 type AIFileStatus struct {
 	FileVersionID    uuid.UUID `json:"fileVersionId"`
+	MessageID        uuid.UUID `json:"-"`
 	ProcessingState  string    `json:"processingState"`
 	FailureCategory  string    `json:"failureCategory,omitempty"`
 	DetectedMIME     string    `json:"detectedMime,omitempty"`

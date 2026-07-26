@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
@@ -63,6 +64,9 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 	}
 	t.Cleanup(func() {
 		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE audit_logs DISABLE TRIGGER audit_logs_immutable`)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM audit_logs WHERE request_id LIKE 'ai-file-review-%'`)
+		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE audit_logs ENABLE TRIGGER audit_logs_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `ALTER TABLE file_access_logs DISABLE TRIGGER file_access_logs_immutable`)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM file_access_logs WHERE ai_message_id=$1 OR requested_file_version_id=ANY($2)`,
 			message, []uuid.UUID{bound, unbound, qaPurpose, notClean})
@@ -104,8 +108,8 @@ VALUES($1,$2,0,'question.txt')`, message, bound); err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				t.Fatalf("access err=%v", err)
 			}
-			if name == "foreign" && (denied.MessageID != message || denied.ObjectKey != "") {
-				t.Fatalf("denied audit target=%+v", denied)
+			if name == "foreign" && (denied.MessageID != uuid.Nil || denied.VersionID != uuid.Nil || denied.ObjectKey != "") {
+				t.Fatalf("foreign identifiers escaped SQL owner scope: %+v", denied)
 			}
 			if _, err := store.ResolveAIStatus(ctx, principal(tc.actor), tc.version); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("status err=%v", err)
@@ -127,5 +131,44 @@ FROM file_access_logs WHERE request_id=$1`, logRequestID).Scan(&loggedMessage, &
 	}
 	if loggedMessage != message || !lessonNull || !qaNull {
 		t.Fatalf("message=%s lessonNull=%v qaNull=%v", loggedMessage, lessonNull, qaNull)
+	}
+
+	service := NewAIAccessService(store, nil, nil, audit.NewPostgresWriter(pool))
+	ownerActor := principal(owner)
+	ownerActor.RequestID = "ai-file-review-status-allow"
+	if _, err := service.Status(ctx, ownerActor, bound); err != nil {
+		t.Fatal(err)
+	}
+	otherActor := principal(other)
+	otherActor.RequestID = "ai-file-review-status-deny"
+	if _, err := service.Status(ctx, otherActor, bound); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("status denial err=%v", err)
+	}
+	ownerActor.RequestID = "ai-file-review-unexpected-query"
+	if err := service.Reject(ctx, ownerActor, bound, "unexpected_query"); err != nil {
+		t.Fatal(err)
+	}
+	ownerActor.RequestID = "ai-file-review-malformed-id"
+	if err := service.Reject(ctx, ownerActor, uuid.Nil, "malformed_id"); err != nil {
+		t.Fatal(err)
+	}
+	var allowedTarget, deniedTarget, malformedTarget uuid.UUID
+	if err := pool.QueryRow(ctx, `
+SELECT
+ coalesce((SELECT ai_message_id FROM file_access_logs WHERE request_id='ai-file-review-status-allow'),'00000000-0000-0000-0000-000000000000'),
+ coalesce((SELECT ai_message_id FROM file_access_logs WHERE request_id='ai-file-review-status-deny'),'00000000-0000-0000-0000-000000000000'),
+ coalesce((SELECT ai_message_id FROM file_access_logs WHERE request_id='ai-file-review-unexpected-query'),'00000000-0000-0000-0000-000000000000')`).Scan(&allowedTarget, &deniedTarget, &malformedTarget); err != nil {
+		t.Fatal(err)
+	}
+	if allowedTarget != message || deniedTarget != uuid.Nil || malformedTarget != uuid.Nil {
+		t.Fatalf("allow=%s deny=%s malformed=%s", allowedTarget, deniedTarget, malformedTarget)
+	}
+	var action, targetType, targetID, reason string
+	if err := pool.QueryRow(ctx, `SELECT action,target_type,target_id,metadata->>'reason'
+FROM audit_logs WHERE request_id='ai-file-review-malformed-id'`).Scan(&action, &targetType, &targetID, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if action != "ai.file_access_rejected" || targetType != "ai_file_request" || targetID != "unresolved" || reason != "malformed_id" {
+		t.Fatalf("durable security audit=%q %q %q %q", action, targetType, targetID, reason)
 	}
 }

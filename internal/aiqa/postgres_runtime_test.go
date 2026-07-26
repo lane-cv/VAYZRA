@@ -143,6 +143,47 @@ func TestPostgresRuntimeSynchronizedDistinctKeysHitActiveIndex(t *testing.T) {
 	}
 }
 
+func TestPostgresRunEventReplayIsBoundedByCapturedSequence(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	store := NewPostgresRuntimeStore(pool)
+	_, run, err := store.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := uuid.New()
+	if _, err = pool.Exec(ctx, `INSERT INTO sessions(id,user_id,token_hash,idle_expires_at,absolute_expires_at)
+VALUES($1,$2,$3,now()+interval '1 hour',now()+interval '1 day')`, sessionID, fixture.student, []byte(uuid.NewString())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO ai_run_events(run_id,sequence,kind,payload_text,created_at) VALUES
+($1,1,'delta','one',now()),($1,2,'delta','two',now())`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET last_sequence=2 WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	actor := Principal{User: auth.User{ID: fixture.student, Role: auth.RoleStudent, Status: auth.StatusActive}, SessionID: sessionID}
+	events, err := store.ListRunEvents(ctx, actor, run.ID, 0, 1, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Sequence != 1 || events[0].Delta != "one" {
+		t.Fatalf("bounded events=%+v", events)
+	}
+	events, err = store.ListRunEvents(ctx, actor, run.ID, 1, 2, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Sequence != 2 || events[0].Delta != "two" {
+		t.Fatalf("next events=%+v", events)
+	}
+}
+
 func TestPostgresRuntimeOneActiveOwnerAndTerminalIdempotency(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

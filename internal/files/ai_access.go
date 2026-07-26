@@ -2,8 +2,11 @@ package files
 
 import (
 	"context"
+	"errors"
+	"net"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/objectstore"
 )
@@ -17,10 +20,15 @@ type AIAccessStore interface {
 type AIAccessService struct {
 	store               AIAccessStore
 	originals, previews objectstore.Store
+	security            audit.Writer
 }
 
-func NewAIAccessService(store AIAccessStore, originals, previews objectstore.Store) *AIAccessService {
-	return &AIAccessService{store: store, originals: originals, previews: previews}
+func NewAIAccessService(store AIAccessStore, originals, previews objectstore.Store, security ...audit.Writer) *AIAccessService {
+	var writer audit.Writer
+	if len(security) == 1 {
+		writer = security[0]
+	}
+	return &AIAccessService{store: store, originals: originals, previews: previews, security: writer}
 }
 
 func validAIActor(actor Principal) bool {
@@ -31,11 +39,52 @@ func (s *AIAccessService) Status(ctx context.Context, actor Principal, version u
 	if s == nil || s.store == nil || !validAIActor(actor) || version == uuid.Nil {
 		return AIFileStatus{}, ErrNotFound
 	}
+	log := AccessLog{
+		ActorUserID: actor.User.ID, RequestedVersionID: version, Action: ActionPreview,
+		RequestID: actor.RequestID, IP: append([]byte(nil), actor.IP...),
+	}
 	out, err := s.store.ResolveAIStatus(ctx, actor, version)
 	if err != nil {
-		return AIFileStatus{}, ErrNotFound
+		log.Result, log.Reason = AccessDenied, "not_found"
+		fallback := ErrNotFound
+		if !errors.Is(err, ErrNotFound) {
+			log.Result, log.Reason, fallback = AccessFailed, "storage", ErrAccessUnavailable
+		}
+		if s.store.WriteAccessLog(ctx, log) != nil {
+			return AIFileStatus{}, ErrAccessUnavailable
+		}
+		return AIFileStatus{}, fallback
+	}
+	log.VersionID, log.AIMessageID, log.Result = out.FileVersionID, out.MessageID, AccessAllowed
+	if s.store.WriteAccessLog(ctx, log) != nil {
+		return AIFileStatus{}, ErrAccessUnavailable
 	}
 	return out, nil
+}
+
+func (s *AIAccessService) Reject(ctx context.Context, actor Principal, version uuid.UUID, reason string) error {
+	if s == nil || actor.User.ID == uuid.Nil {
+		return ErrAccessUnavailable
+	}
+	if actor.IP == nil {
+		actor.IP = net.IPv4zero
+	}
+	if version != uuid.Nil {
+		if s.store == nil {
+			return ErrAccessUnavailable
+		}
+		return s.store.WriteAccessLog(ctx, AccessLog{
+			ActorUserID: actor.User.ID, RequestedVersionID: version, Action: ActionPreview,
+			Result: AccessMalformed, Reason: "policy", RequestID: actor.RequestID, IP: actor.IP,
+		})
+	}
+	if s.security == nil {
+		return ErrAccessUnavailable
+	}
+	return s.security.Write(ctx, audit.Event{
+		ActorUserID: actor.User.ID, Action: "ai.file_access_rejected", TargetType: "ai_file_request", TargetID: "unresolved",
+		Metadata: map[string]any{"reason": reason}, RequestID: actor.RequestID, IP: actor.IP,
+	})
 }
 
 func (s *AIAccessService) Open(ctx context.Context, actor Principal, in AIOpenInput) (OpenedFile, error) {

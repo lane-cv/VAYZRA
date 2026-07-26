@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/app"
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
@@ -504,7 +505,7 @@ func newProductionAIFileAccessService(ctx context.Context, pool *pgxpool.Pool, c
 	if err != nil {
 		return nil, err
 	}
-	return files.NewAIAccessService(files.NewPostgresStore(pool), stores.Originals, stores.Previews), nil
+	return files.NewAIAccessService(files.NewPostgresStore(pool), stores.Originals, stores.Previews, audit.NewPostgresWriter(pool)), nil
 }
 
 func newProductionStudentAIService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error) {

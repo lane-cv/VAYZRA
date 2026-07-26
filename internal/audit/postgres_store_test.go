@@ -128,3 +128,41 @@ func TestAIConfigurationAuditEventsAllowOnlyRedactedMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestAIFileRequestAuditAllowsOnlyStableRejectionMetadata(t *testing.T) {
+	base := Event{
+		ActorUserID: uuid.New(), Action: "ai.file_access_rejected", TargetType: "ai_file_request", TargetID: "unresolved",
+		Metadata: map[string]any{"reason": "malformed_id"}, RequestID: "request-ai-file", IP: net.ParseIP("192.0.2.9"),
+	}
+	for _, reason := range []string{"malformed_id", "unexpected_query", "invalid_actor", "invalid_ip"} {
+		event := base
+		event.Metadata = map[string]any{"reason": reason}
+		if _, err := validateAndMarshal(event); err != nil {
+			t.Fatalf("approved reason %q rejected: %v", reason, err)
+		}
+	}
+	for name, mutate := range map[string]func(Event) Event{
+		"raw identifier": func(event Event) Event {
+			event.Metadata = map[string]any{"reason": "malformed_id", "fileVersionId": uuid.NewString()}
+			return event
+		},
+		"raw query": func(event Event) Event {
+			event.Metadata = map[string]any{"reason": "unexpected_query", "query": "secret=value"}
+			return event
+		},
+		"unknown reason": func(event Event) Event {
+			event.Metadata = map[string]any{"reason": "foreign_object"}
+			return event
+		},
+		"resolved target": func(event Event) Event {
+			event.TargetID = uuid.NewString()
+			return event
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validateAndMarshal(mutate(base)); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("unsafe event accepted: %v", err)
+			}
+		})
+	}
+}

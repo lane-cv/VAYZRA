@@ -176,7 +176,7 @@ func studentAICanonicalUUID(raw string) (uuid.UUID, error) {
 
 func validStudentAIText(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
-	return trimmed != "" && utf8.ValidString(raw) && utf8.RuneCountInString(trimmed) <= maxStudentMessageRunes
+	return trimmed != "" && utf8.ValidString(raw) && utf8.RuneCountInString(raw) <= maxStudentMessageRunes
 }
 
 func studentAIError(w http.ResponseWriter, r *http.Request, err error) {

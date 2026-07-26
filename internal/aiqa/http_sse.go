@@ -23,7 +23,7 @@ type RunStreamState struct {
 
 type StudentEventStore interface {
 	RunStreamState(context.Context, Principal, uuid.UUID) (RunStreamState, error)
-	ListRunEvents(context.Context, Principal, uuid.UUID, int64, int) ([]RunEvent, error)
+	ListRunEvents(context.Context, Principal, uuid.UUID, int64, int64, int) ([]RunEvent, error)
 }
 
 type EventWaiter interface {
@@ -138,7 +138,7 @@ func (h *StudentHandler) eventsStream(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		events, err := h.events.ListRunEvents(r.Context(), actor, runID, after, 128)
+		events, err := h.events.ListRunEvents(r.Context(), actor, runID, after, state.LastSequence, 128)
 		if err != nil {
 			return
 		}
@@ -278,8 +278,8 @@ WHERE r.id=$2 AND r.student_id=$1`, actor.User.ID, runID, actor.SessionID).Scan(
 	return out, err
 }
 
-func (s *PostgresRuntimeStore) ListRunEvents(ctx context.Context, actor Principal, runID uuid.UUID, after int64, limit int) ([]RunEvent, error) {
-	if s == nil || s.pool == nil || actor.User.ID == uuid.Nil || actor.SessionID == uuid.Nil || runID == uuid.Nil || after < 0 {
+func (s *PostgresRuntimeStore) ListRunEvents(ctx context.Context, actor Principal, runID uuid.UUID, after, through int64, limit int) ([]RunEvent, error) {
+	if s == nil || s.pool == nil || actor.User.ID == uuid.Nil || actor.SessionID == uuid.Nil || runID == uuid.Nil || after < 0 || through < after {
 		return nil, ErrNotFound
 	}
 	if limit < 1 || limit > 128 {
@@ -293,8 +293,8 @@ JOIN ai_threads t ON t.id=r.thread_id AND t.student_id=$1
 JOIN users u ON u.id=t.student_id AND u.role='student' AND u.status='active' AND u.deleted_at IS NULL
 JOIN sessions sess ON sess.id=$3 AND sess.user_id=u.id AND sess.revoked_at IS NULL
  AND sess.idle_expires_at>now() AND sess.absolute_expires_at>now()
-WHERE e.run_id=$2 AND e.sequence>$4
-ORDER BY e.sequence LIMIT $5`, actor.User.ID, runID, actor.SessionID, after, limit)
+WHERE e.run_id=$2 AND e.sequence>$4 AND e.sequence<=$5
+ORDER BY e.sequence LIMIT $6`, actor.User.ID, runID, actor.SessionID, after, through, limit)
 	if err != nil {
 		return nil, err
 	}

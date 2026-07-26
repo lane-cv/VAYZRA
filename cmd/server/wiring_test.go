@@ -43,7 +43,7 @@ func (*serverStudentAI) RetryRun(context.Context, aiqa.Principal, uuid.UUID, str
 func (*serverStudentAI) RunStreamState(context.Context, aiqa.Principal, uuid.UUID) (aiqa.RunStreamState, error) {
 	return aiqa.RunStreamState{}, aiqa.ErrNotFound
 }
-func (*serverStudentAI) ListRunEvents(context.Context, aiqa.Principal, uuid.UUID, int64, int) ([]aiqa.RunEvent, error) {
+func (*serverStudentAI) ListRunEvents(context.Context, aiqa.Principal, uuid.UUID, int64, int64, int) ([]aiqa.RunEvent, error) {
 	return nil, aiqa.ErrNotFound
 }
 
@@ -54,6 +54,9 @@ func (*serverAIFileAccess) Status(_ context.Context, _ files.Principal, id uuid.
 }
 func (*serverAIFileAccess) Open(context.Context, files.Principal, files.AIOpenInput) (files.OpenedFile, error) {
 	return files.OpenedFile{}, files.ErrNotFound
+}
+func (*serverAIFileAccess) Reject(context.Context, files.Principal, uuid.UUID, string) error {
+	return nil
 }
 
 func TestBuildApplicationWiresStudentAIAndControlledFileFactories(t *testing.T) {

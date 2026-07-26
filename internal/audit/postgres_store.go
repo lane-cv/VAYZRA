@@ -147,6 +147,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
 	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
 	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.provider_tested": {"providerId": true, "protocol": true, "ok": true, "errorCategory": true, "latencyMs": true}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
+	"ai.file_access_rejected": {"reason": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -158,6 +159,7 @@ var allowedTargetTypes = map[string]string{
 	"file.processing_artifact_cleanup_scheduled": "file_version", "file.processing_artifact_cleanup_completed": "file_version",
 	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
 	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
+	"ai.file_access_rejected": "ai_file_request",
 }
 
 func validAIEvent(e Event) bool {
@@ -196,6 +198,16 @@ func validAIEvent(e Event) bool {
 	case "ai.limits_student_put":
 		_, x := uuid.Parse(v("studentId"))
 		return len(e.Metadata) == 1 && x == nil
+	case "ai.file_access_rejected":
+		if e.TargetID != "unresolved" || len(e.Metadata) != 1 {
+			return false
+		}
+		switch v("reason") {
+		case "malformed_id", "unexpected_query", "invalid_actor", "invalid_ip":
+			return true
+		default:
+			return false
+		}
 	}
 	return false
 }

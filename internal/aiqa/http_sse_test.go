@@ -2,7 +2,6 @@ package aiqa
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,23 +19,31 @@ type streamStoreStub struct {
 	state       RunStreamState
 	events      []RunEvent
 	stateCalls  int
+	principals  []Principal
 	eventsAfter []int64
+	eventsUntil []int64
+	onList      func()
 	err         error
 }
 
-func (s *streamStoreStub) RunStreamState(context.Context, Principal, uuid.UUID) (RunStreamState, error) {
+func (s *streamStoreStub) RunStreamState(_ context.Context, principal Principal, _ uuid.UUID) (RunStreamState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stateCalls++
+	s.principals = append(s.principals, principal)
 	return s.state, s.err
 }
-func (s *streamStoreStub) ListRunEvents(_ context.Context, _ Principal, _ uuid.UUID, after int64, _ int) ([]RunEvent, error) {
+func (s *streamStoreStub) ListRunEvents(_ context.Context, _ Principal, _ uuid.UUID, after, through int64, _ int) ([]RunEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.eventsAfter = append(s.eventsAfter, after)
+	s.eventsUntil = append(s.eventsUntil, through)
+	if s.onList != nil {
+		s.onList()
+	}
 	out := make([]RunEvent, 0)
 	for _, event := range s.events {
-		if event.Sequence > after {
+		if event.Sequence > after && event.Sequence <= through {
 			out = append(out, event)
 		}
 	}
@@ -48,6 +55,32 @@ type oneWait struct{ calls int }
 func (w *oneWait) Wait(ctx context.Context, _ time.Duration) error {
 	w.calls++
 	return context.Canceled
+}
+
+type continueOnceWait struct{ calls int }
+
+func (w *continueOnceWait) Wait(context.Context, time.Duration) error {
+	w.calls++
+	if w.calls == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+type revokeSessionWait struct {
+	store *streamStoreStub
+	once  sync.Once
+}
+
+func (w *revokeSessionWait) Wait(context.Context, time.Duration) error {
+	w.once.Do(func() {
+		w.store.mu.Lock()
+		w.store.events = append(w.store.events, RunEvent{Sequence: 2, Kind: "delta", Delta: "must-not-emit"})
+		w.store.state = RunStreamState{Status: RunStreaming, LastSequence: 2}
+		w.store.err = ErrNotFound
+		w.store.mu.Unlock()
+	})
+	return nil
 }
 
 type delayedTerminalWait struct {
@@ -137,6 +170,34 @@ func TestSSEReplaysPersistedEventsAndClosesOnTerminal(t *testing.T) {
 	}
 }
 
+func TestSSEConcurrentAppendAfterStateSnapshotContinuesOnNextPoll(t *testing.T) {
+	store := &streamStoreStub{
+		state:  RunStreamState{Status: RunStreaming, LastSequence: 1},
+		events: []RunEvent{{Sequence: 1, Kind: "delta", Delta: "a"}},
+	}
+	var appendOnce sync.Once
+	store.onList = func() {
+		appendOnce.Do(func() {
+			store.events = append(store.events, RunEvent{Sequence: 2, Kind: "completed"})
+			store.state = RunStreamState{Status: RunSucceeded, LastSequence: 2}
+		})
+	}
+	h := NewStudentHandler(&studentHTTPStub{}, store)
+	h.waiter = &continueOnceWait{}
+	h.sessionID = func(context.Context) (uuid.UUID, bool) { return uuid.New(), true }
+	r := httptest.NewRequest(http.MethodGet, "/runs/"+studentHTTPRunID.String()+"/events", nil)
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive}))
+	result := httptest.NewRecorder()
+	h.Routes().ServeHTTP(result, r)
+	body := result.Body.String()
+	if !strings.Contains(body, "id: 1\n") || !strings.Contains(body, "id: 2\n") || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("stream closed on concurrent append: %q", body)
+	}
+	if len(store.eventsUntil) < 2 || store.eventsUntil[0] != 1 || store.eventsUntil[1] != 2 {
+		t.Fatalf("snapshot bounds=%v", store.eventsUntil)
+	}
+}
+
 func TestSSELastEventIDAndAfterSequenceAreStrict(t *testing.T) {
 	tests := []struct {
 		name, header, query string
@@ -175,7 +236,7 @@ func TestSSELastEventIDAndAfterSequenceAreStrict(t *testing.T) {
 	}
 }
 
-func TestSSEDuplicateHeaderOwnershipRecheckAndDisconnect(t *testing.T) {
+func TestSSEDuplicateHeaderAndOwnershipRecheck(t *testing.T) {
 	store := &streamStoreStub{state: RunStreamState{Status: RunStreaming, LastSequence: 0}}
 	waiter := &oneWait{}
 	h := NewStudentHandler(&studentHTTPStub{}, store)
@@ -203,9 +264,59 @@ func TestSSEDuplicateHeaderOwnershipRecheckAndDisconnect(t *testing.T) {
 	if waiter.calls != 1 {
 		t.Fatalf("wait calls=%d", waiter.calls)
 	}
-	// Subscription cancellation must never invoke the run cancellation service.
-	if !errors.Is(context.Canceled, context.Canceled) {
-		t.Fatal("unreachable")
+}
+
+func TestSSEDisconnectReturnsWithoutCancellingRun(t *testing.T) {
+	store := &streamStoreStub{state: RunStreamState{Status: RunStreaming}}
+	waiter := &blockingEventWait{started: make(chan struct{})}
+	service := &studentHTTPStub{}
+	h := NewStudentHandler(service, store)
+	h.waiter = waiter
+	h.sessionID = func(context.Context) (uuid.UUID, bool) { return uuid.New(), true }
+	requestCtx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/runs/"+studentHTTPRunID.String()+"/events", nil)
+	request = request.WithContext(auth.ContextWithUser(requestCtx, auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive}))
+	done := make(chan struct{})
+	go func() {
+		h.Routes().ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+	<-waiter.started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream handler did not return after disconnect")
+	}
+	if service.cancelled != 0 {
+		t.Fatalf("disconnect cancelled run %d times", service.cancelled)
+	}
+}
+
+func TestSSESessionRevocationBetweenPollsClosesBeforeLaterEvents(t *testing.T) {
+	store := &streamStoreStub{
+		state:  RunStreamState{Status: RunStreaming, LastSequence: 1},
+		events: []RunEvent{{Sequence: 1, Kind: "delta", Delta: "owned"}},
+	}
+	h := NewStudentHandler(&studentHTTPStub{}, store)
+	h.waiter = &revokeSessionWait{store: store}
+	sessionID := uuid.MustParse("20000000-0000-4000-8000-000000000099")
+	h.sessionID = func(context.Context) (uuid.UUID, bool) { return sessionID, true }
+	r := httptest.NewRequest(http.MethodGet, "/runs/"+studentHTTPRunID.String()+"/events", nil)
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive}))
+	result := httptest.NewRecorder()
+	h.Routes().ServeHTTP(result, r)
+	body := result.Body.String()
+	if !strings.Contains(body, "id: 1\n") || strings.Contains(body, "id: 2\n") || strings.Contains(body, "must-not-emit") {
+		t.Fatalf("revoked stream body=%q", body)
+	}
+	if store.stateCalls < 3 {
+		t.Fatalf("authorization was not rechecked after revocation: %d", store.stateCalls)
+	}
+	for _, principal := range store.principals {
+		if principal.User.ID != studentHTTPUserID || principal.SessionID != sessionID {
+			t.Fatalf("principal recheck=%+v", principal)
+		}
 	}
 }
 
