@@ -205,6 +205,7 @@ func (s *PostgresConfigStore) ForRun(ctx context.Context, subject Subject, modal
 		return RuntimeProviderConfig{}, ErrAIDisabled
 	}
 	out.BaseURL = u
+	out.KeyVersion = keyVersion
 	key, err := s.box.Open(out.ProviderID, EncryptedSecret{KeyVersion: keyVersion, Blob: encrypted})
 	if err != nil {
 		return RuntimeProviderConfig{}, ErrAIDisabled

@@ -214,19 +214,25 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 		}
 	}
 	if purpose == "ai_attachment" {
-		keys := make([]string, 0, 2)
+		artifacts := make([]*PreviewResult, 0, 2)
 		if result.AIText != nil {
-			keys = append(keys, result.AIText.ObjectKey)
+			artifacts = append(artifacts, result.AIText)
 		}
 		if result.Preview != nil {
-			keys = append(keys, result.Preview.ObjectKey)
+			artifacts = append(artifacts, result.Preview)
 		}
-		tag, err := tx.Exec(ctx, `DELETE FROM file_processing_artifacts WHERE processing_job_id=$1 AND file_version_id=$2 AND attempt_no=$3 AND state='stored' AND object_key=ANY($4)`, job.ID, job.FileVersionID, job.Attempts, keys)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != int64(len(keys)) {
-			return errors.New("processing artifact publication conflict")
+		for _, artifact := range artifacts {
+			tag, err := tx.Exec(ctx, `DELETE FROM file_processing_artifacts
+WHERE processing_job_id=$1 AND file_version_id=$2 AND attempt_no=$3 AND state='stored'
+  AND artifact_kind=$4 AND object_key=$5 AND content_type=$6 AND size_bytes=$7 AND sha256=$8`,
+				job.ID, job.FileVersionID, job.Attempts, artifact.Kind, artifact.ObjectKey,
+				artifact.ContentType, artifact.Size, artifact.SHA256)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return errors.New("processing artifact publication conflict")
+			}
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE file_processing_jobs SET state='completed',lease_owner=NULL,lease_until=NULL,last_failure_category=NULL,updated_at=now() WHERE id=$1`, job.ID); err != nil {

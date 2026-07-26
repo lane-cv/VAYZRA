@@ -170,6 +170,28 @@ func TestSSEReplaysPersistedEventsAndClosesOnTerminal(t *testing.T) {
 	}
 }
 
+func TestSSEReplaysQueuedCancellationTerminalEvent(t *testing.T) {
+	for _, lastEventID := range []string{"", "0"} {
+		store := &streamStoreStub{
+			state:  RunStreamState{Status: RunCancelled, LastSequence: 1},
+			events: []RunEvent{{Sequence: 1, Kind: "cancelled", ErrorCode: "cancelled"}},
+		}
+		h := NewStudentHandler(&studentHTTPStub{}, store)
+		h.sessionID = func(context.Context) (uuid.UUID, bool) { return uuid.New(), true }
+		r := httptest.NewRequest(http.MethodGet, "/runs/"+studentHTTPRunID.String()+"/events", nil)
+		if lastEventID != "" {
+			r.Header.Set("Last-Event-ID", lastEventID)
+		}
+		r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: studentHTTPUserID, Role: auth.RoleStudent, Status: auth.StatusActive}))
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "id: 1\n") ||
+			!strings.Contains(w.Body.String(), `"status":"cancelled"`) {
+			t.Fatalf("lastEventID=%q status=%d body=%q", lastEventID, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestSSEConcurrentAppendAfterStateSnapshotContinuesOnNextPoll(t *testing.T) {
 	store := &streamStoreStub{
 		state:  RunStreamState{Status: RunStreaming, LastSequence: 1},

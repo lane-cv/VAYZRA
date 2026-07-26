@@ -57,6 +57,49 @@ func TestPostgresRunnerLeaseRebuildsStoredSnapshotAndTransitionsBeforeIO(t *test
 	}
 }
 
+func TestPostgresRunnerRejectsRotatedProviderKeyBeforeLeaseAndReleasesOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	runtimeStore := NewPostgresRuntimeStore(pool)
+	_, run, err := runtimeStore.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE ai_providers SET encrypted_api_key=decode(repeat('11',29),'hex'),key_version=2,key_updated_at=now() WHERE id=$1`, fixture.provider); err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
+	if _, err = store.LeaseNext(ctx, "rotated-key", time.Now().UTC(), time.Minute); !errors.Is(err, ErrNoRunnableRun) {
+		t.Fatalf("lease error=%v", err)
+	}
+	if _, err = store.LeaseNext(ctx, "rotated-key-again", time.Now().UTC(), time.Minute); !errors.Is(err, ErrNoRunnableRun) {
+		t.Fatalf("second lease error=%v", err)
+	}
+	var status RunStatus
+	var code, kind string
+	var lastSequence int64
+	var releases int
+	if err = pool.QueryRow(ctx, `SELECT status,error_code,last_sequence FROM ai_runs WHERE id=$1`, run.ID).Scan(&status, &code, &lastSequence); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT kind FROM ai_run_events WHERE run_id=$1 AND sequence=1`, run.ID).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE run_id=$1 AND action='release'`, run.ID).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if status != RunFailed || code != "provider_key_rotated" || lastSequence != 1 || kind != "failed" || releases != 2 {
+		t.Fatalf("status=%s code=%s seq=%d kind=%s releases=%d", status, code, lastSequence, kind, releases)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET provider_key_version=3 WHERE id=$1`, run.ID); err == nil {
+		t.Fatal("provider key version immutability trigger was not enforcing after migration")
+	}
+}
+
 func TestPostgresRunnerStreamingCancelIsDeferredToLeaseOwner(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
@@ -484,6 +527,68 @@ FROM ai_usage_ledger WHERE run_id=$1`, run.ID).Scan(&settles, &releases); err !=
 	}
 }
 
+func TestPostgresRunnerEstimatedUsageSettlesReservationAndPreservesAnomaly(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	fixture.cfg.Model.InputPriceMicroUSD = 1_000_000
+	fixture.cfg.Model.OutputPriceMicroUSD = 2_000_000
+	if _, err := pool.Exec(ctx, `UPDATE ai_models
+SET input_price_micro_usd_per_million_tokens=$2,output_price_micro_usd_per_million_tokens=$3
+WHERE id=$1`, fixture.model, fixture.cfg.Model.InputPriceMicroUSD, fixture.cfg.Model.OutputPriceMicroUSD); err != nil {
+		t.Fatal(err)
+	}
+	in := fixture.admission()
+	in.Reservation.TokenCount = 10
+	runtimeStore := NewPostgresRuntimeStore(pool)
+	_, run, err := runtimeStore.AdmitRun(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
+	gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {
+		if err := cb(GatewayEvent{Kind: "delta", Delta: "output"}); err != nil {
+			return err
+		}
+		return cb(GatewayEvent{Kind: "completed", FinishReason: "stop"})
+	})
+	stop := StartRunner(Runner{
+		Store: store, Gateway: gateway, Owner: "estimated-postgres", GlobalConcurrency: 1,
+		PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+		FlushInterval: time.Millisecond, FlushBytes: 4096,
+	})
+	waitRunner(t, func() bool {
+		var status RunStatus
+		_ = pool.QueryRow(ctx, `SELECT status FROM ai_runs WHERE id=$1`, run.ID).Scan(&status)
+		return status == RunSucceeded
+	})
+	stop()
+	var input, output, cost, charged int64
+	var source, reason string
+	var blocked bool
+	if err = pool.QueryRow(ctx, `SELECT input_tokens,output_tokens,cost_micro_usd,usage_source FROM ai_runs WHERE id=$1`,
+		run.ID).Scan(&input, &output, &cost, &source); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT COALESCE(sum(token_delta),0) FROM ai_usage_ledger WHERE run_id=$1 AND action='settle'`, run.ID).Scan(&charged); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT quota_blocked_at IS NOT NULL,quota_block_reason FROM ai_models WHERE id=$1`, fixture.model).Scan(&blocked, &reason); err != nil {
+		t.Fatal(err)
+	}
+	wantInput := int64(len([]byte("runtime prompt")) + len([]byte("question")))
+	wantOutput := int64(len([]byte("output")))
+	wantCost := wantInput + 2*wantOutput
+	if input != wantInput || output != wantOutput || cost != wantCost || source != "estimated" ||
+		charged != 20 || !blocked || reason != "quota_estimation_anomaly" {
+		t.Fatalf("usage=%d/%d cost=%d source=%s charged=%d blocked=%t reason=%s",
+			input, output, cost, source, charged, blocked, reason)
+	}
+}
+
 func TestPostgresRuntimeQueuedCancelRemainsImmediate(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
@@ -499,6 +604,25 @@ func TestPostgresRuntimeQueuedCancelRemainsImmediate(t *testing.T) {
 	cancelled, err := store.CancelRun(ctx, fixture.student, run.ID, time.Now().UTC())
 	if err != nil || cancelled.Status != RunCancelled {
 		t.Fatalf("cancelled=%+v err=%v", cancelled, err)
+	}
+	replayed, err := store.CancelRun(ctx, fixture.student, run.ID, time.Now().UTC())
+	if err != nil || replayed.LastSequence != 1 {
+		t.Fatalf("idempotent cancel=%+v err=%v", replayed, err)
+	}
+	var sequence int64
+	var kind, code string
+	var events, releases int
+	if err = pool.QueryRow(ctx, `SELECT sequence,kind,error_code FROM ai_run_events WHERE run_id=$1`, run.ID).Scan(&sequence, &kind, &code); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_run_events WHERE run_id=$1`, run.ID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE run_id=$1 AND action='release'`, run.ID).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if sequence != 1 || kind != "cancelled" || code != "cancelled" || events != 1 || releases != 2 {
+		t.Fatalf("sequence=%d kind=%s code=%s events=%d releases=%d", sequence, kind, code, events, releases)
 	}
 }
 

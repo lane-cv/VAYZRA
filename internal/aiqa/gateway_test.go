@@ -483,3 +483,25 @@ func categoryOf(err error) string {
 	}
 	return ""
 }
+
+func TestGatewayTransportFactoryReceivesEachRunTimeoutSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+	}))
+	defer server.Close()
+	var got GatewayTimeouts
+	gateway := newGatewayWithClientFactory(func(cfg RuntimeProviderConfig) *http.Client {
+		got = cfg.Timeouts
+		return server.Client()
+	})
+	cfg := testRuntimeConfig(t, server, ProtocolChatCompletions)
+	cfg.Timeouts.Connect = 137 * time.Millisecond
+	cfg.Timeouts.ResponseHeader = 2468 * time.Millisecond
+	if err := gateway.Stream(context.Background(), cfg, testGatewayRequest(), func(GatewayEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got.Connect != cfg.Timeouts.Connect || got.ResponseHeader != cfg.Timeouts.ResponseHeader {
+		t.Fatalf("factory timeouts=%+v want=%+v", got, cfg.Timeouts)
+	}
+}

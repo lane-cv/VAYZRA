@@ -573,16 +573,16 @@ func newProductionAIRunner(ctx context.Context, pool *pgxpool.Pool, cfg config.C
 		return nil, err
 	}
 	attachments := aiqa.NewPostgresAttachmentStore(pool, stores.Originals, stores.Previews)
-	client := aiqa.NewSafeHTTPClient(policy, aiqa.GatewayTimeouts{
-		Connect: 5 * time.Second, ResponseHeader: 30 * time.Second,
-		IdleStream: 30 * time.Second, Total: 10 * time.Minute,
-	})
 	return aiqa.StartRunner(aiqa.Runner{
-		Store: aiqa.NewPostgresRunnerStore(pool, box, attachments), Gateway: aiqa.NewGateway(client),
+		Store: aiqa.NewPostgresRunnerStore(pool, box, attachments), Gateway: newProductionAIGateway(policy),
 		Owner: uuid.NewString(), GlobalConcurrency: cfg.AIGlobalConcurrency,
 		PollInterval: time.Second, LeaseDuration: 30 * time.Second,
 		FlushInterval: 250 * time.Millisecond, FlushBytes: 4 << 10,
 	}), nil
+}
+
+func newProductionAIGateway(policy aiqa.URLPolicy) aiqa.Gateway {
+	return aiqa.NewSafeGateway(policy)
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {

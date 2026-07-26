@@ -116,6 +116,7 @@ type PutLimitsInput struct {
 }
 type RuntimeProviderConfig struct {
 	ProviderID   uuid.UUID
+	KeyVersion   int16
 	BaseURL      *url.URL
 	ProtocolMode ProtocolMode
 	APIKey       []byte

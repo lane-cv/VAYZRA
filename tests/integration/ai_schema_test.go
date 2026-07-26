@@ -409,7 +409,7 @@ func aiRun(t *testing.T, pool *pgxpool.Pool, threadID, student, messageID uuid.U
 const aiRunInsertSQL = `
 INSERT INTO ai_runs(
   id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,status,
-  provider_id,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,
+  provider_id,provider_key_version,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,
   context_window_tokens,max_output_tokens,image_quota_tokens,
   input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,
   prompt_id,prompt_subject,prompt_version,prompt_sha256,
@@ -417,7 +417,7 @@ INSERT INTO ai_runs(
   reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,estimator_version
 ) VALUES(
   $1,$2,$3,$4,$5,$6,$7,
-  $8,'https://provider.invalid','chat_completions',$9,'model','text',1000,100,10,0,0,
+  $8,1,'https://provider.invalid','chat_completions',$9,'model','text',1000,100,10,0,0,
 	$10,'math',1,$11,
   1000,2000,2000,3000,1,100,'2026-07-26','2026-07',1
 )`
@@ -425,7 +425,7 @@ INSERT INTO ai_runs(
 const aiRunTerminalInsertSQL = `
 INSERT INTO ai_runs(
   id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,status,
-  provider_id,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,
+  provider_id,provider_key_version,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,
   context_window_tokens,max_output_tokens,image_quota_tokens,
   input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,
   prompt_id,prompt_subject,prompt_version,prompt_sha256,
@@ -434,7 +434,7 @@ INSERT INTO ai_runs(
   completed_at,error_code,usage_source
 ) VALUES(
   $1,$2,$3,$4,$5,$6,$7,
-  $8,'https://provider.invalid','chat_completions',$9,'model','text',1000,100,10,0,0,
+  $8,1,'https://provider.invalid','chat_completions',$9,'model','text',1000,100,10,0,0,
 	$10,'math',1,$11,
   1000,2000,2000,3000,1,100,'2026-07-26','2026-07',1,
   now(),'upstream_failed','unknown'

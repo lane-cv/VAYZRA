@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -228,8 +227,11 @@ func (r Runner) execute(parent context.Context, leased LeasedRun) {
 		case "usage":
 			buffer.inputTokens = event.InputTokens
 			buffer.outputTokens = event.OutputTokens
-			buffer.finishReason = event.FinishReason
 			buffer.usageSeen = true
+		case "completed":
+			buffer.finishReason = event.FinishReason
+			buffer.mu.Unlock()
+			return nil
 		default:
 			buffer.mu.Unlock()
 			return nil
@@ -286,8 +288,8 @@ func (r Runner) execute(parent context.Context, leased LeasedRun) {
 	usageSource := "upstream"
 	if !usageSeen {
 		usageSource = "estimated"
-		input = 0
-		output = int64((utf8.RuneCountInString(answer) + 3) / 4)
+		input = estimateGatewayInput(leased.Request, leased.Config.Model.ImageQuotaTokens)
+		output = int64(len([]byte(answer)))
 	}
 	firstByteMS := totalMS
 	if !firstByte.IsZero() {
@@ -314,6 +316,25 @@ func (r Runner) execute(parent context.Context, leased LeasedRun) {
 			Status: RunFailed, ErrorCode: "terminal_store_failure", UsageSource: "unknown", TotalMS: totalMS,
 		})
 	}
+}
+
+func estimateGatewayInput(request GatewayRequest, imageQuotaTokens int64) int64 {
+	total := int64(len([]byte(request.SystemPrompt)))
+	for _, turn := range request.Turns {
+		textBytes := int64(len([]byte(turn.Text)))
+		if textBytes > math.MaxInt64-total {
+			return math.MaxInt64
+		}
+		total += textBytes
+	}
+	if imageQuotaTokens <= 0 || len(request.Images) == 0 {
+		return total
+	}
+	images := int64(len(request.Images))
+	if images > (math.MaxInt64-total)/imageQuotaTokens {
+		return math.MaxInt64
+	}
+	return total + images*imageQuotaTokens
 }
 
 func (r Runner) flush(ctx context.Context, leased LeasedRun, buffer *runBuffer) error {

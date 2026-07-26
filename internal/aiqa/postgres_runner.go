@@ -35,6 +35,14 @@ func (s *PostgresRunnerStore) LeaseNext(ctx context.Context, owner string, now t
 		return leased, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if failed, failErr := failQueuedRunWithRotatedKey(ctx, tx, now); failErr != nil {
+		return LeasedRun{}, failErr
+	} else if failed {
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return LeasedRun{}, commitErr
+		}
+		return LeasedRun{}, ErrNoRunnableRun
+	}
 
 	var studentID uuid.UUID
 	var rawURL string
@@ -54,7 +62,7 @@ UPDATE ai_runs r SET status='streaming',lease_owner=$1,lease_expires_at=$2,heart
 FROM candidate c WHERE r.id=c.id
 RETURNING r.id,r.thread_id,r.student_id,r.trigger_message_id,r.status,r.attempt_no,r.last_sequence,
  r.modality,r.reserved_token_count,r.created_at,r.updated_at,
- r.provider_id,r.provider_base_url,r.protocol_mode,r.model_id,r.upstream_model_id,
+ r.provider_id,r.provider_key_version,r.provider_base_url,r.protocol_mode,r.model_id,r.upstream_model_id,
  r.context_window_tokens,r.max_output_tokens,r.image_quota_tokens,
  r.input_price_micro_usd_per_million_tokens,r.output_price_micro_usd_per_million_tokens,
  r.prompt_id,r.prompt_subject,r.prompt_version,r.prompt_sha256,
@@ -63,7 +71,7 @@ RETURNING r.id,r.thread_id,r.student_id,r.trigger_message_id,r.status,r.attempt_
 		&leased.Run.ID, &leased.Run.ThreadID, &studentID, &leased.Run.TriggerMessageID, &leased.Run.Status,
 		&leased.Run.AttemptNo, &leased.Run.LastSequence, &leased.Run.Modality, &leased.Run.ReservedTokenCount,
 		&leased.Run.CreatedAt, &leased.Run.UpdatedAt,
-		&leased.Config.ProviderID, &rawURL, &leased.Config.ProtocolMode, &leased.Config.Model.ID,
+		&leased.Config.ProviderID, &leased.Config.KeyVersion, &rawURL, &leased.Config.ProtocolMode, &leased.Config.Model.ID,
 		&leased.Config.Model.UpstreamModelID, &leased.Config.Model.ContextTokens, &leased.Config.Model.MaxOutputTokens,
 		&leased.Config.Model.ImageQuotaTokens, &leased.Config.Model.InputPriceMicroUSD,
 		&leased.Config.Model.OutputPriceMicroUSD, &leased.Config.Prompt.ID, &leased.Config.Prompt.Subject,
@@ -86,8 +94,11 @@ RETURNING r.id,r.thread_id,r.student_id,r.trigger_message_id,r.status,r.attempt_
 	if err != nil || leased.Config.BaseURL.Scheme == "" || leased.Config.BaseURL.Host == "" {
 		return LeasedRun{}, ErrProviderUnavailable
 	}
-	err = tx.QueryRow(ctx, `SELECT encrypted_api_key,key_version FROM ai_providers WHERE id=$1`, leased.Config.ProviderID).
-		Scan(&encrypted, &keyVersion)
+	err = tx.QueryRow(ctx, `SELECT encrypted_api_key,key_version FROM ai_providers WHERE id=$1 AND key_version=$2`,
+		leased.Config.ProviderID, leased.Config.KeyVersion).Scan(&encrypted, &keyVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return LeasedRun{}, ErrProviderUnavailable
+	}
 	if err != nil {
 		return LeasedRun{}, err
 	}
@@ -243,6 +254,41 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 		return LeasedRun{}, ErrNoRunnableRun
 	}
 	return leased, nil
+}
+
+func failQueuedRunWithRotatedKey(ctx context.Context, tx pgx.Tx, now time.Time) (bool, error) {
+	var runID, studentID uuid.UUID
+	var reservedRequests, reservedTokens, sequence int64
+	var day, month string
+	err := tx.QueryRow(ctx, `
+SELECT r.id,r.student_id,r.reserved_request_count,r.reserved_token_count,
+       r.quota_day_key,r.quota_month_key,r.last_sequence
+FROM ai_runs r
+JOIN ai_providers p ON p.id=r.provider_id
+WHERE r.status='queued' AND p.key_version<>r.provider_key_version
+ORDER BY r.created_at,r.id
+FOR UPDATE OF r SKIP LOCKED
+LIMIT 1`).Scan(&runID, &studentID, &reservedRequests, &reservedTokens, &day, &month, &sequence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sequence++
+	if _, err = tx.Exec(ctx, `INSERT INTO ai_run_events(run_id,sequence,kind,payload_text,error_code,created_at)
+VALUES($1,$2,'failed','',$3,$4)`, runID, sequence, "provider_key_rotated", now); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE ai_runs SET status='failed',completed_at=$2,updated_at=$2,
+usage_source='unknown',error_code='provider_key_rotated',last_sequence=$3 WHERE id=$1 AND status='queued'`,
+		runID, now, sequence); err != nil {
+		return false, err
+	}
+	if err = settleRunnerQuota(ctx, tx, studentID, runID, day, month, reservedRequests, reservedTokens, 0, now, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *PostgresRunnerStore) startPreparationHeartbeat(parent context.Context, leased LeasedRun, leaseDuration time.Duration) (context.Context, func() error) {

@@ -66,14 +66,24 @@ func (e *GatewayError) Error() string { return e.Category }
 func (e *GatewayError) Unwrap() error { return e.cause }
 
 type compatibleGateway struct {
-	client *http.Client
+	clientFactory func(RuntimeProviderConfig) *http.Client
 }
 
 func NewGateway(client *http.Client) Gateway {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &compatibleGateway{client: client}
+	return newGatewayWithClientFactory(func(RuntimeProviderConfig) *http.Client { return client })
+}
+
+func NewSafeGateway(policy URLPolicy) Gateway {
+	return newGatewayWithClientFactory(func(cfg RuntimeProviderConfig) *http.Client {
+		return NewSafeHTTPClient(policy, cfg.Timeouts)
+	})
+}
+
+func newGatewayWithClientFactory(factory func(RuntimeProviderConfig) *http.Client) Gateway {
+	return &compatibleGateway{clientFactory: factory}
 }
 
 type protocolAdapter interface {
@@ -106,6 +116,10 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 	defer func() { authorization = "" }()
 
 	observed := false
+	client := g.clientFactory(cfg)
+	if client == nil {
+		return gatewayError("stream_interrupted", nil)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		written := atomic.Bool{}
 		trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) {
@@ -116,7 +130,7 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 		if err != nil {
 			return err
 		}
-		response, doErr := g.client.Do(httpRequest)
+		response, doErr := client.Do(httpRequest)
 		httpRequest.Header.Del("Authorization")
 		if doErr != nil {
 			_ = body.Close()

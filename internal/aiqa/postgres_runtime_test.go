@@ -459,7 +459,7 @@ VALUES($1,$2,'runtime-model','text',8192,1024,1000,2,3,true,1000,5000,5000,30000
 	}
 	u, _ := url.Parse("https://api.example.test/v1")
 	f.cfg = RuntimeProviderConfig{
-		ProviderID: f.provider, BaseURL: u, ProtocolMode: ProtocolResponses,
+		ProviderID: f.provider, KeyVersion: 1, BaseURL: u, ProtocolMode: ProtocolResponses,
 		Model:    ModelView{ID: f.model, ProviderID: f.provider, UpstreamModelID: "runtime-model", Modality: ModalityText, ContextTokens: 8192, MaxOutputTokens: 1024, ImageQuotaTokens: 1000, InputPriceMicroUSD: 2, OutputPriceMicroUSD: 3, Enabled: true},
 		Prompt:   PromptView{ID: f.prompt, Subject: SubjectMath, Version: 1, Body: "runtime prompt", Active: true},
 		Timeouts: GatewayTimeouts{Connect: time.Second, ResponseHeader: 5 * time.Second, IdleStream: 5 * time.Second, Total: 30 * time.Second},

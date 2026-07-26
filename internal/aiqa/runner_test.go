@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,7 +93,10 @@ func TestRunnerCompletesWithMonotonicEventsAndUsage(t *testing.T) {
 		if err := cb(GatewayEvent{Kind: "delta", Delta: "text"}); err != nil {
 			return err
 		}
-		return cb(GatewayEvent{Kind: "usage", InputTokens: 10, OutputTokens: 4, FinishReason: "stop"})
+		if err := cb(GatewayEvent{Kind: "usage", InputTokens: 10, OutputTokens: 4}); err != nil {
+			return err
+		}
+		return cb(GatewayEvent{Kind: "completed", FinishReason: "stop"})
 	})
 	stop := StartRunner(Runner{
 		Store: store, Gateway: gateway, Owner: "test", GlobalConcurrency: 1,
@@ -116,6 +122,109 @@ func TestRunnerCompletesWithMonotonicEventsAndUsage(t *testing.T) {
 		if event.Sequence != int64(i+1) {
 			t.Fatalf("event[%d].sequence=%d", i, event.Sequence)
 		}
+	}
+}
+
+func TestRunnerEstimatesExactReconstructedRequestWhenUsageMissing(t *testing.T) {
+	request := GatewayRequest{
+		SystemPrompt: "system✓",
+		Turns: []GatewayTurn{
+			{Role: "student", Text: "history"},
+			{Role: "assistant", Text: "answer"},
+			{Role: "student", Text: "current\n\nAttachment text:\ndocument"},
+		},
+		Images: []GatewayImage{{MediaType: "image/png", Size: 1, Open: func(context.Context) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("x")), nil
+		}}},
+	}
+	store := &runnerMemoryStore{queued: []LeasedRun{{
+		Run: Run{ID: uuid.New(), ReservedTokenCount: 10},
+		Config: RuntimeProviderConfig{Model: ModelView{
+			ImageQuotaTokens: 17, InputPriceMicroUSD: 1_000_000, OutputPriceMicroUSD: 2_000_000,
+		}},
+		Request: request,
+	}}}
+	gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {
+		if err := cb(GatewayEvent{Kind: "delta", Delta: "输出✓"}); err != nil {
+			return err
+		}
+		return cb(GatewayEvent{Kind: "completed", FinishReason: "stop"})
+	})
+	stop := StartRunner(Runner{
+		Store: store, Gateway: gateway, Owner: "estimate", GlobalConcurrency: 1,
+		PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+		FlushInterval: time.Millisecond, FlushBytes: 4096,
+	})
+	waitRunner(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.completed) == 1
+	})
+	stop()
+	store.mu.Lock()
+	got := store.completed[0]
+	store.mu.Unlock()
+	wantInput := int64(len([]byte(request.SystemPrompt)) + 17)
+	for _, turn := range request.Turns {
+		wantInput += int64(len([]byte(turn.Text)))
+	}
+	wantOutput := int64(len([]byte("输出✓")))
+	if got.InputTokens != wantInput || got.OutputTokens != wantOutput || got.UsageSource != "estimated" ||
+		got.CostMicroUSD != wantInput+2*wantOutput || got.FinishReason != "stop" {
+		t.Fatalf("completion=%+v want input=%d output=%d", got, wantInput, wantOutput)
+	}
+}
+
+func TestRunnerCapturesCompletedFinishReasonFromRealAdapters(t *testing.T) {
+	tests := []struct {
+		name, stream, finish string
+		protocol             ProtocolMode
+	}{
+		{
+			name: "chat completions", protocol: ProtocolChatCompletions, finish: "stop",
+			stream: "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n",
+		},
+		{
+			name: "responses", protocol: ProtocolResponses, finish: "completed",
+			stream: "event: response.output_text.delta\ndata: {\"delta\":\"answer\"}\n\n" +
+				"event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.stream)
+			}))
+			defer server.Close()
+			cfg := testRuntimeConfig(t, server, tc.protocol)
+			store := &runnerMemoryStore{queued: []LeasedRun{{
+				Run: Run{ID: uuid.New()}, Config: cfg, Request: testGatewayRequest(),
+			}}}
+			stop := StartRunner(Runner{
+				Store: store, Gateway: NewGateway(server.Client()), Owner: "adapter-contract", GlobalConcurrency: 1,
+				PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+				FlushInterval: time.Millisecond, FlushBytes: 4096,
+			})
+			waitRunner(t, func() bool {
+				store.mu.Lock()
+				defer store.mu.Unlock()
+				return len(store.completed) == 1
+			})
+			stop()
+			store.mu.Lock()
+			got := store.completed[0]
+			store.mu.Unlock()
+			if got.FinishReason != tc.finish || got.UsageSource != "upstream" || got.Answer != "answer" {
+				t.Fatalf("completion=%+v", got)
+			}
+			for _, event := range store.events {
+				if event.Kind == "completed" {
+					t.Fatalf("adapter completed event was persisted as a content checkpoint: %+v", event)
+				}
+			}
+		})
 	}
 }
 

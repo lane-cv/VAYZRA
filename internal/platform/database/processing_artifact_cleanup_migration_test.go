@@ -26,7 +26,7 @@ SELECT EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=17 AND is_applied)
 FROM goose_db_version`).Scan(&applied, &tablePresent, &latest); err != nil {
 		t.Fatal(err)
 	}
-	if !applied || !tablePresent || latest != 17 {
+	if !applied || !tablePresent || latest < 17 {
 		t.Fatalf("applied=%t table_present=%t latest=%d", applied, tablePresent, latest)
 	}
 

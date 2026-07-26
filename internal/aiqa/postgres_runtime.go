@@ -332,8 +332,16 @@ WHERE id=$1 AND student_id=$2 AND status='streaming'`, runID, studentID, now)
 		}
 		return run, runtimeDBError(err)
 	}
-	_, err = tx.Exec(ctx, `UPDATE ai_runs SET status=$3,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,completed_at=$4,updated_at=$4,usage_source='unknown',error_code=$5 WHERE id=$1 AND student_id=$2`,
-		runID, studentID, target, now, errorCode)
+	var sequence int64
+	if err = tx.QueryRow(ctx, `SELECT last_sequence+1 FROM ai_runs WHERE id=$1 AND student_id=$2`, runID, studentID).Scan(&sequence); err != nil {
+		return run, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO ai_run_events(run_id,sequence,kind,payload_text,error_code,created_at)
+VALUES($1,$2,$3,'',$4,$5)`, runID, sequence, target, errorCode, now); err != nil {
+		return run, runtimeDBError(err)
+	}
+	_, err = tx.Exec(ctx, `UPDATE ai_runs SET status=$3,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,completed_at=$4,updated_at=$4,usage_source='unknown',error_code=$5,last_sequence=$6 WHERE id=$1 AND student_id=$2`,
+		runID, studentID, target, now, errorCode, sequence)
 	if err != nil {
 		return run, runtimeDBError(err)
 	}
@@ -505,15 +513,16 @@ FROM ai_models WHERE id=$1 FOR UPDATE`, p.Model.ID).Scan(
 	var baseURL string
 	var protocol ProtocolMode
 	var providerActive bool
-	err = tx.QueryRow(ctx, `SELECT base_url,protocol_mode,active FROM ai_providers WHERE id=$1`, p.ProviderID).
-		Scan(&baseURL, &protocol, &providerActive)
+	var keyVersion int16
+	err = tx.QueryRow(ctx, `SELECT base_url,protocol_mode,active,key_version FROM ai_providers WHERE id=$1`, p.ProviderID).
+		Scan(&baseURL, &protocol, &providerActive, &keyVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrAIDisabled
 	}
 	if err != nil {
 		return err
 	}
-	if !providerActive || baseURL != p.BaseURL.String() || protocol != p.ProtocolMode {
+	if !providerActive || baseURL != p.BaseURL.String() || protocol != p.ProtocolMode || keyVersion != p.KeyVersion {
 		return ErrAIDisabled
 	}
 	var subject Subject
@@ -540,13 +549,13 @@ func insertRun(ctx context.Context, tx pgx.Tx, runID, studentID, threadID, messa
 	p := snapshot.Provider
 	_, err := tx.Exec(ctx, `INSERT INTO ai_runs(
 id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,status,
-provider_id,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,
+provider_id,provider_key_version,provider_base_url,protocol_mode,model_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,
 input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,prompt_id,prompt_subject,prompt_version,prompt_sha256,
 connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,
 reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,estimator_version,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,'queued',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$31)`,
+VALUES($1,$2,$3,$4,$5,$6,'queued',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$32)`,
 		runID, threadID, studentID, messageID, attempt, key,
-		p.ProviderID, p.BaseURL.String(), p.ProtocolMode, p.Model.ID, p.Model.UpstreamModelID, p.Model.Modality, p.Model.ContextTokens, p.Model.MaxOutputTokens, p.Model.ImageQuotaTokens,
+		p.ProviderID, p.KeyVersion, p.BaseURL.String(), p.ProtocolMode, p.Model.ID, p.Model.UpstreamModelID, p.Model.Modality, p.Model.ContextTokens, p.Model.MaxOutputTokens, p.Model.ImageQuotaTokens,
 		p.Model.InputPriceMicroUSD, p.Model.OutputPriceMicroUSD, p.Prompt.ID, p.Prompt.Subject, p.Prompt.Version, snapshot.PromptSHA256,
 		p.Timeouts.Connect.Milliseconds(), p.Timeouts.ResponseHeader.Milliseconds(), p.Timeouts.IdleStream.Milliseconds(), p.Timeouts.Total.Milliseconds(),
 		reservation.RequestCount, reservation.TokenCount, reservation.DayKey, reservation.MonthKey, reservation.EstimatorVersion, now)

@@ -81,6 +81,15 @@ func TestPostgresAITextCompletionRequiresAndPersistsPrivateArtifact(t *testing.T
 	if err := store.MarkArtifactStored(ctx, result.AIText.ObjectKey); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE file_processing_artifacts SET content_type='application/octet-stream' WHERE object_key=$1`, result.AIText.ObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(ctx, job, result); err == nil {
+		t.Fatal("completion accepted processing artifact registry metadata mismatch")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE file_processing_artifacts SET content_type=$2 WHERE object_key=$1`, result.AIText.ObjectKey, result.AIText.ContentType); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Complete(ctx, job, result); err != nil {
 		t.Fatal(err)
 	}
