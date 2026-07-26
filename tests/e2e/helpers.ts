@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { expect, type APIResponse, type Page } from '@playwright/test'
@@ -147,6 +147,220 @@ export async function waitForQuestionFile(page: Page, fileVersionId: string, tim
     await new Promise((resolve) => setTimeout(resolve, 500))
   }
   throw new Error(`question file ${fileVersionId} did not become ready (last=${JSON.stringify(last)})`)
+}
+
+export type AIProtocolMode = 'chat_completions' | 'responses'
+export type AIRunStatus = 'queued' | 'streaming' | 'succeeded' | 'failed' | 'cancelled'
+export type AIRun = {
+  id: string
+  status: AIRunStatus
+  attemptNo: number
+  lastSequence: number
+  errorCode?: string
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+    costMicroUSD: string
+    source: 'provider' | 'estimated'
+  }
+  createdAt: string
+  updatedAt: string
+}
+export type AIFileStatus = {
+  fileVersionId: string
+  processingState: string
+  failureCategory?: string
+  detectedMime?: string
+  size: number
+  previewAvailable: boolean
+}
+export type AIProvider = {
+  id: string
+  name: string
+  baseUrl: string
+  protocolMode: AIProtocolMode
+  active: boolean
+  hasKey: boolean
+  keyUpdatedAt: string
+  version: number
+}
+export type AIModel = {
+  id: string
+  providerId: string
+  upstreamModelId: string
+  modality: 'text' | 'vision'
+  contextTokens: number
+  maxOutputTokens: number
+  imageQuotaTokens: number
+  inputPriceMicroUsd: number
+  outputPriceMicroUsd: number
+  connectTimeoutMs: number
+  responseHeaderTimeoutMs: number
+  idleStreamTimeoutMs: number
+  totalTimeoutMs: number
+  enabled: boolean
+  version: number
+}
+
+const fakeProviderBaseURL = process.env.E2E_AI_PROVIDER_BASE_URL ?? 'http://fake-ai:8090/v1'
+const fakeProviderKey = process.env.E2E_AI_PROVIDER_KEY ?? 'e2e-provider-key'
+
+/**
+ * Install a complete, production-shaped AI configuration through the real
+ * admin endpoints. UI-specific provider/configuration behavior is covered in
+ * ai-admin.spec.ts; workflow tests use this helper to avoid coupling every
+ * scenario to the tabbed form.
+ */
+export async function configureAIProvider(page: Page, mode: AIProtocolMode): Promise<void> {
+  const suffix = randomUUID().slice(0, 8)
+  const provider = await apiJSON<AIProvider>(page, 'POST', '/api/v1/admin/ai/providers', {
+    name: `E2E AI ${mode} ${suffix}`,
+    baseUrl: fakeProviderBaseURL,
+    protocolMode: mode,
+    apiKey: fakeProviderKey,
+  }, { 'Idempotency-Key': randomUUID() })
+
+  const modelInput = (modality: 'text' | 'vision', upstreamModelId: string) => ({
+    upstreamModelId,
+    modality,
+    contextTokens: 16_384,
+    maxOutputTokens: 2_048,
+    imageQuotaTokens: 1_024,
+    inputPriceMicroUsd: 1_000,
+    outputPriceMicroUsd: 2_000,
+    connectTimeoutMs: 1_000,
+    responseHeaderTimeoutMs: 45_000,
+    idleStreamTimeoutMs: 45_000,
+    totalTimeoutMs: 90_000,
+    enabled: true,
+    clearQuotaBlock: false,
+    expectedVersion: 0,
+  })
+  await apiJSON<AIModel>(
+    page,
+    'PUT',
+    `/api/v1/admin/ai/providers/${provider.id}/models/${randomUUID()}`,
+    modelInput('text', `fixture-text-${suffix}`),
+  )
+  await apiJSON<AIModel>(
+    page,
+    'PUT',
+    `/api/v1/admin/ai/providers/${provider.id}/models/${randomUUID()}`,
+    modelInput('vision', `fixture-vision-${suffix}`),
+  )
+
+  const prompts = await apiJSON<Array<{ subject: 'math' | 'physics'; version: number; active: boolean }>>(
+    page,
+    'GET',
+    '/api/v1/admin/ai/prompts',
+  )
+  for (const subject of ['math', 'physics'] as const) {
+    const current = prompts.find((prompt) => prompt.subject === subject && prompt.active)
+    await apiJSON(page, 'PUT', `/api/v1/admin/ai/prompts/${subject}`, {
+      body: subject === 'math'
+        ? '你是数学助教。给出安全、清晰、可核对的推导。'
+        : '你是物理助教。说明系统、已知量、定律和单位。',
+      expectedVersion: current?.version ?? 0,
+    })
+  }
+  const limits = await apiJSON<{ global: { version: number } }>(page, 'GET', '/api/v1/admin/ai/limits')
+  await apiJSON(page, 'PUT', '/api/v1/admin/ai/limits/global', {
+    dailyRequests: { mode: 'limit', value: 1_000 },
+    monthlyRequests: { mode: 'limit', value: 10_000 },
+    dailyTokens: { mode: 'limit', value: 1_000_000 },
+    monthlyTokens: { mode: 'limit', value: 10_000_000 },
+    expectedVersion: limits.global.version,
+  })
+  await apiJSON<AIProvider>(page, 'PUT', '/api/v1/admin/ai/active-provider', {
+    providerId: provider.id,
+    expectedVersion: provider.version,
+  })
+}
+
+export async function uploadAIFixture(page: Page, path: string, declaredMime: string): Promise<UploadedFile> {
+  const bytes = await readFile(path)
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  const prefix = '/api/v1/student/ai-uploads'
+  const session = await apiJSON<{ id: string }>(page, 'POST', prefix, {
+    displayName: basename(path),
+    declaredMime,
+    expectedSize: bytes.length,
+    expectedSha256: sha256,
+  })
+  const partSize = 8 * 1024 * 1024
+  for (let offset = 0, number = 1; offset < bytes.length; offset += partSize, number += 1) {
+    const part = bytes.subarray(offset, Math.min(offset + partSize, bytes.length))
+    const response = await page.request.put(`${prefix}/${session.id}/parts/${number}`, {
+      data: part,
+      headers: {
+        ...(await csrfHeader(page)),
+        'Content-Type': 'application/octet-stream',
+        'X-Part-SHA256': createHash('sha256').update(part).digest('hex'),
+      },
+    })
+    await expect(response, `AI upload part ${number}`).toBeOK()
+  }
+  return apiJSON<UploadedFile>(page, 'POST', `${prefix}/${session.id}/complete`, {})
+}
+
+export async function waitForAIFile(page: Page, fileVersionId: string, timeout = 120_000): Promise<AIFileStatus> {
+  const deadline = Date.now() + timeout
+  let last: AIFileStatus | undefined
+  while (Date.now() < deadline) {
+    const response = await page.request.get(`/api/v1/ai-question-files/${fileVersionId}/status`)
+    if (response.ok()) {
+      last = await response.json() as AIFileStatus
+      const isImage = last.detectedMime?.startsWith('image/') ?? false
+      // Non-image AI attachments are usable only after the worker published
+      // their private ai_text preview; "ready" alone proves only clean scan.
+      if (last.processingState === 'ready' && (isImage || last.previewAvailable)) return last
+      if (last.processingState === 'rejected' || last.processingState === 'failed') break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  throw new Error(`AI file ${fileVersionId} did not become ready (last=${JSON.stringify(last)})`)
+}
+
+export async function waitForRunStatus(
+  page: Page,
+  runId: string,
+  status: AIRunStatus,
+  timeout = 120_000,
+): Promise<AIRun> {
+  const deadline = Date.now() + timeout
+  let last: AIRun | undefined
+  while (Date.now() < deadline) {
+    const threadResponse = await page.request.get('/api/v1/student/ai/threads?limit=100')
+    await expect(threadResponse).toBeOK()
+    const threads = (await threadResponse.json()).data as Array<{ id: string }>
+    for (const thread of threads) {
+      const detail = await apiJSON<{ activeRun?: AIRun }>(
+        page,
+        'GET',
+        `/api/v1/student/ai/threads/${thread.id}?limit=100`,
+      )
+      if (detail.activeRun?.id !== runId) continue
+      last = detail.activeRun
+      if (last.status === status) return last
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300))
+  }
+  throw new Error(`AI run ${runId} did not reach ${status} (last=${JSON.stringify(last)})`)
+}
+
+export async function providerHitCounts(page: Page): Promise<Record<string, number>> {
+  const countsURL = process.env.E2E_AI_PROVIDER_COUNTS_URL ?? 'http://fake-ai:8090/test/counts'
+  const response = await page.request.get(countsURL)
+  await expect(response, 'fake AI provider aggregate counts').toBeOK()
+  const payload = await response.json() as Record<string, unknown>
+  const counts: Record<string, number> = {}
+  for (const [label, value] of Object.entries(payload)) {
+    if (!/^(chat_completions|responses)\.[a-z0-9-]+$/.test(label) || !Number.isSafeInteger(value) || (value as number) < 0) {
+      throw new Error('fake AI provider returned non-aggregate counts')
+    }
+    counts[label] = value as number
+  }
+  return counts
 }
 
 export type NotificationRecord = { id: string; kind: string; targetId: string; targetPath: string; readAt?: string }

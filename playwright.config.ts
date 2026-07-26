@@ -19,5 +19,17 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'off',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    {
+      name: 'chromium',
+      grepInvert: /@phase4-mobile/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'phase4-mobile',
+      testMatch: /ai-.*\.spec\.ts/,
+      grep: /@phase4-mobile/,
+      use: { ...devices['Pixel 7'] },
+    },
+  ],
 })
