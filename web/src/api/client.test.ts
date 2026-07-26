@@ -35,6 +35,29 @@ describe('request', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ error: { code: 'invalid_credentials', message: '用户名或密码错误', requestId: 'req-1' } }), { status: 401 }))
     await expect(request('/auth/login', { method: 'POST', json: {} })).rejects.toEqual(expect.objectContaining({ status: 401, code: 'invalid_credentials', requestId: 'req-1' }))
   })
+  it.each([409, 503])('uses the sanitized provider error header fallback for %s connectivity DTOs', async (status) => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ok: false, protocol: 'responses', latencyMs: 12, errorCategory: 'auth',
+    }), { status, headers: { 'X-Error-Code': ' provider_unavailable ' } }))
+    await expect(request('/admin/ai/providers/p1/test', { method: 'POST' })).rejects.toEqual(expect.objectContaining({
+      status, code: 'PROVIDER_UNAVAILABLE', requestId: '',
+    }))
+  })
+  it('prefers ordinary JSON error codes and ignores arbitrary error headers', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'config_conflict', message: '配置已更新', requestId: 'req-json' } }), {
+        status: 409, headers: { 'X-Error-Code': 'PROVIDER_UNAVAILABLE' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false }), {
+        status: 503, headers: { 'X-Error-Code': 'raw-upstream-secret' },
+      }))
+    await expect(request('/admin/ai/providers/p1', { method: 'PUT' })).rejects.toEqual(expect.objectContaining({
+      code: 'config_conflict', message: '配置已更新', requestId: 'req-json',
+    }))
+    await expect(request('/admin/ai/providers/p1/test', { method: 'POST' })).rejects.toEqual(expect.objectContaining({
+      code: 'request_failed', message: '请求未能完成，请稍后重试', requestId: '',
+    }))
+  })
   it('rejects malformed success envelopes with a stable APIError', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ result: {} })))
     await expect(request('/auth/me')).rejects.toEqual(expect.objectContaining({ status: 200, code: 'invalid_response', requestId: '' }))

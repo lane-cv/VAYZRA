@@ -67,21 +67,23 @@ func (h *AdminConfigHandler) testProvider(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if h.providerTestLimiter != nil {
-		decision, err := h.providerTestLimiter.AllowProviderTest(r.Context(), p.User.ID)
-		if err != nil {
-			httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
-			return
+	if h.providerTestLimiter == nil {
+		httpx.Error(w, r, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE", "供应商测试暂不可用")
+		return
+	}
+	decision, err := h.providerTestLimiter.AllowProviderTest(r.Context(), p.User.ID)
+	if err != nil {
+		httpx.Error(w, r, http.StatusServiceUnavailable, "internal_error", "服务暂不可用")
+		return
+	}
+	if !decision.Allowed {
+		seconds := int(math.Ceil(decision.RetryAfter.Seconds()))
+		if seconds < 1 {
+			seconds = 1
 		}
-		if !decision.Allowed {
-			seconds := int(math.Ceil(decision.RetryAfter.Seconds()))
-			if seconds < 1 {
-				seconds = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			httpx.Error(w, r, http.StatusTooManyRequests, "rate_limited", "请求过于频繁，请稍后重试")
-			return
-		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		httpx.Error(w, r, http.StatusTooManyRequests, "rate_limited", "请求过于频繁，请稍后重试")
+		return
 	}
 	result, err := h.service.TestProvider(r.Context(), p, id)
 	if err != nil {

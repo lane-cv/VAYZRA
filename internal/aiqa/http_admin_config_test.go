@@ -120,7 +120,7 @@ func TestProviderTestHTTPSuccessAndFailureAreSanitized(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := NewAdminConfigHandler(&httpConfigService{testResult: tc.result, testErr: tc.err}, nil).Routes()
+			h := NewAdminConfigHandlerWithConfig(&httpConfigService{testResult: tc.result, testErr: tc.err}, AdminConfigHTTPConfig{ProviderTestLimiter: allowProviderTests()}).Routes()
 			r := httptest.NewRequest(http.MethodPost, "/providers/"+id.String()+"/test", nil)
 			r.RemoteAddr = "192.0.2.1:1234"
 			r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
@@ -164,6 +164,10 @@ type fakeProviderTestLimiter struct {
 	calls    int
 }
 
+func allowProviderTests() *fakeProviderTestLimiter {
+	return &fakeProviderTestLimiter{decision: redisx.ResourceDecision{Allowed: true}}
+}
+
 func (l *fakeProviderTestLimiter) AllowProviderTest(context.Context, uuid.UUID) (redisx.ResourceDecision, error) {
 	l.calls++
 	return l.decision, l.err
@@ -186,6 +190,19 @@ func TestProviderTestHTTPRateLimitRejectsBeforeService(t *testing.T) {
 	}
 }
 
+func TestProviderTestHTTPFailsClosedWithoutLimiter(t *testing.T) {
+	service := &httpConfigService{testResult: ConnectivityResult{OK: true, Protocol: ProtocolResponses}}
+	h := NewAdminConfigHandler(service, nil).Routes()
+	r := httptest.NewRequest(http.MethodPost, "/providers/"+uuid.NewString()+"/test", nil)
+	r.RemoteAddr = "192.0.2.1:1234"
+	r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"code":"PROVIDER_UNAVAILABLE"`) || service.testCalls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, service.testCalls, w.Body.String())
+	}
+}
+
 func TestProviderTestHTTPMapsMissingAndNonAdmin(t *testing.T) {
 	id := uuid.NewString()
 	for _, tc := range []struct {
@@ -199,7 +216,7 @@ func TestProviderTestHTTPMapsMissingAndNonAdmin(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			service := &httpConfigService{testErr: tc.err}
-			h := NewAdminConfigHandler(service, nil).Routes()
+			h := NewAdminConfigHandlerWithConfig(service, AdminConfigHTTPConfig{ProviderTestLimiter: allowProviderTests()}).Routes()
 			r := httptest.NewRequest(http.MethodPost, "/providers/"+id+"/test", nil)
 			r.RemoteAddr = "192.0.2.1:1234"
 			r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: tc.role, Status: auth.StatusActive}))

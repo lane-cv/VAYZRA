@@ -1,6 +1,7 @@
 export type Role = 'admin' | 'student'
 export type UserView = { id: string; username: string; displayName: string; role: Role; mustChangePassword: boolean }
 export type APIResult<T> = { data: T; meta?: Record<string, unknown> }
+export type HeaderAPIErrorCode = 'PROVIDER_UNAVAILABLE'
 type RequestOptions = Omit<RequestInit, 'body' | 'headers'> & { headers?: HeadersInit; json?: unknown }
 let unauthorizedHandler: (() => void) | undefined
 export class APIError extends Error { constructor(public readonly status: number, public readonly code: string, message: string, public readonly requestId: string) { super(message); this.name = 'APIError' } }
@@ -24,7 +25,8 @@ export async function requestWithMeta<T>(path: string, options: RequestOptions =
   if (!response.ok) {
     const error = payload && typeof payload === 'object' ? (payload as { error?: unknown }).error : undefined
     const details = error && typeof error === 'object' ? error as Record<string, unknown> : {}
-    const apiError = new APIError(response.status, typeof details.code === 'string' ? details.code : 'request_failed', typeof details.message === 'string' ? details.message : '请求未能完成，请稍后重试', typeof details.requestId === 'string' ? details.requestId : '')
+    const code = typeof details.code === 'string' ? details.code : normalizedHeaderErrorCode(response) ?? 'request_failed'
+    const apiError = new APIError(response.status, code, typeof details.message === 'string' ? details.message : '请求未能完成，请稍后重试', typeof details.requestId === 'string' ? details.requestId : '')
     if (response.status === 401) unauthorizedHandler?.()
     throw apiError
   }
@@ -35,3 +37,7 @@ export async function requestWithMeta<T>(path: string, options: RequestOptions =
 function isSafeMethod(method: string): boolean { return method === 'GET' || method === 'HEAD' || method === 'OPTIONS' }
 export function csrfCookie(): string | undefined { const values=document.cookie.split(';').map((part)=>part.trim()).filter((part)=>part.startsWith('hl_csrf=')).map((part)=>part.slice(8)); if(values.length!==1||!values[0]) return undefined; try { const value=decodeURIComponent(values[0]); return value || undefined } catch { return undefined } }
 async function parseJSON(response: Response): Promise<unknown> { try { return await response.json() } catch { return undefined } }
+function normalizedHeaderErrorCode(response: Response): HeaderAPIErrorCode | undefined {
+  const code = response.headers.get('X-Error-Code')?.trim().toUpperCase()
+  return code === 'PROVIDER_UNAVAILABLE' ? code : undefined
+}

@@ -74,6 +74,10 @@ func (l *appProviderTestLimiter) AllowProviderTest(context.Context, uuid.UUID) (
 	return l.decision, nil
 }
 
+func allowMountedProviderTests() *appProviderTestLimiter {
+	return &appProviderTestLimiter{decision: redisx.ResourceDecision{Allowed: true}}
+}
+
 func TestMountedAIProviderTestAuthRoleMissingCSRFLimiterAndNotFound(t *testing.T) {
 	providerID := uuid.NewString()
 	request := func(withSession, withCSRF bool) *http.Request {
@@ -91,7 +95,7 @@ func TestMountedAIProviderTestAuthRoleMissingCSRFLimiterAndNotFound(t *testing.T
 
 	t.Run("unauthenticated", func(t *testing.T) {
 		service := &appAI{}
-		h := New(Dependencies{Auth: &appFakeAuth{}, AdminAI: service, PublicOrigin: "https://learn.example.com"})
+		h := New(Dependencies{Auth: &appFakeAuth{}, AdminAI: service, ProviderTestLimiter: allowMountedProviderTests(), PublicOrigin: "https://learn.example.com"})
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, request(false, true))
 		if w.Code != http.StatusUnauthorized || service.testCalls != 0 {
@@ -100,7 +104,7 @@ func TestMountedAIProviderTestAuthRoleMissingCSRFLimiterAndNotFound(t *testing.T
 	})
 	t.Run("non-admin", func(t *testing.T) {
 		service := &appAI{}
-		h := New(Dependencies{Auth: &appStudentAuth{}, AdminAI: service, PublicOrigin: "https://learn.example.com"})
+		h := New(Dependencies{Auth: &appStudentAuth{}, AdminAI: service, ProviderTestLimiter: allowMountedProviderTests(), PublicOrigin: "https://learn.example.com"})
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, request(true, true))
 		if w.Code != http.StatusForbidden || service.testCalls != 0 {
@@ -109,7 +113,7 @@ func TestMountedAIProviderTestAuthRoleMissingCSRFLimiterAndNotFound(t *testing.T
 	})
 	t.Run("missing provider", func(t *testing.T) {
 		service := &appAI{testErr: aiqa.ErrNotFound}
-		h := New(Dependencies{Auth: &appAdminAuth{}, AdminAI: service, PublicOrigin: "https://learn.example.com"})
+		h := New(Dependencies{Auth: &appAdminAuth{}, AdminAI: service, ProviderTestLimiter: allowMountedProviderTests(), PublicOrigin: "https://learn.example.com"})
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, request(true, true))
 		if w.Code != http.StatusNotFound || service.testCalls != 1 {
@@ -118,7 +122,7 @@ func TestMountedAIProviderTestAuthRoleMissingCSRFLimiterAndNotFound(t *testing.T
 	})
 	t.Run("csrf", func(t *testing.T) {
 		service := &appAI{}
-		h := New(Dependencies{Auth: &appAdminAuth{}, AdminAI: service, PublicOrigin: "https://learn.example.com"})
+		h := New(Dependencies{Auth: &appAdminAuth{}, AdminAI: service, ProviderTestLimiter: allowMountedProviderTests(), PublicOrigin: "https://learn.example.com"})
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, request(true, false))
 		if w.Code != http.StatusForbidden || service.testCalls != 0 || !strings.Contains(w.Body.String(), `"csrf_invalid"`) {
