@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -107,10 +108,12 @@ func TestPipelineAITextStoresPrivateNormalizedArtifact(t *testing.T) {
 		DisplayName: "question.txt", DeclaredMIME: "text/plain", Size: int64(len(body)), SHA256: hashHex(body),
 	}
 	previews := &recordingBlobStore{}
+	artifacts := newArtifactRegistryStub()
+	job := Job{ID: uuid.New(), FileVersionID: versionID, Kind: KindProcessFile, Attempts: 1}
 	result, err := (&Pipeline{
 		Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: previews,
-		Runner: &runnerStub{}, WorkRoot: t.TempDir(),
-	}).Process(context.Background(), Job{FileVersionID: versionID, Kind: KindProcessFile})
+		Artifacts: artifacts, Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+	}).Process(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,10 +148,11 @@ func TestPipelineAITextExtractsOfficeConvertedPDFAndImagesHaveNoText(t *testing.
 				_ = os.WriteFile(args[3], []byte("converted text"), 0600)
 			}
 		}}
+		job := Job{ID: uuid.New(), FileVersionID: source.VersionID, Kind: KindProcessFile, Attempts: 1}
 		result, err := (&Pipeline{
 			Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: &recordingBlobStore{},
-			Runner: runner, WorkRoot: t.TempDir(),
-		}).Process(context.Background(), Job{FileVersionID: source.VersionID, Kind: KindProcessFile})
+			Artifacts: newArtifactRegistryStub(), Runner: runner, WorkRoot: t.TempDir(),
+		}).Process(context.Background(), job)
 		if err != nil || result.AIText == nil {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
@@ -160,33 +164,82 @@ func TestPipelineAITextExtractsOfficeConvertedPDFAndImagesHaveNoText(t *testing.
 			VersionID: uuid.New(), Purpose: "ai_attachment", ObjectKey: "image",
 			DisplayName: "question.png", DeclaredMIME: "image/png", Size: int64(len(body)), SHA256: hashHex(body),
 		}
+		job := Job{ID: uuid.New(), FileVersionID: source.VersionID, Kind: KindProcessFile, Attempts: 1}
 		result, err := (&Pipeline{
 			Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: &recordingBlobStore{},
-			Runner: &runnerStub{}, WorkRoot: t.TempDir(),
-		}).Process(context.Background(), Job{FileVersionID: source.VersionID, Kind: KindProcessFile})
+			Artifacts: newArtifactRegistryStub(), Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+		}).Process(context.Background(), job)
 		if err != nil || result.AIText != nil {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	})
 }
 
-func TestPipelineAITextCleansFirstArtifactWhenSecondPutFails(t *testing.T) {
+func TestPipelineAmbiguousSecondPutNeverTouchesPreexistingArtifactsAndTracksFailedDeletes(t *testing.T) {
 	body := []byte("private question")
 	versionID := uuid.New()
 	source := SourceFile{
 		VersionID: versionID, Purpose: "ai_attachment", ObjectKey: "originals/private",
 		DisplayName: "question.txt", DeclaredMIME: "text/plain", Size: int64(len(body)), SHA256: hashHex(body),
 	}
-	previews := &recordingBlobStore{failPutAt: 2}
+	priorAIText := "previews/" + versionID.String() + "/ai_text.txt"
+	priorPage := "previews/" + versionID.String() + "/page.txt"
+	previews := &recordingBlobStore{
+		objects:   map[string][]byte{priorAIText: []byte("valid ai text"), priorPage: []byte("valid page")},
+		failPutAt: 2, deleteErr: objectstore.ErrUnavailable,
+	}
+	artifacts := newArtifactRegistryStub()
+	job := Job{ID: uuid.New(), FileVersionID: versionID, Kind: KindProcessFile, Attempts: 2}
 	_, err := (&Pipeline{
 		Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: previews,
-		Runner: &runnerStub{}, WorkRoot: t.TempDir(),
-	}).Process(context.Background(), Job{FileVersionID: versionID, Kind: KindProcessFile})
+		Artifacts: artifacts, Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+	}).Process(context.Background(), job)
 	if category(err) != "storage_unavailable" {
 		t.Fatalf("err=%v", err)
 	}
-	if len(previews.objects) != 0 {
-		t.Fatalf("orphaned preview objects=%v", previews.objects)
+	if string(previews.objects[priorAIText]) != "valid ai text" || string(previews.objects[priorPage]) != "valid page" {
+		t.Fatalf("preexisting artifacts changed: %v", previews.objects)
+	}
+	if len(artifacts.pendingKeys()) != 2 {
+		t.Fatalf("pending cleanup=%v objects=%v", artifacts.pendingKeys(), previews.objects)
+	}
+	for _, key := range artifacts.pendingKeys() {
+		if !strings.Contains(key, job.ID.String()) || !strings.Contains(key, "/2/") {
+			t.Fatalf("key is not attempt-owned: %q", key)
+		}
+		if _, exists := previews.objects[key]; !exists {
+			t.Fatalf("ambiguous object not retained for durable cleanup: %q", key)
+		}
+	}
+}
+
+func TestPipelineAmbiguousFirstPutPreservesPreexistingArtifactAndTracksAttemptObject(t *testing.T) {
+	body := []byte("private question")
+	versionID := uuid.New()
+	source := SourceFile{
+		VersionID: versionID, Purpose: "ai_attachment", ObjectKey: "originals/private",
+		DisplayName: "question.txt", DeclaredMIME: "text/plain", Size: int64(len(body)), SHA256: hashHex(body),
+	}
+	prior := "previews/" + versionID.String() + "/ai_text.txt"
+	previews := &recordingBlobStore{
+		objects:   map[string][]byte{prior: []byte("valid prior")},
+		failPutAt: 1, deleteErr: objectstore.ErrUnavailable,
+	}
+	artifacts := newArtifactRegistryStub()
+	job := Job{ID: uuid.New(), FileVersionID: versionID, Kind: KindProcessFile, Attempts: 1}
+	_, err := (&Pipeline{
+		Sources: sourceStub{source: source}, Originals: &blobStub{body: body}, Previews: previews,
+		Artifacts: artifacts, Runner: &runnerStub{}, WorkRoot: t.TempDir(),
+	}).Process(context.Background(), job)
+	if category(err) != "storage_unavailable" {
+		t.Fatalf("err=%v", err)
+	}
+	if string(previews.objects[prior]) != "valid prior" {
+		t.Fatalf("preexisting artifact changed: %v", previews.objects)
+	}
+	pending := artifacts.pendingKeys()
+	if len(pending) != 1 || !strings.Contains(pending[0], job.ID.String()) {
+		t.Fatalf("pending cleanup=%v", pending)
 	}
 }
 
@@ -200,6 +253,7 @@ type recordingBlobStore struct {
 	objects   map[string][]byte
 	putCalls  int
 	failPutAt int
+	deleteErr error
 }
 
 func (b *recordingBlobStore) Get(context.Context, string, *objectstore.ByteRange) (io.ReadCloser, objectstore.ObjectInfo, error) {
@@ -231,8 +285,50 @@ func (b *recordingBlobStore) Put(_ context.Context, key string, reader io.Reader
 }
 
 func (b *recordingBlobStore) Delete(_ context.Context, key string) error {
+	if b.deleteErr != nil {
+		return b.deleteErr
+	}
 	delete(b.objects, key)
 	return nil
+}
+
+type artifactRegistryStub struct {
+	records map[string]ArtifactState
+}
+
+func newArtifactRegistryStub() *artifactRegistryStub {
+	return &artifactRegistryStub{records: make(map[string]ArtifactState)}
+}
+
+func (s *artifactRegistryStub) ReserveArtifact(_ context.Context, artifact ProcessingArtifact) error {
+	s.records[artifact.ObjectKey] = ArtifactReserved
+	return nil
+}
+
+func (s *artifactRegistryStub) MarkArtifactStored(_ context.Context, key string) error {
+	s.records[key] = ArtifactStored
+	return nil
+}
+
+func (s *artifactRegistryStub) MarkArtifactDeletePending(_ context.Context, key string) error {
+	s.records[key] = ArtifactDeletePending
+	return nil
+}
+
+func (s *artifactRegistryStub) ForgetArtifact(_ context.Context, key string) error {
+	delete(s.records, key)
+	return nil
+}
+
+func (s *artifactRegistryStub) pendingKeys() []string {
+	var out []string
+	for key, state := range s.records {
+		if state == ArtifactDeletePending {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func tinyPNG() []byte {

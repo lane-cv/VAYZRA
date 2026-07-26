@@ -51,3 +51,13 @@ type FileCleanupStore interface {
 	ClaimFileCleanup(context.Context, time.Time, string, time.Duration) (FileCleanupCandidate, bool, error)
 	CompleteFileCleanup(context.Context, FileCleanupCandidate, string, time.Time) error
 }
+
+type ProcessingArtifactCleanupCandidate struct {
+	ID        uuid.UUID
+	ObjectKey string
+}
+
+type ProcessingArtifactCleanupStore interface {
+	ClaimProcessingArtifactCleanup(context.Context, time.Time, string, time.Duration) (ProcessingArtifactCleanupCandidate, bool, error)
+	CompleteProcessingArtifactCleanup(context.Context, ProcessingArtifactCleanupCandidate, string, time.Time) error
+}

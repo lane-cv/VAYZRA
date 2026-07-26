@@ -136,6 +136,120 @@ func (s *PostgresStore) CompleteFileCleanup(ctx context.Context, candidate FileC
 	return tx.Commit(ctx)
 }
 
+func (s *PostgresStore) ClaimProcessingArtifactCleanup(ctx context.Context, now time.Time, owner string, lease time.Duration) (ProcessingArtifactCleanupCandidate, bool, error) {
+	if s == nil || s.pool == nil || now.IsZero() || owner == "" || len(owner) > 128 || lease <= 0 {
+		return ProcessingArtifactCleanupCandidate{}, false, ErrInvalid
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ProcessingArtifactCleanupCandidate{}, false, err
+	}
+	defer tx.Rollback(context.Background())
+
+	var candidate ProcessingArtifactCleanupCandidate
+	var versionID, actorID uuid.UUID
+	err = tx.QueryRow(ctx, `
+SELECT a.id,a.object_key,a.file_version_id,fv.created_by
+FROM file_processing_artifacts a
+JOIN file_processing_jobs j ON j.id=a.processing_job_id
+JOIN file_versions fv ON fv.id=a.file_version_id
+WHERE a.cleanup_attempts<1000
+  AND (a.cleanup_lease_until IS NULL OR a.cleanup_lease_until<$1)
+  AND (
+    a.state='delete_pending'
+    OR (
+      a.state IN ('reserved','stored')
+      AND (
+        j.state IN ('queued','completed','failed')
+        OR (j.state='running' AND (j.attempts>a.attempt_no OR j.lease_until<$1))
+      )
+    )
+  )
+ORDER BY a.updated_at,a.id
+FOR UPDATE OF a SKIP LOCKED LIMIT 1`, now).Scan(&candidate.ID, &candidate.ObjectKey, &versionID, &actorID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProcessingArtifactCleanupCandidate{}, false, nil
+	}
+	if err != nil {
+		return ProcessingArtifactCleanupCandidate{}, false, err
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE file_processing_artifacts
+SET state='delete_pending',cleanup_lease_owner=$2,cleanup_lease_until=$3,
+    cleanup_attempts=cleanup_attempts+1,updated_at=$4
+WHERE id=$1`, candidate.ID, owner, now.Add(lease), now)
+	if err != nil {
+		return ProcessingArtifactCleanupCandidate{}, false, err
+	}
+	if command.RowsAffected() != 1 {
+		return ProcessingArtifactCleanupCandidate{}, false, ErrUploadConflict
+	}
+	if err := audit.NewPostgresWriter(tx).Write(ctx, audit.Event{
+		ActorUserID: actorID,
+		Action:      "file.processing_artifact_cleanup_scheduled",
+		TargetType:  "file_version",
+		TargetID:    versionID.String(),
+		Metadata:    map[string]any{},
+		RequestID:   "maintenance-cleanup",
+		IP:          net.ParseIP("127.0.0.1"),
+	}); err != nil {
+		return ProcessingArtifactCleanupCandidate{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProcessingArtifactCleanupCandidate{}, false, err
+	}
+	return candidate, true, nil
+}
+
+func (s *PostgresStore) CompleteProcessingArtifactCleanup(ctx context.Context, candidate ProcessingArtifactCleanupCandidate, owner string, now time.Time) error {
+	if s == nil || s.pool == nil || candidate.ID == uuid.Nil || candidate.ObjectKey == "" || owner == "" || now.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+
+	var versionID, actorID uuid.UUID
+	var objectKey string
+	err = tx.QueryRow(ctx, `
+SELECT a.file_version_id,a.object_key,fv.created_by
+FROM file_processing_artifacts a
+JOIN file_versions fv ON fv.id=a.file_version_id
+WHERE a.id=$1 AND a.state='delete_pending'
+  AND a.cleanup_lease_owner=$2 AND a.cleanup_lease_until>$3
+FOR UPDATE OF a`, candidate.ID, owner, now).Scan(&versionID, &objectKey, &actorID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrUploadConflict
+	}
+	if err != nil {
+		return err
+	}
+	if objectKey != candidate.ObjectKey {
+		return ErrUploadConflict
+	}
+	command, err := tx.Exec(ctx, `DELETE FROM file_processing_artifacts WHERE id=$1`, candidate.ID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrUploadConflict
+	}
+	if err := audit.NewPostgresWriter(tx).Write(ctx, audit.Event{
+		ActorUserID: actorID,
+		Action:      "file.processing_artifact_cleanup_completed",
+		TargetType:  "file_version",
+		TargetID:    versionID.String(),
+		Metadata:    map[string]any{},
+		RequestID:   "maintenance-cleanup",
+		IP:          net.ParseIP("127.0.0.1"),
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func lockFileVersions(ctx context.Context, tx pgx.Tx, fileID uuid.UUID) error {
 	rows, err := tx.Query(ctx, `SELECT id FROM file_versions WHERE file_id=$1 ORDER BY id FOR UPDATE`, fileID)
 	if err != nil {
@@ -161,3 +275,4 @@ func fileReferenced(ctx context.Context, tx pgx.Tx, fileID uuid.UUID) (bool, err
 }
 
 var _ FileCleanupStore = (*PostgresStore)(nil)
+var _ ProcessingArtifactCleanupStore = (*PostgresStore)(nil)

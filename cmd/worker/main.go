@@ -137,7 +137,11 @@ func newProductionProcessor(sources processing.SourceStore, originals, previews 
 	if sources == nil || originals == nil || previews == nil || !filepath.IsAbs(workDir) {
 		return nil, errors.New("processing pipeline unavailable")
 	}
-	return &processing.Pipeline{Sources: sources, Originals: originals, Previews: previews, Runner: processing.ExecRunner{}, WorkRoot: workDir, ClamDefinitionsDir: "/var/lib/clamav"}, nil
+	artifacts, ok := sources.(processing.ArtifactRegistry)
+	if !ok {
+		return nil, errors.New("processing pipeline unavailable")
+	}
+	return &processing.Pipeline{Sources: sources, Originals: originals, Previews: previews, Artifacts: artifacts, Runner: processing.ExecRunner{}, WorkRoot: workDir, ClamDefinitionsDir: "/var/lib/clamav"}, nil
 }
 
 func buildWorker(store processing.Store, owner string, factory processorFactory) (*processing.Worker, error) {

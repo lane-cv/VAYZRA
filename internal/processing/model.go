@@ -51,6 +51,24 @@ type PreviewResult struct {
 	SHA256      string
 }
 
+type ArtifactState string
+
+const (
+	ArtifactReserved      ArtifactState = "reserved"
+	ArtifactStored        ArtifactState = "stored"
+	ArtifactDeletePending ArtifactState = "delete_pending"
+)
+
+type ProcessingArtifact struct {
+	FileVersionID, ProcessingJobID uuid.UUID
+	AttemptNo                      int
+	Kind                           string
+	ObjectKey                      string
+	ContentType                    string
+	Size                           int64
+	SHA256                         string
+}
+
 type SourceFile struct {
 	VersionID    uuid.UUID
 	ObjectKey    string

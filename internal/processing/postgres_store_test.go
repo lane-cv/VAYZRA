@@ -27,6 +27,9 @@ func TestPostgresAITextCompletionRequiresAndPersistsPrivateArtifact(t *testing.T
 		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_previews fp USING file_versions fv,files f,users u WHERE fp.file_version_id=fv.id AND fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
 			t.Errorf("cleanup previews: %v", err)
 		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_processing_artifacts a USING file_versions fv,files f,users u WHERE a.file_version_id=fv.id AND fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
+			t.Errorf("cleanup processing artifacts: %v", err)
+		}
 		if _, err := pool.Exec(cleanupCtx, `DELETE FROM file_processing_jobs j USING file_versions fv,files f,users u WHERE j.file_version_id=fv.id AND fv.file_id=f.id AND f.created_by=u.id AND u.username LIKE 'processing_ai_text_%'`); err != nil {
 			t.Errorf("cleanup jobs: %v", err)
 		}
@@ -67,7 +70,18 @@ func TestPostgresAITextCompletionRequiresAndPersistsPrivateArtifact(t *testing.T
 		Kind: "ai_text", ObjectKey: "test-processing/ai-text-preview/" + uuid.NewString(),
 		ContentType: "text/plain; charset=utf-8", Size: 4, SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	}
-	if err := NewPostgresStore(pool).Complete(ctx, job, result); err != nil {
+	store := NewPostgresStore(pool)
+	if err := store.ReserveArtifact(ctx, ProcessingArtifact{
+		FileVersionID: versionID, ProcessingJobID: jobID, AttemptNo: 1, Kind: "ai_text",
+		ObjectKey: result.AIText.ObjectKey, ContentType: result.AIText.ContentType,
+		Size: result.AIText.Size, SHA256: result.AIText.SHA256,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkArtifactStored(ctx, result.AIText.ObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(ctx, job, result); err != nil {
 		t.Fatal(err)
 	}
 	var state, previewKey string

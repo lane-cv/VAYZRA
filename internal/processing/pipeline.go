@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,9 +24,16 @@ type BlobStore interface {
 	Put(context.Context, string, io.Reader, int64, objectstore.ObjectMeta) (objectstore.ObjectInfo, error)
 	Delete(context.Context, string) error
 }
+type ArtifactRegistry interface {
+	ReserveArtifact(context.Context, ProcessingArtifact) error
+	MarkArtifactStored(context.Context, string) error
+	MarkArtifactDeletePending(context.Context, string) error
+	ForgetArtifact(context.Context, string) error
+}
 type Pipeline struct {
 	Sources             SourceStore
 	Originals, Previews BlobStore
+	Artifacts           ArtifactRegistry
 	Runner              Runner
 	WorkRoot            string
 	ClamDefinitionsDir  string
@@ -41,6 +50,10 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 	}
 	if source.Size < 1 || source.Size > MaxProcessFileSize || len(source.SHA256) != sha256.Size*2 {
 		return Result{}, reject("object_mismatch")
+	}
+	trackedArtifacts := source.Purpose == "ai_attachment"
+	if trackedArtifacts && (p.Artifacts == nil || job.ID == uuid.Nil || job.Attempts < 1 || job.Attempts > MaxAttempts) {
+		return Result{}, transient("pipeline_unavailable")
 	}
 	jobDir, err := os.MkdirTemp(p.WorkRoot, "job-")
 	if err != nil {
@@ -147,7 +160,7 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 			if err = os.WriteFile(normalizedPath, []byte(text), 0600); err != nil {
 				return Result{}, transient("workspace_unavailable")
 			}
-			aiText, storeErr := p.storePreview(ctx, source.VersionID, normalizedPath, "ai_text", "text/plain; charset=utf-8")
+			aiText, storeErr := p.storePreview(ctx, job, normalizedPath, "ai_text", "text/plain; charset=utf-8", trackedArtifacts)
 			if storeErr != nil {
 				return Result{}, storeErr
 			}
@@ -155,10 +168,10 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 		}
 	}
 	if previewPath != "" {
-		preview, previewErr := p.storePreview(ctx, source.VersionID, previewPath, previewKind, previewType)
+		preview, previewErr := p.storePreview(ctx, job, previewPath, previewKind, previewType, trackedArtifacts)
 		if previewErr != nil {
 			if result.AIText != nil {
-				p.deletePreview(ctx, result.AIText.ObjectKey)
+				p.abandonArtifact(ctx, result.AIText.ObjectKey)
 			}
 			return Result{}, previewErr
 		}
@@ -167,7 +180,7 @@ func (p *Pipeline) Process(ctx context.Context, job Job) (Result, error) {
 	return result, nil
 }
 
-func (p *Pipeline) storePreview(ctx context.Context, versionID uuid.UUID, path, kind, contentType string) (PreviewResult, error) {
+func (p *Pipeline) storePreview(ctx context.Context, job Job, path, kind, contentType string, tracked bool) (PreviewResult, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return PreviewResult{}, transient("preview_unavailable")
@@ -189,22 +202,46 @@ func (p *Pipeline) storePreview(ctx context.Context, versionID uuid.UUID, path, 
 	if ext == "" {
 		ext = map[string]string{"pdf": ".pdf", "page": ".bin", "poster": ".bin", "ai_text": ".txt"}[kind]
 	}
-	key := "previews/" + versionID.String() + "/" + kind + ext
+	key := "previews/" + job.FileVersionID.String() + "/" + kind + ext
+	if tracked {
+		key = "previews/" + job.FileVersionID.String() + "/" + job.ID.String() + "/" + strconv.Itoa(job.Attempts) + "/" + kind + ext
+		artifact := ProcessingArtifact{
+			FileVersionID: job.FileVersionID, ProcessingJobID: job.ID, AttemptNo: job.Attempts,
+			Kind: kind, ObjectKey: key, ContentType: contentType, Size: info.Size(), SHA256: sum,
+		}
+		if err := p.Artifacts.ReserveArtifact(ctx, artifact); err != nil {
+			return PreviewResult{}, transient("database_unavailable")
+		}
+	}
 	stored, err := p.Previews.Put(ctx, key, file, info.Size(), objectstore.ObjectMeta{ContentType: contentType, SHA256: sum})
 	if err != nil || stored.Size != 0 && stored.Size != info.Size() {
-		p.deletePreview(ctx, key)
+		if tracked {
+			p.abandonArtifact(ctx, key)
+		}
 		return PreviewResult{}, transient("storage_unavailable")
+	}
+	if tracked {
+		if err := p.Artifacts.MarkArtifactStored(ctx, key); err != nil {
+			p.abandonArtifact(ctx, key)
+			return PreviewResult{}, transient("database_unavailable")
+		}
 	}
 	return PreviewResult{Kind: kind, ObjectKey: key, ContentType: contentType, Size: info.Size(), SHA256: sum}, nil
 }
 
-func (p *Pipeline) deletePreview(ctx context.Context, key string) {
-	if p == nil || p.Previews == nil || key == "" {
+func (p *Pipeline) abandonArtifact(ctx context.Context, key string) {
+	if p == nil || p.Artifacts == nil || p.Previews == nil || key == "" {
 		return
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	_ = p.Previews.Delete(cleanupCtx, key)
+	if err := p.Artifacts.MarkArtifactDeletePending(cleanupCtx, key); err != nil {
+		return
+	}
+	err := p.Previews.Delete(cleanupCtx, key)
+	if err == nil || errors.Is(err, objectstore.ErrNotFound) {
+		_ = p.Artifacts.ForgetArtifact(cleanupCtx, key)
+	}
 }
 
 var _ Processor = (*Pipeline)(nil)

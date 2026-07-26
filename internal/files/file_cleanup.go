@@ -29,7 +29,29 @@ func (s *FileCleanupService) Cleanup(ctx context.Context, limit int) error {
 		return ErrInvalid
 	}
 	owner := "cleanup:" + uuid.NewString()
-	for range limit {
+	processedCount := 0
+	if artifacts, ok := s.store.(ProcessingArtifactCleanupStore); ok {
+		for processedCount < limit {
+			candidate, processed, err := artifacts.ClaimProcessingArtifactCleanup(ctx, s.now().UTC(), owner, fileCleanupLease)
+			if err != nil {
+				return err
+			}
+			if !processed {
+				break
+			}
+			if candidate.ID == uuid.Nil || candidate.ObjectKey == "" {
+				return ErrInvalid
+			}
+			if err := deleteCleanupObject(ctx, s.previews, candidate.ObjectKey); err != nil {
+				return err
+			}
+			if err := artifacts.CompleteProcessingArtifactCleanup(ctx, candidate, owner, s.now().UTC()); err != nil {
+				return err
+			}
+			processedCount++
+		}
+	}
+	for processedCount < limit {
 		candidate, processed, err := s.store.ClaimFileCleanup(ctx, s.now().UTC(), owner, fileCleanupLease)
 		if err != nil {
 			return err
@@ -54,6 +76,7 @@ func (s *FileCleanupService) Cleanup(ctx context.Context, limit int) error {
 		if err := s.store.CompleteFileCleanup(ctx, candidate, owner, s.now().UTC()); err != nil {
 			return err
 		}
+		processedCount++
 	}
 	return nil
 }

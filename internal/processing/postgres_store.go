@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,6 +22,70 @@ func (s *PostgresStore) LoadSource(ctx context.Context, id uuid.UUID) (SourceFil
 	var source SourceFile
 	err := s.pool.QueryRow(ctx, `SELECT id,object_key,display_name,declared_mime,size_bytes,sha256,purpose FROM file_versions WHERE id=$1`, id).Scan(&source.VersionID, &source.ObjectKey, &source.DisplayName, &source.DeclaredMIME, &source.Size, &source.SHA256, &source.Purpose)
 	return source, err
+}
+
+func (s *PostgresStore) ReserveArtifact(ctx context.Context, artifact ProcessingArtifact) error {
+	if s == nil || s.pool == nil || artifact.FileVersionID == uuid.Nil || artifact.ProcessingJobID == uuid.Nil ||
+		artifact.AttemptNo < 1 || artifact.AttemptNo > MaxAttempts || artifact.Kind == "" || artifact.ObjectKey == "" ||
+		artifact.ContentType == "" || artifact.Size < 1 || len(artifact.SHA256) != 64 {
+		return errors.New("invalid processing artifact")
+	}
+	tag, err := s.pool.Exec(ctx, `
+INSERT INTO file_processing_artifacts
+ (file_version_id,processing_job_id,attempt_no,artifact_kind,object_key,content_type,size_bytes,sha256,state)
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,'reserved'
+FROM file_processing_jobs j
+WHERE j.id=$2 AND j.file_version_id=$1 AND j.state='running' AND j.attempts=$3`, artifact.FileVersionID,
+		artifact.ProcessingJobID, artifact.AttemptNo, artifact.Kind, artifact.ObjectKey, artifact.ContentType, artifact.Size, artifact.SHA256)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+func (s *PostgresStore) MarkArtifactStored(ctx context.Context, key string) error {
+	return s.transitionArtifact(ctx, key, ArtifactStored)
+}
+
+func (s *PostgresStore) MarkArtifactDeletePending(ctx context.Context, key string) error {
+	return s.transitionArtifact(ctx, key, ArtifactDeletePending)
+}
+
+func (s *PostgresStore) transitionArtifact(ctx context.Context, key string, target ArtifactState) error {
+	if s == nil || s.pool == nil || key == "" || (target != ArtifactStored && target != ArtifactDeletePending) {
+		return errors.New("invalid processing artifact transition")
+	}
+	var tag pgconn.CommandTag
+	var err error
+	if target == ArtifactStored {
+		tag, err = s.pool.Exec(ctx, `UPDATE file_processing_artifacts SET state='stored',updated_at=now() WHERE object_key=$1 AND state='reserved' AND cleanup_lease_owner IS NULL`, key)
+	} else {
+		tag, err = s.pool.Exec(ctx, `UPDATE file_processing_artifacts SET state='delete_pending',cleanup_lease_owner=NULL,cleanup_lease_until=NULL,updated_at=now() WHERE object_key=$1 AND state IN ('reserved','stored','delete_pending')`, key)
+	}
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("processing artifact transition conflict")
+	}
+	return nil
+}
+
+func (s *PostgresStore) ForgetArtifact(ctx context.Context, key string) error {
+	if s == nil || s.pool == nil || key == "" {
+		return errors.New("invalid processing artifact forget")
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM file_processing_artifacts WHERE object_key=$1 AND state='delete_pending' AND cleanup_lease_owner IS NULL`, key)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("processing artifact forget conflict")
+	}
+	return nil
 }
 
 func (s *PostgresStore) LeaseNext(ctx context.Context, owner string, now time.Time, duration time.Duration) (Job, error) {
@@ -148,11 +213,29 @@ func (s *PostgresStore) Complete(ctx context.Context, job Job, result Result) er
 			return err
 		}
 	}
+	if purpose == "ai_attachment" {
+		keys := make([]string, 0, 2)
+		if result.AIText != nil {
+			keys = append(keys, result.AIText.ObjectKey)
+		}
+		if result.Preview != nil {
+			keys = append(keys, result.Preview.ObjectKey)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM file_processing_artifacts WHERE processing_job_id=$1 AND file_version_id=$2 AND attempt_no=$3 AND state='stored' AND object_key=ANY($4)`, job.ID, job.FileVersionID, job.Attempts, keys)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != int64(len(keys)) {
+			return errors.New("processing artifact publication conflict")
+		}
+	}
 	if _, err := tx.Exec(ctx, `UPDATE file_processing_jobs SET state='completed',lease_owner=NULL,lease_until=NULL,last_failure_category=NULL,updated_at=now() WHERE id=$1`, job.ID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
+
+var _ ArtifactRegistry = (*PostgresStore)(nil)
 
 func (s *PostgresStore) Fail(ctx context.Context, job Job, failure Failure) error {
 	if s.pool == nil || job.ID == uuid.Nil || job.FileVersionID == uuid.Nil || job.LeaseOwner == "" || !stableCategory.MatchString(failure.Category) || (!failure.Permanent && failure.RetryAt.IsZero()) {

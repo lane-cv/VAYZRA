@@ -129,6 +129,12 @@ type sourceReaderStub struct{}
 func (sourceReaderStub) LoadSource(context.Context, uuid.UUID) (processing.SourceFile, error) {
 	return processing.SourceFile{}, nil
 }
+func (sourceReaderStub) ReserveArtifact(context.Context, processing.ProcessingArtifact) error {
+	return nil
+}
+func (sourceReaderStub) MarkArtifactStored(context.Context, string) error        { return nil }
+func (sourceReaderStub) MarkArtifactDeletePending(context.Context, string) error { return nil }
+func (sourceReaderStub) ForgetArtifact(context.Context, string) error            { return nil }
 
 type workerBlobStub struct{}
 
