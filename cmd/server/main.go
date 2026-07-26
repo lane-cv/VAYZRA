@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"log"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/app"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
@@ -89,6 +91,7 @@ type applicationDependencies struct {
 	startUploadCleanup func(files.ExpiredUploadCleaner) func()
 	newStudentTeaching func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions       func(*pgxpool.Pool) qanda.HTTPServices
+	newAdminAI         func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
 	newNotifications   func(*pgxpool.Pool) notifications.HTTPService
 	startOutbox        func(*pgxpool.Pool) func()
 	ready              func(*pgxpool.Pool) func(context.Context) error
@@ -118,6 +121,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		startUploadCleanup: files.StartCleanupRunner,
 		newStudentTeaching: newProductionStudentTeachingService,
 		newQuestions:       newProductionQuestionServices,
+		newAdminAI:         newProductionAdminAIService,
 		newNotifications:   newProductionNotificationService,
 		startOutbox:        newProductionOutboxRunner,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
@@ -186,6 +190,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	var questionServices qanda.HTTPServices
 	if deps.newQuestions != nil {
 		questionServices = deps.newQuestions(pool)
+	}
+	var adminAI aiqa.AdminConfigHTTPService
+	if deps.newAdminAI != nil {
+		adminAI, err = deps.newAdminAI(ctx, pool, cfg)
+		if err != nil {
+			closePool()
+			return nil, nil, errors.New("initialize AI configuration service")
+		}
 	}
 	var notificationService notifications.HTTPService
 	if deps.newNotifications != nil {
@@ -279,6 +291,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentTeaching:   studentTeachingService,
 		StudentQuestions:  questionServices.Student,
 		AdminQuestions:    questionServices.Admin,
+		AdminAI:           adminAI,
 		Notifications:     notificationService,
 		PublicOrigin:      cfg.PublicOrigin,
 		CookieSecure:      cfg.CookieSecure,
@@ -362,6 +375,15 @@ func newProductionAuthService(pool *pgxpool.Pool) (auth.HTTPService, error) {
 
 func newProductionTeachingService(pool *pgxpool.Pool) teaching.AdminHTTPService {
 	return teaching.NewService(teaching.NewPostgresStore(pool), files.NewReadinessChecker(), time.Now)
+}
+
+func newProductionAdminAIService(_ context.Context, pool *pgxpool.Pool, cfg config.Config) (aiqa.AdminConfigHTTPService, error) {
+	box, err := aiqa.NewAESGCMSecretBox(cfg.AIMasterKey, cfg.AIMasterKeyVersion, rand.Reader)
+	if err != nil {
+		return nil, errors.New("initialize AI secret box")
+	}
+	policy := aiqa.URLPolicy{DevelopmentAllowPrivate: cfg.AIAllowPrivateProvider}
+	return aiqa.NewAdminConfigService(aiqa.NewPostgresConfigStore(pool), policy, box), nil
 }
 
 func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
@@ -35,6 +36,7 @@ type Dependencies struct {
 	StudentTeaching   teaching.StudentHTTPService
 	StudentQuestions  qanda.StudentHTTPService
 	AdminQuestions    qanda.AdminHTTPService
+	AdminAI           aiqa.AdminConfigHTTPService
 	Notifications     notifications.HTTPService
 	PublicOrigin      string
 	CookieSecure      bool
@@ -108,6 +110,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.AdminQuestions != nil {
 					private.Mount("/admin/questions", qanda.NewAdminHandlerWithConfig(d.AdminQuestions, qanda.AdminHTTPConfig{TrustedProxyCIDRs: d.TrustedProxyCIDRs}).Routes())
+				}
+				if d.AdminAI != nil {
+					private.Mount("/admin/ai", aiqa.NewAdminConfigHandler(d.AdminAI, d.TrustedProxyCIDRs).Routes())
 				}
 				if d.Notifications != nil {
 					private.Mount("/notifications", notifications.NewHandler(d.Notifications).Routes())

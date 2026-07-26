@@ -1,0 +1,69 @@
+package aiqa
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/netip"
+	"testing"
+
+	"github.com/google/uuid"
+	"happylearn.local/app/internal/auth"
+)
+
+type testResolver struct{}
+
+func (testResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+}
+
+type testSecretBox struct{}
+
+func (testSecretBox) Seal(id uuid.UUID, p []byte) (EncryptedSecret, error) {
+	return EncryptedSecret{KeyVersion: 1, Blob: append([]byte{1}, p...)}, nil
+}
+func (testSecretBox) Open(uuid.UUID, EncryptedSecret) ([]byte, error) { return nil, nil }
+
+type memoryConfigStore struct{}
+
+func (*memoryConfigStore) ListProviders(context.Context) ([]ProviderView, error) { return nil, nil }
+func (*memoryConfigStore) CreateProvider(_ context.Context, _ Principal, in CreateProviderInput, _ EncryptedSecret) (ProviderView, error) {
+	return ProviderView{Name: in.Name, BaseURL: in.BaseURL, ProtocolMode: in.ProtocolMode, HasKey: true}, nil
+}
+func (*memoryConfigStore) UpdateProvider(context.Context, Principal, UpdateProviderInput, *EncryptedSecret) (ProviderView, error) {
+	return ProviderView{}, nil
+}
+func (*memoryConfigStore) ActivateProvider(context.Context, Principal, uuid.UUID, int64) (ProviderView, error) {
+	return ProviderView{}, nil
+}
+func (*memoryConfigStore) ListModels(context.Context, uuid.UUID) ([]ModelView, error) {
+	return nil, nil
+}
+func (*memoryConfigStore) PutModel(context.Context, Principal, PutModelInput) (ModelView, error) {
+	return ModelView{}, nil
+}
+func (*memoryConfigStore) ListPrompts(context.Context) ([]PromptView, error) { return nil, nil }
+func (*memoryConfigStore) PutPrompt(context.Context, Principal, PutPromptInput) (PromptView, error) {
+	return PromptView{}, nil
+}
+func (*memoryConfigStore) GetLimits(context.Context) (LimitViews, error) { return LimitViews{}, nil }
+func (*memoryConfigStore) PutGlobalLimits(context.Context, Principal, PutLimitsInput) (LimitView, error) {
+	return LimitView{}, nil
+}
+func (*memoryConfigStore) PutStudentLimits(context.Context, Principal, uuid.UUID, PutLimitsInput) (LimitView, error) {
+	return LimitView{}, nil
+}
+
+func TestConfigServiceRejectsStudentAndNormalizesProvider(t *testing.T) {
+	s := NewAdminConfigService(&memoryConfigStore{}, URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}, testSecretBox{})
+	student := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive}, RequestID: "r", IP: net.IPv4(127, 0, 0, 1)}
+	if _, err := s.CreateProvider(context.Background(), student, CreateProviderInput{Name: " x ", BaseURL: "http://api.example.test/", APIKey: "secret", ProtocolMode: ProtocolChatCompletions, IdempotencyKey: "1234567890abcdef"}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("error=%v", err)
+	}
+	admin := student
+	admin.User.Role = auth.RoleAdmin
+	got, err := s.CreateProvider(context.Background(), admin, CreateProviderInput{Name: " x ", BaseURL: "http://api.example.test/", APIKey: "secret", ProtocolMode: ProtocolChatCompletions, IdempotencyKey: "1234567890abcdef"})
+	if err != nil || got.Name != "x" || got.BaseURL != "http://api.example.test" || !got.HasKey {
+		t.Fatalf("provider=%#v err=%v", got, err)
+	}
+}

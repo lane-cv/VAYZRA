@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"net"
 	"regexp"
 	"strconv"
@@ -119,6 +120,11 @@ func validateAndMarshal(event Event) ([]byte, error) {
 			return nil, ErrInvalidEvent
 		}
 	}
+	if strings.HasPrefix(event.Action, "ai.") {
+		if !validAIEvent(event) {
+			return nil, ErrInvalidEvent
+		}
+	}
 	return json.Marshal(event.Metadata)
 }
 
@@ -139,6 +145,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"file.cleanup_scheduled": {"previewCount": true}, "file.cleanup_completed": {},
 	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
 	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
+	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -148,4 +155,27 @@ var allowedTargetTypes = map[string]string{
 	"file.uploaded": "file_version", "file.policy_changed": "lesson", "file.processing_retried": "file_version", "file.replaced": "file", "file.draft_rolled_back": "file_version", "file.delete_requested": "file",
 	"file.cleanup_scheduled": "file_version", "file.cleanup_completed": "file_version",
 	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
+	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
+}
+
+func validAIEvent(e Event) bool {
+	v := func(k string) string { x, _ := e.Metadata[k].(string); return x }
+	switch e.Action {
+	case "ai.provider_created", "ai.provider_activated", "ai.limits_global_put":
+		return len(e.Metadata) == 0
+	case "ai.provider_updated":
+		return len(e.Metadata) == 1 && (v("keyChanged") == "true" || v("keyChanged") == "false")
+	case "ai.model_put":
+		_, x := uuid.Parse(v("providerId"))
+		m := v("modality")
+		return len(e.Metadata) == 2 && x == nil && (m == "text" || m == "vision")
+	case "ai.prompt_put":
+		n, err := strconv.ParseInt(v("version"), 10, 64)
+		s := v("subject")
+		return len(e.Metadata) == 2 && err == nil && n > 0 && (s == "math" || s == "physics")
+	case "ai.limits_student_put":
+		_, x := uuid.Parse(v("studentId"))
+		return len(e.Metadata) == 1 && x == nil
+	}
+	return false
 }

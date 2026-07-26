@@ -91,3 +91,27 @@ func TestQandaTeacherAuditEventsRejectPrivateText(t *testing.T) {
 		}
 	}
 }
+
+func TestAIConfigurationAuditEventsAllowOnlyRedactedMetadata(t *testing.T) {
+	base := Event{ActorUserID: uuid.New(), RequestID: "request-ai", IP: net.ParseIP("192.0.2.8")}
+	approved := []Event{
+		{Action: "ai.provider_created", TargetType: "ai_provider", TargetID: uuid.NewString(), Metadata: map[string]any{}},
+		{Action: "ai.provider_updated", TargetType: "ai_provider", TargetID: uuid.NewString(), Metadata: map[string]any{"keyChanged": "true"}},
+		{Action: "ai.model_put", TargetType: "ai_model", TargetID: uuid.NewString(), Metadata: map[string]any{"providerId": uuid.NewString(), "modality": "vision"}},
+		{Action: "ai.prompt_put", TargetType: "ai_prompt", TargetID: uuid.NewString(), Metadata: map[string]any{"subject": "math", "version": "1"}},
+		{Action: "ai.limits_student_put", TargetType: "ai_limits", TargetID: uuid.NewString(), Metadata: map[string]any{"studentId": uuid.NewString()}},
+	}
+	for _, event := range approved {
+		event.ActorUserID = base.ActorUserID
+		event.RequestID = base.RequestID
+		event.IP = base.IP
+		if _, err := validateAndMarshal(event); err != nil {
+			t.Fatalf("%s rejected: %v", event.Action, err)
+		}
+	}
+	unsafe := approved[1]
+	unsafe.Metadata = map[string]any{"keyChanged": "true", "apiKey": "very-secret"}
+	if _, err := validateAndMarshal(unsafe); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("secret metadata accepted: %v", err)
+	}
+}
