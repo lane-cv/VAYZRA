@@ -1,0 +1,21 @@
+FROM golang:1.26.5-bookworm AS fake-ai-build
+WORKDIR /src
+COPY go.mod ./
+COPY cmd/fake-ai-provider ./cmd/fake-ai-provider
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/fake-ai-provider ./cmd/fake-ai-provider
+
+FROM debian:12.12-slim AS runtime
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid 10003 fake-ai \
+    && useradd --uid 10003 --gid 10003 --no-create-home --shell /usr/sbin/nologin fake-ai \
+    && install -d -o 10003 -g 10003 -m 0555 /app
+WORKDIR /app
+COPY --from=fake-ai-build /out/fake-ai-provider /app/fake-ai-provider
+RUN chown 10003:10003 /app/fake-ai-provider && chmod 0555 /app/fake-ai-provider
+USER 10003:10003
+EXPOSE 8090
+HEALTHCHECK --interval=5s --timeout=2s --retries=12 CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8090/health/live"]
+ENTRYPOINT ["/app/fake-ai-provider"]
