@@ -47,6 +47,8 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.get('a[href="/admin/files"]').text()).toContain('文件中心')
     expect(wrapper.get('a[href="/admin/questions"]').text()).toContain('问题答疑')
     expect(wrapper.get('a[href="/admin/ai"]').text()).toContain('AI 管理')
+    expect(wrapper.get('a[href="/admin/ai-usage"]').text()).toContain('用量统计')
+    expect(wrapper.findAll('a[href="/admin/ai-usage"]')).toHaveLength(1)
     expect(wrapper.get('a[href="/notifications"]').text()).toContain('通知中心')
     expect(wrapper.find('a[href="/student/questions"]').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('即将开放')
@@ -63,6 +65,7 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.find('a[href="/student/notifications"]').exists()).toBe(false)
     expect(wrapper.find('a[href="/admin/questions"]').exists()).toBe(false)
     expect(wrapper.find('a[href="/admin/ai"]').exists()).toBe(false)
+    expect(wrapper.find('a[href="/admin/ai-usage"]').exists()).toBe(false)
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
     const { wrapper, route } = mountLayout(); const trigger = wrapper.get('button[aria-label="打开导航"]')

@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { createAppRouter } from './index'
 import { useSessionStore } from '../stores/session'
 import AIQuestionDetailView from '../features/ai/AIQuestionDetailView.vue'
+import AdminAIUsageView from '../features/ai/AdminAIUsageView.vue'
 describe('console router guards', () => {
   beforeEach(() => setActivePinia(createPinia()))
   it('forces first-login students to change password', async () => {
@@ -53,6 +54,18 @@ describe('console router guards', () => {
     expect(router.currentRoute.value.fullPath).toBe('/student')
     const studentRoot = router.getRoutes().find((route) => route.path === '/student')
     expect(JSON.stringify(studentRoot?.children)).not.toContain('/admin/ai')
+  })
+  it('exposes AI usage only inside the admin route tree', async () => {
+    const session = useSessionStore(); session.bootstrapStatus = 'ready'; session.user = { id: 'a1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }
+    const router = createAppRouter()
+    await router.push('/admin/ai-usage')
+    expect(router.currentRoute.value.name).toBe('admin-ai-usage')
+    const matched = router.currentRoute.value.matched
+    expect(matched[matched.length - 1]?.components?.default).toBe(AdminAIUsageView)
+    session.user = { id: 's1', username: 'student', displayName: '林同学', role: 'student', mustChangePassword: false }
+    await router.push('/student')
+    await router.push('/admin/ai-usage')
+    expect(router.currentRoute.value.fullPath).toBe('/student')
   })
   it('allows only admins to open canonical teacher question routes in one persistent workspace',async()=>{const session=useSessionStore();session.bootstrapStatus='ready';session.user={id:'a1',username:'teacher',displayName:'张老师',role:'admin',mustChangePassword:false};const router=createAppRouter();await router.push('/admin/questions');expect(router.currentRoute.value.name).toBe('admin-questions');const workspace=router.currentRoute.value.matched[1].components?.default;await router.push('/admin/questions/not-a-uuid');expect(router.currentRoute.value.name).toBe('admin-questions');await router.push('/admin/questions/11111111-1111-4111-8111-111111111111');expect(router.currentRoute.value.name).toBe('admin-question-detail');expect(router.currentRoute.value.matched[1].components?.default).toBe(workspace);session.user={id:'s1',username:'student',displayName:'学生',role:'student',mustChangePassword:false};await router.push('/admin/questions');expect(router.currentRoute.value.fullPath).toBe('/student')})
   it('allows either authenticated role on the role-neutral notification route',async()=>{const session=useSessionStore();session.bootstrapStatus='ready';session.user={id:'a1',username:'teacher',displayName:'张老师',role:'admin',mustChangePassword:false};const router=createAppRouter();await router.push('/notifications');expect(router.currentRoute.value.name).toBe('notifications');session.user={id:'s1',username:'student',displayName:'学生',role:'student',mustChangePassword:false};await router.push('/student');await router.push('/notifications');expect(router.currentRoute.value.name).toBe('notifications')})
