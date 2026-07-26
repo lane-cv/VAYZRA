@@ -34,6 +34,27 @@ func TestAIConfigurationSchemaEnforcesSecretsAndOneActiveProvider(t *testing.T) 
 	}
 }
 
+func TestAIConfigurationIdempotencySchemaRejectsUnsafeRows(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	replayAIConfigurationMigration(t, pool)
+	admin := seedActiveAdmin(t, pool)
+	provider := uuid.New()
+	insertProvider(t, pool, provider, admin, false)
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_config_idempotency(key,operation,request_hash,provider_id,created_by) VALUES('short','create_provider',decode(repeat('00',32),'hex'),$1,$2)`, provider, admin); err == nil {
+		t.Fatal("short idempotency key accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_config_idempotency(key,operation,request_hash,provider_id,created_by) VALUES('1234567890abcdef','other',decode(repeat('00',32),'hex'),$1,$2)`, provider, admin); err == nil {
+		t.Fatal("unknown operation accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_config_idempotency(key,operation,request_hash,provider_id,created_by) VALUES('abcdef1234567890','create_provider',decode(repeat('00',31),'hex'),$1,$2)`, provider, admin); err == nil {
+		t.Fatal("short request hash accepted")
+	}
+}
+
 func TestAIConfigurationSchemaEnforcesModelPromptAndLimitInvariants(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

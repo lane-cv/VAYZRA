@@ -2,6 +2,7 @@ package aiqa
 
 import (
 	"context"
+	"crypto/sha256"
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
 	"strings"
@@ -59,7 +60,8 @@ func (s *configService) CreateProvider(c context.Context, p Principal, in Create
 	if e != nil {
 		return ProviderView{}, e
 	}
-	v, e := s.store.CreateProvider(c, p, in, sec)
+	hash := sha256.Sum256([]byte(in.Name + "\x00" + in.BaseURL + "\x00" + string(in.ProtocolMode) + "\x00" + in.APIKey))
+	v, e := s.store.CreateProvider(c, p, id, in, sec, hash)
 	if v.ID == uuid.Nil {
 		v.ID = id
 	}
@@ -116,7 +118,7 @@ func (s *configService) PutModel(c context.Context, p Principal, in PutModelInpu
 	if e := admin(p); e != nil {
 		return ModelView{}, e
 	}
-	if in.ProviderID == uuid.Nil || in.ID == uuid.Nil || in.ExpectedVersion < 1 || strings.TrimSpace(in.UpstreamModelID) == "" || !modalityOK(in.Modality) || in.ContextTokens < 1 || in.MaxOutputTokens < 1 || in.MaxOutputTokens > in.ContextTokens || in.ImageQuotaTokens < 1 || in.InputPriceMicroUSD < 0 || in.OutputPriceMicroUSD < 0 {
+	if in.ProviderID == uuid.Nil || in.ID == uuid.Nil || in.ExpectedVersion < 0 || strings.TrimSpace(in.UpstreamModelID) == "" || !modalityOK(in.Modality) || in.ContextTokens < 1 || in.MaxOutputTokens < 1 || in.MaxOutputTokens > in.ContextTokens || in.ImageQuotaTokens < 1 || in.InputPriceMicroUSD < 0 || in.OutputPriceMicroUSD < 0 {
 		return ModelView{}, ErrInvalidInput
 	}
 	in.UpstreamModelID = strings.TrimSpace(in.UpstreamModelID)
@@ -148,7 +150,7 @@ func (s *configService) PutGlobalLimits(c context.Context, p Principal, in PutLi
 	if e := admin(p); e != nil {
 		return LimitView{}, e
 	}
-	if in.ExpectedVersion < 1 || !limitsOK(in) {
+	if in.ExpectedVersion < 1 || !globalLimitsOK(in) {
 		return LimitView{}, ErrInvalidInput
 	}
 	return s.store.PutGlobalLimits(c, p, in)
@@ -157,7 +159,7 @@ func (s *configService) PutStudentLimits(c context.Context, p Principal, id uuid
 	if e := admin(p); e != nil {
 		return LimitView{}, e
 	}
-	if id == uuid.Nil || in.ExpectedVersion < 1 || !limitsOK(in) {
+	if id == uuid.Nil || in.ExpectedVersion < 0 || !limitsOK(in) {
 		return LimitView{}, ErrInvalidInput
 	}
 	return s.store.PutStudentLimits(c, p, id, in)
@@ -186,4 +188,23 @@ func limitsOK(in PutLimitsInput) bool {
 		}
 	}
 	return true
+}
+func globalLimitsOK(in PutLimitsInput) bool {
+	for _, v := range []LimitValue{in.DailyRequests, in.MonthlyRequests, in.DailyTokens, in.MonthlyTokens} {
+		if v.Mode == "inherit" || !limitValueOK(v) {
+			return false
+		}
+	}
+	return true
+}
+func limitValueOK(v LimitValue) bool {
+	switch v.Mode {
+	case "inherit":
+		return v.Value == nil
+	case "disabled":
+		return v.Value == nil || *v.Value == 0
+	case "limit":
+		return v.Value != nil && *v.Value > 0
+	}
+	return false
 }

@@ -383,7 +383,7 @@ func newProductionAdminAIService(_ context.Context, pool *pgxpool.Pool, cfg conf
 		return nil, errors.New("initialize AI secret box")
 	}
 	policy := aiqa.URLPolicy{DevelopmentAllowPrivate: cfg.AIAllowPrivateProvider}
-	return aiqa.NewAdminConfigService(aiqa.NewPostgresConfigStore(pool), policy, box), nil
+	return aiqa.NewAdminConfigService(aiqa.NewPostgresConfigStoreWithSecurity(pool, box, policy), policy, box), nil
 }
 
 func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {

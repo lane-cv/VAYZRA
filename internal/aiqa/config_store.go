@@ -7,7 +7,7 @@ import "github.com/google/uuid"
 // input normalization; implementations own locking and atomic persistence.
 type ConfigStore interface {
 	ListProviders(context.Context) ([]ProviderView, error)
-	CreateProvider(context.Context, Principal, CreateProviderInput, EncryptedSecret) (ProviderView, error)
+	CreateProvider(context.Context, Principal, uuid.UUID, CreateProviderInput, EncryptedSecret, [32]byte) (ProviderView, error)
 	UpdateProvider(context.Context, Principal, UpdateProviderInput, *EncryptedSecret) (ProviderView, error)
 	ActivateProvider(context.Context, Principal, uuid.UUID, int64) (ProviderView, error)
 	ListModels(context.Context, uuid.UUID) ([]ModelView, error)

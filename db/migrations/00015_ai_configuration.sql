@@ -15,6 +15,15 @@ CREATE TABLE ai_providers (
 );
 CREATE UNIQUE INDEX ai_providers_one_active_idx ON ai_providers(active) WHERE active;
 
+CREATE TABLE ai_config_idempotency (
+  key text PRIMARY KEY CHECK (char_length(key) BETWEEN 16 AND 128),
+  operation text NOT NULL CHECK (operation='create_provider'),
+  request_hash bytea NOT NULL CHECK (octet_length(request_hash)=32),
+  provider_id uuid NOT NULL REFERENCES ai_providers(id) DEFERRABLE INITIALLY DEFERRED,
+  created_by uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE ai_models (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   provider_id uuid NOT NULL REFERENCES ai_providers(id) ON DELETE CASCADE,
@@ -197,5 +206,6 @@ DROP TABLE ai_global_limits;
 DROP INDEX prompt_templates_one_active_subject_idx;
 DROP TABLE prompt_templates;
 DROP TABLE ai_models;
+DROP TABLE IF EXISTS ai_config_idempotency;
 DROP INDEX ai_providers_one_active_idx;
 DROP TABLE ai_providers;

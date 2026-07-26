@@ -27,8 +27,8 @@ func (testSecretBox) Open(uuid.UUID, EncryptedSecret) ([]byte, error) { return n
 type memoryConfigStore struct{}
 
 func (*memoryConfigStore) ListProviders(context.Context) ([]ProviderView, error) { return nil, nil }
-func (*memoryConfigStore) CreateProvider(_ context.Context, _ Principal, in CreateProviderInput, _ EncryptedSecret) (ProviderView, error) {
-	return ProviderView{Name: in.Name, BaseURL: in.BaseURL, ProtocolMode: in.ProtocolMode, HasKey: true}, nil
+func (*memoryConfigStore) CreateProvider(_ context.Context, _ Principal, id uuid.UUID, in CreateProviderInput, _ EncryptedSecret, _ [32]byte) (ProviderView, error) {
+	return ProviderView{ID: id, Name: in.Name, BaseURL: in.BaseURL, ProtocolMode: in.ProtocolMode, HasKey: true}, nil
 }
 func (*memoryConfigStore) UpdateProvider(context.Context, Principal, UpdateProviderInput, *EncryptedSecret) (ProviderView, error) {
 	return ProviderView{}, nil
@@ -63,7 +63,16 @@ func TestConfigServiceRejectsStudentAndNormalizesProvider(t *testing.T) {
 	admin := student
 	admin.User.Role = auth.RoleAdmin
 	got, err := s.CreateProvider(context.Background(), admin, CreateProviderInput{Name: " x ", BaseURL: "http://api.example.test/", APIKey: "secret", ProtocolMode: ProtocolChatCompletions, IdempotencyKey: "1234567890abcdef"})
-	if err != nil || got.Name != "x" || got.BaseURL != "http://api.example.test" || !got.HasKey {
+	if err != nil || got.ID == uuid.Nil || got.Name != "x" || got.BaseURL != "http://api.example.test" || !got.HasKey {
 		t.Fatalf("provider=%#v err=%v", got, err)
+	}
+}
+
+func TestConfigServiceRejectsGlobalLimitInheritance(t *testing.T) {
+	svc := NewAdminConfigService(&memoryConfigStore{}, URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}, testSecretBox{})
+	actor := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}
+	in := PutLimitsInput{DailyRequests: LimitValue{Mode: "inherit"}, MonthlyRequests: LimitValue{Mode: "disabled"}, DailyTokens: LimitValue{Mode: "disabled"}, MonthlyTokens: LimitValue{Mode: "disabled"}, ExpectedVersion: 1}
+	if _, err := svc.PutGlobalLimits(context.Background(), actor, in); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("global inherit=%v", err)
 	}
 }

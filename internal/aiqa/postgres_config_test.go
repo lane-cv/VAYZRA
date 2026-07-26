@@ -1,7 +1,9 @@
 package aiqa
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net"
 	"sync"
@@ -13,6 +15,163 @@ import (
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
+
+func TestPostgresConfigCreateProviderIdempotencyAndSecretAAD(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAIConfig(t, ctx, pool)
+	admin := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'provider_admin','Provider Admin','admin','x',false)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "provider-create", IP: net.ParseIP("192.0.2.10")}
+	store := NewPostgresConfigStore(pool)
+	id := uuid.New()
+	key := []byte("12345678901234567890123456789012")
+	box, err := NewAESGCMSecretBox(key, 1, bytes.NewReader(bytes.Repeat([]byte{7}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := box.Seal(id, []byte("provider-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := CreateProviderInput{Name: "provider", BaseURL: "https://api.example.test", ProtocolMode: ProtocolResponses, IdempotencyKey: "1234567890abcdef"}
+	hash := sha256.Sum256([]byte("request"))
+	first, err := store.CreateProvider(ctx, actor, id, in, secret, hash)
+	if err != nil || first.ID != id {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	again, err := store.CreateProvider(ctx, actor, uuid.New(), in, secret, hash)
+	if err != nil || again.ID != id {
+		t.Fatalf("replay=%#v err=%v", again, err)
+	}
+	different := sha256.Sum256([]byte("different"))
+	if _, err := store.CreateProvider(ctx, actor, uuid.New(), in, secret, different); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("different payload=%v", err)
+	}
+	var blob []byte
+	var version int16
+	if err := pool.QueryRow(ctx, `SELECT encrypted_api_key,key_version FROM ai_providers WHERE id=$1`, id).Scan(&blob, &version); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := box.Open(id, EncryptedSecret{KeyVersion: version, Blob: blob})
+	if err != nil || string(opened) != "provider-secret" {
+		t.Fatalf("AAD open=%q err=%v", opened, err)
+	}
+	var audits int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='ai.provider_created'`).Scan(&audits); err != nil || audits != 1 {
+		t.Fatalf("audits=%d err=%v", audits, err)
+	}
+}
+
+func TestPostgresConfigRuntimeDecryptsAndCopiesSecret(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE users CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	admin := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'runtime_admin','Runtime Admin','admin','x',false)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	box, err := NewAESGCMSecretBox(bytes.Repeat([]byte{4}, 32), 1, bytes.NewReader(bytes.Repeat([]byte{9}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := box.Seal(id, []byte("runtime-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_providers(id,name,base_url,protocol_mode,encrypted_api_key,key_version,key_updated_at,active,created_by) VALUES($1,'runtime','http://api.example.test','responses',$2,$3,now(),true,$4)`, id, sealed.Blob, sealed.KeyVersion, admin); err != nil {
+		t.Fatal(err)
+	}
+	seedActivationDependencies(t, ctx, pool, admin, id)
+	store := NewPostgresConfigStoreWithSecurity(pool, box, URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}})
+	cfg, err := store.ForRun(ctx, SubjectMath, ModalityText)
+	if err != nil || cfg.ProviderID != id || string(cfg.APIKey) != "runtime-secret" || cfg.BaseURL.String() != "http://api.example.test" {
+		t.Fatalf("cfg=%#v err=%v", cfg, err)
+	}
+	cfg.APIKey[0] = 'X'
+	again, err := store.ForRun(ctx, SubjectMath, ModalityText)
+	if err != nil || string(again.APIKey) != "runtime-secret" {
+		t.Fatalf("secret copy=%q err=%v", again.APIKey, err)
+	}
+}
+
+func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAIConfig(t, ctx, pool)
+	admin := uuid.New()
+	student := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'contracts_admin','Contracts Admin','admin','x',false),($2,'contracts_student','Contracts Student','student','x',false)`, admin, student); err != nil {
+		t.Fatal(err)
+	}
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "contracts", IP: net.ParseIP("192.0.2.11")}
+	store := NewPostgresConfigStore(pool)
+	one, two := seedProvider(t, ctx, pool, admin, "one"), seedProvider(t, ctx, pool, admin, "two")
+	model := uuid.New()
+	in := PutModelInput{ProviderID: one, ID: model, UpstreamModelID: "model", Modality: ModalityText, ContextTokens: 100, MaxOutputTokens: 50, ImageQuotaTokens: 10, Enabled: true, ExpectedVersion: 0}
+	first, err := store.PutModel(ctx, actor, in)
+	if err != nil || first.Version != 1 {
+		t.Fatalf("create=%#v err=%v", first, err)
+	}
+	in.ExpectedVersion = 1
+	in.ProviderID = two
+	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("cross provider=%v", err)
+	}
+	in.ProviderID = one
+	in.ExpectedVersion = 2
+	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("stale=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE ai_models SET quota_blocked_at=now(),quota_block_reason='quota_estimation_anomaly' WHERE id=$1`, model); err != nil {
+		t.Fatal(err)
+	}
+	in.ExpectedVersion = 1
+	in.ClearQuotaBlock = true
+	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("clear unchanged=%v", err)
+	}
+	in.ImageQuotaTokens = 11
+	updated, err := store.PutModel(ctx, actor, in)
+	if err != nil || updated.QuotaBlockedAt != nil {
+		t.Fatalf("clear=%#v err=%v", updated, err)
+	}
+	prompt, err := store.PutPrompt(ctx, actor, PutPromptInput{Subject: SubjectMath, Body: "one", ExpectedVersion: 0})
+	if err != nil || prompt.Version != 1 {
+		t.Fatalf("prompt=%#v err=%v", prompt, err)
+	}
+	if _, err := store.PutPrompt(ctx, actor, PutPromptInput{Subject: SubjectMath, Body: "two", ExpectedVersion: 0}); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("prompt stale=%v", err)
+	}
+	v := int64(9)
+	limits := PutLimitsInput{DailyRequests: LimitValue{Mode: "inherit"}, MonthlyRequests: LimitValue{Mode: "disabled"}, DailyTokens: LimitValue{Mode: "limit", Value: &v}, MonthlyTokens: LimitValue{Mode: "inherit"}, ExpectedVersion: 0}
+	studentView, err := store.PutStudentLimits(ctx, actor, student, limits)
+	if err != nil || studentView.DailyRequests.Mode != "inherit" || studentView.MonthlyRequests.Mode != "disabled" || studentView.DailyTokens.Value == nil || *studentView.DailyTokens.Value != 9 {
+		t.Fatalf("student=%#v err=%v", studentView, err)
+	}
+	limits.ExpectedVersion = 0
+	if _, err := store.PutStudentLimits(ctx, actor, student, limits); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("student stale=%v", err)
+	}
+	all, err := store.GetLimits(ctx)
+	if err != nil || all.Students[student].Version != studentView.Version {
+		t.Fatalf("limits=%#v err=%v", all, err)
+	}
+}
 
 func TestPostgresConfigConcurrentActivationAndRedactedReads(t *testing.T) {
 	ctx := context.Background()
@@ -70,6 +229,15 @@ func seedProvider(t *testing.T, ctx context.Context, pool *pgxpool.Pool, admin u
 		t.Fatal(err)
 	}
 	return id
+}
+func resetAIConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE users CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO ai_global_limits(singleton,daily_request_limit,monthly_request_limit,daily_token_limit,monthly_token_limit) VALUES(true,0,0,0,0)`); err != nil {
+		t.Fatal(err)
+	}
 }
 func seedActivationDependencies(t *testing.T, ctx context.Context, pool *pgxpool.Pool, admin, provider uuid.UUID) {
 	t.Helper()

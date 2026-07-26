@@ -96,3 +96,28 @@ func TestAdminConfigHTTPStrictCreateAndRedaction(t *testing.T) {
 		t.Fatalf("body=%s", w.Body.String())
 	}
 }
+
+func TestAdminConfigHTTPDispatchesAllRoutes(t *testing.T) {
+	h := NewAdminConfigHandler(&httpConfigService{}, nil).Routes()
+	id := uuid.NewString()
+	cases := []struct {
+		method, path, body string
+		want               int
+	}{{"GET", "/providers", "", 200}, {"POST", "/providers", `{"name":"p","baseUrl":"https://p.test","apiKey":"secret","protocolMode":"responses"}`, 201}, {"PUT", "/providers/" + id, `{"name":"p","baseUrl":"https://p.test","protocolMode":"responses","expectedVersion":1}`, 200}, {"PUT", "/active-provider", `{"providerId":"` + id + `","expectedVersion":1}`, 200}, {"GET", "/providers/" + id + "/models", "", 200}, {"PUT", "/providers/" + id + "/models/" + uuid.NewString(), `{"upstreamModelId":"m","modality":"text","contextTokens":10,"maxOutputTokens":5,"imageQuotaTokens":1,"inputPriceMicroUsd":0,"outputPriceMicroUsd":0,"enabled":true,"expectedVersion":0}`, 200}, {"GET", "/prompts", "", 200}, {"PUT", "/prompts/math", `{"body":"p","expectedVersion":0}`, 200}, {"GET", "/limits", "", 200}, {"PUT", "/limits/global", `{"dailyRequests":{"mode":"disabled"},"monthlyRequests":{"mode":"disabled"},"dailyTokens":{"mode":"disabled"},"monthlyTokens":{"mode":"disabled"},"expectedVersion":1}`, 200}, {"PUT", "/limits/students/" + id, `{"dailyRequests":{"mode":"inherit"},"monthlyRequests":{"mode":"inherit"},"dailyTokens":{"mode":"inherit"},"monthlyTokens":{"mode":"inherit"},"expectedVersion":0}`, 200}}
+	for _, tc := range cases {
+		r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		if tc.body != "" {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		if tc.method == http.MethodPost {
+			r.Header.Set("Idempotency-Key", "1234567890abcdef")
+		}
+		r.RemoteAddr = "192.0.2.1:1234"
+		r = r.WithContext(auth.ContextWithUser(r.Context(), auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Fatalf("%s %s=%d %s", tc.method, tc.path, w.Code, w.Body.String())
+		}
+	}
+}
