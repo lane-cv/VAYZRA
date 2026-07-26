@@ -264,6 +264,52 @@ describe('StudentQuestionListView', () => {
     wrapper.unmount()
   })
 
+  it('keeps search focus and cancels a deferred multi-page restore synchronously across repeated input', async () => {
+    let resolveRestore!: (value: unknown) => void
+    let restoreSignal: AbortSignal | undefined
+    api.list
+      .mockResolvedValueOnce({ items: [mixed[0]], nextCursor: 'restore-page' })
+      .mockImplementationOnce((_filters, signal: AbortSignal) => {
+        restoreSignal = signal
+        return new Promise((resolve) => { resolveRestore = resolve })
+      })
+      .mockResolvedValueOnce({ items: [{ ...mixed[0], title: '最新搜索结果' }], nextCursor: undefined })
+    const { wrapper } = mountList({
+      cursor: 'restore-page',
+      focus: 'teacher:t1',
+    })
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+    const input = wrapper.get<HTMLInputElement>('[aria-label="搜索问题标题"]')
+    input.element.focus()
+
+    await input.setValue('函')
+    expect(restoreSignal?.aborted).toBe(true)
+    expect(document.activeElement).toBe(input.element)
+    await vi.advanceTimersByTimeAsync(100)
+    await input.setValue('函数')
+
+    resolveRestore({ items: [mixed[1]], nextCursor: undefined })
+    await flushPromises()
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(document.activeElement).toBe(input.element)
+    expect(wrapper.text()).not.toContain('受力分析')
+
+    await vi.advanceTimersByTimeAsync(299)
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(document.activeElement).toBe(input.element)
+    await vi.advanceTimersByTimeAsync(1)
+    await flushPromises()
+    expect(api.list).toHaveBeenCalledTimes(3)
+    expect(api.list).toHaveBeenLastCalledWith({
+      channel: undefined,
+      search: '函数',
+      limit: 20,
+    }, expect.any(AbortSignal))
+    expect(wrapper.text()).toContain('最新搜索结果')
+    wrapper.unmount()
+  })
+
   it.each([
     {
       name: 'channel',

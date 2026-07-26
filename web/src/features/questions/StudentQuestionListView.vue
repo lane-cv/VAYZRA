@@ -213,11 +213,12 @@ async function changeChannel(): Promise<void> {
 
 function changeSearch(): void {
   if (searchTimer) clearTimeout(searchTimer)
+  restoreTargetCursor = undefined
+  originFocusPending = false
+  activeCursor.value = undefined
+  invalidateActiveRequest()
   searchTimer = setTimeout(() => {
     void (async () => {
-      restoreTargetCursor = undefined
-      originFocusPending = false
-      activeCursor.value = undefined
       beginReplacement()
       await updateQuery()
       await load()
