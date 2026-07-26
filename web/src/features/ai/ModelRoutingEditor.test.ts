@@ -151,4 +151,26 @@ describe('ModelRoutingEditor', () => {
       textModel.upstreamModelId,
     )
   })
+
+  it('keeps the original model conflict when its automatic reload fails', async () => {
+    vi.mocked(api.listModels)
+      .mockResolvedValueOnce([textModel])
+      .mockRejectedValueOnce(
+        new APIError(503, 'unavailable', '模型重载失败', 'req-model-reload'),
+      )
+    vi.mocked(api.putModel).mockRejectedValue(
+      new APIError(409, 'config_conflict', '配置已更新', 'req-model-original'),
+    )
+    const wrapper = mount(ModelRoutingEditor)
+    await flushPromises()
+    await wrapper.get('[data-modality="text"] button[type="submit"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-model-original')
+    expect(wrapper.text()).not.toContain('支持编号：req-model-reload')
+    expect(wrapper.get('input[aria-label="文本上游模型"]').element).toHaveProperty(
+      'value',
+      textModel.upstreamModelId,
+    )
+  })
 })

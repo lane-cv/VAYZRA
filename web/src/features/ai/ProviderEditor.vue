@@ -23,6 +23,7 @@ const name = ref('')
 const baseUrl = ref('')
 const protocolMode = ref<ProtocolMode>('responses')
 const apiKey = ref('')
+const conflictFeedbackActive = ref(false)
 
 function details(reason: unknown, fallback: string) {
   return reason instanceof APIError
@@ -34,6 +35,7 @@ function clearFeedback() {
   error.value = ''
   requestId.value = ''
   notice.value = ''
+  conflictFeedbackActive.value = false
 }
 
 async function load(preserveFailure = false) {
@@ -41,6 +43,7 @@ async function load(preserveFailure = false) {
   if (!preserveFailure) clearFeedback()
   try {
     providers.value = await listProviders()
+    rebaseOpenEdit()
     return true
   } catch (reason) {
     if (!preserveFailure) {
@@ -83,20 +86,26 @@ function rebaseEdit(provider: ProviderView) {
   apiKey.value = ''
 }
 
-async function reloadAfterConflict() {
-  if (!await load(true)) return
+function rebaseOpenEdit() {
+  if (!editingId.value) return
   const latest = providers.value.find((provider) => provider.id === editingId.value)
   if (latest) {
     rebaseEdit(latest)
     return
   }
-  if (editingId.value) {
-    editingId.value = undefined
-    replaceKey.value = true
-    name.value = ''
-    baseUrl.value = ''
-    protocolMode.value = 'responses'
-  }
+  editingId.value = undefined
+  replaceKey.value = true
+  name.value = ''
+  baseUrl.value = ''
+  protocolMode.value = 'responses'
+}
+
+async function reloadAfterConflict() {
+  await load(true)
+}
+
+function retryLoad() {
+  void load(conflictFeedbackActive.value)
 }
 
 function validHTTPS(value: string) {
@@ -163,7 +172,10 @@ async function save() {
     const failure = details(reason, '供应商保存失败，请稍后重试')
     error.value = failure.message
     requestId.value = failure.requestId
-    if (failure.conflict) await reloadAfterConflict()
+    if (failure.conflict) {
+      conflictFeedbackActive.value = true
+      await reloadAfterConflict()
+    }
   } finally {
     pending.value = false
   }
@@ -183,7 +195,10 @@ async function activate(provider: ProviderView) {
     const failure = details(reason, '启用供应商失败，请稍后重试')
     error.value = failure.message
     requestId.value = failure.requestId
-    if (failure.conflict) await reloadAfterConflict()
+    if (failure.conflict) {
+      conflictFeedbackActive.value = true
+      await reloadAfterConflict()
+    }
   } finally {
     pending.value = false
   }
@@ -244,7 +259,7 @@ onBeforeMount(() => { void load() })
       <label v-if="!editingId || replaceKey">API Key
         <input v-model="apiKey" aria-label="API Key" type="password" autocomplete="new-password" :disabled="pending" />
       </label>
-      <div v-if="error" role="alert"><p>{{ error }}<span v-if="requestId"> 支持编号：{{ requestId }}</span></p><button type="button" aria-label="重新加载供应商" :disabled="pending" @click="load()">重新加载</button></div>
+      <div v-if="error" role="alert"><p>{{ error }}<span v-if="requestId"> 支持编号：{{ requestId }}</span></p><button type="button" aria-label="重新加载供应商" :disabled="pending" @click="retryLoad">重新加载</button></div>
       <p v-if="notice" role="status">{{ notice }}</p>
       <button type="submit" :disabled="pending">{{ pending ? '正在保存…' : '保存供应商' }}</button>
     </form>

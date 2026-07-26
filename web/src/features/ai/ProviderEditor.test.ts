@@ -193,4 +193,72 @@ describe('ProviderEditor', () => {
     expect(wrapper.text()).toContain('支持编号：req-original-conflict')
     expect(wrapper.text()).not.toContain('支持编号：req-reload')
   })
+
+  it('rebases a stale edit after conflict reload fails and a manual retry succeeds', async () => {
+    const latest = {
+      ...provider,
+      name: '手动恢复后的服务器名称',
+      baseUrl: 'https://manual-recovery.example/v1',
+      version: 4,
+    }
+    vi.mocked(api.listProviders)
+      .mockResolvedValueOnce([provider])
+      .mockRejectedValueOnce(new APIError(503, 'unavailable', '自动重载失败', 'req-auto-reload'))
+      .mockResolvedValue([latest])
+    vi.mocked(api.updateProvider)
+      .mockRejectedValueOnce(new APIError(409, 'config_conflict', '配置已更新', 'req-manual-recovery'))
+      .mockResolvedValue(latest)
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get(`button[aria-label="编辑 ${provider.name}"]`).trigger('click')
+    await wrapper.get('input[aria-label="供应商名称"]').setValue('不能覆盖服务器的旧草稿')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(wrapper.text()).toContain('支持编号：req-manual-recovery')
+
+    await wrapper.get('button[aria-label="重新加载供应商"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('支持编号：req-manual-recovery')
+    expect(wrapper.get('input[aria-label="供应商名称"]').element).toHaveProperty(
+      'value',
+      latest.name,
+    )
+    expect(wrapper.get('input[aria-label="供应商地址"]').element).toHaveProperty(
+      'value',
+      latest.baseUrl,
+    )
+
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(api.updateProvider).toHaveBeenLastCalledWith(provider.id, expect.objectContaining({
+      name: latest.name,
+      baseUrl: latest.baseUrl,
+      expectedVersion: latest.version,
+    }))
+  })
+
+  it('rebases an open edit after activation conflict recovery uses manual retry', async () => {
+    const latest = { ...provider, name: '激活手动恢复后的名称', version: 4 }
+    vi.mocked(api.listProviders)
+      .mockResolvedValueOnce([provider])
+      .mockRejectedValueOnce(new APIError(503, 'unavailable', '自动重载失败', 'req-activate-reload'))
+      .mockResolvedValue([latest])
+    vi.mocked(api.activateProvider).mockRejectedValue(
+      new APIError(409, 'config_conflict', '配置已更新', 'req-activate-recovery'),
+    )
+    const wrapper = mount(ProviderEditor)
+    await flushPromises()
+    await wrapper.get(`button[aria-label="编辑 ${provider.name}"]`).trigger('click')
+    await wrapper.get('input[aria-label="供应商名称"]').setValue('激活前旧草稿')
+    await wrapper.get(`button[aria-label="启用 ${provider.name}"]`).trigger('click')
+    await flushPromises()
+    await wrapper.get('button[aria-label="重新加载供应商"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('支持编号：req-activate-recovery')
+    expect(wrapper.get('input[aria-label="供应商名称"]').element).toHaveProperty(
+      'value',
+      latest.name,
+    )
+  })
 })

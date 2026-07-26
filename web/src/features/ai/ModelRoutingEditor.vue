@@ -120,9 +120,11 @@ async function loadModels(preserveFailure = false) {
     setForm('text', models.find((model) => model.modality === 'text'))
     setForm('vision', models.find((model) => model.modality === 'vision'))
   } catch (reason) {
-    const details = failure(reason, '模型路由加载失败，请稍后重试')
-    error.value = details.message
-    requestId.value = details.requestId
+    if (!preserveFailure) {
+      const details = failure(reason, '模型路由加载失败，请稍后重试')
+      error.value = details.message
+      requestId.value = details.requestId
+    }
   } finally {
     loading.value = false
   }
