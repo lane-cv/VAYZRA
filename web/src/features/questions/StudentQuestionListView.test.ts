@@ -1,7 +1,15 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { reactive } from 'vue'
-import { routeLocationKey, routerKey } from 'vue-router'
+import {
+  NavigationFailureType,
+  createMemoryHistory,
+  createRouter,
+  isNavigationFailure,
+  routeLocationKey,
+  routerKey,
+  type NavigationFailure,
+} from 'vue-router'
 
 const api = vi.hoisted(() => ({ list: vi.fn() }))
 vi.mock('./summaryApi', () => ({
@@ -17,7 +25,9 @@ const mixed = [
 
 function mountList(query: Record<string, unknown> = {}) {
   const route = reactive({ query })
-  const replace = vi.fn(async (target: { query: Record<string, unknown> }) => {
+  const replace = vi.fn(async (
+    target: { query: Record<string, unknown> },
+  ): Promise<void | NavigationFailure> => {
     route.query = target.query
   })
   const push = vi.fn(async () => undefined)
@@ -33,6 +43,43 @@ function mountList(query: Record<string, unknown> = {}) {
     },
   })
   return { wrapper, route, replace, push }
+}
+
+const routeComponent = { template: '<div />' }
+async function realNavigationFailure(
+  type: 'aborted' | 'cancelled' | 'duplicated',
+): Promise<NavigationFailure> {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/', component: routeComponent },
+      { path: '/next', component: routeComponent },
+      { path: '/slow', component: routeComponent },
+    ],
+  })
+  await router.push('/')
+  if (type === 'duplicated') {
+    const failure = await router.replace('/')
+    if (!isNavigationFailure(failure, NavigationFailureType.duplicated)) throw new Error('expected duplicated failure')
+    return failure
+  }
+  if (type === 'aborted') {
+    router.beforeEach((to) => to.path === '/next' ? false : true)
+    const failure = await router.push('/next')
+    if (!isNavigationFailure(failure, NavigationFailureType.aborted)) throw new Error('expected aborted failure')
+    return failure
+  }
+  let release!: () => void
+  router.beforeEach((to) => to.path === '/slow'
+    ? new Promise<boolean>((resolve) => { release = () => resolve(true) })
+    : true)
+  const slow = router.push('/slow')
+  await Promise.resolve()
+  await router.push('/next')
+  release()
+  const failure = await slow
+  if (!isNavigationFailure(failure, NavigationFailureType.cancelled)) throw new Error('expected cancelled failure')
+  return failure
 }
 
 describe('StudentQuestionListView', () => {
@@ -351,6 +398,136 @@ describe('StudentQuestionListView', () => {
     }, expect.any(AbortSignal))
     expect(route.query).toEqual({ search: 'AB' })
     expect(wrapper.text()).toContain('AB 搜索结果')
+    wrapper.unmount()
+  })
+
+  it('settles a rejected search route replacement with safe feedback and a working retry', async () => {
+    const unhandled = vi.fn()
+    window.addEventListener('unhandledrejection', unhandled)
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+      .mockResolvedValueOnce({ items: [{ ...mixed[0], title: '路由重试结果' }], nextCursor: undefined })
+    const { wrapper, route, replace } = mountList()
+    replace.mockRejectedValueOnce(new Error('secret router guard detail'))
+    await flushPromises()
+
+    await wrapper.get('[aria-label="搜索问题标题"]').setValue('函数')
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(unhandled).not.toHaveBeenCalled()
+    expect(api.list).toHaveBeenCalledTimes(1)
+    expect(wrapper.find('[role="status"]').exists()).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('无法更新筛选')
+    expect(wrapper.text()).not.toContain('secret router guard detail')
+    expect(route.query).toEqual({})
+
+    await wrapper.get('[aria-label="重试加载问答"]').trigger('click')
+    await flushPromises()
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(route.query).toEqual({ search: '函数' })
+    expect(wrapper.text()).toContain('路由重试结果')
+    window.removeEventListener('unhandledrejection', unhandled)
+    wrapper.unmount()
+  })
+
+  it.each(['aborted', 'cancelled'] as const)(
+    'does not load an uncommitted channel after a resolved %s navigation failure',
+    async (kind) => {
+      const failure = await realNavigationFailure(kind)
+      api.list
+        .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+        .mockResolvedValueOnce({ items: [{ ...mixed[0], title: '频道重试结果' }], nextCursor: undefined })
+      const { wrapper, route, replace } = mountList()
+      await flushPromises()
+      replace.mockResolvedValueOnce(failure)
+
+      await wrapper.get('[aria-label="答疑类型"]').setValue('ai')
+      await flushPromises()
+
+      expect(api.list).toHaveBeenCalledTimes(1)
+      expect(route.query).toEqual({})
+      expect(wrapper.find('[role="status"]').exists()).toBe(false)
+      expect(wrapper.get('[role="alert"]').text()).toContain('无法更新筛选')
+
+      await wrapper.get('[aria-label="重试加载问答"]').trigger('click')
+      await flushPromises()
+      expect(api.list).toHaveBeenCalledTimes(2)
+      expect(api.list).toHaveBeenLastCalledWith({
+        channel: 'ai',
+        search: undefined,
+        limit: 20,
+      }, expect.any(AbortSignal))
+      expect(route.query).toEqual({ channel: 'ai' })
+      expect(wrapper.text()).toContain('频道重试结果')
+      wrapper.unmount()
+    },
+  )
+
+  it('loads after a duplicated navigation failure only when the current URL is equivalent', async () => {
+    const duplicated = await realNavigationFailure('duplicated')
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+      .mockResolvedValueOnce({ items: [{ ...mixed[0], title: '等价 URL 结果' }], nextCursor: undefined })
+    const { wrapper, route, replace } = mountList({ search: 'same' })
+    await flushPromises()
+    replace.mockResolvedValueOnce(duplicated)
+
+    await wrapper.get('[aria-label="搜索问题标题"]').setValue('same')
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(route.query).toEqual({ search: 'same' })
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('等价 URL 结果')
+    wrapper.unmount()
+  })
+
+  it('rejects a duplicated navigation failure when the current URL is not equivalent', async () => {
+    const duplicated = await realNavigationFailure('duplicated')
+    api.list.mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+    const { wrapper, route, replace } = mountList()
+    await flushPromises()
+    replace.mockResolvedValueOnce(duplicated)
+
+    await wrapper.get('[aria-label="搜索问题标题"]').setValue('different')
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(api.list).toHaveBeenCalledTimes(1)
+    expect(route.query).toEqual({})
+    expect(wrapper.get('[role="alert"]').text()).toContain('无法更新筛选')
+    wrapper.unmount()
+  })
+
+  it('does not let a stale rejected route transaction overwrite newer URL and results', async () => {
+    let rejectOld!: (cause: Error) => void
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+      .mockResolvedValueOnce({ items: [{ ...mixed[0], title: '最新 AB 结果' }], nextCursor: undefined })
+    const { wrapper, route, replace } = mountList()
+    await flushPromises()
+    replace.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectOld = reject
+    }))
+    const input = wrapper.get('[aria-label="搜索问题标题"]')
+
+    await input.setValue('A')
+    await vi.advanceTimersByTimeAsync(300)
+    await input.setValue('AB')
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(route.query).toEqual({ search: 'AB' })
+    expect(wrapper.text()).toContain('最新 AB 结果')
+    rejectOld(new Error('stale secret route failure'))
+    await flushPromises()
+
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(route.query).toEqual({ search: 'AB' })
+    expect(wrapper.text()).toContain('最新 AB 结果')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('stale secret route failure')
     wrapper.unmount()
   })
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { NavigationFailureType, isNavigationFailure, useRoute, useRouter } from 'vue-router'
 import { APIError } from '../../api/client'
 import { listQuestionSummaries, parseSummaryChannel } from './summaryApi'
 import type { QuestionSummary, QuestionSummaryChannel } from './types'
@@ -31,6 +31,7 @@ let loadedThroughCursor: string | undefined
 let restoreTargetCursor = initialCursor
 let originFocusPending = Boolean(initialFocus)
 let searchEpoch = 0
+let routeRetryPending = false
 
 const statusLabels: Record<QuestionSummaryChannel, Record<string, string>> = {
   ai: {
@@ -76,8 +77,23 @@ function canonicalQuery(): Record<string, string> {
   return query
 }
 
-async function updateQuery(): Promise<void> {
-  await router.replace({ query: canonicalQuery() })
+function routeQueryEquals(target: Record<string, string>): boolean {
+  const currentKeys = Object.keys(route.query).filter((key) => route.query[key] !== undefined)
+  const targetKeys = Object.keys(target)
+  return currentKeys.length === targetKeys.length
+    && targetKeys.every((key) => route.query[key] === target[key])
+}
+
+async function updateQuery(): Promise<boolean> {
+  const target = canonicalQuery()
+  try {
+    const failure = await router.replace({ query: target })
+    if (!failure) return routeQueryEquals(target)
+    return isNavigationFailure(failure, NavigationFailureType.duplicated)
+      && routeQueryEquals(target)
+  } catch {
+    return false
+  }
 }
 
 function invalidateActiveRequest(): void {
@@ -92,6 +108,16 @@ function resetRequestFeedback(): void {
   requestId.value = ''
   errorMode.value = undefined
   retryCursor.value = undefined
+  routeRetryPending = false
+}
+
+function showRouteError(mode: LoadMode = 'replace', cursor?: string): void {
+  loading.value = false
+  error.value = '无法更新筛选，请重试'
+  requestId.value = ''
+  errorMode.value = mode
+  retryCursor.value = cursor
+  routeRetryPending = mode === 'replace'
 }
 
 function beginReplacement(): void {
@@ -127,8 +153,13 @@ async function load(cursor?: string, mode: LoadMode = 'replace', updateCursor = 
     loadedThroughCursor = mode === 'append' ? cursor : undefined
     nextCursor.value = page.nextCursor
     if (cursor && updateCursor) {
+      const previousCursor = activeCursor.value
       activeCursor.value = cursor
-      await updateQuery()
+      if (!await updateQuery()) {
+        activeCursor.value = previousCursor
+        showRouteError('append', cursor)
+        return false
+      }
     }
     return true
   } catch (cause) {
@@ -148,6 +179,13 @@ async function load(cursor?: string, mode: LoadMode = 'replace', updateCursor = 
 }
 
 function retry(): void {
+  if (routeRetryPending) {
+    routeRetryPending = false
+    const epoch = ++searchEpoch
+    beginReplacement()
+    void commitFilterAndLoad(epoch)
+    return
+  }
   const mode = errorMode.value === 'append' ? 'append' : 'replace'
   const cursor = retryCursor.value
   void (async () => {
@@ -187,8 +225,11 @@ async function continueRestore(): Promise<void> {
     pageCursor = nextCursor.value
   }
   activeCursor.value = loadedThroughCursor === target ? target : undefined
+  if (!await updateQuery()) {
+    showRouteError('append', target)
+    return
+  }
   restoreTargetCursor = undefined
-  await updateQuery()
   await restoreOriginFocus()
 }
 
@@ -211,8 +252,16 @@ async function changeChannel(): Promise<void> {
   originFocusPending = false
   activeCursor.value = undefined
   beginReplacement()
-  await updateQuery()
+  await commitFilterAndLoad(epoch)
+}
+
+async function commitFilterAndLoad(epoch: number): Promise<void> {
+  const committed = await updateQuery()
   if (epoch !== searchEpoch) return
+  if (!committed) {
+    showRouteError()
+    return
+  }
   await load()
 }
 
@@ -228,9 +277,7 @@ function changeSearch(): void {
       if (epoch !== searchEpoch) return
       searchTimer = undefined
       beginReplacement()
-      await updateQuery()
-      if (epoch !== searchEpoch) return
-      await load()
+      await commitFilterAndLoad(epoch)
     })()
   }, 300)
 }
