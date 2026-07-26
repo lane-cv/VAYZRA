@@ -1,8 +1,11 @@
 package aiqa
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +25,7 @@ type runnerMemoryStore struct {
 	appendErr error
 	heartErr  error
 	heartAt   time.Time
+	complete  func(context.Context, Completion) error
 }
 
 func (s *runnerMemoryStore) LeaseNext(_ context.Context, owner string, _ time.Time, _ time.Duration) (LeasedRun, error) {
@@ -51,7 +55,10 @@ func (s *runnerMemoryStore) AppendEvents(_ context.Context, _ uuid.UUID, _ strin
 	s.events = append(s.events, events...)
 	return nil
 }
-func (s *runnerMemoryStore) Complete(_ context.Context, _ LeasedRun, completion Completion) error {
+func (s *runnerMemoryStore) Complete(ctx context.Context, _ LeasedRun, completion Completion) error {
+	if s.complete != nil {
+		return s.complete(ctx, completion)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.completed = append(s.completed, completion)
@@ -167,8 +174,6 @@ func TestRunnerFlushesByTimeAndCancelsPromptly(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	originalAppend := store.AppendEvents
-	_ = originalAppend
 	probe := &appendProbeStore{runnerMemoryStore: store, flushed: flushed}
 	stop := StartRunner(Runner{
 		Store: probe, Gateway: gateway, Owner: "test", GlobalConcurrency: 1,
@@ -186,6 +191,150 @@ func TestRunnerFlushesByTimeAndCancelsPromptly(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("runner shutdown was not prompt")
+	}
+}
+
+func TestRunnerFlushesAtActualFourKiBBoundary(t *testing.T) {
+	store := &runnerMemoryStore{queued: []LeasedRun{{Run: Run{ID: uuid.New()}}}}
+	flushed := make(chan struct{})
+	probe := &appendProbeStore{runnerMemoryStore: store, flushed: flushed}
+	gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {
+		if err := cb(GatewayEvent{Kind: "delta", Delta: strings.Repeat("x", 4095)}); err != nil {
+			return err
+		}
+		select {
+		case <-flushed:
+			return errors.New("flushed before 4 KiB")
+		default:
+		}
+		if err := cb(GatewayEvent{Kind: "delta", Delta: "y"}); err != nil {
+			return err
+		}
+		select {
+		case <-flushed:
+			return nil
+		case <-time.After(time.Second):
+			return errors.New("4 KiB flush not observed")
+		}
+	})
+	stop := StartRunner(Runner{
+		Store: probe, Gateway: gateway, Owner: "size-test", GlobalConcurrency: 1,
+		PollInterval: time.Millisecond, LeaseDuration: time.Second,
+		FlushInterval: time.Hour, FlushBytes: 4096,
+	})
+	waitRunner(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.completed) == 1
+	})
+	stop()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.events) != 2 || len(store.events[0].Delta)+len(store.events[1].Delta) != 4096 {
+		t.Fatalf("events=%+v", store.events)
+	}
+}
+
+func TestRunnerCompleteFailureMapsAndBlockingTerminalStoreBoundsShutdown(t *testing.T) {
+	t.Run("complete failure", func(t *testing.T) {
+		store := &runnerMemoryStore{
+			queued: []LeasedRun{{Run: Run{ID: uuid.New()}}},
+			complete: func(context.Context, Completion) error {
+				return errors.New("commit failed")
+			},
+		}
+		gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {
+			return cb(GatewayEvent{Kind: "delta", Delta: "answer"})
+		})
+		stop := StartRunner(Runner{
+			Store: store, Gateway: gateway, Owner: "complete-failure", GlobalConcurrency: 1,
+			PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+			FlushInterval: time.Millisecond, FlushBytes: 4096,
+		})
+		waitRunner(t, func() bool {
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			return len(store.failed) == 1
+		})
+		stop()
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.failed[0].ErrorCode != "terminal_store_failure" {
+			t.Fatalf("failure=%+v", store.failed[0])
+		}
+	})
+
+	t.Run("blocking terminal store", func(t *testing.T) {
+		started := make(chan struct{})
+		store := &runnerMemoryStore{
+			queued: []LeasedRun{{Run: Run{ID: uuid.New()}}},
+			complete: func(ctx context.Context, _ Completion) error {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {
+			return cb(GatewayEvent{Kind: "delta", Delta: "answer"})
+		})
+		stop := StartRunner(Runner{
+			Store: store, Gateway: gateway, Owner: "blocking-complete", GlobalConcurrency: 1,
+			PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+			FlushInterval: time.Millisecond, FlushBytes: 4096,
+		})
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("terminal store did not start")
+		}
+		begin := time.Now()
+		stop()
+		if elapsed := time.Since(begin); elapsed > 250*time.Millisecond {
+			t.Fatalf("shutdown elapsed=%s", elapsed)
+		}
+	})
+}
+
+func TestRunnerPersistsOnlyStableGatewayCategoriesAndLogsNoContent(t *testing.T) {
+	previous := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	for _, test := range []struct {
+		category, want string
+	}{
+		{category: "auth", want: "auth"},
+		{category: "student secret answer", want: "stream_interrupted"},
+	} {
+		store := &runnerMemoryStore{queued: []LeasedRun{{
+			Run:     Run{ID: uuid.New()},
+			Config:  RuntimeProviderConfig{Prompt: PromptView{Body: "private system prompt"}, APIKey: []byte("private-api-key")},
+			Request: GatewayRequest{SystemPrompt: "private system prompt"},
+		}}}
+		gateway := runnerGatewayFunc(func(context.Context, RuntimeProviderConfig, GatewayRequest, func(GatewayEvent) error) error {
+			return &GatewayError{Category: test.category}
+		})
+		stop := StartRunner(Runner{
+			Store: store, Gateway: gateway, Owner: "category-test", GlobalConcurrency: 1,
+			PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+			FlushInterval: time.Millisecond, FlushBytes: 4096,
+		})
+		waitRunner(t, func() bool {
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			return len(store.failed) == 1
+		})
+		stop()
+		store.mu.Lock()
+		got := store.failed[0].ErrorCode
+		store.mu.Unlock()
+		if got != test.want {
+			t.Fatalf("category=%q got=%q want=%q", test.category, got, test.want)
+		}
+	}
+	if output := logs.String(); output != "" ||
+		strings.Contains(output, "private system prompt") || strings.Contains(output, "private-api-key") {
+		t.Fatalf("content leaked to logs: %q", output)
 	}
 }
 

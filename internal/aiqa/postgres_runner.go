@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -127,14 +128,30 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 	if err = tx.Commit(ctx); err != nil {
 		return LeasedRun{}, err
 	}
+	if err = s.Heartbeat(ctx, leased.Run.ID, leased.LeaseOwner, time.Now().Add(duration).UTC()); err != nil {
+		s.finishLostPreparation(ctx, leased, duration, err)
+		return LeasedRun{}, ErrNoRunnableRun
+	}
+	preparationCtx, stopPreparationHeartbeat := s.startPreparationHeartbeat(ctx, leased, duration)
+	preparationHeartbeatStopped := false
+	defer func() {
+		if !preparationHeartbeatStopped {
+			_ = stopPreparationHeartbeat()
+		}
+	}()
 	leased.Config.APIKey, err = s.box.Open(leased.Config.ProviderID, EncryptedSecret{KeyVersion: keyVersion, Blob: encrypted})
 	if err != nil {
+		heartbeatErr := stopPreparationHeartbeat()
+		preparationHeartbeatStopped = true
+		if heartbeatErr != nil {
+			return LeasedRun{}, ErrNoRunnableRun
+		}
 		s.failPreparation(ctx, leased, duration, "provider_secret_unavailable")
 		return LeasedRun{}, ErrNoRunnableRun
 	}
 	var extracted strings.Builder
 	imageCount := 0
-	attachments, attachmentErr := loadMessageAttachments(ctx, s.pool, studentID, leased.Run.TriggerMessageID)
+	attachments, attachmentErr := loadMessageAttachments(preparationCtx, s.pool, studentID, leased.Run.TriggerMessageID)
 	if attachmentErr == nil {
 		for _, attachment := range attachments {
 			attachment := attachment
@@ -160,7 +177,7 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 				continue
 			}
 			var text string
-			text, attachmentErr = s.attachments.LoadAIText(ctx, studentID, attachment.FileVersionID)
+			text, attachmentErr = s.attachments.LoadAIText(preparationCtx, studentID, attachment.FileVersionID)
 			if attachmentErr != nil {
 				break
 			}
@@ -171,6 +188,17 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 		}
 	}
 	if attachmentErr != nil {
+		heartbeatErr := stopPreparationHeartbeat()
+		preparationHeartbeatStopped = true
+		if heartbeatErr != nil {
+			s.finishLostPreparation(ctx, leased, duration, heartbeatErr)
+			zeroBytes(leased.Config.APIKey)
+			return LeasedRun{}, ErrNoRunnableRun
+		}
+		if ctx.Err() != nil {
+			zeroBytes(leased.Config.APIKey)
+			return LeasedRun{}, ctx.Err()
+		}
 		s.failPreparation(ctx, leased, duration, "attachment_unavailable")
 		zeroBytes(leased.Config.APIKey)
 		return LeasedRun{}, ErrNoRunnableRun
@@ -178,6 +206,13 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 	turns, err := selectContext(leased.Config.Prompt.Body, history, leased.Run.TriggerBody, extracted.String(), imageCount,
 		leased.Config.Model.ImageQuotaTokens, leased.Config.Model.ContextTokens, leased.Config.Model.MaxOutputTokens)
 	if err != nil {
+		heartbeatErr := stopPreparationHeartbeat()
+		preparationHeartbeatStopped = true
+		if heartbeatErr != nil {
+			s.finishLostPreparation(ctx, leased, duration, heartbeatErr)
+			zeroBytes(leased.Config.APIKey)
+			return LeasedRun{}, ErrNoRunnableRun
+		}
 		s.failPreparation(ctx, leased, duration, "context_too_large")
 		zeroBytes(leased.Config.APIKey)
 		return LeasedRun{}, ErrNoRunnableRun
@@ -195,7 +230,90 @@ ORDER BY created_at,id`, leased.Run.ThreadID, leased.Run.TriggerMessageID)
 		leased.Request.Turns = append(leased.Request.Turns, GatewayTurn{Role: turn.Role, Text: turn.Text})
 	}
 	leased.Request.Turns = append(leased.Request.Turns, GatewayTurn{Role: "student", Text: current})
+	heartbeatErr := stopPreparationHeartbeat()
+	preparationHeartbeatStopped = true
+	if heartbeatErr != nil {
+		s.finishLostPreparation(ctx, leased, duration, heartbeatErr)
+		zeroBytes(leased.Config.APIKey)
+		return LeasedRun{}, ErrNoRunnableRun
+	}
+	if err = s.verifyPreparedLease(ctx, leased, time.Now().UTC()); err != nil {
+		s.finishLostPreparation(ctx, leased, duration, err)
+		zeroBytes(leased.Config.APIKey)
+		return LeasedRun{}, ErrNoRunnableRun
+	}
 	return leased, nil
+}
+
+func (s *PostgresRunnerStore) startPreparationHeartbeat(parent context.Context, leased LeasedRun, leaseDuration time.Duration) (context.Context, func() error) {
+	preparationCtx, cancelPreparation := context.WithCancel(parent)
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	interval := leaseDuration / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			case <-preparationCtx.Done():
+				done <- preparationCtx.Err()
+				return
+			case now := <-ticker.C:
+				err := s.Heartbeat(preparationCtx, leased.Run.ID, leased.LeaseOwner, now.Add(leaseDuration).UTC())
+				if err != nil {
+					cancelPreparation()
+					done <- err
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	var heartbeatErr error
+	return preparationCtx, func() error {
+		once.Do(func() {
+			close(stop)
+			heartbeatErr = <-done
+			cancelPreparation()
+		})
+		return heartbeatErr
+	}
+}
+
+func (s *PostgresRunnerStore) verifyPreparedLease(ctx context.Context, leased LeasedRun, now time.Time) error {
+	var cancelRequested bool
+	err := s.pool.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM ai_runs
+WHERE id=$1 AND status='streaming' AND lease_owner=$2 AND lease_expires_at>$3`,
+		leased.Run.ID, leased.LeaseOwner, now).Scan(&cancelRequested)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrRunnerLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if cancelRequested {
+		return ErrCancelRequested
+	}
+	return nil
+}
+
+func (s *PostgresRunnerStore) finishLostPreparation(ctx context.Context, leased LeasedRun, leaseDuration time.Duration, err error) {
+	if ctx.Err() != nil || errors.Is(err, ErrRunnerLeaseLost) {
+		return
+	}
+	failure := Failure{Status: RunFailed, ErrorCode: "preparation_store_failure", UsageSource: "unknown"}
+	if errors.Is(err, ErrCancelRequested) {
+		failure = Failure{Status: RunCancelled, ErrorCode: "cancelled", UsageSource: "unknown"}
+	}
+	failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runnerTerminalTimeout(leaseDuration))
+	defer cancel()
+	_ = s.Fail(failCtx, leased, failure)
 }
 
 func (s *PostgresRunnerStore) failPreparation(ctx context.Context, leased LeasedRun, leaseDuration time.Duration, code string) {
@@ -456,37 +574,81 @@ func (s *PostgresRunnerStore) ReconcileExpired(ctx context.Context, now time.Tim
 WHERE status='queued' AND lease_expires_at<$1`, now); err != nil {
 		return err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,lease_owner FROM ai_runs
-WHERE status='streaming' AND lease_expires_at<$1 ORDER BY lease_expires_at,id LIMIT $2`, now, limit)
-	if err != nil {
-		return err
-	}
-	type expired struct {
-		id    uuid.UUID
-		owner string
-	}
-	var runs []expired
-	for rows.Next() {
-		var run expired
-		if err = rows.Scan(&run.id, &run.owner); err != nil {
-			rows.Close()
-			return err
-		}
-		runs = append(runs, run)
-	}
-	rows.Close()
-	if err = rows.Err(); err != nil {
-		return err
-	}
-	for _, run := range runs {
-		err = s.Fail(ctx, LeasedRun{Run: Run{ID: run.id}, LeaseOwner: run.owner}, Failure{
-			Status: RunFailed, ErrorCode: "runner_lost", UsageSource: "unknown",
-		})
-		if err != nil && !errors.Is(err, ErrRunnerLeaseLost) {
+	for reconciled := 0; reconciled < limit; reconciled++ {
+		found, err := s.reconcileOneExpired(ctx, now)
+		if err != nil {
 			return fmt.Errorf("reconcile AI run: %w", err)
+		}
+		if !found {
+			return nil
 		}
 	}
 	return nil
+}
+
+func (s *PostgresRunnerStore) reconcileOneExpired(ctx context.Context, now time.Time) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Resolve the quota-lock key without taking a row lock so reconciliation
+	// follows the same advisory-lock -> run-row-lock order as completion,
+	// cancellation and admission.
+	var runID, studentID uuid.UUID
+	var owner string
+	err = tx.QueryRow(ctx, `SELECT id,student_id,lease_owner FROM ai_runs
+WHERE status='streaming' AND lease_expires_at<$1
+ORDER BY lease_expires_at,id LIMIT 1`, now).Scan(&runID, &studentID, &owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = lockStudent(ctx, tx, studentID); err != nil {
+		return false, err
+	}
+
+	var reservedRequests, reservedTokens, sequence int64
+	var day, month string
+	err = tx.QueryRow(ctx, `SELECT reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,last_sequence
+FROM ai_runs
+WHERE id=$1 AND student_id=$2 AND status='streaming' AND lease_owner=$3 AND lease_expires_at<$4
+FOR UPDATE SKIP LOCKED`, runID, studentID, owner, now).
+		Scan(&reservedRequests, &reservedTokens, &day, &month, &sequence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The owner renewed, another reconciler owns the row, or the run became
+		// terminal. All are safe no-op outcomes for this pass.
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sequence++
+	if _, err = tx.Exec(ctx, `INSERT INTO ai_run_events(run_id,sequence,kind,payload_text,error_code,created_at)
+VALUES($1,$2,'failed','','runner_lost',$3)`, runID, sequence, now); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE ai_runs SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
+heartbeat_at=NULL,completed_at=$4,updated_at=$4,usage_source='unknown',error_code='runner_lost',
+total_ms=GREATEST(0,extract(epoch FROM ($4-started_at))*1000)::bigint,last_sequence=$5
+WHERE id=$1 AND student_id=$2 AND lease_owner=$3 AND status='streaming' AND lease_expires_at<$4`,
+		runID, studentID, owner, now, sequence)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return false, ErrRunnerLeaseLost
+	}
+	if err = settleRunnerQuota(ctx, tx, studentID, runID, day, month, reservedRequests, reservedTokens, 0, now, false); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 var _ RunnerStore = (*PostgresRunnerStore)(nil)

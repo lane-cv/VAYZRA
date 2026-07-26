@@ -3,6 +3,9 @@ package aiqa
 import (
 	"context"
 	"errors"
+	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,11 +117,14 @@ func TestPostgresRunnerReconcileExpiredStreamingFailsOnceAndPreservesEvents(t *t
 		t.Fatal(err)
 	}
 	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
-	leased, err := store.LeaseNext(ctx, "dead-runner", time.Now().Add(-time.Minute).UTC(), 10*time.Millisecond)
+	leased, err := store.LeaseNext(ctx, "dead-runner", time.Now().UTC(), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = store.AppendEvents(ctx, run.ID, leased.LeaseOwner, []RunEvent{{Sequence: 1, Kind: "delta", Delta: "partial", CreatedAt: time.Now().UTC()}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, run.ID); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
@@ -141,6 +147,260 @@ func TestPostgresRunnerReconcileExpiredStreamingFailsOnceAndPreservesEvents(t *t
 	}
 	if deltas != 1 || failures != 1 || releases != 2 {
 		t.Fatalf("deltas=%d failures=%d releases=%d", deltas, failures, releases)
+	}
+}
+
+func TestPostgresRunnerReconcileRechecksRenewedLeaseUnderLock(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	runtimeStore := NewPostgresRuntimeStore(pool)
+	_, run, err := runtimeStore.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
+	leased, err := store.LeaseNext(ctx, "renewed-runner", time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE ai_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	lockKey := "ai-quota:" + fixture.student.String()
+	if _, err = blocker.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1::text,0))`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = blocker.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1::text,0))`, lockKey)
+		}
+	}()
+
+	reconciled := make(chan error, 1)
+	go func() { reconciled <- store.ReconcileExpired(ctx, time.Now().UTC(), 10) }()
+	waitForDatabaseWait(t, ctx, pool, "advisory", "pg_advisory_xact_lock")
+	newExpiry := time.Now().Add(time.Minute).UTC()
+	if err = store.Heartbeat(ctx, run.ID, leased.LeaseOwner, newExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = blocker.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended($1::text,0))`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	if err = <-reconciled; err != nil {
+		t.Fatal(err)
+	}
+	var status RunStatus
+	var expiry time.Time
+	if err = pool.QueryRow(ctx, `SELECT status,lease_expires_at FROM ai_runs WHERE id=$1`, run.ID).Scan(&status, &expiry); err != nil {
+		t.Fatal(err)
+	}
+	if status != RunStreaming || expiry.Sub(newExpiry) > time.Microsecond || newExpiry.Sub(expiry) > time.Microsecond {
+		t.Fatalf("renewed run was reconciled: status=%s expiry=%s want=%s", status, expiry, newExpiry)
+	}
+}
+
+func TestPostgresRunnerSlowPreparationKeepsLeaseAndLossPreventsReturn(t *testing.T) {
+	t.Run("slow preparation keeps lease", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integration.StartPostgres(t)
+		if err := database.Migrate(ctx, pool); err != nil {
+			t.Fatal(err)
+		}
+		fixture := newRuntimeFixture(t, ctx, pool, 20)
+		versionID := insertAttachmentVersion(t, ctx, pool, fixture.student, "ai_attachment", "ready", "text/plain", "slow.txt")
+		in := fixture.admission()
+		in.Attachments = []AttachmentMetadata{{
+			FileVersionID: versionID, DisplayName: "slow.txt", DetectedMIME: "text/plain", Modality: ModalityText, Size: 1,
+		}}
+		runtimeStore := NewPostgresRuntimeStore(pool)
+		_, run, err := runtimeStore.AdmitRun(ctx, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachments := newBlockingRunnerAttachmentStore()
+		store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, attachments)
+		result := make(chan struct {
+			leased LeasedRun
+			err    error
+		}, 1)
+		go func() {
+			leased, leaseErr := store.LeaseNext(ctx, "slow-prep", time.Now().UTC(), 60*time.Millisecond)
+			result <- struct {
+				leased LeasedRun
+				err    error
+			}{leased, leaseErr}
+		}()
+		<-attachments.started
+		time.Sleep(100 * time.Millisecond)
+		if err = store.ReconcileExpired(ctx, time.Now().UTC(), 10); err != nil {
+			t.Fatal(err)
+		}
+		close(attachments.release)
+		got := <-result
+		if got.err != nil || got.leased.Run.ID != run.ID {
+			t.Fatalf("lease=%+v err=%v", got.leased, got.err)
+		}
+		var status RunStatus
+		var expires time.Time
+		if err = pool.QueryRow(ctx, `SELECT status,lease_expires_at FROM ai_runs WHERE id=$1`, run.ID).Scan(&status, &expires); err != nil {
+			t.Fatal(err)
+		}
+		if status != RunStreaming || !expires.After(time.Now()) {
+			t.Fatalf("status=%s expires=%s", status, expires)
+		}
+	})
+
+	t.Run("lease loss prevents prepared request return", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integration.StartPostgres(t)
+		if err := database.Migrate(ctx, pool); err != nil {
+			t.Fatal(err)
+		}
+		fixture := newRuntimeFixture(t, ctx, pool, 20)
+		versionID := insertAttachmentVersion(t, ctx, pool, fixture.student, "ai_attachment", "ready", "text/plain", "lost.txt")
+		in := fixture.admission()
+		in.Attachments = []AttachmentMetadata{{
+			FileVersionID: versionID, DisplayName: "lost.txt", DetectedMIME: "text/plain", Modality: ModalityText, Size: 1,
+		}}
+		runtimeStore := NewPostgresRuntimeStore(pool)
+		_, run, err := runtimeStore.AdmitRun(ctx, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachments := newBlockingRunnerAttachmentStore()
+		store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, attachments)
+		result := make(chan error, 1)
+		go func() {
+			_, leaseErr := store.LeaseNext(ctx, "losing-prep", time.Now().UTC(), 60*time.Millisecond)
+			result <- leaseErr
+		}()
+		<-attachments.started
+		if _, err = pool.Exec(ctx, `UPDATE ai_runs SET lease_owner='stolen-owner',lease_expires_at=now()+interval '1 minute',heartbeat_at=now() WHERE id=$1`, run.ID); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err = <-result:
+		case <-time.After(time.Second):
+			t.Fatal("preparation did not stop after lease loss")
+		}
+		if !errors.Is(err, ErrNoRunnableRun) {
+			t.Fatalf("lease loss error=%v", err)
+		}
+	})
+}
+
+func TestPostgresRunnerReconcileExpiredQueuedRemainsClaimableAndTerminalUntouched(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	runtimeStore := NewPostgresRuntimeStore(pool)
+	_, run, err := runtimeStore.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresRunnerStore(pool, runnerTestSecretBox{}, nil)
+	if err = store.ReconcileExpired(ctx, time.Now().Add(time.Hour), 10); err != nil {
+		t.Fatal(err)
+	}
+	leased, err := store.LeaseNext(ctx, "queued-reclaim", time.Now().UTC(), time.Minute)
+	if err != nil || leased.Run.ID != run.ID {
+		t.Fatalf("queued lease=%+v err=%v", leased, err)
+	}
+	if err = store.Fail(ctx, leased, Failure{Status: RunFailed, ErrorCode: "terminal-test", UsageSource: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	var beforeEvents, beforeReleases int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_run_events WHERE run_id=$1`, run.ID).Scan(&beforeEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE run_id=$1 AND action='release'`, run.ID).Scan(&beforeReleases); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReconcileExpired(ctx, time.Now().Add(24*time.Hour), 10); err != nil {
+		t.Fatal(err)
+	}
+	var status RunStatus
+	var afterEvents, afterReleases int
+	if err = pool.QueryRow(ctx, `SELECT status FROM ai_runs WHERE id=$1`, run.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_run_events WHERE run_id=$1`, run.ID).Scan(&afterEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM ai_usage_ledger WHERE run_id=$1 AND action='release'`, run.ID).Scan(&afterReleases); err != nil {
+		t.Fatal(err)
+	}
+	if status != RunFailed || beforeEvents != afterEvents || beforeReleases != afterReleases {
+		t.Fatalf("terminal changed: status=%s events=%d/%d releases=%d/%d", status, beforeEvents, afterEvents, beforeReleases, afterReleases)
+	}
+}
+
+func TestPostgresRunnerConcurrentClaimsSkipLockedRows(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	runtimeStore := NewPostgresRuntimeStore(pool)
+	_, first, err := runtimeStore.AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStudent := uuid.New()
+	if _, err = pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,status,password_hash)
+VALUES($1,$2,$2,'student','active','x')`, secondStudent, "runner-second-"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	secondAdmission := fixture.admission()
+	secondAdmission.StudentID = secondStudent
+	secondAdmission.IdempotencyKey = "runner-second-admission"
+	_, second, err := runtimeStore.AdmitRun(ctx, secondAdmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	box := &barrierRunnerSecretBox{ready: make(chan struct{}), release: make(chan struct{})}
+	store := NewPostgresRunnerStore(pool, box, nil)
+	results := make(chan LeasedRun, 2)
+	errs := make(chan error, 2)
+	for _, owner := range []string{"skip-a", "skip-b"} {
+		owner := owner
+		go func() {
+			leased, leaseErr := store.LeaseNext(ctx, owner, time.Now().UTC(), time.Minute)
+			results <- leased
+			errs <- leaseErr
+		}()
+	}
+	select {
+	case <-box.ready:
+	case <-time.After(time.Second):
+		t.Fatal("both concurrent claims did not reach post-claim preparation")
+	}
+	close(box.release)
+	a, b := <-results, <-results
+	if err = <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if a.Run.ID == b.Run.ID || (a.Run.ID != first.ID && a.Run.ID != second.ID) || (b.Run.ID != first.ID && b.Run.ID != second.ID) {
+		t.Fatalf("claims=%s,%s want=%s,%s", a.Run.ID, b.Run.ID, first.ID, second.ID)
 	}
 }
 
@@ -231,5 +491,48 @@ func (runnerTestSecretBox) Seal(uuid.UUID, []byte) (EncryptedSecret, error) {
 	return EncryptedSecret{}, errors.New("unused")
 }
 func (runnerTestSecretBox) Open(uuid.UUID, EncryptedSecret) ([]byte, error) {
+	return []byte("runner-secret"), nil
+}
+
+type blockingRunnerAttachmentStore struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingRunnerAttachmentStore() *blockingRunnerAttachmentStore {
+	return &blockingRunnerAttachmentStore{started: make(chan struct{}), release: make(chan struct{})}
+}
+func (s *blockingRunnerAttachmentStore) ValidateForAI(context.Context, uuid.UUID, uuid.UUID, []AttachmentInput) ([]AttachmentMetadata, error) {
+	return nil, errors.New("unused")
+}
+func (s *blockingRunnerAttachmentStore) LoadAIText(ctx context.Context, _, _ uuid.UUID) (string, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return "extracted attachment", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+func (s *blockingRunnerAttachmentStore) OpenAIImage(context.Context, uuid.UUID, uuid.UUID) (io.ReadCloser, string, int64, error) {
+	return nil, "", 0, errors.New("unused")
+}
+
+type barrierRunnerSecretBox struct {
+	count   atomic.Int32
+	ready   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *barrierRunnerSecretBox) Seal(uuid.UUID, []byte) (EncryptedSecret, error) {
+	return EncryptedSecret{}, errors.New("unused")
+}
+func (b *barrierRunnerSecretBox) Open(uuid.UUID, EncryptedSecret) ([]byte, error) {
+	if b.count.Add(1) == 2 {
+		b.once.Do(func() { close(b.ready) })
+	}
+	<-b.release
 	return []byte("runner-secret"), nil
 }
