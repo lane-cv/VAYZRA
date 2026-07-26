@@ -19,6 +19,21 @@ type appAI struct {
 
 type appStudentAI struct{}
 
+type appAISummaries struct{}
+
+func (*appAISummaries) ListQuestionSummaries(context.Context, aiqa.Principal, aiqa.SummaryFilter) ([]aiqa.QuestionSummary, aiqa.SummaryCursor, error) {
+	return []aiqa.QuestionSummary{}, aiqa.SummaryCursor{}, nil
+}
+
+type appAIUsage struct{}
+
+func (*appAIUsage) UsageSummary(context.Context, aiqa.Principal, aiqa.UsageFilter) (aiqa.UsageSummary, error) {
+	return aiqa.UsageSummary{}, nil
+}
+func (*appAIUsage) UsageRuns(context.Context, aiqa.Principal, aiqa.UsageFilter) ([]aiqa.UsageRun, aiqa.UsageCursor, error) {
+	return []aiqa.UsageRun{}, aiqa.UsageCursor{}, nil
+}
+
 func (*appStudentAI) CreateThread(context.Context, aiqa.Principal, aiqa.CreateThreadInput) (aiqa.ThreadDetail, aiqa.Run, error) {
 	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
 }
@@ -115,6 +130,39 @@ func TestAIRoutesStudentAndAdminWriteSurfacesStayIsolated(t *testing.T) {
 		h.ServeHTTP(w, r)
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body)
+		}
+	})
+}
+
+func TestAIRoutesUnifiedStudentSummaryAndAdminUsageReads(t *testing.T) {
+	t.Run("student unified summaries", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appStudentAuth{}, StudentAISummaries: &appAISummaries{}})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/student/question-summaries", nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("student cannot reach usage", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appStudentAuth{}, AdminAIUsage: &appAIUsage{}})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/ai/usage/summary", nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("admin usage", func(t *testing.T) {
+		h := New(Dependencies{Auth: &appAdminAuth{}, AdminAI: &appAI{}, AdminAIUsage: &appAIUsage{}})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/ai/usage/runs", nil)
+		r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 		}
 	})
 }

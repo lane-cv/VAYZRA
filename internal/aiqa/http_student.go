@@ -17,6 +17,88 @@ type StudentHTTPConfig struct {
 	TrustedProxyCIDRs []netip.Prefix
 }
 
+type StudentSummaryHandler struct {
+	service SummaryService
+	trusted []netip.Prefix
+	now     func() time.Time
+}
+
+func NewStudentSummaryHandler(service SummaryService, trusted []netip.Prefix) *StudentSummaryHandler {
+	return &StudentSummaryHandler{service: service, trusted: append([]netip.Prefix(nil), trusted...), now: time.Now}
+}
+
+func (h *StudentSummaryHandler) Routes() http.Handler {
+	r := chi.NewRouter()
+	r.Use(httpx.NoStore, auth.RequireRole(auth.RoleStudent))
+	r.Get("/", h.list)
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) { studentAIError(w, r, ErrNotFound) })
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不被允许")
+	})
+	return r
+}
+
+func (h *StudentSummaryHandler) list(w http.ResponseWriter, r *http.Request) {
+	query, err := studentAIQuery(r, "channel", "search", "cursor", "limit")
+	if err != nil || explicitEmptyAIQuery(query, "channel", "search", "cursor", "limit") {
+		studentAIInvalid(w, r)
+		return
+	}
+	limit, err := studentAILimit(query.Get("limit"))
+	if err != nil {
+		studentAIInvalid(w, r)
+		return
+	}
+	cursor, err := decodeSummaryCursor(query.Get("cursor"), h.now())
+	if err != nil {
+		studentAIInvalid(w, r)
+		return
+	}
+	filter := SummaryFilter{Channel: query.Get("channel"), Search: query.Get("search"), Cursor: cursor, Limit: limit}
+	if err = validateSummaryFilter(filter); err != nil {
+		studentAIInvalid(w, r)
+		return
+	}
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok || user.ID == uuid.Nil || user.Role != auth.RoleStudent || user.Status != auth.StatusActive {
+		studentAIError(w, r, ErrNotFound)
+		return
+	}
+	addr, err := httpx.ClientIP(r, h.trusted)
+	if err != nil {
+		studentAIInvalid(w, r)
+		return
+	}
+	items, next, err := h.service.ListQuestionSummaries(r.Context(), Principal{
+		User: user, RequestID: httpx.RequestIDFromContext(r.Context()), IP: net.IP(addr.AsSlice()),
+	}, filter)
+	if err != nil {
+		studentAIError(w, r, err)
+		return
+	}
+	data := make([]questionSummaryDTO, len(items))
+	for i := range items {
+		data[i] = questionSummaryDTO(items[i])
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data []questionSummaryDTO `json:"data"`
+		Meta struct {
+			NextCursor string `json:"nextCursor,omitempty"`
+		} `json:"meta"`
+	}{Data: data, Meta: struct {
+		NextCursor string `json:"nextCursor,omitempty"`
+	}{NextCursor: encodeSummaryCursor(next)}})
+}
+
+type questionSummaryDTO struct {
+	ID            uuid.UUID `json:"id"`
+	Channel       string    `json:"channel"`
+	Title         string    `json:"title"`
+	RawStatus     string    `json:"rawStatus"`
+	LastMessageAt time.Time `json:"lastMessageAt"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
 type StudentHandler struct {
 	service           StudentService
 	events            StudentEventStore

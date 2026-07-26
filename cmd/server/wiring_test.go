@@ -22,6 +22,18 @@ import (
 
 type serverStudentAI struct{}
 
+type serverAIReads struct{}
+
+func (*serverAIReads) ListQuestionSummaries(context.Context, aiqa.Principal, aiqa.SummaryFilter) ([]aiqa.QuestionSummary, aiqa.SummaryCursor, error) {
+	return []aiqa.QuestionSummary{}, aiqa.SummaryCursor{}, nil
+}
+func (*serverAIReads) UsageSummary(context.Context, aiqa.Principal, aiqa.UsageFilter) (aiqa.UsageSummary, error) {
+	return aiqa.UsageSummary{}, nil
+}
+func (*serverAIReads) UsageRuns(context.Context, aiqa.Principal, aiqa.UsageFilter) ([]aiqa.UsageRun, aiqa.UsageCursor, error) {
+	return []aiqa.UsageRun{}, aiqa.UsageCursor{}, nil
+}
+
 func (*serverStudentAI) CreateThread(context.Context, aiqa.Principal, aiqa.CreateThreadInput) (aiqa.ThreadDetail, aiqa.Run, error) {
 	return aiqa.ThreadDetail{}, aiqa.Run{}, aiqa.ErrNotFound
 }
@@ -92,6 +104,44 @@ func TestBuildApplicationWiresStudentAIAndControlledFileFactories(t *testing.T) 
 	}
 	if !studentFactory || !fileFactory {
 		t.Fatalf("studentFactory=%t fileFactory=%t", studentFactory, fileFactory)
+	}
+}
+
+func TestBuildApplicationWiresAIReadFactories(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		auth auth.HTTPService
+		path string
+	}{
+		{"student summary", serverStudentAuth{}, "/api/v1/student/question-summaries"},
+		{"admin usage", serverAdminAuth{}, "/api/v1/admin/ai/usage/summary"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			h, closeResources, err := buildApplication(context.Background(), config.Config{}, applicationDependencies{
+				open:    func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+				migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+				newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return tc.auth, nil },
+				newAIReads: func(*pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService) {
+					called = true
+					reads := &serverAIReads{}
+					return reads, reads
+				},
+				ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+				close: func(*pgxpool.Pool) {},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(closeResources)
+			r := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			r.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if !called || w.Code != http.StatusOK {
+				t.Fatalf("called=%t status=%d body=%s", called, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

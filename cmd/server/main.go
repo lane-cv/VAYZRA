@@ -96,6 +96,7 @@ type applicationDependencies struct {
 	newStudentTeaching     func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions           func(*pgxpool.Pool) qanda.HTTPServices
 	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
+	newAIReads             func(*pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService)
 	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
 	startOutbox            func(*pgxpool.Pool) func()
 	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config) (func(), error)
@@ -131,6 +132,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newStudentTeaching: newProductionStudentTeachingService,
 		newQuestions:       newProductionQuestionServices,
 		newAdminAI:         newProductionAdminAIService,
+		newAIReads:         newProductionAIReadServices,
 		newNotifications:   newProductionNotificationService,
 		startOutbox:        newProductionOutboxRunner,
 		startAIRunner:      newProductionAIRunner,
@@ -227,6 +229,15 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if err != nil {
 			closePool()
 			return nil, nil, errors.New("initialize AI configuration service")
+		}
+	}
+	var studentAISummaries aiqa.SummaryService
+	var adminAIUsage aiqa.AdminUsageService
+	if deps.newAIReads != nil {
+		studentAISummaries, adminAIUsage = deps.newAIReads(pool)
+		if studentAISummaries == nil || adminAIUsage == nil {
+			closePool()
+			return nil, nil, errors.New("initialize AI read services")
 		}
 	}
 	var notificationService notifications.HTTPService
@@ -335,8 +346,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentQuestions:    questionServices.Student,
 		AdminQuestions:      questionServices.Admin,
 		AdminAI:             adminAI,
+		AdminAIUsage:        adminAIUsage,
 		StudentAI:           studentAI,
 		StudentAIEvents:     studentAIEvents,
+		StudentAISummaries:  studentAISummaries,
 		Notifications:       notificationService,
 		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
@@ -444,6 +457,10 @@ func newProductionAdminAIService(_ context.Context, pool *pgxpool.Pool, cfg conf
 	policy := aiqa.URLPolicy{DevelopmentAllowPrivate: cfg.AIAllowPrivateProvider}
 	store := aiqa.NewPostgresConfigStoreWithSecurity(pool, box, policy)
 	return aiqa.NewAdminConfigServiceWithConnectivity(store, policy, box, aiqa.NewProviderConnectivityTester(policy)), nil
+}
+
+func newProductionAIReadServices(pool *pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService) {
+	return aiqa.NewSummaryService(aiqa.NewPostgresSummaryStore(pool)), aiqa.NewPostgresAdminUsageService(pool)
 }
 
 func newProductionUploadService(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (files.UploadHTTPService, error) {

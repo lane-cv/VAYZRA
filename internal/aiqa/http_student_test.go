@@ -22,6 +22,36 @@ type studentHTTPStub struct {
 	err       error
 }
 
+type summaryHTTPStub struct {
+	filter SummaryFilter
+}
+
+func (s *summaryHTTPStub) ListQuestionSummaries(_ context.Context, _ Principal, filter SummaryFilter) ([]QuestionSummary, SummaryCursor, error) {
+	s.filter = filter
+	return []QuestionSummary{{
+		ID: uuid.New(), Channel: "ai", Title: "二次方程", RawStatus: string(RunSucceeded),
+		LastMessageAt: studentHTTPTime, CreatedAt: studentHTTPTime,
+	}}, SummaryCursor{}, nil
+}
+
+func TestStudentQuestionSummariesHTTPIsUnifiedAndPrivate(t *testing.T) {
+	service := &summaryHTTPStub{}
+	h := NewStudentSummaryHandler(service, nil).Routes()
+	w := studentHTTPRequest(t, h, http.MethodGet, "/?channel=ai&search=%E6%96%B9%E7%A8%8B&limit=20", "", nil, auth.RoleStudent)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if service.filter.Channel != "ai" || service.filter.Search != "方程" {
+		t.Fatalf("filter=%+v", service.filter)
+	}
+	body := w.Body.String()
+	for _, forbidden := range []string{"body", "note", "studentId", "provider", "prompt"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
 func (s *studentHTTPStub) CreateThread(_ context.Context, p Principal, in CreateThreadInput) (ThreadDetail, Run, error) {
 	s.principal, s.create = p, in
 	return studentHTTPDetail(), studentHTTPRun(), s.err
