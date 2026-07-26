@@ -31,16 +31,24 @@ func TestTeachingMigrationDownRemovesTaskOneObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 14); err != nil {
+		if _, err := provider.Up(context.Background()); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
+	var expectedRollbacks int
+	var latestVersion int64
+	if err := pool.QueryRow(ctx, `SELECT count(*),max(version_id) FROM goose_db_version WHERE is_applied AND version_id >= 4`).Scan(&expectedRollbacks, &latestVersion); err != nil {
+		t.Fatal(err)
+	}
+	if expectedRollbacks == 0 {
+		t.Fatal("expected applied migrations from version 4 onward")
+	}
 	results, err := provider.DownTo(ctx, 3)
 	if err != nil {
 		t.Fatalf("rollback teaching migration: %v", err)
 	}
-	if len(results) != 11 || results[len(results)-1].Source.Version != 4 {
-		t.Fatalf("rolled back migrations=%v, want versions 14 through 4", results)
+	if len(results) != expectedRollbacks || results[0].Source.Version != latestVersion || results[len(results)-1].Source.Version != 4 {
+		t.Fatalf("rolled back migrations=%v, want versions %d through 4", results, latestVersion)
 	}
 	var tables, routines int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('grades','terms','subjects','chapters','lessons','lesson_drafts','lesson_revisions','lesson_revision_finalizations','lesson_draft_audiences','lesson_draft_audience_users','lesson_revision_audiences','lesson_revision_audience_users','lesson_draft_external_videos','lesson_revision_external_videos','outbox_events','lesson_progress')`).Scan(&tables); err != nil {

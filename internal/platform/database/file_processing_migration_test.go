@@ -52,15 +52,16 @@ func TestFileProcessingMigrationUsesVersionSevenAndBackfillsPendingFiles(t *test
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var version, jobs int
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
+	var versionSevenApplied bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=7 AND is_applied)`).Scan(&versionSevenApplied); err != nil {
 		t.Fatal(err)
 	}
+	var jobs int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_processing_jobs WHERE file_version_id=$1 AND kind='process_file' AND state='queued'`, versionID).Scan(&jobs); err != nil {
 		t.Fatal(err)
 	}
-	if version != 14 || jobs != 1 {
-		t.Fatalf("migration version=%d jobs=%d", version, jobs)
+	if !versionSevenApplied || jobs != 1 {
+		t.Fatalf("version_seven_applied=%t jobs=%d", versionSevenApplied, jobs)
 	}
 }
 

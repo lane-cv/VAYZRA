@@ -155,7 +155,7 @@ func TestAIConfigurationMigrationDownUpRoundTrip(t *testing.T) {
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 15); err != nil {
+		if _, err := provider.Up(context.Background()); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
@@ -184,6 +184,11 @@ func replayAIConfigurationMigration(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
 	t.Cleanup(closeProvider)
+	t.Cleanup(func() {
+		if _, err := provider.Up(context.Background()); err != nil {
+			t.Errorf("restore latest migration: %v", err)
+		}
+	})
 	if _, err := provider.DownTo(context.Background(), 14); err != nil {
 		t.Fatal(err)
 	}

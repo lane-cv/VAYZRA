@@ -32,10 +32,6 @@ func TestFileSchemaCreatesDurableTablesAndConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var version int
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version != 14 {
-		t.Fatalf("migration version=%d err=%v", version, err)
-	}
 	var count int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('files','file_versions','file_previews','lesson_draft_files','lesson_revision_files','upload_sessions','upload_parts','file_access_logs')`).Scan(&count); err != nil || count != 8 {
 		t.Fatalf("secure file table count=%d err=%v", count, err)

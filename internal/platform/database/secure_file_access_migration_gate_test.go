@@ -241,7 +241,7 @@ func registerMigrationProviderCleanup(t *testing.T, provider *goose.Provider, cl
 	t.Helper()
 	t.Cleanup(closeProvider)
 	t.Cleanup(func() {
-		if _, err := provider.UpTo(context.Background(), 7); err != nil {
+		if _, err := provider.Up(context.Background()); err != nil {
 			t.Errorf("restore latest migration: %v", err)
 		}
 	})
