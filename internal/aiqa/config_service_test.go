@@ -76,3 +76,11 @@ func TestConfigServiceRejectsGlobalLimitInheritance(t *testing.T) {
 		t.Fatalf("global inherit=%v", err)
 	}
 }
+
+func TestConfigServiceAllowsInitialPromptVersion(t *testing.T) {
+	svc := NewAdminConfigService(&memoryConfigStore{}, URLPolicy{DevelopmentAllowPrivate: true, Resolver: testResolver{}}, testSecretBox{})
+	actor := Principal{User: auth.User{ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive}}
+	if _, err := svc.PutPrompt(context.Background(), actor, PutPromptInput{Subject: SubjectMath, Body: "initial", ExpectedVersion: 0}); err != nil {
+		t.Fatalf("initial prompt=%v", err)
+	}
+}

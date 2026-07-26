@@ -135,7 +135,7 @@ func (s *configService) PutPrompt(c context.Context, p Principal, in PutPromptIn
 		return PromptView{}, e
 	}
 	in.Body = strings.TrimSpace(in.Body)
-	if !subjectOK(in.Subject) || in.ExpectedVersion < 1 || in.Body == "" || len(in.Body) > 100000 {
+	if !subjectOK(in.Subject) || in.ExpectedVersion < 0 || in.Body == "" || len(in.Body) > 100000 {
 		return PromptView{}, ErrInvalidInput
 	}
 	return s.store.PutPrompt(c, p, in)

@@ -127,6 +127,9 @@ func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {
 	if err != nil || first.Version != 1 {
 		t.Fatalf("create=%#v err=%v", first, err)
 	}
+	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("duplicate create=%v", err)
+	}
 	in.ExpectedVersion = 1
 	in.ProviderID = two
 	if _, err := store.PutModel(ctx, actor, in); !errors.Is(err, ErrConfigConflict) {
@@ -170,6 +173,35 @@ func TestPostgresConfigModelPromptAndLimitContracts(t *testing.T) {
 	all, err := store.GetLimits(ctx)
 	if err != nil || all.Students[student].Version != studentView.Version {
 		t.Fatalf("limits=%#v err=%v", all, err)
+	}
+}
+
+func TestPostgresConfigRollsBackMutationWhenAuditFails(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	resetAIConfig(t, ctx, pool)
+	admin := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,username,display_name,role,password_hash,must_change_password) VALUES($1,'rollback_admin','Rollback Admin','admin','x',false)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION aiqa_reject_audit() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'forced ai audit failure'; END; $$ LANGUAGE plpgsql; CREATE TRIGGER aiqa_reject_audit BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION aiqa_reject_audit()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DROP TRIGGER IF EXISTS aiqa_reject_audit ON audit_logs; DROP FUNCTION IF EXISTS aiqa_reject_audit()`)
+	})
+	actor := Principal{User: auth.User{ID: admin, Role: auth.RoleAdmin, Status: auth.StatusActive}, RequestID: "rollback", IP: net.ParseIP("192.0.2.12")}
+	zero := int64(0)
+	in := PutLimitsInput{DailyRequests: LimitValue{Mode: "limit", Value: &zero}, MonthlyRequests: LimitValue{Mode: "disabled"}, DailyTokens: LimitValue{Mode: "disabled"}, MonthlyTokens: LimitValue{Mode: "disabled"}, ExpectedVersion: 1}
+	if _, err := NewPostgresConfigStore(pool).PutGlobalLimits(ctx, actor, in); err == nil {
+		t.Fatal("expected audit failure")
+	}
+	var version, daily int64
+	if err := pool.QueryRow(ctx, `SELECT version,daily_request_limit FROM ai_global_limits`).Scan(&version, &daily); err != nil || version != 1 || daily != 0 {
+		t.Fatalf("version=%d daily=%d err=%v", version, daily, err)
 	}
 }
 

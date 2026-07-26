@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/audit"
 	"time"
@@ -177,7 +178,7 @@ func (s *PostgresConfigStore) PutModel(ctx context.Context, p Principal, in PutM
 		if in.ExpectedVersion == 0 {
 			e := tx.QueryRow(ctx, `INSERT INTO ai_models(id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,created_by,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING id,provider_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,image_quota_tokens,input_price_micro_usd_per_million_tokens,output_price_micro_usd_per_million_tokens,enabled,quota_blocked_at,coalesce(quota_block_reason,''),version`, in.ID, in.ProviderID, in.UpstreamModelID, in.Modality, in.ContextTokens, in.MaxOutputTokens, in.ImageQuotaTokens, in.InputPriceMicroUSD, in.OutputPriceMicroUSD, in.Enabled, p.User.ID).Scan(&out.ID, &out.ProviderID, &out.UpstreamModelID, &out.Modality, &out.ContextTokens, &out.MaxOutputTokens, &out.ImageQuotaTokens, &out.InputPriceMicroUSD, &out.OutputPriceMicroUSD, &out.Enabled, &out.QuotaBlockedAt, &out.QuotaBlockReason, &out.Version)
 			if e != nil {
-				return e
+				return configErr(e)
 			}
 		} else {
 			var oldContext, oldOutput, oldQuota int64
@@ -334,6 +335,10 @@ func writeAudit(ctx context.Context, tx pgx.Tx, p Principal, a, t, id string, m 
 }
 func configErr(e error) error {
 	if errors.Is(e, pgx.ErrNoRows) {
+		return ErrConfigConflict
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(e, &pgErr) && pgErr.Code == "23505" {
 		return ErrConfigConflict
 	}
 	return e
