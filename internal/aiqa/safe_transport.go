@@ -86,7 +86,8 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	dialer := net.Dialer{Timeout: s.timeouts.Connect}
 	transport := &http.Transport{
-		Proxy: nil,
+		Proxy:             nil,
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].String(), port))
 		},

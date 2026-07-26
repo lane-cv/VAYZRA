@@ -1,10 +1,13 @@
 package aiqa
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +224,46 @@ func TestSafeTransportRevalidatesEveryNewRequest(t *testing.T) {
 	}
 	if len(resolver.lookups) != 2 {
 		t.Fatalf("lookups = %d, want 2", len(resolver.lookups))
+	}
+}
+
+func TestSafeGatewayCompletedStreamPromptlyClosesOneShotConnection(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.Start()
+	defer server.Close()
+	port := strings.TrimPrefix(server.URL, "http://127.0.0.1:")
+	baseURL, err := url.Parse("http://supplier.test:" + port + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := URLPolicy{DevelopmentAllowPrivate: true, Resolver: &fakeResolver{
+		answers: map[string][]netip.Addr{"supplier.test": {netip.MustParseAddr("127.0.0.1")}},
+	}}
+	cfg := RuntimeProviderConfig{
+		BaseURL: baseURL, ProtocolMode: ProtocolChatCompletions, APIKey: []byte("secret"),
+		Timeouts: GatewayTimeouts{
+			Connect: time.Second, ResponseHeader: time.Second, IdleStream: 5 * time.Second, Total: time.Second,
+		},
+	}
+	if err = NewSafeGateway(policy).Stream(context.Background(), cfg, testGatewayRequest(), func(GatewayEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("completed one-shot provider connection remained idle")
 	}
 }
 
