@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory, type RouterHistory, type RouteRecordRaw } from 'vue-router'
+import { defineComponent, h } from 'vue'
 import ConsoleLayout from '../layouts/ConsoleLayout.vue'
 import LoginView from '../features/auth/LoginView.vue'
 import ChangePasswordView from '../features/auth/ChangePasswordView.vue'
@@ -21,6 +22,14 @@ import type { Role } from '../api/client'
 
 declare module 'vue-router' { interface RouteMeta { requiresAuth?: boolean; roles?: Role[]; allowDuringPasswordChange?: boolean } }
 
+const AIQuestionPlaceholder = defineComponent({
+  name: 'AIQuestionPlaceholder',
+  setup: () => () => h('section', { 'aria-labelledby': 'ai-question-title' }, [
+    h('h1', { id: 'ai-question-title' }, 'AI 答疑'),
+    h('p', 'AI 会话详情正在准备中。'),
+  ]),
+})
+
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/login' },
   { path: '/login', name: 'login', component: LoginView },
@@ -32,7 +41,20 @@ const routes: RouteRecordRaw[] = [
     { path: 'learning/:lessonId', name: 'student-lesson', component: LearningView, props: true },
     { path: 'questions', name: 'student-questions', component: StudentQuestionListView },
     { path: 'questions/new', name: 'student-question-new', component: NewQuestionView },
-    { path: 'questions/:questionId', name: 'student-question-detail', component: StudentQuestionDetailView, props: true },
+    { path: 'questions/ai/:threadId', name: 'student-ai-question-detail', component: AIQuestionPlaceholder, props: true },
+    {
+      path: 'questions/teacher/:threadId',
+      name: 'student-teacher-question-detail',
+      component: StudentQuestionDetailView,
+      props: (route) => ({ questionId: route.params.threadId }),
+    },
+    {
+      path: 'questions/:questionId',
+      name: 'student-question-legacy',
+      redirect: (route) => canonicalUUID(String(route.params.questionId))
+        ? `/student/questions/teacher/${String(route.params.questionId)}`
+        : { name: 'student-questions' },
+    },
   ] },
   { path: '/notifications', component: ConsoleLayout, meta: { requiresAuth: true }, children: [{ path: '', name: 'notifications', component: NotificationCenterView }] },
   { path: '/:pathMatch(.*)*', redirect: '/login' },
@@ -45,7 +67,10 @@ export function createAppRouter(history: RouterHistory = createWebHistory()) {
   const router = createRouter({ history, routes })
   let skipBootstrapForLogin = false
   router.beforeEach(async (to) => {
-    if (to.name === 'student-question-detail' && !canonicalUUID(String(to.params.questionId))) return { name: 'student-questions' }
+    if (
+      (to.name === 'student-ai-question-detail' || to.name === 'student-teacher-question-detail')
+      && !canonicalUUID(String(to.params.threadId))
+    ) return { name: 'student-questions' }
     if (to.name === 'admin-question-detail' && !canonicalUUID(String(to.params.questionId))) return { name: 'admin-questions' }
     const session = useSessionStore()
     if (to.name === 'login' && skipBootstrapForLogin) { skipBootstrapForLogin = false; return true }

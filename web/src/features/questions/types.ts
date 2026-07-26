@@ -7,3 +7,13 @@ export type QuestionDetail = { thread: QuestionThread; messages: QuestionMessage
 export type ThreadPage = { items: QuestionThread[]; nextCursor?: string }
 export type MessagePage = { items: QuestionMessage[]; nextCursor?: string }
 export type QAFileStatus = { fileVersionId: string; processingState: string; failureCategory?: string; detectedMime?: string; size: number; previewAvailable: boolean }
+export type QuestionSummaryChannel = 'ai' | 'teacher'
+export type QuestionSummary = {
+  id: string
+  channel: QuestionSummaryChannel
+  title: string
+  rawStatus: string
+  lastMessageAt: string
+  createdAt: string
+}
+export type QuestionSummaryPage = { items: QuestionSummary[]; nextCursor?: string }

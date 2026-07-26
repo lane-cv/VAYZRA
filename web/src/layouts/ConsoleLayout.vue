@@ -42,7 +42,7 @@ watch(() => session.user?.id, (userId) => { if (userId) notifications.start(user
         <RouterLink v-if="isAdmin" to="/admin/questions" @click="closeDrawer()">问题答疑</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student/learning" @click="closeDrawer()">课程学习</RouterLink>
-        <RouterLink v-if="!isAdmin" to="/student/questions" @click="closeDrawer()">老师答疑</RouterLink>
+        <RouterLink v-if="!isAdmin" to="/student/questions" @click="closeDrawer()">答疑中心</RouterLink>
         <RouterLink to="/notifications" @click="closeDrawer()">通知中心</RouterLink>
       </nav>
       <p class="sidebar-note">高中数学 · 物理<br>循序渐进，稳步提升</p>

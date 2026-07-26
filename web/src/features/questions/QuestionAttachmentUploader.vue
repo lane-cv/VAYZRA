@@ -2,12 +2,22 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useSessionStore } from '../../stores/session'
 import { createUploadManager, type UploadManagerState } from '../teaching/uploadManager'
+import { aiFileStatus, createAIUploadManager } from '../ai/aiUpload'
 import { questionFileStatus } from './studentApi'
 import { adminQuestionUploadTransport, createAdminQuestionSessionStore, createStudentQuestionSessionStore, studentQuestionUploadTransport } from './questionUpload'
 import type { AttachmentInput, QAFileStatus } from './types'
 
-const props = withDefaults(defineProps<{ userId?: string; disabled?: boolean; role?: 'student'|'admin' }>(), { userId: '', disabled: false, role:'student' })
-const emit = defineEmits<{ 'update:attachments': [value: AttachmentInput[]]; 'pending-change': [value: boolean] }>()
+const props = withDefaults(defineProps<{
+  userId?: string
+  disabled?: boolean
+  role?: 'student'|'admin'
+  purpose?: 'teacher'|'ai'
+}>(), { userId: '', disabled: false, role:'student', purpose: 'teacher' })
+const emit = defineEmits<{
+  'update:attachments': [value: AttachmentInput[]]
+  'pending-change': [value: boolean]
+  'state-change': [value: boolean]
+}>()
 type Item = { name: string; size: number; state: 'pending' | 'ready' | 'rejected'; message: string; status?: QAFileStatus }
 const items = ref<Item[]>([])
 const error = ref('')
@@ -24,6 +34,7 @@ function isActive(token: number) { return !destroyed && token === generation }
 function publish(token = generation) {
   if (!isActive(token)) return
   emit('pending-change', pending.value)
+  emit('state-change', items.value.length > 0)
   emit('update:attachments', items.value.filter((item) => item.state === 'ready' && item.status).map((item, index) => ({ fileVersionId: item.status!.fileVersionId, sortPosition: index })))
 }
 function clientError(files: File[]): string {
@@ -49,12 +60,19 @@ async function choose(event: Event) {
     const item = items.value[items.value.length - 1]
     publish(token)
     const uid=props.userId||session?.user?.id||'unknown'
-    const manager = createUploadManager({ transport: props.role==='admin'?adminQuestionUploadTransport:studentQuestionUploadTransport, sessions: props.role==='admin'?createAdminQuestionSessionStore(uid):createStudentQuestionSessionStore(uid), onState: (state: UploadManagerState) => {
+    const onState = (state: UploadManagerState) => {
       if (!isActive(token)) return
       if (state.kind === 'hashing') item.message = `正在校验 ${state.progress}%`
       else if (state.kind === 'uploading') item.message = `正在上传 ${state.progress}%`
       else if (state.kind === 'failed') { item.state = 'rejected'; item.message = `上传失败：${state.message}`; publish(token) }
-    } })
+    }
+    const manager = props.role !== 'admin' && props.purpose === 'ai'
+      ? createAIUploadManager(uid, onState)
+      : createUploadManager({
+          transport: props.role === 'admin' ? adminQuestionUploadTransport : studentQuestionUploadTransport,
+          sessions: props.role === 'admin' ? createAdminQuestionSessionStore(uid) : createStudentQuestionSessionStore(uid),
+          onState,
+        })
     activeManagers.add(manager)
     try {
       const completed = await manager.start(file)
@@ -75,7 +93,9 @@ async function waitUntilProcessed(id: string, item: Item, token: number) {
   try {
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (!isActive(token)) return
-      const status = await questionFileStatus(id, controller.signal)
+      const status = props.role !== 'admin' && props.purpose === 'ai'
+        ? await aiFileStatus(id, controller.signal)
+        : await questionFileStatus(id, controller.signal)
       if (!isActive(token)) return
       if (status.processingState === 'ready') { item.state = 'ready'; item.status = status; item.message = '已就绪'; publish(token); return }
       if (status.processingState === 'rejected' || status.processingState === 'failed') { item.state = 'rejected'; item.message = status.processingState === 'rejected' ? '未通过安全检查' : '文件处理失败'; publish(token); return }
@@ -96,10 +116,20 @@ function invalidate(clear: boolean) {
   generation += 1
   activeControllers.forEach((controller) => controller.abort()); activeControllers.clear()
   const managers = [...activeManagers]; activeManagers.clear(); managers.forEach((manager) => { try { const cancellation=manager.cancel();if(cancellation !== undefined)void cancellation.catch(()=>undefined) } catch { /* Teardown remains best-effort. */ } })
-  if (clear && !destroyed) { items.value = []; error.value = '';if(inputRef.value)inputRef.value.value='';emit('pending-change', false); emit('update:attachments', []) }
+  if (clear && !destroyed) {
+    items.value = []
+    error.value = ''
+    if (inputRef.value) inputRef.value.value = ''
+    emit('pending-change', false)
+    emit('state-change', false)
+    emit('update:attachments', [])
+  }
 }
 watch(() => props.userId || session?.user?.id || '', (next, previous) => { if (next !== previous) invalidate(true) })
+watch(() => props.purpose, (next, previous) => { if (next !== previous) invalidate(true) })
 onBeforeUnmount(() => { destroyed = true; invalidate(false) })
+function clear() { invalidate(true) }
+defineExpose({ clear })
 </script>
 <template>
   <section class="uploader" aria-labelledby="qa-upload-title">
