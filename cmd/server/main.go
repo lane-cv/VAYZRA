@@ -95,6 +95,7 @@ type applicationDependencies struct {
 	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
 	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
 	startOutbox            func(*pgxpool.Pool) func()
+	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config) (func(), error)
 	ready                  func(*pgxpool.Pool) func(context.Context) error
 	objectReady            func(context.Context, config.Config) (func(context.Context) error, error)
 	readinessTimeout       time.Duration
@@ -127,6 +128,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newAdminAI:         newProductionAdminAIService,
 		newNotifications:   newProductionNotificationService,
 		startOutbox:        newProductionOutboxRunner,
+		startAIRunner:      newProductionAIRunner,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -334,6 +336,18 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closeOtherResources()
 		}
 	}
+	if deps.startAIRunner != nil {
+		stopAIRunner, startErr := deps.startAIRunner(ctx, pool, cfg)
+		if startErr != nil || stopAIRunner == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize AI runner")
+		}
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopAIRunner()
+			closeOtherResources()
+		}
+	}
 	return handler, closeResources, nil
 }
 
@@ -485,6 +499,33 @@ func newProductionOutboxRunner(pool *pgxpool.Pool) func() {
 		Store: notifications.NewPostgresOutboxStore(pool), Owner: uuid.NewString(),
 		PollInterval: time.Second, BatchTimeout: 10 * time.Second, ShutdownTimeout: 2 * time.Second,
 	})
+}
+
+func newProductionAIRunner(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (func(), error) {
+	box, err := aiqa.NewAESGCMSecretBox(cfg.AIMasterKey, cfg.AIMasterKeyVersion, rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	policy := aiqa.URLPolicy{DevelopmentAllowPrivate: cfg.AIAllowPrivateProvider}
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
+		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
+		SkipLifecycleBootstrap: cfg.Environment == "development",
+	})
+	if err != nil {
+		return nil, err
+	}
+	attachments := aiqa.NewPostgresAttachmentStore(pool, stores.Originals, stores.Previews)
+	client := aiqa.NewSafeHTTPClient(policy, aiqa.GatewayTimeouts{
+		Connect: 5 * time.Second, ResponseHeader: 30 * time.Second,
+		IdleStream: 30 * time.Second, Total: 10 * time.Minute,
+	})
+	return aiqa.StartRunner(aiqa.Runner{
+		Store: aiqa.NewPostgresRunnerStore(pool, box, attachments), Gateway: aiqa.NewGateway(client),
+		Owner: uuid.NewString(), GlobalConcurrency: cfg.AIGlobalConcurrency,
+		PollInterval: time.Second, LeaseDuration: 30 * time.Second,
+		FlushInterval: 250 * time.Millisecond, FlushBytes: 4 << 10,
+	}), nil
 }
 
 func newProductionStudentService(pool *pgxpool.Pool) students.HTTPService {

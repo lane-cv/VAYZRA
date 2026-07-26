@@ -320,6 +320,18 @@ func (s *PostgresRuntimeStore) releaseTerminal(ctx context.Context, studentID, r
 	if status == RunSucceeded || status == RunFailed || status == RunCancelled {
 		return run, ErrRunConflict
 	}
+	if target == RunCancelled && status == RunStreaming {
+		_, err = tx.Exec(ctx, `UPDATE ai_runs SET cancel_requested_at=COALESCE(cancel_requested_at,$3),updated_at=$3
+WHERE id=$1 AND student_id=$2 AND status='streaming'`, runID, studentID, now)
+		if err != nil {
+			return run, runtimeDBError(err)
+		}
+		run, err = scanRun(tx.QueryRow(ctx, runSelect+` WHERE r.id=$1 AND r.student_id=$2`, runID, studentID))
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		return run, runtimeDBError(err)
+	}
 	_, err = tx.Exec(ctx, `UPDATE ai_runs SET status=$3,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,completed_at=$4,updated_at=$4,usage_source='unknown',error_code=$5 WHERE id=$1 AND student_id=$2`,
 		runID, studentID, target, now, errorCode)
 	if err != nil {
