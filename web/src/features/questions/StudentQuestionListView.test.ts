@@ -310,6 +310,50 @@ describe('StudentQuestionListView', () => {
     wrapper.unmount()
   })
 
+  it('does not let an older debounced route commit start a request after newer input', async () => {
+    let releaseOldReplace!: () => void
+    api.list
+      .mockResolvedValueOnce({ items: mixed, nextCursor: undefined })
+      .mockResolvedValueOnce({ items: [{ ...mixed[0], title: 'AB 搜索结果' }], nextCursor: undefined })
+    const { wrapper, route, replace } = mountList()
+    document.body.appendChild(wrapper.element)
+    await flushPromises()
+    replace.mockImplementationOnce((target: { query: Record<string, unknown> }) => new Promise<void>((resolve) => {
+      releaseOldReplace = () => {
+        route.query = target.query
+        resolve()
+      }
+    }))
+    const input = wrapper.get<HTMLInputElement>('[aria-label="搜索问题标题"]')
+    input.element.focus()
+
+    await input.setValue('A')
+    await vi.advanceTimersByTimeAsync(300)
+    expect(replace).toHaveBeenCalledTimes(1)
+    expect(api.list).toHaveBeenCalledTimes(1)
+
+    await input.setValue('AB')
+    await vi.advanceTimersByTimeAsync(299)
+    releaseOldReplace()
+    await flushPromises()
+
+    expect(api.list).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(input.element)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await flushPromises()
+    expect(replace).toHaveBeenCalledTimes(2)
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(api.list).toHaveBeenLastCalledWith({
+      channel: undefined,
+      search: 'AB',
+      limit: 20,
+    }, expect.any(AbortSignal))
+    expect(route.query).toEqual({ search: 'AB' })
+    expect(wrapper.text()).toContain('AB 搜索结果')
+    wrapper.unmount()
+  })
+
   it.each([
     {
       name: 'channel',

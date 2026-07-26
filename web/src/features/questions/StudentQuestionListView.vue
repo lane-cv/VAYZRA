@@ -30,6 +30,7 @@ let searchTimer: ReturnType<typeof setTimeout> | undefined
 let loadedThroughCursor: string | undefined
 let restoreTargetCursor = initialCursor
 let originFocusPending = Boolean(initialFocus)
+let searchEpoch = 0
 
 const statusLabels: Record<QuestionSummaryChannel, Record<string, string>> = {
   ai: {
@@ -203,24 +204,32 @@ async function restoreOriginFocus(): Promise<void> {
 }
 
 async function changeChannel(): Promise<void> {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = undefined
+  const epoch = ++searchEpoch
   restoreTargetCursor = undefined
   originFocusPending = false
   activeCursor.value = undefined
   beginReplacement()
   await updateQuery()
+  if (epoch !== searchEpoch) return
   await load()
 }
 
 function changeSearch(): void {
   if (searchTimer) clearTimeout(searchTimer)
+  const epoch = ++searchEpoch
   restoreTargetCursor = undefined
   originFocusPending = false
   activeCursor.value = undefined
   invalidateActiveRequest()
   searchTimer = setTimeout(() => {
     void (async () => {
+      if (epoch !== searchEpoch) return
+      searchTimer = undefined
       beginReplacement()
       await updateQuery()
+      if (epoch !== searchEpoch) return
       await load()
     })()
   }, 300)
@@ -229,7 +238,9 @@ function changeSearch(): void {
 onMounted(() => void restoreThrough(activeCursor.value))
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
-  controller?.abort()
+  searchTimer = undefined
+  searchEpoch += 1
+  invalidateActiveRequest()
 })
 </script>
 
