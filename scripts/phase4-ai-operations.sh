@@ -84,6 +84,15 @@ file_owner() {
   stat -f '%u' "$1" 2>/dev/null || stat -c '%u' "$1"
 }
 
+canonical_env_file() {
+  local env_file="$1" env_parent env_name
+  env_parent="$(dirname -- "$env_file")"
+  env_name="$(basename -- "$env_file")"
+  env_parent="$(cd -P -- "$env_parent" 2>/dev/null && pwd -P)" ||
+    fail 'environment file parent directory is missing'
+  printf '%s/%s\n' "$env_parent" "$env_name"
+}
+
 assert_trusted_env_file() {
   local env_file="$1" label="$2" mode mode_value
   [[ -f "$env_file" && -r "$env_file" && ! -L "$env_file" ]] ||
@@ -123,18 +132,18 @@ run_with_env() {
     fail 'usage: phase4-ai-operations.sh run-with-env BASE_ENV AI_ENV COMMAND [ARG...]'
   local base_env_file="$1" ai_env_file="$2"
   shift 2
+  base_env_file="$(canonical_env_file "$base_env_file")"
+  ai_env_file="$(canonical_env_file "$ai_env_file")"
   assert_trusted_env_file "$base_env_file" 'base'
   assert_trusted_env_file "$ai_env_file" 'AI'
   validate_ai_env_file "$ai_env_file"
-  (
-    set -a
-    # Both files are owner-controlled shell syntax. AI settings load last so
-    # host processes use the same key/version precedence as Docker Compose.
-    source "$base_env_file"
-    source "$ai_env_file"
-    set +a
-    exec "$@"
-  )
+  set -a
+  # Both canonical files are owner-controlled shell syntax. AI settings load
+  # last so host processes match Docker Compose key/version precedence.
+  source "$base_env_file"
+  source "$ai_env_file"
+  set +a
+  exec "$@"
 }
 
 verify_secret_absence() {

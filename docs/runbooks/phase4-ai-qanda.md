@@ -39,7 +39,7 @@ docker compose --env-file .env --env-file .secrets/ai.env \
 
 当前 Docker Compose 的 `--env-file` 是可重复选项，后面的文件覆盖前面的同名值；这里先加载保留数据库、Redis、对象存储等设置的 `.env`，再加载只含六个 AI 设置的 `.secrets/ai.env`。用 `docker compose --help` 确认本机版本显示 `--env-file stringArray`；若部署工具不支持重复选项，不得继续，先升级 Compose。开发模式在密钥为空时会使用固定的一次性密钥，仅方便首次启动，不得把这种状态带到共享或生产环境。供应商服务地址没有环境默认值，必须经教师控制台配置。生产必须保持私网供应商开关为 `false`。
 
-所有连接同一持久数据库的主机迁移、server 和 bootstrap 命令必须通过 `scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env COMMAND...` 启动。加载器在子 shell 中执行 `set -a`，先 `source .env`、后 `source .secrets/ai.env`，再 `set +a` 和 `exec`；它不会打印环境。Shell `source` 会执行文件内容，因此两个文件只能由当前用户在本机创建并保持 `0600`，不得 source 下载、工单或聊天中取得的文件。加载器会拒绝缺失、符号链接、非当前用户所有、组/其他用户可读写，以及不是辅助脚本精确生成格式的 AI 文件。
+所有连接同一持久数据库的主机迁移、server 和 bootstrap 命令必须通过 `scripts/phase4-ai-operations.sh run-with-env ./.env ./.secrets/ai.env COMMAND...` 启动。加载器先把参数的物理父目录与文件名组成规范绝对路径，再对该路径检查并 source，裸文件名不会触发 Bash 的 `PATH` 搜索。它在 helper 主进程执行 `set -a`，先 source 规范 `.env`、后 source 规范 `.secrets/ai.env`，再 `set +a` 和直接 `exec`；不会打印环境，并把相同 PID、退出状态和信号语义交给目标进程。Shell `source` 会执行文件内容，因此两个文件只能由当前用户在本机创建并保持 `0600`，不得 source 下载、工单或聊天中取得的文件。加载器会拒绝缺失、符号链接、非当前用户所有、组/其他用户可读写，以及不是辅助脚本精确生成格式的 AI 文件；任一 source 失败时目标命令不会运行。
 
 若 `.secrets/ai.env` 缺失，受控主机命令会在连接数据库前失败，绝不静默使用开发 fallback。只有明确的一次性实验、全新空数据库且永不与 Compose/持久环境切换时，才可在辅助脚本之外使用开发 fallback；该模式不得保存需要后续解密的供应商配置。同一数据库在 host 与 Compose 之间切换时，必须始终使用同一 `.env`、`.secrets/ai.env` 和密钥版本；先运行两种启动方式各自的 `config`/加载检查，再停止当前进程并切换，不能并行使用不同密钥。
 

@@ -37,8 +37,8 @@ grep -Fq 'scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secr
 grep -Fq -- '--env-file .env --env-file .secrets/ai.env' "$runbook"
 ! grep -Fq 'install -m 0600 /dev/null .env' "$runbook"
 grep -Fq 'scripts/phase4-ai-operations.sh verify-secret-absence' "$runbook"
-grep -Fq 'scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/server' "$local_runbook"
-grep -Fq 'scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/admin' "$local_runbook"
+grep -Fq 'scripts/phase4-ai-operations.sh run-with-env ./.env ./.secrets/ai.env go run ./cmd/server' "$local_runbook"
+grep -Fq 'scripts/phase4-ai-operations.sh run-with-env ./.env ./.secrets/ai.env go run ./cmd/admin' "$local_runbook"
 ! grep -Fq 'set -a; . ./.env; set +a' "$local_runbook"
 grep -Fq 'docker stats --no-stream happylearn-dev-app-1 happylearn-dev-worker-1' "$runbook"
 grep -Fq '"SELECT status,count(*) FROM ai_runs GROUP BY status ORDER BY status;"' "$runbook"
@@ -110,6 +110,55 @@ if "$operations" run-with-env "$tmpdir/base.env" "$tmpdir/missing-ai.env" \
 fi
 test ! -e "$tmpdir/missing-ai-command-ran"
 ! grep -Fq 'base-fallback-marker' "$tmpdir/missing.stdout" "$tmpdir/missing.stderr"
+
+mkdir -p "$tmpdir/source-case" "$tmpdir/malicious-path"
+cp "$tmpdir/base.env" "$tmpdir/source-case/.env"
+cp "$tmpdir/ai.env" "$tmpdir/source-case/ai.env"
+printf '%s\n' 'HAPPYLEARN_EXISTING_SENTINEL=malicious-path-value' > "$tmpdir/malicious-path/.env"
+chmod 0600 "$tmpdir/source-case/.env" "$tmpdir/source-case/ai.env" "$tmpdir/malicious-path/.env"
+(
+  cd "$tmpdir/source-case"
+  PATH="$tmpdir/malicious-path:$PATH" "$operations" run-with-env .env ./ai.env \
+    bash -c '[[ "$HAPPYLEARN_EXISTING_SENTINEL" == preserved ]]'
+)
+
+helper_pid=''
+signal_child_pid=''
+cleanup_process_test() {
+  [[ -z "$signal_child_pid" ]] || kill -KILL "$signal_child_pid" 2>/dev/null || true
+}
+trap 'cleanup_process_test; rm -rf "$tmpdir"' EXIT
+"$operations" run-with-env "$tmpdir/base.env" "$tmpdir/ai.env" \
+  bash -c 'printf "%s\n" "$$" > "$1"; exit 23' _ "$tmpdir/exit-child-pid" &
+helper_pid=$!
+child_exit=0
+wait "$helper_pid" || child_exit=$?
+test "$child_exit" -eq 23
+test "$(cat "$tmpdir/exit-child-pid")" = "$helper_pid"
+
+"$operations" run-with-env "$tmpdir/base.env" "$tmpdir/ai.env" \
+  bash -c 'printf "%s\n" "$$" > "$1"; touch "$2"; trap "exit 42" TERM; while :; do sleep 1; done' \
+  _ "$tmpdir/signal-child-pid" "$tmpdir/signal-ready" &
+helper_pid=$!
+for _ in $(seq 1 100); do [[ -f "$tmpdir/signal-ready" ]] && break; sleep .02; done
+test -f "$tmpdir/signal-ready"
+signal_child_pid="$(cat "$tmpdir/signal-child-pid")"
+kill -TERM "$helper_pid"
+signal_exit=0
+wait "$helper_pid" || signal_exit=$?
+test "$signal_child_pid" = "$helper_pid"
+test "$signal_exit" -eq 42
+signal_child_pid=''
+
+printf '%s\n' 'HAPPYLEARN_SOURCE_FAILURE_MARKER=source-failure-secret' 'return 19' > "$tmpdir/source-failure.env"
+chmod 0600 "$tmpdir/source-failure.env"
+source_exit=0
+"$operations" run-with-env "$tmpdir/source-failure.env" "$tmpdir/ai.env" \
+  bash -c 'touch "$1"' _ "$tmpdir/source-failure-child-ran" \
+  >"$tmpdir/source-failure.stdout" 2>"$tmpdir/source-failure.stderr" || source_exit=$?
+test "$source_exit" -eq 19
+test ! -e "$tmpdir/source-failure-child-ran"
+! grep -Fq 'source-failure-secret' "$tmpdir/source-failure.stdout" "$tmpdir/source-failure.stderr"
 
 cat > "$tmpdir/bin/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
