@@ -102,11 +102,26 @@ func composeService(t *testing.T, compose, name string) string {
 	if start < 0 {
 		t.Fatalf("Compose service %q not found", name)
 	}
-	end := strings.Index(compose[start:], "\nnetworks:")
-	if end < 0 {
-		t.Fatalf("Compose service %q has no terminating networks section", name)
+
+	service := compose[start:]
+	offset := 0
+	for _, line := range strings.SplitAfter(service, "\n") {
+		key := strings.TrimSuffix(line, "\n")
+		isPeerService := strings.HasPrefix(key, "  ") &&
+			len(key) > 2 &&
+			key[2] != ' ' &&
+			key[2] != '\t' &&
+			strings.HasSuffix(key, ":")
+		isTopLevelKey := len(key) > 0 &&
+			key[0] != ' ' &&
+			key[0] != '\t' &&
+			strings.HasSuffix(key, ":")
+		if offset > 0 && (isPeerService || isTopLevelKey) {
+			return service[:offset]
+		}
+		offset += len(line)
 	}
-	return compose[start : start+end]
+	return service
 }
 
 func repositoryFile(t *testing.T, parts ...string) string {

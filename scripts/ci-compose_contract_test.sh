@@ -32,6 +32,23 @@ line_is() {
     fail "unexpected workflow line $line_number: expected: $expected"
 }
 
+exact_line_between() {
+  local needle="$1"
+  local first_line="$2"
+  local last_line="$3"
+  local matches
+
+  matches="$(
+    awk -v needle="$needle" -v first="$first_line" -v last="$last_line" '
+      NR >= first && NR <= last && $0 == needle { print NR }
+    ' "$workflow"
+  )"
+  test -n "$matches" || fail "missing verify-job workflow line: $needle"
+  test "$matches" = "${matches%%$'\n'*}" ||
+    fail "verify-job workflow line must occur exactly once: $needle"
+  printf '%s\n' "$matches"
+}
+
 test -f "$ci" || fail "missing deploy/compose.ci.yml"
 
 ci_structure="$(
@@ -72,27 +89,38 @@ for config in "$base_json" "$merged_json"; do
     fail "every published port must bind strictly to 127.0.0.1"
 done
 
-startup_name_line="$(exact_line '      - name: Start private integration dependencies')"
-startup_run_line="$(exact_line '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio')"
-probe_name_line="$(exact_line '      - name: Verify host integration ports')"
+verify_job_line="$(exact_line '  verify:')"
+verify_job_end="$(
+  awk -v verify_line="$verify_job_line" '
+    NR > verify_line && /^  [^[:space:]][^:]*:$/ {
+      print NR - 1
+      exit
+    }
+  ' "$workflow"
+)"
+test -n "$verify_job_end" || fail "verify job has no following job boundary"
+
+startup_name_line="$(exact_line_between '      - name: Start private integration dependencies' "$verify_job_line" "$verify_job_end")"
+startup_run_line="$(exact_line_between '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio' "$verify_job_line" "$verify_job_end")"
+probe_name_line="$(exact_line_between '      - name: Verify host integration ports' "$verify_job_line" "$verify_job_end")"
 probe_run_line="$((probe_name_line + 1))"
 probe_for_line="$((probe_name_line + 2))"
 probe_timeout_line="$((probe_name_line + 3))"
 probe_done_line="$((probe_name_line + 4))"
-go_test_line="$(exact_line '      - run: go test -p 1 ./... -count=1')"
-go_race_test_line="$(exact_line '      - run: go test -race -p 1 ./... -count=1')"
-minio_probe_name_line="$(exact_line '      - name: Verify authenticated MinIO readiness')"
+go_test_line="$(exact_line_between '      - run: go test -p 1 ./... -count=1' "$verify_job_line" "$verify_job_end")"
+go_race_test_line="$(exact_line_between '      - run: go test -race -p 1 ./... -count=1' "$verify_job_line" "$verify_job_end")"
+minio_probe_name_line="$(exact_line_between '      - name: Verify authenticated MinIO readiness' "$verify_job_line" "$verify_job_end")"
 minio_probe_run_line="$((minio_probe_name_line + 1))"
 minio_probe_command_line="$((minio_probe_name_line + 2))"
-merged_validation_line="$(exact_line '      - run: docker compose -f deploy/compose.dev.yml -f deploy/compose.ci.yml config --quiet')"
-report_name_line="$(exact_line '      - name: Report integration dependency failure')"
+merged_validation_line="$(exact_line_between '      - run: docker compose -f deploy/compose.dev.yml -f deploy/compose.ci.yml config --quiet' "$verify_job_line" "$verify_job_end")"
+report_name_line="$(exact_line_between '      - name: Report integration dependency failure' "$verify_job_line" "$verify_job_end")"
 report_if_line="$((report_name_line + 1))"
 report_run_line="$((report_name_line + 2))"
 report_ps_line="$((report_name_line + 3))"
 report_logs_line="$((report_name_line + 4))"
-cleanup_name_line="$(exact_line '      - name: Stop integration dependencies')"
-cleanup_if_line="$(exact_line '        if: always()')"
-cleanup_run_line="$(exact_line '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml down --volumes --remove-orphans')"
+cleanup_name_line="$(exact_line_between '      - name: Stop integration dependencies' "$verify_job_line" "$verify_job_end")"
+cleanup_if_line="$(exact_line_between '        if: always()' "$verify_job_line" "$verify_job_end")"
+cleanup_run_line="$(exact_line_between '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml down --volumes --remove-orphans' "$verify_job_line" "$verify_job_end")"
 
 test "$startup_run_line" -eq "$((startup_name_line + 1))" ||
   fail "startup command must belong to the named startup step"
@@ -110,18 +138,71 @@ test "$go_test_line" -gt "$minio_probe_command_line" ||
   fail "ordinary Go tests must follow authenticated MinIO readiness"
 test "$go_race_test_line" -gt "$go_test_line" ||
   fail "race-enabled Go tests must follow ordinary Go tests"
-if grep -Eq -- '^      - run: go test( -race)? \./\.\.\.([[:space:]]|$)' "$workflow"; then
-  fail "workflow Go package tests must use -p 1"
-fi
+noncanonical_repository_go_test_line="$(
+  awk -v first="$verify_job_line" -v last="$verify_job_end" '
+    function is_repository_go_test(command) {
+      return command ~ /go[[:space:]]+test([[:space:]]|$)/ &&
+        command ~ /(^|[[:space:]"\047;|&()])\.\/\.\.\.($|[[:space:]"\047;|&()])/
+    }
+
+    function inspect_run(command, line_number, canonical) {
+      if (!canonical && is_repository_go_test(command)) {
+        print line_number
+        exit
+      }
+    }
+
+    NR < first || NR > last { next }
+
+    in_run_block {
+      if ($0 ~ /^[[:space:]]*$/) {
+        block_command = block_command " "
+        next
+      }
+      if ($0 ~ /^          /) {
+        command = $0
+        sub(/^          /, "", command)
+        block_command = block_command " " command
+        next
+      }
+      in_run_block = 0
+      inspect_run(block_command, run_line, 0)
+      block_command = ""
+    }
+
+    /^(      - |        )run:[[:space:]]*/ {
+      run_yaml = $0
+      command = $0
+      sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", command)
+      if (command ~ /^[|>][+-]?([[:space:]]+#.*)?$/) {
+        in_run_block = 1
+        run_line = NR
+        block_command = ""
+      } else {
+        canonical = run_yaml == "      - run: go test -p 1 ./... -count=1" ||
+          run_yaml == "      - run: go test -race -p 1 ./... -count=1"
+        inspect_run(command, NR, canonical)
+      }
+    }
+
+    END {
+      if (in_run_block) {
+        inspect_run(block_command, run_line, 0)
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$noncanonical_repository_go_test_line" ||
+  fail "noncanonical repository-wide Go test run at verify-job line $noncanonical_repository_go_test_line"
 go_test_before_probe_line="$(
-  awk -v probe_line="$probe_name_line" '
+  awk -v first="$verify_job_line" -v probe_line="$probe_name_line" '
     function starts_go_test(command) {
       sub(/^[[:space:]]+/, "", command)
       sub(/^["\047]/, "", command)
       return command ~ /^go[[:space:]]+test([[:space:]]|$)/
     }
 
-    NR >= probe_line { next }
+    NR < first || NR >= probe_line { next }
 
     in_run_block {
       if ($0 ~ /^[[:space:]]*$/) { next }
@@ -151,26 +232,20 @@ go_test_before_probe_line="$(
 )"
 test -z "$go_test_before_probe_line" ||
   fail "go test run step at line $go_test_before_probe_line precedes host-port verification"
+test "$go_test_line" -lt "$report_name_line" &&
+  test "$go_race_test_line" -lt "$report_name_line" &&
+  test "$go_race_test_line" -lt "$cleanup_name_line" ||
+  fail "repository Go tests must finish before failure reporting and cleanup"
 test "$merged_validation_line" -lt "$cleanup_name_line" ||
   fail "merged Compose validation must precede cleanup"
 line_is "$report_if_line" '        if: failure()'
 line_is "$report_run_line" '        run: |'
 line_is "$report_ps_line" '          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml ps'
 line_is "$report_logs_line" '          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml logs --no-color --tail 100 minio'
-test "$report_name_line" -lt "$cleanup_name_line" ||
-  fail "dependency failure report must precede cleanup"
-report_next_step_line="$(
-  awk -v report_line="$report_name_line" '
-    NR > report_line && /^      - / {
-      print NR
-      exit
-    }
-  ' "$workflow"
-)"
-test -n "$report_next_step_line" ||
-  fail "dependency failure report must be followed by another workflow step"
+test "$cleanup_name_line" -eq "$((report_logs_line + 1))" ||
+  fail "cleanup must immediately follow the two-command dependency failure report"
 report_block="$(
-  sed -n "${report_name_line},$((report_next_step_line - 1))p" "$workflow"
+  sed -n "${report_name_line},${report_logs_line}p" "$workflow"
 )"
 if grep -Eiq -- 'printenv|docker[[:space:]]+inspect|cat.*license|MINIO_ROOT_(USER|PASSWORD)' <<<"$report_block"; then
   fail "dependency failure report must not expose environment, container metadata, or license credentials"
