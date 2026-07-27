@@ -17,7 +17,14 @@ for script in "$phase2" "$phase3" "$phase4"; do
     test "$(grep -Ec 'docker_bounded [0-9]+ build' "$script")" -eq 2
   fi
   grep -Fq 'cancel_bounded_command' "$script"
+  grep -Fq 'admin_user="$(id -u):$(id -g)"' "$script"
+  grep -Fq 'chmod 0600 "$password_file"' "$script"
+  grep -Fq -- '--name "$admin_init"' "$script"
+  grep -Fq -- '--name "$admin_init" --network "$network" --read-only' "$script"
+  grep -Fq -- '--user "$admin_user" --cap-drop ALL' "$script"
+  ! grep -Eq 'admin_init.*--user 0:0' "$script"
 done
+grep -Fq -- '--security-opt no-new-privileges --memory 128m --cpus .1' "$phase4"
 grep -Fq -- '--read-only --user 1000:1000' "$phase2"
 grep -Fq 'runner_init=' "$phase2"
 

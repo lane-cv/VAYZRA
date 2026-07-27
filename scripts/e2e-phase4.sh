@@ -86,6 +86,7 @@ if [[ "$allowed_artifact_root_canonical" != "$allowed_artifact_root" ||
 fi
 artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 tmpdir="$(mktemp -d)"
+admin_user="$(id -u):$(id -g)"
 early_cleanup() {
   local exit_status=$?
   trap - EXIT INT TERM
@@ -278,8 +279,8 @@ wait_for fake-provider "$fake_ai" exec "$fake_ai" curl --fail --silent http://12
 password_file="$tmpdir/admin-password"
 printf '%s' "$admin_password" > "$password_file"
 chmod 0600 "$password_file"
-docker_bounded 120 run --rm --name "$admin_init" --network "$network" --read-only --user 0:0 --cap-drop ALL \
-  --security-opt no-new-privileges --memory 64m --cpus .1 --tmpfs /tmp:rw,noexec,nosuid,size=16m "${common_env[@]}" \
+docker_bounded 120 run --rm --name "$admin_init" --network "$network" --read-only --user "$admin_user" --cap-drop ALL \
+  --security-opt no-new-privileges --memory 128m --cpus .1 --tmpfs /tmp:rw,noexec,nosuid,size=16m "${common_env[@]}" \
   -v "$password_file:/run/admin-password:ro" --entrypoint /app/happylearn-admin "$app_image" \
   create-teacher --username admin --display-name 'Phase 4 Teacher' --password-file /run/admin-password
 

@@ -41,6 +41,7 @@ student_new_password="Phase2 Changed ${nonce}!"
 artifact_dir="${E2E_ARTIFACT_DIR:-$PWD/test-results/phase2}"
 artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 tmpdir="$(mktemp -d)"
+admin_user="$(id -u):$(id -g)"
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
 
@@ -153,7 +154,7 @@ password_file="$tmpdir/admin-password"
 umask 077
 printf '%s' "$admin_password" > "$password_file"
 chmod 0600 "$password_file"
-docker_bounded 120 run --rm --name "$admin_init" --network "$network" --read-only --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
+docker_bounded 120 run --rm --name "$admin_init" --network "$network" --read-only --user "$admin_user" --cap-drop ALL --security-opt no-new-privileges \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   "${common_env[@]}" -v "$password_file:/run/admin-password:ro" --entrypoint /app/happylearn-admin "$app_image" \
   create-teacher --username admin --display-name 'Phase 2 Teacher' --password-file /run/admin-password
