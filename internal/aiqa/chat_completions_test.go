@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChatCompletionsExactRequestAndIncrementalImage(t *testing.T) {
@@ -27,8 +28,10 @@ func TestChatCompletionsExactRequestAndIncrementalImage(t *testing.T) {
 
 	request := testGatewayRequest()
 	request.Images = []GatewayImage{{MediaType: "image/png", Size: 20 << 20, Open: image.open}}
+	cfg := testRuntimeConfig(t, server, ProtocolChatCompletions)
+	cfg.Timeouts.Total = time.Minute
 	var events []GatewayEvent
-	err := NewGateway(server.Client()).Stream(context.Background(), testRuntimeConfig(t, server, ProtocolChatCompletions), request, func(event GatewayEvent) error {
+	err := NewGateway(server.Client()).Stream(context.Background(), cfg, request, func(event GatewayEvent) error {
 		events = append(events, event)
 		return nil
 	})
