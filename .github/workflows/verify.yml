@@ -39,7 +39,12 @@ jobs:
       - run: pnpm e2e-contracts
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
       - name: Start private integration dependencies
-        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml up -d --wait --wait-timeout 120 postgres redis minio
+        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio
+      - name: Verify host integration ports
+        run: |
+          for port in 54329 56379 59000; do
+            timeout 30 bash -c "until </dev/tcp/127.0.0.1/$port; do sleep 1; done"
+          done
       - run: go test ./... -count=1
       - run: go test -race ./... -count=1
       - run: go vet ./...
@@ -50,6 +55,7 @@ jobs:
       - run: pnpm --dir web build
       - run: pnpm audit --prod
       - run: docker compose -f deploy/compose.dev.yml config --quiet
+      - run: docker compose -f deploy/compose.dev.yml -f deploy/compose.ci.yml config --quiet
       - run: docker build --tag happylearn:ci .
       - run: docker build --file Dockerfile.worker --tag happylearn-worker:ci .
       - name: Verify hardened image metadata
@@ -60,7 +66,7 @@ jobs:
           test "$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' happylearn-worker:ci)" != 'null'
       - name: Stop integration dependencies
         if: always()
-        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml down --volumes --remove-orphans
+        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml down --volumes --remove-orphans
 
   phase2-e2e:
     runs-on: ubuntu-24.04
