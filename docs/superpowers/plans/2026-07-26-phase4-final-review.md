@@ -1,11 +1,22 @@
 # HappyLearn Phase 4 Final Gate and Review
 
 Date: 2026-07-27
-Reviewed range: `b9f7f0a..HEAD`
+Reviewed range: `b9f7f0a..9ff0fa1`
 Status: **BLOCKED — do not report Phase 4 complete**
 
 This review covers the four Phase 4 implementation plans and the complete
-182-file Phase 4 diff. No Phase 5 work is included.
+183-file Phase 4 diff through the fixed acceptance-evidence commit `9ff0fa1`.
+The tracked final-review file itself is included in that fixed range. No Phase
+5 work is included.
+
+The scope is reproducible with:
+
+```bash
+git diff --name-only b9f7f0a..9ff0fa1 | wc -l
+# 183
+git diff --stat b9f7f0a..9ff0fa1 | tail -1
+# 183 files changed, 29535 insertions(+), 273 deletions(-)
+```
 
 ## Gate results
 
@@ -31,7 +42,7 @@ This review covers the four Phase 4 implementation plans and the complete
 | Licensed Phase 1–4 browser E2E | Not run because `HAPPYLEARN_AISTOR_LICENSE_FILE` is unset. | BLOCKED; not claimed as PASS. |
 | Live two-supplier/one-pending-run resource capture | Not run because the disposable licensed stack could not start. | BLOCKED; not claimed as PASS. |
 | Configured resource arithmetic | Phase 4 contract passed: peak configured memory is 4000 MiB and CPU is 2.0; app is 256 MiB and worker is 1792 MiB. | Static contract PASS only; it does not replace live `docker stats`. |
-| `git diff --check b9f7f0a..HEAD` | PASS. | PASS. |
+| `git diff --check b9f7f0a..9ff0fa1` | PASS. | PASS. |
 
 ## Spec compliance
 
