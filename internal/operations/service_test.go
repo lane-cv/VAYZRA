@@ -834,6 +834,111 @@ func TestRenewedLeaseIgnoresAlreadyWaitingExpiryCallback(t *testing.T) {
 	}
 }
 
+func TestCanceledRenewAfterCommitReschedulesExpiryBeforeReturning(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	oldExpiry := time.Now().UTC().Add(400 * time.Millisecond)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: oldExpiry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), lease) })
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, `
+SELECT singleton_id FROM operational_modes
+WHERE singleton_id=true FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	newExpiry := time.Now().UTC().Add(900 * time.Millisecond)
+	renewCtx, cancelRenew := context.WithCancel(ctx)
+	type renewResult struct {
+		lease Lease
+		err   error
+	}
+	renewed := make(chan renewResult, 1)
+	go func() {
+		next, err := store.RenewLease(renewCtx, lease, newExpiry)
+		renewed <- renewResult{lease: next, err: err}
+	}()
+
+	waitDeadline := time.Now().Add(time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `
+SELECT EXISTS (
+	SELECT 1
+	FROM pg_stat_activity
+	WHERE datname=current_database()
+	  AND pid<>pg_backend_pid()
+	  AND state='active'
+	  AND wait_event_type='Lock'
+	  AND query LIKE '%SELECT mode,owner_id,lease_token_hash%'
+)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("renewal did not block on the operational mode row")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancelRenew()
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var result renewResult
+	select {
+	case result = <-renewed:
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not return after the row blocker committed")
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("renewal error = %v, want context canceled", result.err)
+	}
+	var durableExpiry time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT lease_expires_at FROM operational_modes WHERE singleton_id=true`,
+	).Scan(&durableExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if delta := durableExpiry.Sub(newExpiry); delta < -time.Millisecond || delta > time.Millisecond {
+		t.Fatalf("durable expiry = %v, want %v", durableExpiry, newExpiry)
+	}
+
+	timer := time.NewTimer(time.Until(oldExpiry) + 75*time.Millisecond)
+	defer timer.Stop()
+	<-timer.C
+	tokenHash := sha256.Sum256(lease.Token)
+	store.mu.Lock()
+	_, retained := store.sessions[tokenHash]
+	store.mu.Unlock()
+	if !retained {
+		t.Fatal("committed renewal retained the old expiry timer")
+	}
+
+	timer.Reset(time.Until(newExpiry) + 75*time.Millisecond)
+	<-timer.C
+	store.mu.Lock()
+	_, retained = store.sessions[tokenHash]
+	store.mu.Unlock()
+	if retained {
+		t.Fatal("committed renewal remained registered after its new expiry")
+	}
+}
+
 func validSettings() Settings {
 	return Settings{
 		Version:                        1,

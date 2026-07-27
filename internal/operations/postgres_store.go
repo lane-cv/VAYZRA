@@ -442,11 +442,11 @@ RETURNING mode,lease_expires_at,version`,
 	if err := tx.Commit(dbCtx); err != nil {
 		return Lease{}, mapLeaseError(err)
 	}
+	updated.ExpiresAt = updated.ExpiresAt.UTC()
+	s.scheduleLeaseExpiryLocked(tokenHash, session, updated.ExpiresAt)
 	if err := ctx.Err(); err != nil {
 		return Lease{}, err
 	}
-	updated.ExpiresAt = updated.ExpiresAt.UTC()
-	s.scheduleLeaseExpiryLocked(tokenHash, session, updated.ExpiresAt)
 	return updated, nil
 }
 
