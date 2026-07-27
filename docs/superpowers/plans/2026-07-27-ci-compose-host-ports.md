@@ -18,7 +18,7 @@
 
 ---
 
-### Task 1: Lock the CI network contract
+### Task 1: Implement CI runner access with a red-green contract
 
 **Files:**
 - Create: `scripts/ci-compose_contract_test.sh`
@@ -70,16 +70,14 @@ bash scripts/ci-compose_contract_test.sh
 
 Expected: FAIL at `test -f "$ci"` because `deploy/compose.ci.yml` does not exist.
 
-- [ ] **Step 3: Commit the failing contract**
+- [ ] **Step 3: Preserve the RED result and continue without committing**
 
-```bash
-git add scripts/ci-compose_contract_test.sh Makefile
-git commit -m "test(ci): specify Compose host port access"
-```
+Record the failing command and expected `test -f "$ci"` result in the task
+report. Do not commit a deliberately failing branch state.
 
 ---
 
-### Task 2: Add the CI-only network override
+#### Phase 2: Add the CI-only network override
 
 **Files:**
 - Create: `deploy/compose.ci.yml`
@@ -111,16 +109,14 @@ HAPPYLEARN_AISTOR_LICENSE_FILE="/Users/lane/Downloads/minio.license" \
 
 Expected: base JSON contains `"internal": true`; merged JSON contains `"internal": false`; all published addresses remain `127.0.0.1`.
 
-- [ ] **Step 3: Commit the override**
+- [ ] **Step 3: Continue to the workflow change**
 
-```bash
-git add deploy/compose.ci.yml
-git commit -m "fix(ci): expose integration services to runner"
-```
+Do not commit yet; the focused contract remains red until the workflow uses
+the override consistently.
 
 ---
 
-### Task 3: Use the override consistently in GitHub Actions
+#### Phase 3: Use the override consistently in GitHub Actions
 
 **Files:**
 - Modify: `.github/workflows/verify.yml:39-66`
@@ -178,16 +174,16 @@ bash scripts/ci-compose_contract_test.sh
 
 Expected: `CI Compose host-port contract: PASS`.
 
-- [ ] **Step 6: Commit the workflow change**
+- [ ] **Step 6: Commit the complete green implementation**
 
 ```bash
-git add .github/workflows/verify.yml
+git add scripts/ci-compose_contract_test.sh Makefile deploy/compose.ci.yml .github/workflows/verify.yml
 git commit -m "fix(ci): use runner-accessible Compose network"
 ```
 
 ---
 
-### Task 4: Complete verification and publish
+### Task 2: Complete verification and publish
 
 **Files:**
 - Verify: `.github/workflows/verify.yml`
@@ -197,7 +193,7 @@ git commit -m "fix(ci): use runner-accessible Compose network"
 - Verify: `Makefile`
 
 **Interfaces:**
-- Consumes: all changes from Tasks 1-3.
+- Consumes: all changes from Task 1.
 - Produces: a validated `master` push that triggers GitHub Actions.
 
 - [ ] **Step 1: Validate shell and workflow syntax**
