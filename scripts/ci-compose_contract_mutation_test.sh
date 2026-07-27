@@ -72,12 +72,39 @@ expect_rejected() {
     fail "workflow mutation $name failed for the wrong reason"
 }
 
+expect_accepted() {
+  local name="$1"
+  local workflow="$2"
+  local output="$tmp_dir/$name.out"
+
+  HAPPYLEARN_CI_COMPOSE_CONTRACT_WORKFLOW="$workflow" bash "$contract" >"$output" 2>&1 ||
+    fail "rejected safely neutralized workflow mutation: $name"
+}
+
 pristine="$tmp_dir/pristine.yml"
 cp "$source_workflow" "$pristine"
 HAPPYLEARN_CI_COMPOSE_CONTRACT_WORKFLOW="$pristine" bash "$contract" >/dev/null ||
   fail "unmodified workflow copy does not satisfy the contract"
 
-ordinary_go_step='      - run: go test -p 1 ./... -count=1'
+ordinary_go_step="      - run: GOFLAGS='' go test -p 1 ./... -count=1"
+
+verify_continue_on_error="$tmp_dir/verify-continue-on-error.yml"
+insert_after "$source_workflow" "$verify_continue_on_error" '  verify:' \
+  '    continue-on-error: true'
+expect_rejected "verify-continue-on-error" "$verify_continue_on_error" \
+  "verify job must not set continue-on-error"
+
+verify_quoted_continue_on_error="$tmp_dir/verify-quoted-continue-on-error.yml"
+insert_after "$source_workflow" "$verify_quoted_continue_on_error" '  verify:' \
+  '    "continue-on-error": true'
+expect_rejected "verify-quoted-continue-on-error" "$verify_quoted_continue_on_error" \
+  "verify job must not set continue-on-error"
+
+verify_flow_continue_on_error="$tmp_dir/verify-flow-continue-on-error.yml"
+insert_after "$source_workflow" "$verify_flow_continue_on_error" '  verify:' \
+  '    <<: {"continue-on-error": true}'
+expect_rejected "verify-flow-continue-on-error" "$verify_flow_continue_on_error" \
+  "verify job must not set continue-on-error"
 
 step_if_false="$tmp_dir/step-if-false.yml"
 insert_after "$source_workflow" "$step_if_false" "$ordinary_go_step" \
@@ -138,5 +165,20 @@ insert_before "$source_workflow" "$root_inline_quoted_goflags" 'jobs:' \
   $'env: {"GOFLAGS": "-run=^$"}\n'
 expect_rejected "root-inline-quoted-goflags" "$root_inline_quoted_goflags" \
   "workflow and verify job must not set GOFLAGS"
+
+verify_quoted_parent_env="$tmp_dir/verify-quoted-parent-env.yml"
+insert_after "$source_workflow" "$verify_quoted_parent_env" '  verify:' \
+  '    "env": {"GOFLAGS": "-run=^$"}'
+expect_accepted "verify-quoted-parent-env" "$verify_quoted_parent_env"
+
+root_quoted_parent_env="$tmp_dir/root-quoted-parent-env.yml"
+insert_before "$source_workflow" "$root_quoted_parent_env" 'jobs:' \
+  $'"env": {"GOFLAGS": "-run=^$"}\n'
+expect_accepted "root-quoted-parent-env" "$root_quoted_parent_env"
+
+github_env_injection="$tmp_dir/github-env-injection.yml"
+insert_before "$source_workflow" "$github_env_injection" "$ordinary_go_step" \
+  '      - run: echo "GOFLAGS=-run=^$" >> "$GITHUB_ENV"'
+expect_accepted "github-env-injection" "$github_env_injection"
 
 echo "CI Compose workflow mutation contract: PASS"

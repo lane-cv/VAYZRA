@@ -4,7 +4,7 @@
 
 **Goal:** Make the `verify` workflow wait for authenticated MinIO readiness and prevent PostgreSQL-backed Go packages from timing out in a cross-package advisory-lock queue.
 
-**Architecture:** Keep application code unchanged. Encode the desired CI behavior in the existing shell and Go deployment-contract tests, then minimally change the workflow and Compose health check to satisfy those contracts. Serialize Go package binaries with `-p 1`, use the AIStor readiness endpoint, and add a bounded authenticated S3 probe plus sanitized failure evidence.
+**Architecture:** Keep application code unchanged. Encode the desired CI behavior in the existing shell and Go deployment-contract tests, then minimally change the workflow and Compose health check to satisfy those contracts. Serialize Go package binaries with `-p 1`, explicitly clear inherited `GOFLAGS` for both repository test commands, use the AIStor readiness endpoint, and add a bounded authenticated S3 probe plus sanitized failure evidence.
 
 **Tech Stack:** GitHub Actions YAML, Docker Compose, Bash contract tests, Go 1.26 deployment-contract tests, MinIO Client (`mc`) included in the pinned AIStor image.
 
@@ -30,8 +30,8 @@
 After the existing host-port probe assertions in `scripts/ci-compose_contract_test.sh`, add:
 
 ```bash
-go_test_line="$(exact_line '      - run: go test -p 1 ./... -count=1')"
-go_race_line="$(exact_line '      - run: go test -race -p 1 ./... -count=1')"
+go_test_line="$(exact_line "      - run: GOFLAGS='' go test -p 1 ./... -count=1")"
+go_race_line="$(exact_line "      - run: GOFLAGS='' go test -race -p 1 ./... -count=1")"
 test "$go_test_line" -gt "$probe_done_line" ||
   fail "ordinary Go tests must run after dependency verification"
 test "$go_race_line" -gt "$go_test_line" ||
@@ -106,7 +106,7 @@ Run:
 HAPPYLEARN_AISTOR_LICENSE_FILE=/Users/lane/Downloads/minio.license bash scripts/ci-compose_contract_test.sh
 ```
 
-Expected: FAIL with `missing workflow line:       - run: go test -p 1 ./... -count=1`.
+Expected: FAIL with `missing verify-job workflow line:       - run: GOFLAGS='' go test -p 1 ./... -count=1`.
 
 - [ ] **Step 6: Run the Go deployment contract and verify RED**
 
@@ -161,8 +161,8 @@ Immediately after `Verify host integration ports` in `.github/workflows/verify.y
 Replace the two workflow commands with:
 
 ```yaml
-      - run: go test -p 1 ./... -count=1
-      - run: go test -race -p 1 ./... -count=1
+      - run: GOFLAGS='' go test -p 1 ./... -count=1
+      - run: GOFLAGS='' go test -race -p 1 ./... -count=1
 ```
 
 - [ ] **Step 4: Add sanitized failure evidence**
@@ -365,7 +365,7 @@ Open the repository's `verify` workflow page and confirm that the newest run ref
 Confirm that the run passes:
 
 - `Verify authenticated MinIO readiness`;
-- `Run go test -p 1 ./... -count=1`;
-- `Run go test -race -p 1 ./... -count=1`.
+- `Run GOFLAGS='' go test -p 1 ./... -count=1`;
+- `Run GOFLAGS='' go test -race -p 1 ./... -count=1`.
 
 If a gate fails, read its full log and return to systematic root-cause investigation rather than adding another speculative fix.

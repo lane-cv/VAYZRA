@@ -149,6 +149,18 @@ workflow_bypass="$(
       print "verify job must not have an if condition"
       exit
     }
+    /^    ["\047]?continue-on-error["\047]?[[:space:]]*:/ {
+      print "verify job must not set continue-on-error"
+      exit
+    }
+    /^    <<[[:space:]]*:/ && /["\047]?continue-on-error["\047]?[[:space:]]*:/ {
+      print "verify job must not set continue-on-error"
+      exit
+    }
+    /^    \?[[:space:]]*["\047]?continue-on-error["\047]?[[:space:]]*$/ {
+      print "verify job must not set continue-on-error"
+      exit
+    }
 
     /^    defaults:[[:space:]]*\{/ && /working-directory[[:space:]]*:/ {
       print "verify job must not override the run working directory"
@@ -197,8 +209,8 @@ probe_run_line="$((probe_name_line + 1))"
 probe_for_line="$((probe_name_line + 2))"
 probe_timeout_line="$((probe_name_line + 3))"
 probe_done_line="$((probe_name_line + 4))"
-go_test_line="$(exact_line_between '      - run: go test -p 1 ./... -count=1' "$verify_job_line" "$verify_job_end")"
-go_race_test_line="$(exact_line_between '      - run: go test -race -p 1 ./... -count=1' "$verify_job_line" "$verify_job_end")"
+go_test_line="$(exact_line_between "      - run: GOFLAGS='' go test -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
+go_race_test_line="$(exact_line_between "      - run: GOFLAGS='' go test -race -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
 minio_probe_name_line="$(exact_line_between '      - name: Verify authenticated MinIO readiness' "$verify_job_line" "$verify_job_end")"
 minio_probe_run_line="$((minio_probe_name_line + 1))"
 minio_probe_command_line="$((minio_probe_name_line + 2))"
@@ -276,8 +288,8 @@ noncanonical_repository_go_test_line="$(
         run_line = NR
         block_command = ""
       } else {
-        canonical = run_yaml == "      - run: go test -p 1 ./... -count=1" ||
-          run_yaml == "      - run: go test -race -p 1 ./... -count=1"
+        canonical = run_yaml == "      - run: GOFLAGS=\047\047 go test -p 1 ./... -count=1" ||
+          run_yaml == "      - run: GOFLAGS=\047\047 go test -race -p 1 ./... -count=1"
         inspect_run(command, NR, canonical)
       }
     }
