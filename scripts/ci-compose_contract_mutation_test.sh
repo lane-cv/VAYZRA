@@ -92,25 +92,25 @@ verify_continue_on_error="$tmp_dir/verify-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_continue_on_error" '  verify:' \
   '    continue-on-error: true'
 expect_rejected "verify-continue-on-error" "$verify_continue_on_error" \
-  "verify job must not set continue-on-error"
+  "verify job contains a noncanonical top-level key"
 
 verify_quoted_continue_on_error="$tmp_dir/verify-quoted-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_quoted_continue_on_error" '  verify:' \
   '    "continue-on-error": true'
 expect_rejected "verify-quoted-continue-on-error" "$verify_quoted_continue_on_error" \
-  "verify job must not set continue-on-error"
+  "verify job contains a noncanonical top-level key"
 
 verify_flow_continue_on_error="$tmp_dir/verify-flow-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_flow_continue_on_error" '  verify:' \
   '    <<: {"continue-on-error": true}'
 expect_rejected "verify-flow-continue-on-error" "$verify_flow_continue_on_error" \
-  "verify job must not set continue-on-error"
+  "verify job contains a noncanonical top-level key"
 
 verify_explicit_continue_on_error="$tmp_dir/verify-explicit-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_explicit_continue_on_error" '  verify:' \
   $'    ? "continue-on-error"\n    : true'
 expect_rejected "verify-explicit-continue-on-error" "$verify_explicit_continue_on_error" \
-  "verify job must not set continue-on-error"
+  "verify job contains a noncanonical top-level key"
 
 step_if_false="$tmp_dir/step-if-false.yml"
 insert_after "$source_workflow" "$step_if_false" "$ordinary_go_step" \
@@ -134,105 +134,125 @@ verify_defaults="$tmp_dir/verify-defaults.yml"
 insert_after "$source_workflow" "$verify_defaults" '  verify:' \
   $'    defaults:\n      run:\n        working-directory: web'
 expect_rejected "verify-defaults" "$verify_defaults" \
-  "verify job must not override the run working directory"
+  "verify job contains a noncanonical top-level key"
 
 verify_if="$tmp_dir/verify-if.yml"
 insert_after "$source_workflow" "$verify_if" '  verify:' \
   '    if: false'
 expect_rejected "verify-if" "$verify_if" \
-  "verify job must not have an if condition"
+  "verify job contains a noncanonical top-level key"
 
 verify_quoted_if="$tmp_dir/verify-quoted-if.yml"
 insert_after "$source_workflow" "$verify_quoted_if" '  verify:' \
   '    "if": false'
 expect_rejected "verify-quoted-if" "$verify_quoted_if" \
-  "verify job must not have an if condition"
+  "verify job contains a noncanonical top-level key"
 
 verify_single_quoted_if="$tmp_dir/verify-single-quoted-if.yml"
 insert_after "$source_workflow" "$verify_single_quoted_if" '  verify:' \
   "    'if': false"
 expect_rejected "verify-single-quoted-if" "$verify_single_quoted_if" \
-  "verify job must not have an if condition"
+  "verify job contains a noncanonical top-level key"
 
 verify_flow_if="$tmp_dir/verify-flow-if.yml"
 insert_after "$source_workflow" "$verify_flow_if" '  verify:' \
   '    <<: {"if": false}'
 expect_rejected "verify-flow-if" "$verify_flow_if" \
-  "verify job must not have an if condition"
+  "verify job contains a noncanonical top-level key"
 
 verify_explicit_if="$tmp_dir/verify-explicit-if.yml"
 insert_after "$source_workflow" "$verify_explicit_if" '  verify:' \
   $'    ? "if"\n    : false'
 expect_rejected "verify-explicit-if" "$verify_explicit_if" \
-  "verify job must not have an if condition"
+  "verify job contains a noncanonical top-level key"
 
 root_defaults="$tmp_dir/root-defaults.yml"
 insert_before "$source_workflow" "$root_defaults" 'jobs:' \
   $'defaults:\n  run:\n    working-directory: web\n'
 expect_rejected "root-defaults" "$root_defaults" \
-  "workflow must not override the run working directory"
+  "workflow contains a noncanonical top-level key"
 
 root_quoted_defaults="$tmp_dir/root-quoted-defaults.yml"
 insert_before "$source_workflow" "$root_quoted_defaults" 'jobs:' \
   $'"defaults":\n  "run":\n    "working-directory": internal/aiqa\n'
 expect_rejected "root-quoted-defaults" "$root_quoted_defaults" \
-  "workflow must not override the run working directory"
+  "workflow contains a noncanonical top-level key"
 
 root_flow_defaults="$tmp_dir/root-flow-defaults.yml"
 insert_before "$source_workflow" "$root_flow_defaults" 'jobs:' \
   $'"defaults": {"run": {"working-directory": "internal/aiqa"}}\n'
 expect_rejected "root-flow-defaults" "$root_flow_defaults" \
-  "workflow must not override the run working directory"
+  "workflow contains a noncanonical top-level key"
 
 verify_goflags="$tmp_dir/verify-goflags.yml"
 insert_after "$source_workflow" "$verify_goflags" '  verify:' \
   $'    env:\n      GOFLAGS: "-run=^$"'
 expect_rejected "verify-goflags" "$verify_goflags" \
-  "workflow and verify job must not set GOFLAGS"
+  "verify job contains a noncanonical top-level key"
 
 verify_inline_quoted_goflags="$tmp_dir/verify-inline-quoted-goflags.yml"
 insert_after "$source_workflow" "$verify_inline_quoted_goflags" '  verify:' \
   '    env: {"GOFLAGS": "-run=^$"}'
 expect_rejected "verify-inline-quoted-goflags" "$verify_inline_quoted_goflags" \
-  "workflow and verify job must not set GOFLAGS"
+  "verify job contains a noncanonical top-level key"
 
 root_goflags="$tmp_dir/root-goflags.yml"
 insert_before "$source_workflow" "$root_goflags" 'jobs:' \
   $'env:\n  GOFLAGS: "-run=^$"\n'
 expect_rejected "root-goflags" "$root_goflags" \
-  "workflow and verify job must not set GOFLAGS"
+  "workflow contains a noncanonical top-level key"
 
 root_inline_quoted_goflags="$tmp_dir/root-inline-quoted-goflags.yml"
 insert_before "$source_workflow" "$root_inline_quoted_goflags" 'jobs:' \
   $'env: {"GOFLAGS": "-run=^$"}\n'
 expect_rejected "root-inline-quoted-goflags" "$root_inline_quoted_goflags" \
-  "workflow and verify job must not set GOFLAGS"
+  "workflow contains a noncanonical top-level key"
 
 verify_quoted_defaults="$tmp_dir/verify-quoted-defaults.yml"
 insert_after "$source_workflow" "$verify_quoted_defaults" '  verify:' \
   $'    "defaults":\n      "run":\n        "working-directory": internal/aiqa'
 expect_rejected "verify-quoted-defaults" "$verify_quoted_defaults" \
-  "verify job must not override the run working directory"
+  "verify job contains a noncanonical top-level key"
 
 verify_flow_defaults="$tmp_dir/verify-flow-defaults.yml"
 insert_after "$source_workflow" "$verify_flow_defaults" '  verify:' \
   '    "defaults": {"run": {"working-directory": "internal/aiqa"}}'
 expect_rejected "verify-flow-defaults" "$verify_flow_defaults" \
-  "verify job must not override the run working directory"
+  "verify job contains a noncanonical top-level key"
 
 verify_quoted_parent_env="$tmp_dir/verify-quoted-parent-env.yml"
 insert_after "$source_workflow" "$verify_quoted_parent_env" '  verify:' \
   '    "env": {"GOFLAGS": "-run=^$"}'
-expect_accepted "verify-quoted-parent-env" "$verify_quoted_parent_env"
+expect_rejected "verify-quoted-parent-env" "$verify_quoted_parent_env" \
+  "verify job contains a noncanonical top-level key"
 
 root_quoted_parent_env="$tmp_dir/root-quoted-parent-env.yml"
 insert_before "$source_workflow" "$root_quoted_parent_env" 'jobs:' \
   $'"env": {"GOFLAGS": "-run=^$"}\n'
-expect_accepted "root-quoted-parent-env" "$root_quoted_parent_env"
+expect_rejected "root-quoted-parent-env" "$root_quoted_parent_env" \
+  "workflow contains a noncanonical top-level key"
 
 github_env_injection="$tmp_dir/github-env-injection.yml"
 insert_before "$source_workflow" "$github_env_injection" "$ordinary_go_step" \
   '      - run: echo "GOFLAGS=-run=^$" >> "$GITHUB_ENV"'
 expect_accepted "github-env-injection" "$github_env_injection"
+
+verify_defaults_merge="$tmp_dir/verify-defaults-merge.yml"
+insert_after "$source_workflow" "$verify_defaults_merge" '  verify:' \
+  '    <<: {"defaults": {"run": {"working-directory": "internal/aiqa"}}}'
+expect_rejected "verify-defaults-merge" "$verify_defaults_merge" \
+  "verify job contains a noncanonical top-level key"
+
+verify_explicit_defaults="$tmp_dir/verify-explicit-defaults.yml"
+insert_after "$source_workflow" "$verify_explicit_defaults" '  verify:' \
+  $'    ? "defaults"\n    : {"run": {"working-directory": "internal/aiqa"}}'
+expect_rejected "verify-explicit-defaults" "$verify_explicit_defaults" \
+  "verify job contains a noncanonical top-level key"
+
+root_defaults_merge="$tmp_dir/root-defaults-merge.yml"
+insert_before "$source_workflow" "$root_defaults_merge" 'jobs:' \
+  $'<<: {"defaults": {"run": {"working-directory": "internal/aiqa"}}}\n'
+expect_rejected "root-defaults-merge" "$root_defaults_merge" \
+  "workflow contains a noncanonical top-level key"
 
 echo "CI Compose workflow mutation contract: PASS"

@@ -103,117 +103,52 @@ verify_job_end="$(
 )"
 test -n "$verify_job_end" || fail "verify job has no following job boundary"
 
-workflow_bypass="$(
+workflow_structure_violation="$(
   awk -v verify_first="$verify_job_line" -v verify_last="$verify_job_end" '
-    /^[^[:space:]]/ {
-      if ($0 !~ /^["\047]?defaults["\047]?[[:space:]]*:/) {
-        in_root_defaults = 0
-        in_root_defaults_run = 0
+    /^[^[:space:]#]/ {
+      if ($0 !~ /^(name|on|permissions|jobs):/) {
+        print "workflow contains a noncanonical top-level key at line " NR
+        failed = 1
+        exit
       }
-      if ($0 != "env:" && $0 !~ /^env:[[:space:]]*\{/) {
-        in_root_env = 0
+      key = $0
+      sub(/:.*/, "", key)
+      root_count[key]++
+    }
+
+    NR >= verify_first && NR <= verify_last &&
+      /^    [^[:space:]#]/ {
+      if ($0 !~ /^    (runs-on|timeout-minutes|steps):/) {
+        print "verify job contains a noncanonical top-level key at line " NR
+        failed = 1
+        exit
       }
+      key = $0
+      sub(/^    /, "", key)
+      sub(/:.*/, "", key)
+      verify_count[key]++
     }
 
-    /^["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*$/ {
-      in_root_defaults = 1
-      in_root_defaults_run = 0
-    }
-    /^["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*\{/ &&
-      /["\047]?working-directory["\047]?[[:space:]]*:/ {
-      print "workflow must not override the run working directory"
-      exit
-    }
-    in_root_defaults && /^  ["\047]?run["\047]?[[:space:]]*:[[:space:]]*$/ {
-      in_root_defaults_run = 1
-    }
-    in_root_defaults_run &&
-      /^    ["\047]?working-directory["\047]?[[:space:]]*:/ {
-      print "workflow must not override the run working directory"
-      exit
-    }
-
-    $0 == "env:" {
-      in_root_env = 1
-    }
-    /^env:[[:space:]]*\{/ && /["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
-      print "workflow and verify job must not set GOFLAGS"
-      exit
-    }
-    in_root_env && /^  ["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
-      print "workflow and verify job must not set GOFLAGS"
-      exit
-    }
-
-    NR < verify_first || NR > verify_last { next }
-
-    /^    ["\047]?if["\047]?[[:space:]]*:/ {
-      print "verify job must not have an if condition"
-      exit
-    }
-    /^    <<[[:space:]]*:/ && /["\047]?if["\047]?[[:space:]]*:/ {
-      print "verify job must not have an if condition"
-      exit
-    }
-    /^    \?[[:space:]]*["\047]?if["\047]?[[:space:]]*$/ {
-      print "verify job must not have an if condition"
-      exit
-    }
-    /^    ["\047]?continue-on-error["\047]?[[:space:]]*:/ {
-      print "verify job must not set continue-on-error"
-      exit
-    }
-    /^    <<[[:space:]]*:/ && /["\047]?continue-on-error["\047]?[[:space:]]*:/ {
-      print "verify job must not set continue-on-error"
-      exit
-    }
-    /^    \?[[:space:]]*["\047]?continue-on-error["\047]?[[:space:]]*$/ {
-      print "verify job must not set continue-on-error"
-      exit
-    }
-
-    /^    ["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*\{/ &&
-      /["\047]?working-directory["\047]?[[:space:]]*:/ {
-      print "verify job must not override the run working directory"
-      exit
-    }
-    /^    ["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*$/ {
-      in_verify_defaults = 1
-      in_verify_defaults_run = 0
-      next
-    }
-    in_verify_defaults && /^    [^[:space:]]/ {
-      in_verify_defaults = 0
-      in_verify_defaults_run = 0
-    }
-    in_verify_defaults &&
-      /^      ["\047]?run["\047]?[[:space:]]*:[[:space:]]*$/ {
-      in_verify_defaults_run = 1
-    }
-    in_verify_defaults_run &&
-      /^        ["\047]?working-directory["\047]?[[:space:]]*:/ {
-      print "verify job must not override the run working directory"
-      exit
-    }
-
-    /^    env:[[:space:]]*\{/ && /["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
-      print "workflow and verify job must not set GOFLAGS"
-      exit
-    }
-    $0 == "    env:" {
-      in_verify_env = 1
-      next
-    }
-    in_verify_env && /^    [^[:space:]]/ {
-      in_verify_env = 0
-    }
-    in_verify_env && /^      ["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
-      print "workflow and verify job must not set GOFLAGS"
-      exit
+    END {
+      if (failed) {
+        exit
+      }
+      if (root_count["name"] != 1 ||
+          root_count["on"] != 1 ||
+          root_count["permissions"] != 1 ||
+          root_count["jobs"] != 1) {
+        print "workflow canonical top-level keys must each occur exactly once"
+        exit
+      }
+      if (verify_count["runs-on"] != 1 ||
+          verify_count["timeout-minutes"] != 1 ||
+          verify_count["steps"] != 1) {
+        print "verify job canonical top-level keys must each occur exactly once"
+      }
     }
   ' "$workflow"
 )"
-test -z "$workflow_bypass" || fail "$workflow_bypass"
+test -z "$workflow_structure_violation" || fail "$workflow_structure_violation"
 
 startup_name_line="$(exact_line_between '      - name: Start private integration dependencies' "$verify_job_line" "$verify_job_end")"
 startup_run_line="$(exact_line_between '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio' "$verify_job_line" "$verify_job_end")"

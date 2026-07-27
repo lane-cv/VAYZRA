@@ -33,6 +33,16 @@ changing test selection, while `GOFLAGS=''` neutralizes inherited process and
 workflow flags. Individual tests keep their current isolation mechanism, and no
 application runtime behavior changes.
 
+### Allowlist workflow structure
+
+Treat the workflow root and the `verify` job as closed structures rather than
+enumerating unsafe YAML spellings. Ignoring blank lines and comments, root keys
+must be exactly one each of `name`, `on`, `permissions`, and `jobs`; `verify`
+job-level keys must be exactly one each of `runs-on`, `timeout-minutes`, and
+`steps`. Any extra, quoted, merge, flow, or explicit key is rejected before
+step-level contracts are evaluated. The two repository Go steps retain their
+exact `GOENV=off GOFLAGS=''` command allowlist.
+
 ### Use MinIO readiness semantics
 
 Change the Compose MinIO health check from `/minio/health/live` to
@@ -56,6 +66,8 @@ Repository contract tests will verify that:
 
 - both workflow Go test commands use `GOENV=off`, clear `GOFLAGS`, and include
   `-p 1`;
+- the workflow root and `verify` job contain only their canonical allowlisted
+  keys;
 - the MinIO health check uses `/minio/health/ready` and not `/live`;
 - the authenticated readiness probe occurs after dependency startup and before Go
   tests;

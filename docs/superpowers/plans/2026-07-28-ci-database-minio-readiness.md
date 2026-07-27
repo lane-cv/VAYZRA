@@ -4,7 +4,7 @@
 
 **Goal:** Make the `verify` workflow wait for authenticated MinIO readiness and prevent PostgreSQL-backed Go packages from timing out in a cross-package advisory-lock queue.
 
-**Architecture:** Keep application code unchanged. Encode the desired CI behavior in the existing shell and Go deployment-contract tests, then minimally change the workflow and Compose health check to satisfy those contracts. Serialize Go package binaries with `-p 1`, disable GOENV and explicitly clear inherited `GOFLAGS` for both repository test commands, use the AIStor readiness endpoint, and add a bounded authenticated S3 probe plus sanitized failure evidence.
+**Architecture:** Keep application code unchanged. Encode the desired CI behavior in the existing shell and Go deployment-contract tests, then minimally change the workflow and Compose health check to satisfy those contracts. Treat the workflow root and `verify` job as closed key allowlists, serialize Go package binaries with `-p 1`, disable GOENV and explicitly clear inherited `GOFLAGS` for both repository test commands, use the AIStor readiness endpoint, and add a bounded authenticated S3 probe plus sanitized failure evidence.
 
 **Tech Stack:** GitHub Actions YAML, Docker Compose, Bash contract tests, Go 1.26 deployment-contract tests, MinIO Client (`mc`) included in the pinned AIStor image.
 
@@ -14,7 +14,7 @@
 
 - Modify `.github/workflows/verify.yml`: serialize Go package tests, add the authenticated MinIO probe, and emit bounded dependency failure evidence.
 - Modify `deploy/compose.dev.yml`: change the MinIO health check from liveness to readiness.
-- Modify `scripts/ci-compose_contract_test.sh`: enforce workflow ordering, `-p 1`, bounded authenticated readiness, and sanitized diagnostics.
+- Modify `scripts/ci-compose_contract_test.sh`: allowlist root and `verify` job keys, enforce workflow ordering, `-p 1`, bounded authenticated readiness, and sanitized diagnostics.
 - Add `scripts/ci-goenv_contract_test.sh`: prove that `GOENV=off` prevents persistent user Go flags from skipping repository tests.
 - Modify `Makefile`: include the GOENV behavior regression in `e2e-contracts`.
 - Modify `internal/platform/objectstore/deployment_test.go`: lock the Compose MinIO readiness endpoint.
