@@ -8,9 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  HAPPYLEARN_AISTOR_LICENSE_FILE: ${{ runner.temp }}/minio.license
-
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -35,7 +32,9 @@ jobs:
         run: |
           test -n "$AISTOR_LICENSE"
           umask 077
-          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+          license_file="$RUNNER_TEMP/minio.license"
+          printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
       - run: pnpm e2e-contracts
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
@@ -75,7 +74,9 @@ jobs:
         run: |
           test -n "$AISTOR_LICENSE"
           umask 077
-          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+          license_file="$RUNNER_TEMP/minio.license"
+          printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - name: Run isolated Phase 2 acceptance
         run: bash scripts/e2e-phase2.sh
       - name: Upload sanitized disposable failure evidence
@@ -99,7 +100,9 @@ jobs:
         run: |
           test -n "$AISTOR_LICENSE"
           umask 077
-          printf '%s' "$AISTOR_LICENSE" > "$HAPPYLEARN_AISTOR_LICENSE_FILE"
+          license_file="$RUNNER_TEMP/minio.license"
+          printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - name: Run isolated Phase 3 acceptance
         run: bash scripts/e2e-phase3.sh
       - name: Upload sanitized disposable failure evidence
