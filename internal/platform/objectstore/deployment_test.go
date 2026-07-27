@@ -23,6 +23,9 @@ func TestMinIODeploymentSecurityContract(t *testing.T) {
 	}
 
 	server := composeService(t, compose, "minio")
+	if strings.Contains(server, "/minio/health/live") {
+		t.Fatal("MinIO service health check still uses the liveness endpoint instead of readiness")
+	}
 	for _, required := range []string{
 		`user: "1000:0"`,
 		"restart: unless-stopped",
@@ -30,7 +33,7 @@ func TestMinIODeploymentSecurityContract(t *testing.T) {
 		"source: aistor_license",
 		"target: /minio.license",
 		`mode: 0440`,
-		`test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/live"]`,
+		`test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/ready"]`,
 		`condition: service_completed_successfully`,
 		`- "127.0.0.1:59000:9000"`,
 		`- "127.0.0.1:59001:9001"`,

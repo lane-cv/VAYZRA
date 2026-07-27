@@ -79,7 +79,17 @@ probe_run_line="$((probe_name_line + 1))"
 probe_for_line="$((probe_name_line + 2))"
 probe_timeout_line="$((probe_name_line + 3))"
 probe_done_line="$((probe_name_line + 4))"
+go_test_line="$(exact_line '      - run: go test -p 1 ./... -count=1')"
+go_race_test_line="$(exact_line '      - run: go test -race -p 1 ./... -count=1')"
+minio_probe_name_line="$(exact_line '      - name: Verify authenticated MinIO readiness')"
+minio_probe_run_line="$((minio_probe_name_line + 1))"
+minio_probe_command_line="$((minio_probe_name_line + 2))"
 merged_validation_line="$(exact_line '      - run: docker compose -f deploy/compose.dev.yml -f deploy/compose.ci.yml config --quiet')"
+report_name_line="$(exact_line '      - name: Report integration dependency failure')"
+report_if_line="$((report_name_line + 1))"
+report_run_line="$((report_name_line + 2))"
+report_ps_line="$((report_name_line + 3))"
+report_logs_line="$((report_name_line + 4))"
 cleanup_name_line="$(exact_line '      - name: Stop integration dependencies')"
 cleanup_if_line="$(exact_line '        if: always()')"
 cleanup_run_line="$(exact_line '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml down --volumes --remove-orphans')"
@@ -92,6 +102,17 @@ line_is "$probe_run_line" '        run: |'
 line_is "$probe_for_line" '          for port in 54329 56379 59000; do'
 line_is "$probe_timeout_line" '            timeout 30 bash -c "until </dev/tcp/127.0.0.1/$port; do sleep 1; done"'
 line_is "$probe_done_line" '          done'
+test "$minio_probe_name_line" -eq "$((probe_done_line + 1))" ||
+  fail "authenticated MinIO readiness must immediately follow host-port verification"
+line_is "$minio_probe_run_line" '        run: |'
+line_is "$minio_probe_command_line" "          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'mc alias set local http://127.0.0.1:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'"
+test "$go_test_line" -gt "$minio_probe_command_line" ||
+  fail "ordinary Go tests must follow authenticated MinIO readiness"
+test "$go_race_test_line" -gt "$go_test_line" ||
+  fail "race-enabled Go tests must follow ordinary Go tests"
+if grep -Eq -- '^      - run: go test( -race)? \./\.\.\.([[:space:]]|$)' "$workflow"; then
+  fail "workflow Go package tests must use -p 1"
+fi
 go_test_before_probe_line="$(
   awk -v probe_line="$probe_name_line" '
     function starts_go_test(command) {
@@ -132,6 +153,28 @@ test -z "$go_test_before_probe_line" ||
   fail "go test run step at line $go_test_before_probe_line precedes host-port verification"
 test "$merged_validation_line" -lt "$cleanup_name_line" ||
   fail "merged Compose validation must precede cleanup"
+line_is "$report_if_line" '        if: failure()'
+line_is "$report_run_line" '        run: |'
+line_is "$report_ps_line" '          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml ps'
+line_is "$report_logs_line" '          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml logs --no-color --tail 100 minio'
+test "$report_name_line" -lt "$cleanup_name_line" ||
+  fail "dependency failure report must precede cleanup"
+report_next_step_line="$(
+  awk -v report_line="$report_name_line" '
+    NR > report_line && /^      - / {
+      print NR
+      exit
+    }
+  ' "$workflow"
+)"
+test -n "$report_next_step_line" ||
+  fail "dependency failure report must be followed by another workflow step"
+report_block="$(
+  sed -n "${report_name_line},$((report_next_step_line - 1))p" "$workflow"
+)"
+if grep -Eiq -- 'printenv|docker[[:space:]]+inspect|cat.*license|MINIO_ROOT_(USER|PASSWORD)' <<<"$report_block"; then
+  fail "dependency failure report must not expose environment, container metadata, or license credentials"
+fi
 test "$cleanup_if_line" -eq "$((cleanup_name_line + 1))" &&
   test "$cleanup_run_line" -eq "$((cleanup_if_line + 1))" ||
   fail "cleanup must always run with the startup project and Compose files"
