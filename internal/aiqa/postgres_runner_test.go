@@ -557,7 +557,7 @@ WHERE id=$1`, fixture.model, fixture.cfg.Model.InputPriceMicroUSD, fixture.cfg.M
 	})
 	stop := StartRunner(Runner{
 		Store: store, Gateway: gateway, Owner: "estimated-postgres", GlobalConcurrency: 1,
-		PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
+		PollInterval: time.Millisecond, LeaseDuration: time.Minute,
 		FlushInterval: time.Millisecond, FlushBytes: 4096,
 	})
 	waitRunnerWithin(t, 5*time.Second, func() bool {
