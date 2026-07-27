@@ -200,7 +200,7 @@ run_case() {
   if [[ "$scenario" == sanitizer_fail && ! -f "$state/markers/sanitizer-failed" ]]; then failure_reasons+=$'\nsanitizer failure marker missing'; fi
   if [[ "$scenario" == publish_install_fail && ! -f "$state/markers/publish-install-failed" ]]; then failure_reasons+=$'\npublish install failure marker missing'; fi
   if [[ "$scenario" == publish_mv_fail && ! -f "$state/markers/publish-mv-failed" ]]; then failure_reasons+=$'\npublish mv failure marker missing'; fi
-  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail || "$scenario" == phase4_diagnostic ]]; then
     assert_safe_upload_directory "$artifact_path" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
     [[ -z "$(find "$artifact_path" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit 2>/dev/null)" ]] || failure_reasons+=$'\npublish temporary file remained'
   fi

@@ -94,8 +94,10 @@ func TestTerminalVariantsAndFaultMarkers(t *testing.T) {
 		{"responses disconnect", "/v1/responses", "[case:disconnect-after-delta]", 200, []string{`response.output_text.delta`, `"delta":"Fixture "`}, []string{"response.completed"}},
 		{"chat malformed", "/v1/chat/completions", "[case:malformed-event]", 200, []string{"data: not-json"}, []string{"[DONE]"}},
 		{"responses malformed", "/v1/responses", "[case:malformed-event]", 200, []string{"event: response.output_text.delta", "data: not-json"}, []string{"response.completed"}},
-		{"rate limited", "/v1/chat/completions", "[case:429]", 429, []string{`"error":"fixture_rate_limited"`}, nil},
-		{"upstream failure", "/v1/responses", "[case:500]", 500, []string{`"error":"fixture_upstream_failure"`}, nil},
+		{"chat rate limited", "/v1/chat/completions", "[case:429]", 429, []string{`"error":"fixture_rate_limited"`}, nil},
+		{"responses rate limited", "/v1/responses", "[case:429]", 429, []string{`"error":"fixture_rate_limited"`}, nil},
+		{"chat upstream failure", "/v1/chat/completions", "[case:500]", 500, []string{`"error":"fixture_upstream_failure"`}, nil},
+		{"responses upstream failure", "/v1/responses", "[case:500]", 500, []string{`"error":"fixture_upstream_failure"`}, nil},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -124,18 +126,22 @@ func TestTerminalVariantsAndFaultMarkers(t *testing.T) {
 func TestSlowCasesStopWhenRequestContextIsCancelled(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
+		name           string
+		path           string
 		marker         string
 		wantFirstDelta bool
 	}{
-		{"[case:slow-first-byte]", false},
-		{"[case:idle-timeout]", true},
+		{"chat slow first byte", "/v1/chat/completions", "[case:slow-first-byte]", false},
+		{"responses slow first byte", "/v1/responses", "[case:slow-first-byte]", false},
+		{"chat idle timeout", "/v1/chat/completions", "[case:idle-timeout]", true},
+		{"responses idle timeout", "/v1/responses", "[case:idle-timeout]", true},
 	}
 	for _, tt := range tests {
 		tt := tt
-		t.Run(tt.marker, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(context.Background())
-			request := authenticatedRequest(t, ctx, "/v1/chat/completions", `{"prompt":"`+tt.marker+`"}`)
+			request := authenticatedRequest(t, ctx, tt.path, `{"prompt":"`+tt.marker+`"}`)
 			writer := newRecordingResponseWriter()
 			started := make(chan struct{})
 			done := make(chan struct{})
@@ -155,7 +161,7 @@ func TestSlowCasesStopWhenRequestContextIsCancelled(t *testing.T) {
 				t.Fatal("handler did not stop after context cancellation")
 			}
 			got := writer.bodyString()
-			if tt.wantFirstDelta && !strings.Contains(got, `"content":"Fixture "`) {
+			if tt.wantFirstDelta && !strings.Contains(got, "Fixture ") {
 				t.Fatalf("body=%q, want first delta", got)
 			}
 			if strings.Contains(got, "[DONE]") {
