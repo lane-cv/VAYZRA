@@ -131,9 +131,9 @@ func (g *compatibleGateway) Stream(ctx context.Context, cfg RuntimeProviderConfi
 			return err
 		}
 		response, doErr := client.Do(httpRequest)
+		_ = body.Close()
 		httpRequest.Header.Del("Authorization")
 		if doErr != nil {
-			_ = body.Close()
 			if attempt == 0 && !written.Load() && !observed && ctx.Err() == nil {
 				continue
 			}

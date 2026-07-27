@@ -126,6 +126,31 @@ func TestGatewayCancellationAndCallbackFailure(t *testing.T) {
 	}
 }
 
+func TestGatewayClosesStreamingRequestBodyWhenTransportDoesNotRead(t *testing.T) {
+	var capturedBody io.ReadCloser
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		capturedBody = request.Body
+		return sseResponse("event: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n"), nil
+	})}
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	err := NewGateway(client).Stream(context.Background(), testRuntimeConfig(t, server, ProtocolResponses), testGatewayRequest(), func(GatewayEvent) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capturedBody == nil {
+		t.Fatal("transport did not receive request body")
+	}
+	defer capturedBody.Close()
+
+	buffer := make([]byte, 1)
+	n, readErr := capturedBody.Read(buffer)
+	if n != 0 || !errors.Is(readErr, io.ErrClosedPipe) {
+		t.Fatalf("request body remains readable after Stream returned: bytes=%d err=%v", n, readErr)
+	}
+}
+
 func TestGatewayRetriesExactlyOnceOnlyBeforeWriteAndReopensImages(t *testing.T) {
 	var attempts atomic.Int32
 	var opens atomic.Int32
