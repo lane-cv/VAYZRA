@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { expect, test, type Browser, type Page } from '@playwright/test'
+import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
 import {
   apiJSON,
   changePassword,
@@ -176,6 +176,69 @@ test('unified teacher and AI flow streams safe math, follows up, and deduplicate
   }
 })
 
+test('two simultaneous supplier calls leave one third run pending for the resource fixture', async ({ browser }) => {
+  test.setTimeout(180_000)
+  const setup = await provisionStudent(browser, 'resource-budget')
+  const { adminContext, studentContext, admin, page } = setup
+  const extraContexts: BrowserContext[] = []
+  const pages = [page]
+  const mutations: AIThreadMutation[] = []
+  try {
+    for (const index of [2, 3]) {
+      const student = await createStudentAPI(
+        admin,
+        `ai-resource-${index}-${randomUUID().slice(0, 8)}`,
+        `资源验收学生${index}`,
+        studentPassword!,
+      )
+      const context = await browser.newContext()
+      extraContexts.push(context)
+      const studentPage = await context.newPage()
+      await login(studentPage, student.username, studentPassword!)
+      await changePassword(
+        studentPage,
+        studentPassword!,
+        `${studentNewPassword!}-resource-${index}-${randomUUID().slice(0, 8)}`,
+      )
+      pages.push(studentPage)
+    }
+
+    const before = await providerHitCounts(page)
+    mutations.push(...await Promise.all(pages.map((studentPage, index) => createAIThread(
+      studentPage,
+      `合成资源预算-${index + 1}`,
+      '[case:slow-first-byte] 保持供应商调用以采集聚合资源。',
+    ))))
+
+    const ids = new Set(mutations.map((mutation) => mutation.run.id))
+    const deadline = Date.now() + 20_000
+    let states: Array<{ id: string; status: string }> = []
+    while (Date.now() < deadline) {
+      states = (await apiJSON<Array<{ id: string; status: string }>>(
+        admin,
+        'GET',
+        '/api/v1/admin/ai/usage/runs?limit=100',
+      )).filter((run) => ids.has(run.id))
+      if (
+        states.filter((run) => run.status === 'streaming').length === 2
+        && states.filter((run) => run.status === 'queued').length === 1
+      ) break
+      await page.waitForTimeout(250)
+    }
+    expect(states.filter((run) => run.status === 'streaming')).toHaveLength(2)
+    expect(states.filter((run) => run.status === 'queued')).toHaveLength(1)
+    const after = await providerHitCounts(page)
+    expect((after['responses.slow-first-byte'] ?? 0) - (before['responses.slow-first-byte'] ?? 0)).toBe(2)
+    await page.waitForTimeout(5_000)
+  } finally {
+    await Promise.all(mutations.map((mutation, index) =>
+      apiJSON(pages[index], 'POST', `/api/v1/student/ai/runs/${mutation.run.id}/cancel`, {}).catch(() => undefined)))
+    await Promise.all(extraContexts.map((context) => context.close()))
+    await studentContext.close()
+    await adminContext.close()
+  }
+})
+
 test('vision and extracted PDF/DOCX route to the intended models', async ({ browser }) => {
   test.setTimeout(420_000)
   const setup = await provisionStudent(browser, 'attachments', 'chat_completions')
@@ -230,17 +293,21 @@ test('refresh and explicit reconnect resume one run without another provider req
     await page.reload()
     await expect(page.getByRole('heading', { name: '合成恢复问题' })).toBeVisible()
 
-    let interrupted = false
+    let allowReconnect = false
     await page.route(`**/api/v1/student/ai/runs/${mutation.run.id}/events*`, async (route) => {
-      if (!interrupted) {
-        interrupted = true
-        await route.abort('failed')
+      if (!allowReconnect) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: '{}',
+        })
         return
       }
       await route.continue()
     })
     await page.reload()
-    await expect(page.getByLabel('生成状态：连接中断')).toBeVisible()
+    await expect(page.getByLabel('生成状态：连接中断')).toBeVisible({ timeout: 15_000 })
+    allowReconnect = true
     await page.getByLabel('重新连接回答').click()
     await waitForRunStatus(page, mutation.run.id, 'succeeded')
     await page.unroute(`**/api/v1/student/ai/runs/${mutation.run.id}/events*`)
@@ -306,6 +373,8 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
       expect((await cancelResponsePromise).status()).toBe(200)
       const cancelled = await waitForRunStatus(settlementPage, cancellable.run.id, 'cancelled')
       expect(cancelled.usage).toBeUndefined()
+      await settlementPage.reload()
+      await expect(settlementPage.getByLabel('重试生成')).toBeVisible()
       const retryResponsePromise = settlementPage.waitForResponse((response) =>
         response.request().method() === 'POST' && /\/runs\/[^/]+\/retries$/.test(response.url()))
       await settlementPage.getByLabel('重试生成').click()
@@ -449,12 +518,17 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
       `/api/v1/admin/ai/providers/${active.id}/models`,
     )
     const textModel = models.find((model) => model.modality === 'text')!
-    await apiJSON(admin, 'PUT', `/api/v1/admin/ai/providers/${active.id}/models/${textModel.id}`, {
-      ...modelWrite(textModel),
-      contextTokens: 16,
-      maxOutputTokens: 8,
-      expectedVersion: textModel.version,
-    })
+    const constrainedModel = await apiJSON<AIModelWithVersion>(
+      admin,
+      'PUT',
+      `/api/v1/admin/ai/providers/${active.id}/models/${textModel.id}`,
+      {
+        ...modelWrite(textModel),
+        contextTokens: 16,
+        maxOutputTokens: 8,
+        expectedVersion: textModel.version,
+      },
+    )
     const contextResponse = await page.request.post('/api/v1/student/ai/threads', {
       headers: { ...(await csrfHeader(page)), 'Idempotency-Key': randomUUID() },
       data: {
@@ -466,6 +540,12 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
     })
     expect(contextResponse.status()).toBe(422)
     expect((await contextResponse.json()).error.code).toBe('CONTEXT_TOO_LARGE')
+    await apiJSON(admin, 'PUT', `/api/v1/admin/ai/providers/${active.id}/models/${textModel.id}`, {
+      ...modelWrite(constrainedModel),
+      contextTokens: textModel.contextTokens,
+      maxOutputTokens: textModel.maxOutputTokens,
+      expectedVersion: constrainedModel.version,
+    })
 
     await putStudentLimits(admin, student.id, {
       ...inheritedLimits,

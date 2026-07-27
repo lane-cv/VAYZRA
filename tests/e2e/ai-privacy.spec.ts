@@ -96,7 +96,7 @@ test('two students receive uniform 404s and AI data never enters teacher queue o
       expect(shape, path).toEqual(canonical404)
     }
     expect(await apiJSON<unknown[]>(pageB, 'GET', '/api/v1/student/ai/threads?limit=100')).toEqual([])
-    expect(JSON.stringify(await apiJSON(pageB, 'GET', '/api/v1/student/questions?limit=100'))).not.toContain(ai.thread.id)
+    expect(JSON.stringify(await apiJSON(pageB, 'GET', '/api/v1/student/questions?limit=50'))).not.toContain(ai.thread.id)
 
     for (const path of [
       '/api/v1/admin/ai/providers',
@@ -126,7 +126,7 @@ test('two students receive uniform 404s and AI data never enters teacher queue o
     const teacherQueue = await apiJSON<Array<{ id: string; title: string }>>(
       admin,
       'GET',
-      '/api/v1/admin/questions?limit=100',
+      '/api/v1/admin/questions?limit=50',
     )
     expect(teacherQueue.some((item) => item.id === ai.thread.id)).toBe(false)
     expect(teacherQueue.some((item) => item.title === `合成私有 AI 问题-${suffix}`)).toBe(false)

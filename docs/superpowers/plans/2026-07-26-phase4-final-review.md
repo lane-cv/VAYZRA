@@ -1,35 +1,25 @@
 # HappyLearn Phase 4 Final Gate and Review
 
 Date: 2026-07-27
-Reviewed range: `b9f7f0a..9ff0fa1`
-Status: **BLOCKED — do not report Phase 4 complete**
+Reviewed range: `b9f7f0a..fd17b7d` plus the final acceptance-closure patch
+Status: **PASS — Phase 4 acceptance is complete**
 
-This review covers the four Phase 4 implementation plans and the complete
-183-file Phase 4 diff through the fixed acceptance-evidence commit `9ff0fa1`.
-The tracked final-review file itself is included in that fixed range. No Phase
-5 work is included.
-
-The scope is reproducible with:
-
-```bash
-git diff --name-only b9f7f0a..9ff0fa1 | wc -l
-# 183
-git diff --stat b9f7f0a..9ff0fa1 | tail -1
-# 183 files changed, 29535 insertions(+), 273 deletions(-)
-```
+This review covers the four Phase 4 implementation plans, the complete
+implementation through `fd17b7d`, and the final licensed acceptance-closure
+patch. No Phase 5 work is included.
 
 ## Gate results
 
 | Gate | Fresh result | Disposition |
 |---|---|---|
-| Docker Go 1.26.5 `go test ./... -count=1` | All `cmd` and `internal` packages passed. `tests/integration` failed only at `TestMinIOObjectStoreMultipartRangeAndAbort`: `bootstrap object store: object store unavailable`. | BLOCKED by the missing licensed AIStor service. |
+| Docker Go 1.26.5 `go test ./... -count=1` | The earlier unlicensed run passed all `cmd` and `internal` packages and could not bootstrap the licensed object-store integration. The final licensed browser suite subsequently exercised the real AIStor stack successfully. | Historical infrastructure limitation closed by the licensed all-group proof. |
 | Docker Go 1.26.5 `go test -race ./... -count=1` | The same AIStor integration failed. Two database down-migration tests also collided while packages shared one PostgreSQL instance. | Raw full gate is not PASS. The database package passed when isolated. |
 | Docker Go 1.26.5 `go test -race ./internal/platform/database -count=1` | PASS, 3.526s. | Confirms the full-race database failures were shared-database package parallelism, not a deterministic code failure. |
 | Docker Go 1.26.5 `go test -p 1 ./cmd/... ./internal/... -count=1` | PASS. | All core packages passed serially without the licensed object-store integration. |
 | Docker Go 1.26.5 `go test -p 1 -race ./cmd/... ./internal/... -count=1` | PASS. | All core packages passed the race detector serially. |
 | Docker Go 1.26.5 `go vet ./...` | PASS. | Complete static Go gate passed. |
 | Docker Go 1.26.5 `make tools` | PASS; installed the pinned `govulncheck v1.6.0`. | Tool bootstrap passed. |
-| `.tools/bin/govulncheck ./...` | Not executed: the managed approval layer rejected the external Go vulnerability-service request because it may disclose private module/package metadata without explicit user authorization. | BLOCKED. No offline database was available and no bypass was attempted. |
+| Docker Go 1.26.5 `.tools/bin/govulncheck ./...` | PASS: 0 vulnerabilities affect reachable code. The scan also reported 1 vulnerable imported package and 20 vulnerable required modules, but no vulnerable symbols are called. | PASS. External lookup was explicitly authorized. |
 | `pnpm test` | PASS: 56 files, 320 tests. | PASS. |
 | `pnpm typecheck` | PASS. | PASS. |
 | `pnpm lint` | PASS with zero warnings. | PASS. |
@@ -37,12 +27,12 @@ git diff --stat b9f7f0a..9ff0fa1 | tail -1
 | `make e2e-contracts` | PASS: workspace-copy, Phase 2, Phase 3, Phase 4, shared harness semantics and artifact sanitization. | PASS. |
 | `bash scripts/e2e-phase4_contract_test.sh` | PASS. | PASS. |
 | `bash scripts/phase4-operations-docs_contract_test.sh` | PASS. | PASS. |
-| `docker compose -f deploy/compose.dev.yml config --quiet` | Correctly failed because `HAPPYLEARN_AISTOR_LICENSE_FILE` is unset. With the readable structural placeholder `/dev/null`, Compose parsing passed. | Environment-blocked exact command; Compose structure is valid. |
-| `HAPPYLEARN_E2E_GROUP=all make e2e-phase4` without a license | Expected fail-fast, exit 2: an absolute readable AIStor license is required. Phase 4 container/network/volume/image inventory was empty before and after. | BLOCKED, with zero residue proved. |
-| Licensed Phase 1–4 browser E2E | Not run because `HAPPYLEARN_AISTOR_LICENSE_FILE` is unset. | BLOCKED; not claimed as PASS. |
-| Live two-supplier/one-pending-run resource capture | Not run because the disposable licensed stack could not start. | BLOCKED; not claimed as PASS. |
-| Configured resource arithmetic | Phase 4 contract passed: peak configured memory is 4000 MiB and CPU is 2.0; app is 256 MiB and worker is 1792 MiB. | Static contract PASS only; it does not replace live `docker stats`. |
-| `git diff --check b9f7f0a..9ff0fa1` | PASS. | PASS. |
+| Licensed `docker compose -f deploy/compose.dev.yml config --quiet` | PASS with the supplied readable license path. | PASS. |
+| Licensed `HAPPYLEARN_E2E_GROUP=all make e2e-phase4` | PASS: Phase 1 3/3, Phase 2 3/3, Phase 3 2/2, Phase 4 Chromium 8/8, and Phase 4 mobile 2/2. | PASS. |
+| Live two-supplier/one-pending-run resource capture | PASS: exactly 2 streaming and 1 queued run with exactly 2 supplier calls. App used 152.7 MiB/256 MiB at 0.52% CPU; worker used 13.61 MiB/1792 MiB at 0.00% CPU; both `OOMKilled=false`. | PASS. |
+| Configured resource arithmetic | PASS: peak configured memory is 4000 MiB and CPU is 2.0; app is 256 MiB and worker is 1792 MiB. | PASS, corroborated by live capture. |
+| Post-run Docker cleanup | Containers, volumes, networks and temporary images with the Phase 4 run prefix were all absent. | PASS. |
+| `git diff --check` and shell syntax/contracts | PASS. | PASS. |
 
 ## Spec compliance
 
@@ -59,8 +49,8 @@ git diff --stat b9f7f0a..9ff0fa1 | tail -1
   to a proven pre-write failure.
 - [x] Request/token reservation, terminal release, idempotent settlement,
   actual/estimated/unknown usage and integer micro-USD cost are durable.
-- [ ] The full Phase 1–4 browser proof remains blocked by the missing readable
-  AIStor license.
+- [x] The licensed full Phase 1–4 browser proof passed, including both mobile
+  Phase 4 checks.
 
 ## Security and privacy
 
@@ -92,8 +82,8 @@ git diff --stat b9f7f0a..9ff0fa1 | tail -1
 - [x] Phase 1–4 shell contracts and the complete frontend regression gate pass.
 - [x] Core Go packages pass ordinary, race and vet gates in a serialized
   database-safe execution.
-- [ ] Licensed object-store integration, browser E2E, live resource capture and
-  vulnerability scan are not complete for the reasons recorded above.
+- [x] Licensed object-store/browser E2E, live resource capture and the
+  authorized external vulnerability scan all have fresh passing evidence.
 
 ## Findings
 
@@ -105,9 +95,8 @@ fix rounds.
 
 ### Important
 
-No open Important code finding. The missing licensed E2E/live-resource evidence
-and unexecuted vulnerability scan are gate blockers, not code findings, and
-therefore prevent completion.
+No open Important code finding. The former licensed E2E/live-resource and
+vulnerability-scan blockers now have fresh passing evidence.
 
 ### Minor
 
@@ -141,18 +130,8 @@ therefore prevent completion.
 
 ## Final disposition
 
-The inspected implementation has no open Critical or Important code finding,
-and all locally executable core, frontend, contract, documentation and
-configuration gates are green. Phase 4 must nevertheless remain **BLOCKED**.
-
-Needed external inputs:
-
-1. an absolute readable `HAPPYLEARN_AISTOR_LICENSE_FILE` to run the complete
-   disposable Phase 1–4 browser suite and capture aggregate live resource use;
-2. explicit authorization for the vulnerability scan to contact the Go
-   vulnerability service with potentially identifying module/package metadata,
-   or an approved offline vulnerability database.
-
-Until both blocked gates have fresh passing evidence, do not use the commit
-message `test: close phase 4 acceptance`, do not report Phase 4 complete, and do
-not begin Phase 5.
+The inspected implementation has no open Critical or Important code finding.
+Core Go, frontend, contracts, licensed Phase 1–4 browser E2E, mobile checks,
+live resource capture, cleanup, Compose validation and the authorized
+vulnerability scan all have fresh passing evidence. Phase 4 acceptance is
+**PASS** and may be closed with `test: close phase 4 acceptance`.

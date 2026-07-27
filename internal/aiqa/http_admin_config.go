@@ -123,6 +123,9 @@ func (h *AdminConfigHandler) list(w http.ResponseWriter, r *http.Request) {
 		configError(w, r, e)
 		return
 	}
+	if v == nil {
+		v = []ProviderView{}
+	}
 	httpx.JSON(w, 200, struct {
 		Data []ProviderView `json:"data"`
 	}{v})
@@ -218,6 +221,9 @@ func (h *AdminConfigHandler) models(w http.ResponseWriter, r *http.Request) {
 		configError(w, r, e)
 		return
 	}
+	if v == nil {
+		v = []ModelView{}
+	}
 	httpx.JSON(w, 200, struct {
 		Data []ModelView `json:"data"`
 	}{v})
@@ -259,6 +265,9 @@ func (h *AdminConfigHandler) prompts(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		configError(w, r, e)
 		return
+	}
+	if v == nil {
+		v = []PromptView{}
 	}
 	httpx.JSON(w, 200, struct {
 		Data []PromptView `json:"data"`

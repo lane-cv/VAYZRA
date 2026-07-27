@@ -100,7 +100,7 @@ secret_volume="${prefix}_secrets"
 secret_init="${prefix}_secret_init"
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
 temporary_containers+=("$secret_init")
-service_containers=("$app" "$worker" "$fake_ai" "$minio" "$redis" "$postgres")
+service_containers=("$fake_ai" "$app" "$worker" "$minio" "$redis" "$postgres")
 
 umask 077
 openssl rand -base64 32 > "$master_key_file"
@@ -216,16 +216,16 @@ docker_bounded 120 run --rm --name "$secret_init" --network none --read-only --u
 
 docker_bounded 120 run --rm --name "$data_init" --network none --read-only --user 0:0 --cap-drop ALL \
   --cap-add CHOWN --security-opt no-new-privileges --memory 32m --cpus .05 --entrypoint /bin/sh -v "$data_volume:/data" "$minio_image" \
-  -c 'chown 1000:0 /data && chmod 0750 /data'
+  -c 'chmod 0750 /data && chown 1000:0 /data'
 docker_bounded 120 run --rm --name "$runner_init" --network none --read-only --user 0:0 --cap-drop ALL \
   --cap-add CHOWN --security-opt no-new-privileges --memory 32m --cpus .05 --entrypoint /bin/sh \
   -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures" "$playwright_image" \
-  -c 'chown 1000:1000 /workspace /fixtures && chmod 0700 /workspace /fixtures'
+  -c 'chmod 0700 /workspace /fixtures && chown 1000:1000 /workspace /fixtures'
 
 docker_bounded 60 run -d --name "$postgres" --network "$network" --read-only --user 999:999 --cap-drop ALL \
   --security-opt no-new-privileges --memory 384m --cpus .1 \
   --tmpfs /var/run/postgresql:rw,noexec,nosuid,size=16m,uid=999,gid=999 \
-  --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=320m,uid=999,gid=999 \
+  --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=320m,uid=999,gid=999 \
   -e POSTGRES_USER=happylearn -e POSTGRES_PASSWORD=happylearn_e2e -e POSTGRES_DB="$database" postgres:18.4 >/dev/null
 docker_bounded 60 run -d --name "$redis" --network "$network" --read-only --user 999:999 --cap-drop ALL \
   --security-opt no-new-privileges --memory 96m --cpus .05 \
@@ -236,16 +236,9 @@ docker_bounded 60 run -d --name "$minio" --network "$network" --network-alias mi
   -e MINIO_ROOT_USER=happylearn_e2e -e "MINIO_ROOT_PASSWORD=$object_secret" \
   -v "$data_volume:/data" -v "$license_file:/minio.license:ro" "$minio_image" \
   minio server /data --console-address :9001 --license /minio.license >/dev/null
-docker_bounded 60 run -d --name "$fake_ai" --network "$network" --network-alias fake-ai --read-only --user 10003:10003 \
-  --cap-drop ALL --security-opt no-new-privileges --memory 64m --cpus .05 --tmpfs /tmp:rw,noexec,nosuid,size=4m \
-  --mount "type=volume,src=$secret_volume,dst=/run/e2e-provider-key,volume-subpath=fake-provider,readonly" \
-  --entrypoint /bin/sh "$fake_ai_image" -c \
-  'export E2E_AI_PROVIDER_KEY="$(cat /run/e2e-provider-key/value)"; exec /app/fake-ai-provider' >/dev/null
-
 wait_for PostgreSQL "$postgres" exec "$postgres" pg_isready -U happylearn -d "$database"
 wait_for Redis "$redis" exec "$redis" redis-cli ping
 wait_for AIStor "$minio" exec "$minio" curl --fail --silent http://127.0.0.1:9000/minio/health/live
-wait_for fake-provider "$fake_ai" exec "$fake_ai" curl --fail --silent http://127.0.0.1:8090/health/live
 
 common_env=(
   -e HAPPYLEARN_ENV=development
@@ -275,6 +268,12 @@ docker_bounded 60 run -d --name "$app" --network "$network" --network-alias app 
   --entrypoint /bin/sh "$app_image" -c \
   'export HAPPYLEARN_AI_MASTER_KEY="$(cat /run/e2e-master-key/value)"; exec /app/happylearn' >/dev/null
 wait_for application "$app" exec "$app" curl --fail --silent http://127.0.0.1:8080/api/v1/health/ready
+docker_bounded 60 run -d --name "$fake_ai" --network "container:$app" --read-only --user 10003:10003 \
+  --cap-drop ALL --security-opt no-new-privileges --memory 64m --cpus .05 --tmpfs /tmp:rw,noexec,nosuid,size=4m \
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-provider-key,volume-subpath=fake-provider,readonly" \
+  --entrypoint /bin/sh "$fake_ai_image" -c \
+  'export E2E_AI_PROVIDER_KEY="$(cat /run/e2e-provider-key/value)"; exec /app/fake-ai-provider' >/dev/null
+wait_for fake-provider "$fake_ai" exec "$fake_ai" curl --fail --silent http://127.0.0.1:8090/health/live
 
 password_file="$tmpdir/admin-password"
 printf '%s' "$admin_password" > "$password_file"
@@ -300,7 +299,7 @@ docker_bounded 300 run --rm --name "$fixture_runner" --network none --read-only 
   --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=1000,gid=1000,mode=0700 -w /tmp --entrypoint /bin/bash \
   -v "$repo_root:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
   /src/scripts/generate-phase2-fixtures.sh /fixtures
-docker_bounded 600 run --rm --name "$install_runner" --network none --read-only --user 1000:1000 \
+docker_bounded 600 run --rm --name "$install_runner" --network bridge --read-only --user 1000:1000 \
   --cap-drop ALL --security-opt no-new-privileges --memory 1024m --cpus .5 --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   -v "$repo_root:/source:ro" -v "$runner_volume:/workspace" --entrypoint /bin/bash \
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
@@ -320,8 +319,8 @@ docker_bounded 1800 run --rm --name "$e2e_runner" --network "$network" --read-on
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
   -e E2E_BASE_URL=http://app:8080 -e "E2E_ADMIN_PASSWORD=$admin_password" -e "E2E_STUDENT_PASSWORD=$student_password" \
   -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" -e E2E_FIXTURE_DIR=/fixtures \
-  -e E2E_AI_PROVIDER_BASE_URL=http://fake-ai:8090/v1 \
-  -e E2E_AI_PROVIDER_COUNTS_URL=http://fake-ai:8090/test/counts \
+  -e E2E_AI_PROVIDER_BASE_URL=http://localhost:8090/v1 \
+  -e E2E_AI_PROVIDER_COUNTS_URL=http://app:8090/test/counts \
   -e E2E_AI_PROCESSING_CONTROL_URL=http://processing-supervisor:8092 \
   --mount "type=volume,src=$secret_volume,dst=/run/e2e-provider-key,volume-subpath=runner-provider,readonly" \
   --mount "type=volume,src=$secret_volume,dst=/run/e2e-control-token,volume-subpath=runner-control,readonly" \

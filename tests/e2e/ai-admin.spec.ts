@@ -56,7 +56,7 @@ test('admin creates, tests, and switches a provider without secret readback', as
   await expect(card).toContainText('Responses')
   await expect(card).toContainText('已安全保存')
   await card.getByLabel(`编辑 ${name}`).click()
-  await expect(page.getByLabel('API Key')).toHaveCount(0)
+  await expect(page.getByLabel('API Key', { exact: true })).toHaveCount(0)
 
   await page.getByLabel('协议模式').selectOption('chat_completions')
   const updateResponse = page.waitForResponse((response) =>
@@ -64,6 +64,27 @@ test('admin creates, tests, and switches a provider without secret readback', as
   await page.getByRole('button', { name: '保存供应商' }).click()
   expect((await updateResponse).status()).toBe(200)
   await expect(card).toContainText('Chat Completions')
+
+  const provider = (await apiJSON<AIProvider[]>(page, 'GET', '/api/v1/admin/ai/providers'))
+    .find((item) => item.name === name)
+  expect(provider).toBeTruthy()
+  expect(provider!.hasKey).toBe(true)
+  await apiJSON(page, 'PUT', `/api/v1/admin/ai/providers/${provider!.id}/models/${randomUUID()}`, {
+    upstreamModelId: `connectivity-${suffix}`,
+    modality: 'text',
+    contextTokens: 4096,
+    maxOutputTokens: 256,
+    imageQuotaTokens: 256,
+    inputPriceMicroUsd: 0,
+    outputPriceMicroUsd: 0,
+    connectTimeoutMs: 1_000,
+    responseHeaderTimeoutMs: 30_000,
+    idleStreamTimeoutMs: 30_000,
+    totalTimeoutMs: 60_000,
+    enabled: true,
+    clearQuotaBlock: false,
+    expectedVersion: 0,
+  })
 
   page.once('dialog', async (dialog) => {
     expect(dialog.message()).toContain('少量费用')
@@ -74,11 +95,6 @@ test('admin creates, tests, and switches a provider without secret readback', as
   await card.getByLabel(`测试 ${name} 的连接`).click()
   expect((await tested).status()).toBe(200)
   await expect(page.getByRole('status')).toContainText('连接成功')
-
-  const provider = (await apiJSON<AIProvider[]>(page, 'GET', '/api/v1/admin/ai/providers'))
-    .find((item) => item.name === name)
-  expect(provider).toBeTruthy()
-  expect(provider!.hasKey).toBe(true)
 })
 
 test('admin saves text/vision routing, subject prompts, global/student limits, and usage filters', async ({ page }) => {
@@ -126,10 +142,10 @@ test('admin saves text/vision routing, subject prompts, global/student limits, a
   await expect(page.getByLabel('视觉上游模型')).toHaveValue(visionValue)
 
   await page.getByRole('tab', { name: '提示词' }).click()
-  await page.getByLabel('数学提示词').fill('数学验收提示词：逐步推导并检查结果。')
+  await page.getByLabel('数学提示词', { exact: true }).fill('数学验收提示词：逐步推导并检查结果。')
   await page.getByLabel('保存数学提示词').click()
   await expect(page.getByRole('status')).toContainText('数学提示词已保存')
-  await page.getByLabel('物理提示词').fill('物理验收提示词：说明系统、定律和单位。')
+  await page.getByLabel('物理提示词', { exact: true }).fill('物理验收提示词：说明系统、定律和单位。')
   await page.getByLabel('保存物理提示词').click()
   await expect(page.getByRole('status')).toContainText('物理提示词已保存')
 

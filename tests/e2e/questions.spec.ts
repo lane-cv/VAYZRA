@@ -52,6 +52,7 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   const title = `动量题-${suffix}`
   const body = '请解释碰撞后的动量守恒。'
   await pageA.goto('/student/questions/new')
+  await pageA.getByLabel('老师答疑').check()
   const uploader = pageA.getByRole('region', { name: '添加附件（最多 20 个，合计不超过 100 MB）' })
   const fileInput = uploader.locator('input[type="file"]')
   await fileInput.setInputFiles({ name: 'question.png', mimeType: 'image/png', buffer: await readFile(join(fixtureDir, 'question.png')) })
@@ -95,7 +96,7 @@ test('UI covers attachments, retry, Q&A lifecycle, privacy, disabling, and respo
   expect(created.thread.id).toBe(committedCreate?.thread.id)
   expect(created.message.id).toBe(committedCreate?.message.id)
   await pageA.unroute('**/api/v1/student/questions')
-  await expect(pageA).toHaveURL(new RegExp(`/student/questions/${created.thread.id}$`))
+  await expect(pageA).toHaveURL(new RegExp(`/student/questions/teacher/${created.thread.id}$`))
   await expect(pageA.getByLabel('问答消息')).toContainText(body)
   await expect(pageA.getByLabel('问答消息').locator('article')).toHaveCount(1)
   await pageA.getByRole('link', { name: '← 返回我的问题' }).click()
