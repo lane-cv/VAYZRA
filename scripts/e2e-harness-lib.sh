@@ -6,6 +6,12 @@
 E2E_ACTIVE_COMMAND_PID=''
 E2E_ACTIVE_TIMER_PID=''
 
+preserve_first_failure() {
+  local current="${1:?current status required}" candidate="${2:?candidate status required}"
+  [[ "$current" =~ ^[0-9]+$ && "$candidate" =~ ^[1-9][0-9]*$ ]] || return 2
+  if (( current == 0 )); then printf '%s\n' "$candidate"; else printf '%s\n' "$current"; fi
+}
+
 bounded_seconds() {
   local requested="${1:?deadline required}" cap="${HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS:-}"
   if [[ -n "$cap" ]]; then

@@ -3,6 +3,25 @@ set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 source "$script_dir/e2e-harness-lib.sh"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
+
+canonicalize_directory_target() {
+  local input="${1:?path required}" probe part suffix='' base
+  [[ "$input" == /* ]] || return 1
+  probe="${input%/}"
+  [[ -n "$probe" ]] || return 1
+  while [[ ! -e "$probe" ]]; do
+    part="$(basename "$probe")"
+    [[ "$part" != . && "$part" != .. && -n "$part" ]] || return 1
+    suffix="/$part$suffix"
+    base="$(dirname "$probe")"
+    [[ "$base" != "$probe" ]] || return 1
+    probe="$base"
+  done
+  [[ -d "$probe" ]] || return 1
+  base="$(cd "$probe" && pwd -P)" || return 1
+  printf '%s%s\n' "$base" "$suffix"
+}
 
 license_file="${HAPPYLEARN_AISTOR_LICENSE_FILE:-}"
 if [[ -z "$license_file" || "$license_file" != /* || ! -r "$license_file" ]]; then
@@ -49,17 +68,38 @@ admin_password="Phase4 Admin ${nonce}!"
 student_password="Phase4 Student ${nonce}!"
 student_new_password="Phase4 Changed ${nonce}!"
 object_secret="phase4-object-${nonce}-secret"
-artifact_dir="${E2E_ARTIFACT_DIR:-$PWD/test-results/phase4}"
-if [[ -z "$artifact_dir" || "$artifact_dir" == / || "$artifact_dir" == "$PWD" ]]; then
-  echo "E2E_ARTIFACT_DIR must name a dedicated artifact directory" >&2
+allowed_artifact_root="$repo_root/test-results"
+artifact_input="${E2E_ARTIFACT_DIR:-$allowed_artifact_root/phase4}"
+allowed_artifact_root_canonical="$(canonicalize_directory_target "$allowed_artifact_root")" || {
+  echo "repository test-results root cannot be resolved safely" >&2
+  exit 2
+}
+artifact_dir="$(canonicalize_directory_target "$artifact_input")" || {
+  echo "E2E_ARTIFACT_DIR must be an absolute safe directory below repository test-results" >&2
+  exit 2
+}
+if [[ "$allowed_artifact_root_canonical" != "$allowed_artifact_root" ||
+      "$artifact_dir" == "$allowed_artifact_root_canonical" ||
+      "$artifact_dir" != "$allowed_artifact_root_canonical"/* ]]; then
+  echo "E2E_ARTIFACT_DIR must be an absolute safe directory below repository test-results" >&2
   exit 2
 fi
 artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 tmpdir="$(mktemp -d)"
+early_cleanup() {
+  local exit_status=$?
+  trap - EXIT INT TERM
+  rm -rf "$tmpdir"
+  exit "$exit_status"
+}
+trap early_cleanup EXIT INT TERM
 master_key_file="$tmpdir/master-key"
 provider_key_file="$tmpdir/provider-key"
 control_key_file="$tmpdir/control-key"
+secret_volume="${prefix}_secrets"
+secret_init="${prefix}_secret_init"
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
+temporary_containers+=("$secret_init")
 service_containers=("$app" "$worker" "$fake_ai" "$minio" "$redis" "$postgres")
 
 umask 077
@@ -67,15 +107,22 @@ openssl rand -base64 32 > "$master_key_file"
 openssl rand -base64 32 > "$provider_key_file"
 openssl rand -base64 32 > "$control_key_file"
 chmod 0600 "$master_key_file" "$provider_key_file" "$control_key_file"
-master_key="$(tr -d '\r\n' < "$master_key_file")"
-provider_key="$(tr -d '\r\n' < "$provider_key_file")"
-control_key="$(tr -d '\r\n' < "$control_key_file")"
+
+artifact_target_is_safe() {
+  local current
+  [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 1
+  current="$(canonicalize_directory_target "$artifact_dir")" || return 1
+  [[ "$current" == "$artifact_dir" &&
+     "$current" != "$allowed_artifact_root_canonical" &&
+     "$current" == "$allowed_artifact_root_canonical"/* ]]
+}
 
 diagnostics() {
   local staging_dir="$tmpdir/diagnostics"
   local staging_log="$staging_dir/containers.log"
   local final_log="$artifact_dir/containers.log"
   local publish_tmp="$artifact_dir/.containers.log.${nonce}.tmp"
+  artifact_target_is_safe || return 0
   rm -f "$final_log" "$publish_tmp" 2>/dev/null || true
   rm -rf "$staging_dir" || return 0
   install -d -m 0700 "$staging_dir" || return 0
@@ -106,15 +153,19 @@ cleanup() {
   set +e
   cancel_bounded_command || true
   if (( exit_status != 0 )); then diagnostics || true; fi
-  bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" || sanitizer_status=$?
+  if artifact_target_is_safe; then
+    bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" || sanitizer_status=$?
+  else
+    sanitizer_status=2
+  fi
   if (( sanitizer_status != 0 )); then
-    find "$artifact_dir" -mindepth 1 -delete 2>/dev/null || true
+    if artifact_target_is_safe; then find "$artifact_dir" -mindepth 1 -delete 2>/dev/null || true; fi
     if (( exit_status == 0 )); then exit_status=$sanitizer_status; fi
   fi
   docker_bounded 30 rm -f "${temporary_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 rm -f "${service_containers[@]}" >/dev/null 2>&1 || true
   docker_bounded 30 network rm "$network" >/dev/null 2>&1 || true
-  docker_bounded 30 volume rm "$runner_volume" "$fixture_volume" "$data_volume" >/dev/null 2>&1 || true
+  docker_bounded 30 volume rm "$runner_volume" "$fixture_volume" "$secret_volume" "$data_volume" >/dev/null 2>&1 || true
   docker_bounded 60 image rm "$supervisor_image" "$fake_ai_image" "$worker_image" "$app_image" >/dev/null 2>&1 || true
   rm -rf "$tmpdir" || true
   exit "$exit_status"
@@ -137,9 +188,13 @@ wait_for() {
   return 1
 }
 
-install -d -m 0700 "$artifact_dir" || true
+install -d -m 0700 "$artifact_dir"
+if ! artifact_target_is_safe; then
+  echo "E2E_ARTIFACT_DIR changed during validation" >&2
+  exit 2
+fi
 docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0 \
-  --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=4m \
+  --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges --memory 16m --cpus .05 --tmpfs /tmp:rw,noexec,nosuid,size=4m \
   -v "$artifact_init_script:/init-e2e-artifacts.sh:ro" -v "$artifact_dir:/artifacts" \
   "$artifact_init_image" /bin/sh /init-e2e-artifacts.sh /artifacts
 
@@ -151,12 +206,19 @@ docker_bounded 60 network create --internal "$network" >/dev/null
 docker_bounded 60 volume create "$data_volume" >/dev/null
 docker_bounded 60 volume create "$fixture_volume" >/dev/null
 docker_bounded 60 volume create "$runner_volume" >/dev/null
+docker_bounded 60 volume create "$secret_volume" >/dev/null
+
+docker_bounded 120 run --rm --name "$secret_init" --network none --read-only --user 0:0 --cap-drop ALL \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges --memory 16m --cpus .05 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=4m -v "$tmpdir:/source:ro" -v "$secret_volume:/secrets" \
+  "$artifact_init_image" /bin/sh -c \
+  'mkdir /secrets/app-master /secrets/fake-provider /secrets/runner-provider /secrets/supervisor-control /secrets/runner-control; cp /source/master-key /secrets/app-master/value; cp /source/provider-key /secrets/fake-provider/value; cp /source/provider-key /secrets/runner-provider/value; cp /source/control-key /secrets/supervisor-control/value; cp /source/control-key /secrets/runner-control/value; chmod 0500 /secrets/*; chmod 0400 /secrets/*/value; chown -R 10001:10001 /secrets/app-master; chown -R 10003:10003 /secrets/fake-provider; chown -R 1000:1000 /secrets/runner-provider /secrets/runner-control; chown -R 10002:10002 /secrets/supervisor-control'
 
 docker_bounded 120 run --rm --name "$data_init" --network none --read-only --user 0:0 --cap-drop ALL \
-  --cap-add CHOWN --security-opt no-new-privileges --entrypoint /bin/sh -v "$data_volume:/data" "$minio_image" \
+  --cap-add CHOWN --security-opt no-new-privileges --memory 32m --cpus .05 --entrypoint /bin/sh -v "$data_volume:/data" "$minio_image" \
   -c 'chown 1000:0 /data && chmod 0750 /data'
 docker_bounded 120 run --rm --name "$runner_init" --network none --read-only --user 0:0 --cap-drop ALL \
-  --cap-add CHOWN --security-opt no-new-privileges --entrypoint /bin/sh \
+  --cap-add CHOWN --security-opt no-new-privileges --memory 32m --cpus .05 --entrypoint /bin/sh \
   -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures" "$playwright_image" \
   -c 'chown 1000:1000 /workspace /fixtures && chmod 0700 /workspace /fixtures'
 
@@ -176,7 +238,9 @@ docker_bounded 60 run -d --name "$minio" --network "$network" --network-alias mi
   minio server /data --console-address :9001 --license /minio.license >/dev/null
 docker_bounded 60 run -d --name "$fake_ai" --network "$network" --network-alias fake-ai --read-only --user 10003:10003 \
   --cap-drop ALL --security-opt no-new-privileges --memory 64m --cpus .05 --tmpfs /tmp:rw,noexec,nosuid,size=4m \
-  -e "E2E_AI_PROVIDER_KEY=$provider_key" "$fake_ai_image" >/dev/null
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-provider-key,volume-subpath=fake-provider,readonly" \
+  --entrypoint /bin/sh "$fake_ai_image" -c \
+  'export E2E_AI_PROVIDER_KEY="$(cat /run/e2e-provider-key/value)"; exec /app/fake-ai-provider' >/dev/null
 
 wait_for PostgreSQL "$postgres" exec "$postgres" pg_isready -U happylearn -d "$database"
 wait_for Redis "$redis" exec "$redis" redis-cli ping
@@ -197,7 +261,6 @@ common_env=(
 )
 app_env=(
   "${common_env[@]}"
-  -e "HAPPYLEARN_AI_MASTER_KEY=$master_key"
   -e HAPPYLEARN_AI_MASTER_KEY_VERSION=1
   -e HAPPYLEARN_AI_BUSINESS_TIMEZONE=Asia/Shanghai
   -e HAPPYLEARN_AI_GLOBAL_CONCURRENCY=2
@@ -207,14 +270,17 @@ app_env=(
 
 docker_bounded 60 run -d --name "$app" --network "$network" --network-alias app --read-only --user 10001:10001 \
   --cap-drop ALL --security-opt no-new-privileges --memory 256m --cpus .2 --tmpfs /tmp:rw,noexec,nosuid,size=32m \
-  "${app_env[@]}" "$app_image" >/dev/null
+  "${app_env[@]}" \
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-master-key,volume-subpath=app-master,readonly" \
+  --entrypoint /bin/sh "$app_image" -c \
+  'export HAPPYLEARN_AI_MASTER_KEY="$(cat /run/e2e-master-key/value)"; exec /app/happylearn' >/dev/null
 wait_for application "$app" exec "$app" curl --fail --silent http://127.0.0.1:8080/api/v1/health/ready
 
 password_file="$tmpdir/admin-password"
 printf '%s' "$admin_password" > "$password_file"
 chmod 0600 "$password_file"
 docker_bounded 120 run --rm --name "$admin_init" --network "$network" --read-only --user 0:0 --cap-drop ALL \
-  --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=16m "${common_env[@]}" \
+  --security-opt no-new-privileges --memory 64m --cpus .1 --tmpfs /tmp:rw,noexec,nosuid,size=16m "${common_env[@]}" \
   -v "$password_file:/run/admin-password:ro" --entrypoint /app/happylearn-admin "$app_image" \
   create-teacher --username admin --display-name 'Phase 4 Teacher' --password-file /run/admin-password
 
@@ -222,26 +288,29 @@ docker_bounded 60 run -d --name "$worker" --network "$network" --network-alias p
   --cap-drop ALL --security-opt no-new-privileges --memory 1792m --cpus 1 \
   --tmpfs /work:rw,noexec,nosuid,size=1408m,uid=10002,gid=10002,mode=0700 \
   --tmpfs /tmp:rw,noexec,nosuid,size=32m,uid=10002,gid=10002,mode=0700 \
-  "${common_env[@]}" -e HAPPYLEARN_WORK_DIR=/work -e "E2E_AI_PROCESSING_CONTROL_TOKEN=$control_key" "$supervisor_image" >/dev/null
+  "${common_env[@]}" -e HAPPYLEARN_WORK_DIR=/work \
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-control-token,volume-subpath=supervisor-control,readonly" \
+  --entrypoint /bin/sh "$supervisor_image" -c \
+  'export E2E_AI_PROCESSING_CONTROL_TOKEN="$(cat /run/e2e-control-token/value)"; exec /app/e2e-processing-supervisor' >/dev/null
 wait_for worker "$worker" exec "$worker" curl --fail --silent http://127.0.0.1:8081/ready
 wait_for processing-supervisor "$processing_supervisor" exec "$processing_supervisor" curl --fail --silent http://127.0.0.1:8092/health/live
 
 docker_bounded 300 run --rm --name "$fixture_runner" --network none --read-only --user 1000:1000 \
   --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus .5 \
   --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=1000,gid=1000,mode=0700 -w /tmp --entrypoint /bin/bash \
-  -v "$PWD:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
+  -v "$repo_root:/src:ro" -v "$fixture_volume:/fixtures" "$worker_image" \
   /src/scripts/generate-phase2-fixtures.sh /fixtures
 docker_bounded 600 run --rm --name "$install_runner" --network none --read-only --user 1000:1000 \
-  --cap-drop ALL --security-opt no-new-privileges --memory 1280m --cpus .5 --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  -v "$PWD:/source:ro" -v "$runner_volume:/workspace" --entrypoint /bin/bash \
+  --cap-drop ALL --security-opt no-new-privileges --memory 1024m --cpus .5 --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -v "$repo_root:/source:ro" -v "$runner_volume:/workspace" --entrypoint /bin/bash \
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
   "$playwright_image" -lc '/source/scripts/copy-e2e-workspace.sh /source /workspace && cd /workspace && corepack pnpm install --frozen-lockfile --store-dir /workspace/.pnpm-store'
 
 phase4_specs='tests/e2e/ai-questions.spec.ts tests/e2e/ai-admin.spec.ts tests/e2e/ai-privacy.spec.ts'
 if [[ "$e2e_group" == phase4 ]]; then
-  e2e_command="test_status=0; E2E_OUTPUT_DIR=/artifacts/results/phase4 corepack pnpm exec playwright test $phase4_specs --project=chromium || test_status=\$?; E2E_OUTPUT_DIR=/artifacts/results/phase4-mobile corepack pnpm exec playwright test $phase4_specs --project=phase4-mobile --grep @phase4-mobile || test_status=\$?; exit \"\$test_status\""
+  e2e_command=". /workspace/scripts/e2e-harness-lib.sh; test_status=0; E2E_OUTPUT_DIR=/artifacts/results/phase4 corepack pnpm exec playwright test $phase4_specs --project=chromium || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; E2E_OUTPUT_DIR=/artifacts/results/phase4-mobile corepack pnpm exec playwright test $phase4_specs --project=phase4-mobile --grep @phase4-mobile || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; exit \"\$test_status\""
 else
-  e2e_command="test_status=0; E2E_OUTPUT_DIR=/artifacts/results/phase1 corepack pnpm exec playwright test tests/e2e/auth-students.spec.ts tests/e2e/teaching.spec.ts --project=chromium || test_status=\$?; E2E_OUTPUT_DIR=/artifacts/results/phase2 corepack pnpm exec playwright test tests/e2e/files.spec.ts tests/e2e/learning.spec.ts --project=chromium || test_status=\$?; E2E_OUTPUT_DIR=/artifacts/results/phase3 corepack pnpm exec playwright test tests/e2e/questions.spec.ts tests/e2e/notifications.spec.ts --project=chromium || test_status=\$?; E2E_OUTPUT_DIR=/artifacts/results/phase4 corepack pnpm exec playwright test $phase4_specs --project=chromium || test_status=\$?; E2E_OUTPUT_DIR=/artifacts/results/phase4-mobile corepack pnpm exec playwright test $phase4_specs --project=phase4-mobile --grep @phase4-mobile || test_status=\$?; exit \"\$test_status\""
+  e2e_command=". /workspace/scripts/e2e-harness-lib.sh; test_status=0; E2E_OUTPUT_DIR=/artifacts/results/phase1 corepack pnpm exec playwright test tests/e2e/auth-students.spec.ts tests/e2e/teaching.spec.ts --project=chromium || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; E2E_OUTPUT_DIR=/artifacts/results/phase2 corepack pnpm exec playwright test tests/e2e/files.spec.ts tests/e2e/learning.spec.ts --project=chromium || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; E2E_OUTPUT_DIR=/artifacts/results/phase3 corepack pnpm exec playwright test tests/e2e/questions.spec.ts tests/e2e/notifications.spec.ts --project=chromium || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; E2E_OUTPUT_DIR=/artifacts/results/phase4 corepack pnpm exec playwright test $phase4_specs --project=chromium || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; E2E_OUTPUT_DIR=/artifacts/results/phase4-mobile corepack pnpm exec playwright test $phase4_specs --project=phase4-mobile --grep @phase4-mobile || test_status=\"\$(preserve_first_failure \"\$test_status\" \"\$?\")\"; exit \"\$test_status\""
 fi
 
 docker_bounded 1800 run --rm --name "$e2e_runner" --network "$network" --read-only --user 1000:1000 \
@@ -251,8 +320,10 @@ docker_bounded 1800 run --rm --name "$e2e_runner" --network "$network" --read-on
   -e COREPACK_HOME=/workspace/.corepack -e XDG_DATA_HOME=/workspace/.xdg -e PNPM_HOME=/workspace/.pnpm \
   -e E2E_BASE_URL=http://app:8080 -e "E2E_ADMIN_PASSWORD=$admin_password" -e "E2E_STUDENT_PASSWORD=$student_password" \
   -e "E2E_STUDENT_NEW_PASSWORD=$student_new_password" -e E2E_FIXTURE_DIR=/fixtures \
-  -e E2E_AI_PROVIDER_BASE_URL=http://fake-ai:8090/v1 -e "E2E_AI_PROVIDER_KEY=$provider_key" \
+  -e E2E_AI_PROVIDER_BASE_URL=http://fake-ai:8090/v1 \
   -e E2E_AI_PROVIDER_COUNTS_URL=http://fake-ai:8090/test/counts \
   -e E2E_AI_PROCESSING_CONTROL_URL=http://processing-supervisor:8092 \
-  -e "E2E_AI_PROCESSING_CONTROL_TOKEN=$control_key" \
-  "$playwright_image" /bin/bash -lc "$e2e_command"
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-provider-key,volume-subpath=runner-provider,readonly" \
+  --mount "type=volume,src=$secret_volume,dst=/run/e2e-control-token,volume-subpath=runner-control,readonly" \
+  "$playwright_image" /bin/bash -lc \
+  "export E2E_AI_PROVIDER_KEY=\"\$(cat /run/e2e-provider-key/value)\" E2E_AI_PROCESSING_CONTROL_TOKEN=\"\$(cat /run/e2e-control-token/value)\"; $e2e_command"

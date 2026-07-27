@@ -22,6 +22,7 @@ grep -Fq -- '--read-only --user 1000:1000' "$phase2"
 grep -Fq 'runner_init=' "$phase2"
 
 tmpdir="$(mktemp -d)"
+semantics_nonce="$(date +%s)-$RANDOM"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/bin"
 license="$tmpdir/dummy-license"
@@ -89,11 +90,11 @@ case "${1:-}" in
     [[ -n "$name" ]] || exit 2
     touch "$state/resources/containers/$name"
     if [[ "$name" == *_data_init ]]; then
-      if [[ "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
+      if [[ "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail || "$scenario" == phase4_diagnostic ]]; then
         service="${name%_data_init}_postgres"
         touch "$state/resources/containers/$service"
       fi
-      if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
+      if [[ "$scenario" == cleanup_hang || "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail || "$scenario" == phase4_diagnostic ]]; then
         touch "$state/markers/normal-command-started"
         exit 9
       fi
@@ -122,6 +123,9 @@ cat > "$tmpdir/bin/install" <<'FAKE_INSTALL'
 #!/bin/bash
 set -Eeuo pipefail
 last="${*: -1}"
+if [[ "${FAKE_DOCKER_SCENARIO:-}" == diagnostics_write_fail && "$last" == */diagnostics ]]; then
+  exit 72
+fi
 if [[ "${FAKE_DOCKER_SCENARIO:-}" == publish_install_fail && "$last" == */.containers.log.*.tmp ]]; then
   touch "${FAKE_DOCKER_STATE:?}/markers/publish-install-failed"
   exit 73
@@ -152,24 +156,25 @@ assert_safe_upload_directory() {
   [[ -f "$final_log" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
-      diagnostics_version=1|container=happylearn_phase2_*|container=happylearn_phase3_*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
+      diagnostics_version=1|container=happylearn_phase2_*|container=happylearn_phase3_*|container=happylearn_phase4_*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
       *) return 1 ;;
     esac
   done < "$final_log"
 }
 
 run_case() {
-  local script="$1" scenario="$2" state status=0 expected_status failure_reasons=''
+  local script="$1" scenario="$2" state artifact_path status=0 expected_status failure_reasons=''
   state="$tmpdir/state-$(basename "$script")-$scenario"
+  artifact_path="$repo_root/test-results/.harness-semantics-${semantics_nonce}-$(basename "$script")-$scenario"
+  rm -rf "$artifact_path"
   mkdir -p "$state/resources/containers" "$state/resources/networks" "$state/resources/volumes" "$state/resources/images" "$state/markers"
-  if [[ "$scenario" == diagnostics_write_fail ]]; then : > "$state/artifacts"; fi
-  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then expected_status=9; else expected_status='nonzero'; fi
+  if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail || "$scenario" == phase4_diagnostic ]]; then expected_status=9; else expected_status='nonzero'; fi
   local before after started_at elapsed pid=''
   before="$(snapshot "$state")"
   started_at="$(date +%s)"
   if [[ "$scenario" == interrupt ]]; then
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$artifact_path" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" &
     pid=$!
     for _ in $(seq 1 1200); do [[ -f "$state/markers/normal-command-started" ]] && break; sleep .05; done
@@ -179,7 +184,7 @@ run_case() {
     wait "$pid" || status=$?
   else
     PATH="$tmpdir/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_SCENARIO="$scenario" \
-      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$state/artifacts" \
+      HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=3 HAPPYLEARN_E2E_TEST_READY_FILE="$state/ready" FAKE_DOCKER_READY_FILE="$state/ready" HAPPYLEARN_AISTOR_LICENSE_FILE="$license" E2E_ARTIFACT_DIR="$artifact_path" \
       /bin/bash "$script" >"$state/stdout" 2>"$state/stderr" || status=$?
   fi
   elapsed=$(( $(date +%s) - started_at ))
@@ -196,8 +201,8 @@ run_case() {
   if [[ "$scenario" == publish_install_fail && ! -f "$state/markers/publish-install-failed" ]]; then failure_reasons+=$'\npublish install failure marker missing'; fi
   if [[ "$scenario" == publish_mv_fail && ! -f "$state/markers/publish-mv-failed" ]]; then failure_reasons+=$'\npublish mv failure marker missing'; fi
   if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]]; then
-    assert_safe_upload_directory "$state/artifacts" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
-    [[ -z "$(find "$state/artifacts" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit 2>/dev/null)" ]] || failure_reasons+=$'\npublish temporary file remained'
+    assert_safe_upload_directory "$artifact_path" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
+    [[ -z "$(find "$artifact_path" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit 2>/dev/null)" ]] || failure_reasons+=$'\npublish temporary file remained'
   fi
   local container_line network_line volume_line image_line
   container_line="$(grep -n '^container-rm$' "$state/order.log" 2>/dev/null | head -1 | cut -d: -f1 || true)"
@@ -219,8 +224,10 @@ run_case() {
         if [[ -f "$state/$diagnostic_file" ]]; then sed -n '1,240p' "$state/$diagnostic_file"; else printf '%s\n' '<missing>'; fi
       done
     } >&2
+    rm -rf "$artifact_path"
     return 1
   fi
+  rm -rf "$artifact_path"
 }
 
 for script in "$phase2" "$phase3" "$phase4"; do
@@ -232,5 +239,6 @@ for script in "$phase2" "$phase3" "$phase4"; do
   run_case "$script" publish_install_fail
   run_case "$script" publish_mv_fail
 done
+run_case "$phase4" phase4_diagnostic
 
 echo 'E2E harness semantics contract: PASS'
