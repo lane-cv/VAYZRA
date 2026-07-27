@@ -34,6 +34,8 @@ jobs:
           umask 077
           license_file="$RUNNER_TEMP/minio.license"
           printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          sudo chgrp 0 "$license_file"
+          chmod 0440 "$license_file"
           printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
       - run: pnpm e2e-contracts
@@ -90,6 +92,8 @@ jobs:
           umask 077
           license_file="$RUNNER_TEMP/minio.license"
           printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          sudo chgrp 0 "$license_file"
+          chmod 0440 "$license_file"
           printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - name: Run isolated Phase 2 acceptance
         run: bash scripts/e2e-phase2.sh
@@ -116,6 +120,8 @@ jobs:
           umask 077
           license_file="$RUNNER_TEMP/minio.license"
           printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          sudo chgrp 0 "$license_file"
+          chmod 0440 "$license_file"
           printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
       - name: Run isolated Phase 3 acceptance
         run: bash scripts/e2e-phase3.sh

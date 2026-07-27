@@ -59,6 +59,45 @@ insert_before() {
   ' "$source" >"$destination"
 }
 
+remove_first_exact() {
+  local source="$1"
+  local destination="$2"
+  local needle="$3"
+
+  awk -v needle="$needle" '
+    $0 == needle && !removed {
+      removed = 1
+      next
+    }
+    { print }
+    END {
+      if (!removed) {
+        exit 1
+      }
+    }
+  ' "$source" >"$destination"
+}
+
+insert_after_first() {
+  local source="$1"
+  local destination="$2"
+  local needle="$3"
+  local insertion="$4"
+
+  NEEDLE="$needle" INSERTION="$insertion" awk '
+    { print }
+    $0 == ENVIRON["NEEDLE"] && !inserted {
+      print ENVIRON["INSERTION"]
+      inserted = 1
+    }
+    END {
+      if (!inserted) {
+        exit 1
+      }
+    }
+  ' "$source" >"$destination"
+}
+
 expect_rejected() {
   local name="$1"
   local workflow="$2"
@@ -85,6 +124,32 @@ pristine="$tmp_dir/pristine.yml"
 cp "$source_workflow" "$pristine"
 HAPPYLEARN_CI_COMPOSE_CONTRACT_WORKFLOW="$pristine" bash "$contract" >/dev/null ||
   fail "unmodified workflow copy does not satisfy the contract"
+
+missing_license_group="$tmp_dir/missing-license-group.yml"
+remove_first_exact "$source_workflow" "$missing_license_group" \
+  '          sudo chgrp 0 "$license_file"'
+expect_rejected "missing-license-group" "$missing_license_group" \
+  "AIStor license must grant the container root group immediately after creation"
+
+missing_license_mode="$tmp_dir/missing-license-mode.yml"
+remove_first_exact "$source_workflow" "$missing_license_mode" \
+  '          chmod 0440 "$license_file"'
+expect_rejected "missing-license-mode" "$missing_license_mode" \
+  "AIStor license must be made container-readable immediately after creation"
+
+license_export_line='          printf '"'"'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n'"'"' "$license_file" >> "$GITHUB_ENV"'
+
+license_revoked_after_export="$tmp_dir/license-revoked-after-export.yml"
+insert_after_first "$source_workflow" "$license_revoked_after_export" "$license_export_line" \
+  '          chmod 0000 "$license_file"'
+expect_rejected "license-revoked-after-export" "$license_revoked_after_export" \
+  "AIStor license configuration step must end immediately after exporting the path"
+
+license_world_writable_after_export="$tmp_dir/license-world-writable-after-export.yml"
+insert_after_first "$source_workflow" "$license_world_writable_after_export" "$license_export_line" \
+  '          chmod 0666 "$license_file"'
+expect_rejected "license-world-writable-after-export" "$license_world_writable_after_export" \
+  "AIStor license configuration step must end immediately after exporting the path"
 
 ordinary_go_step="      - run: GOENV=off GOFLAGS='' go test -p 1 ./... -count=1"
 

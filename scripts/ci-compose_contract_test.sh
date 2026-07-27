@@ -103,6 +103,46 @@ verify_job_end="$(
 )"
 test -n "$verify_job_end" || fail "verify job has no following job boundary"
 
+license_permission_violation="$(
+  awk '
+    $0 == "          printf \047%s\047 \"\$AISTOR_LICENSE\" > \"\$license_file\"" {
+      configured++
+      if ((getline) <= 0 || $0 != "          sudo chgrp 0 \"\$license_file\"") {
+        failed = 1
+        print "AIStor license must grant the container root group immediately after creation"
+        exit
+      }
+      if ((getline) <= 0 || $0 != "          chmod 0440 \"\$license_file\"") {
+        failed = 1
+        print "AIStor license must be made container-readable immediately after creation"
+        exit
+      }
+      if ((getline) <= 0 || $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"") {
+        failed = 1
+        print "AIStor license path must be exported immediately after permission hardening"
+        exit
+      }
+      while ((getline) > 0) {
+        if ($0 ~ /^[[:space:]]*$/) {
+          continue
+        }
+        if ($0 ~ /^      - /) {
+          break
+        }
+        failed = 1
+        print "AIStor license configuration step must end immediately after exporting the path"
+        exit
+      }
+    }
+    END {
+      if (!failed && configured != 3) {
+        print "workflow must configure exactly three hardened AIStor license files"
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$license_permission_violation" || fail "$license_permission_violation"
+
 workflow_structure_violation="$(
   awk -v verify_first="$verify_job_line" -v verify_last="$verify_job_end" '
     /^[^[:space:]#]/ {
