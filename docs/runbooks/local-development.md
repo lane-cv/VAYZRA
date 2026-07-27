@@ -1,6 +1,6 @@
 # HappyLearn local development and Ubuntu container runbook
 
-This phase produces a same-origin Go/API and Vue-console image plus a serial file-processing worker. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL, Redis, AIStor S3, and the worker health endpoint remain private to the Docker network. This runbook does not deploy to a remote server.
+This phase produces a same-origin Go/API and Vue console with unified teacher/AI Q&A plus a serial file-processing worker. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL, Redis, AIStor S3, and the worker health endpoint remain private to the Docker network. This runbook does not deploy to a remote server. AI provider setup, safe diagnostics, master-key rotation and Phase 3 rollback are documented in [phase4-ai-qanda.md](phase4-ai-qanda.md).
 
 ## Shell requirement
 
@@ -47,6 +47,7 @@ Create a private local secret directory and environment file. The values below a
 install -d -m 0700 .secrets
 umask 077
 openssl rand -base64 48 > .secrets/login-throttle-secret
+openssl rand -base64 32 > .secrets/ai-master-key
 cat > .env <<EOF
 HAPPYLEARN_ENV=development
 HAPPYLEARN_LISTEN=:8080
@@ -54,9 +55,15 @@ HAPPYLEARN_DATABASE_URL=postgres://happylearn:happylearn_dev@127.0.0.1:54329/hap
 HAPPYLEARN_REDIS_URL=redis://127.0.0.1:56379/0
 HAPPYLEARN_LOGIN_THROTTLE_SECRET=$(cat .secrets/login-throttle-secret)
 HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:8080
+HAPPYLEARN_AI_MASTER_KEY=$(tr -d '\n' < .secrets/ai-master-key)
+HAPPYLEARN_AI_MASTER_KEY_VERSION=1
+HAPPYLEARN_AI_BUSINESS_TIMEZONE=Asia/Shanghai
+HAPPYLEARN_AI_GLOBAL_CONCURRENCY=2
+HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY=1
+HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER=false
 HAPPYLEARN_TRUSTED_PROXY_CIDRS=
 EOF
-chmod 600 .env .secrets/login-throttle-secret
+chmod 600 .env .secrets/login-throttle-secret .secrets/ai-master-key
 ```
 
 Build the console before starting the Go server; server startup applies the embedded migrations. Create the sole teacher once using a password file with owner-only permissions.
@@ -97,6 +104,15 @@ Phase 3 acceptance also runs all earlier suites plus Q&A, attachment privacy, no
 ```bash
 HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license" make e2e-phase3
 ```
+
+Phase 4 acceptance adds both AI protocols, the unified student Q&A center, streaming/reconnect/retry, privacy, quota, usage and mobile scenarios. It requires the same external AIStor license and leaves only sanitized evidence under `test-results/phase4`:
+
+```bash
+HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license" \
+  HAPPYLEARN_E2E_GROUP=phase4 make e2e-phase4
+```
+
+For Phase 4 manual operations, including the exact aggregate status query and resource inspection command, follow [phase4-ai-qanda.md](phase4-ai-qanda.md). The disposable harness supplies its own internal fake provider; the normal development Compose stack deliberately does not include one and leaves the provider service address unset until it is saved through `/admin/ai`.
 
 For manual diagnosis only, start the server as above and use new test-only passwords (never production values):
 
