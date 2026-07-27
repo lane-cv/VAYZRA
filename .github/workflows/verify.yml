@@ -45,8 +45,11 @@ jobs:
           for port in 54329 56379 59000; do
             timeout 30 bash -c "until </dev/tcp/127.0.0.1/$port; do sleep 1; done"
           done
-      - run: go test ./... -count=1
-      - run: go test -race ./... -count=1
+      - name: Verify authenticated MinIO readiness
+        run: |
+          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'
+      - run: go test -p 1 ./... -count=1
+      - run: go test -race -p 1 ./... -count=1
       - run: go vet ./...
       - run: govulncheck ./...
       - run: pnpm --dir web test
@@ -64,6 +67,11 @@ jobs:
           test "$(docker image inspect -f '{{.Config.User}}' happylearn-worker:ci)" = '10002:10002'
           test "$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' happylearn:ci)" != 'null'
           test "$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' happylearn-worker:ci)" != 'null'
+      - name: Report integration dependency failure
+        if: failure()
+        run: |
+          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml ps
+          docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml logs --no-color --tail 100 minio
       - name: Stop integration dependencies
         if: always()
         run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml down --volumes --remove-orphans
