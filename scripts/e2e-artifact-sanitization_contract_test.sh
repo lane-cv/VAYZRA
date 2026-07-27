@@ -8,6 +8,16 @@ test -x "$publisher"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/nested"
+
+file_mode() {
+  local path="$1" mode
+  if mode="$(stat -c '%a' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+  else
+    stat -f '%Lp' "$path"
+  fi
+}
+
 cat > "$tmpdir/containers.log" <<'MALICIOUS_LOG'
 diagnostics_version=1
 container=happylearn_phase3_123_app
@@ -44,7 +54,7 @@ touch "$tmpdir/nested/trace.zip" "$tmpdir/nested/failure.png" "$tmpdir/nested/vi
 bash "$sanitizer" "$tmpdir"
 test "$(find "$tmpdir" -type f | wc -l | tr -d ' ')" -eq 1
 test -f "$tmpdir/containers.log"
-mode="$(stat -f '%Lp' "$tmpdir/containers.log" 2>/dev/null || stat -c '%a' "$tmpdir/containers.log")"
+mode="$(file_mode "$tmpdir/containers.log")"
 test "$mode" = 600
 ! grep -Eqi 'private|json-token|json-password|header-secret|header-cookie|header-csrf|csrf-header-secret|colon-password|quoted-secret|equals-token|db-user|db-password|query-token|query-password|redis-password|url-user|url-password|url-token|url-secret|encoded-password|encoded-token|authorization|cookie|x-csrf|bearer|postgres://|redis://|https://|master-key-material|provider-key-material|provider-ciphertext-material|synthetic-prompt|synthetic-message|synthetic-answer|private-object|object-user|object-password|db-secret|cache-secret' "$tmpdir/containers.log"
 while IFS= read -r line; do
@@ -93,7 +103,7 @@ MOCK_MV
     test "$status" -eq 0
     test -f "$publish_dir/containers.log"
     test ! -e "$publish_dir/.containers.log.$scenario.tmp"
-    mode="$(stat -f '%Lp' "$publish_dir/containers.log" 2>/dev/null || stat -c '%a' "$publish_dir/containers.log")"
+    mode="$(file_mode "$publish_dir/containers.log")"
     test "$mode" = 600
     cmp -s "$publish_dir/sanitized.log" "$publish_dir/containers.log"
   else
