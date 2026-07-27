@@ -37,6 +37,9 @@ grep -Fq 'scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secr
 grep -Fq -- '--env-file .env --env-file .secrets/ai.env' "$runbook"
 ! grep -Fq 'install -m 0600 /dev/null .env' "$runbook"
 grep -Fq 'scripts/phase4-ai-operations.sh verify-secret-absence' "$runbook"
+grep -Fq 'scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/server' "$local_runbook"
+grep -Fq 'scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/admin' "$local_runbook"
+! grep -Fq 'set -a; . ./.env; set +a' "$local_runbook"
 grep -Fq 'docker stats --no-stream happylearn-dev-app-1 happylearn-dev-worker-1' "$runbook"
 grep -Fq '"SELECT status,count(*) FROM ai_runs GROUP BY status ORDER BY status;"' "$runbook"
 grep -Fq 'runner_lost' "$runbook"
@@ -55,6 +58,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/bin"
 printf '%s\n' \
   'HAPPYLEARN_EXISTING_SENTINEL=preserved' \
+  'HAPPYLEARN_AI_MASTER_KEY=base-fallback-marker' \
+  'HAPPYLEARN_AI_MASTER_KEY_VERSION=9' \
   'HAPPYLEARN_AI_GLOBAL_CONCURRENCY=7' > "$tmpdir/base.env"
 printf '%s\n' 'old-ai-env-sentinel' > "$tmpdir/ai.env"
 printf '%s\n' 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' > "$tmpdir/master-key"
@@ -86,6 +91,25 @@ if "$operations" write-env "$tmpdir/invalid-key" "$tmpdir/ai.env" >"$tmpdir/writ
 fi
 grep -Fxq 'old-ai-env-sentinel' "$tmpdir/ai.env"
 ! grep -Fq 'invalid-key' "$tmpdir/write.stdout" "$tmpdir/write.stderr"
+
+"$operations" write-env "$tmpdir/master-key" "$tmpdir/ai.env"
+"$operations" run-with-env "$tmpdir/base.env" "$tmpdir/ai.env" \
+  bash -c '
+    [[ "$HAPPYLEARN_EXISTING_SENTINEL" == preserved ]]
+    [[ "$HAPPYLEARN_AI_MASTER_KEY" != base-fallback-marker ]]
+    [[ "$HAPPYLEARN_AI_MASTER_KEY_VERSION" == 1 ]]
+    [[ "$HAPPYLEARN_AI_GLOBAL_CONCURRENCY" == 2 ]]
+    printf "%s\n" host-env-ok > "$1"
+  ' _ "$tmpdir/host-env-result"
+grep -Fxq 'host-env-ok' "$tmpdir/host-env-result"
+if "$operations" run-with-env "$tmpdir/base.env" "$tmpdir/missing-ai.env" \
+  bash -c 'touch "$1"' _ "$tmpdir/missing-ai-command-ran" \
+  >"$tmpdir/missing.stdout" 2>"$tmpdir/missing.stderr"; then
+  echo 'missing AI environment unexpectedly allowed host command' >&2
+  exit 1
+fi
+test ! -e "$tmpdir/missing-ai-command-ran"
+! grep -Fq 'base-fallback-marker' "$tmpdir/missing.stdout" "$tmpdir/missing.stderr"
 
 cat > "$tmpdir/bin/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash

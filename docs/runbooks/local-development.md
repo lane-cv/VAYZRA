@@ -59,7 +59,7 @@ chmod 600 .env .secrets/login-throttle-secret .secrets/ai-master-key
 scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secrets/ai.env
 ```
 
-The AI helper never edits `.env`; it atomically creates the separate owner-only `.secrets/ai.env`. Start or re-create the Compose stack with both files in this order:
+The AI helper never edits `.env`; it atomically creates the separate owner-only `.secrets/ai.env`. Both files are trusted Bash syntax and are sourced by host-development commands, so never replace either file with downloaded or externally supplied content. The host loader rejects missing files, symlinks, files owned by another user, group/world-readable permissions, and AI files that do not have the exact helper-generated six-line schema. Start or re-create the Compose stack with both files in this order:
 
 ```bash
 docker compose --env-file .env --env-file .secrets/ai.env \
@@ -73,19 +73,17 @@ Build the console before starting the Go server; server startup applies the embe
 ```bash
 pnpm install --frozen-lockfile
 pnpm build
-set -a; . ./.env; set +a
-go run ./cmd/server
+scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/server
 # In a second terminal, after the server has applied migrations:
-set -a; . ./.env; set +a
 read -rs -p 'Development teacher password: ' HAPPYLEARN_BOOTSTRAP_PASSWORD; echo
 printf '%s' "$HAPPYLEARN_BOOTSTRAP_PASSWORD" > .secrets/admin-password
 unset HAPPYLEARN_BOOTSTRAP_PASSWORD
 chmod 600 .secrets/admin-password
-go run ./cmd/admin create-teacher --username admin --display-name '教师' --password-file .secrets/admin-password
+scripts/phase4-ai-operations.sh run-with-env .env .secrets/ai.env go run ./cmd/admin create-teacher --username admin --display-name '教师' --password-file .secrets/admin-password
 shred -u .secrets/admin-password
 ```
 
-The running server exposes `GET /api/v1/health/live` and `GET /api/v1/health/ready` on the same `http://127.0.0.1:8080` origin as the Vue application.
+`run-with-env` executes `set -a`, sources `.env`, then sources `.secrets/ai.env`, executes `set +a`, and finally replaces itself with the requested command. Loading the AI file last gives host migration/server/bootstrap processes the same master key and version as Compose without printing the environment. The running server exposes `GET /api/v1/health/live` and `GET /api/v1/health/ready` on the same `http://127.0.0.1:8080` origin as the Vue application.
 
 ## Test and acceptance commands
 
