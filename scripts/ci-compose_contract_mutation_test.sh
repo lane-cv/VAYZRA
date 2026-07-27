@@ -121,10 +121,22 @@ insert_after "$source_workflow" "$verify_goflags" '  verify:' \
 expect_rejected "verify-goflags" "$verify_goflags" \
   "workflow and verify job must not set GOFLAGS"
 
+verify_inline_quoted_goflags="$tmp_dir/verify-inline-quoted-goflags.yml"
+insert_after "$source_workflow" "$verify_inline_quoted_goflags" '  verify:' \
+  '    env: {"GOFLAGS": "-run=^$"}'
+expect_rejected "verify-inline-quoted-goflags" "$verify_inline_quoted_goflags" \
+  "workflow and verify job must not set GOFLAGS"
+
 root_goflags="$tmp_dir/root-goflags.yml"
 insert_before "$source_workflow" "$root_goflags" 'jobs:' \
   $'env:\n  GOFLAGS: "-run=^$"\n'
 expect_rejected "root-goflags" "$root_goflags" \
+  "workflow and verify job must not set GOFLAGS"
+
+root_inline_quoted_goflags="$tmp_dir/root-inline-quoted-goflags.yml"
+insert_before "$source_workflow" "$root_inline_quoted_goflags" 'jobs:' \
+  $'env: {"GOFLAGS": "-run=^$"}\n'
+expect_rejected "root-inline-quoted-goflags" "$root_inline_quoted_goflags" \
   "workflow and verify job must not set GOFLAGS"
 
 echo "CI Compose workflow mutation contract: PASS"

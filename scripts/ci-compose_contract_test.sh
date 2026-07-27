@@ -134,7 +134,7 @@ workflow_bypass="$(
     $0 == "env:" {
       in_root_env = 1
     }
-    /^env:[[:space:]]*\{/ && /GOFLAGS[[:space:]]*:/ {
+    /^env:[[:space:]]*\{/ && /["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
       print "workflow and verify job must not set GOFLAGS"
       exit
     }
@@ -171,7 +171,7 @@ workflow_bypass="$(
       exit
     }
 
-    /^    env:[[:space:]]*\{/ && /GOFLAGS[[:space:]]*:/ {
+    /^    env:[[:space:]]*\{/ && /["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
       print "workflow and verify job must not set GOFLAGS"
       exit
     }
