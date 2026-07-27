@@ -103,6 +103,7 @@ go_test_before_probe_line="$(
     NR >= probe_line { next }
 
     in_run_block {
+      if ($0 ~ /^[[:space:]]*$/) { next }
       if ($0 ~ /^          /) {
         command = $0
         sub(/^          /, "", command)
