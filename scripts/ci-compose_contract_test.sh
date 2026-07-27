@@ -4,12 +4,15 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 base="$repo_root/deploy/compose.dev.yml"
 ci="$repo_root/deploy/compose.ci.yml"
-workflow="$repo_root/.github/workflows/verify.yml"
+workflow="${HAPPYLEARN_CI_COMPOSE_CONTRACT_WORKFLOW:-$repo_root/.github/workflows/verify.yml}"
 
 fail() {
   echo "CI Compose host-port contract: FAIL: $*" >&2
   exit 1
 }
+
+test -f "$workflow" ||
+  fail "workflow contract input must be a regular file: $workflow"
 
 exact_line() {
   local needle="$1"
@@ -100,6 +103,93 @@ verify_job_end="$(
 )"
 test -n "$verify_job_end" || fail "verify job has no following job boundary"
 
+workflow_bypass="$(
+  awk -v verify_first="$verify_job_line" -v verify_last="$verify_job_end" '
+    /^[^[:space:]]/ {
+      if ($0 != "defaults:" && $0 !~ /^defaults:[[:space:]]*\{/) {
+        in_root_defaults = 0
+        in_root_defaults_run = 0
+      }
+      if ($0 != "env:" && $0 !~ /^env:[[:space:]]*\{/) {
+        in_root_env = 0
+      }
+    }
+
+    $0 == "defaults:" {
+      in_root_defaults = 1
+      in_root_defaults_run = 0
+    }
+    /^defaults:[[:space:]]*\{/ && /working-directory[[:space:]]*:/ {
+      print "workflow must not override the run working directory"
+      exit
+    }
+    in_root_defaults && $0 == "  run:" {
+      in_root_defaults_run = 1
+    }
+    in_root_defaults_run && /^    working-directory[[:space:]]*:/ {
+      print "workflow must not override the run working directory"
+      exit
+    }
+
+    $0 == "env:" {
+      in_root_env = 1
+    }
+    /^env:[[:space:]]*\{/ && /GOFLAGS[[:space:]]*:/ {
+      print "workflow and verify job must not set GOFLAGS"
+      exit
+    }
+    in_root_env && /^  ["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
+      print "workflow and verify job must not set GOFLAGS"
+      exit
+    }
+
+    NR < verify_first || NR > verify_last { next }
+
+    /^    if[[:space:]]*:/ {
+      print "verify job must not have an if condition"
+      exit
+    }
+
+    /^    defaults:[[:space:]]*\{/ && /working-directory[[:space:]]*:/ {
+      print "verify job must not override the run working directory"
+      exit
+    }
+    $0 == "    defaults:" {
+      in_verify_defaults = 1
+      in_verify_defaults_run = 0
+      next
+    }
+    in_verify_defaults && /^    [^[:space:]]/ {
+      in_verify_defaults = 0
+      in_verify_defaults_run = 0
+    }
+    in_verify_defaults && $0 == "      run:" {
+      in_verify_defaults_run = 1
+    }
+    in_verify_defaults_run && /^        working-directory[[:space:]]*:/ {
+      print "verify job must not override the run working directory"
+      exit
+    }
+
+    /^    env:[[:space:]]*\{/ && /GOFLAGS[[:space:]]*:/ {
+      print "workflow and verify job must not set GOFLAGS"
+      exit
+    }
+    $0 == "    env:" {
+      in_verify_env = 1
+      next
+    }
+    in_verify_env && /^    [^[:space:]]/ {
+      in_verify_env = 0
+    }
+    in_verify_env && /^      ["\047]?GOFLAGS["\047]?[[:space:]]*:/ {
+      print "workflow and verify job must not set GOFLAGS"
+      exit
+    }
+  ' "$workflow"
+)"
+test -z "$workflow_bypass" || fail "$workflow_bypass"
+
 startup_name_line="$(exact_line_between '      - name: Start private integration dependencies' "$verify_job_line" "$verify_job_end")"
 startup_run_line="$(exact_line_between '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio' "$verify_job_line" "$verify_job_end")"
 probe_name_line="$(exact_line_between '      - name: Verify host integration ports' "$verify_job_line" "$verify_job_end")"
@@ -138,6 +228,13 @@ test "$go_test_line" -gt "$minio_probe_command_line" ||
   fail "ordinary Go tests must follow authenticated MinIO readiness"
 test "$go_race_test_line" -gt "$go_test_line" ||
   fail "race-enabled Go tests must follow ordinary Go tests"
+for repository_go_test_line in "$go_test_line" "$go_race_test_line"; do
+  next_step_line="$(sed -n "$((repository_go_test_line + 1))p" "$workflow")"
+  case "$next_step_line" in
+    '      - '*) ;;
+    *) fail "repository Go test steps must be standalone" ;;
+  esac
+done
 noncanonical_repository_go_test_line="$(
   awk -v first="$verify_job_line" -v last="$verify_job_end" '
     function is_repository_go_test(command) {
