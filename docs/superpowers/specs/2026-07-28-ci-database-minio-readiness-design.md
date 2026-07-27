@@ -23,12 +23,14 @@ by CI scheduling rather than a deterministic runtime-store deadlock.
 Run both ordinary and race-enabled repository tests with `-p 1`:
 
 ```sh
-GOFLAGS='' go test -p 1 ./... -count=1
-GOFLAGS='' go test -race -p 1 ./... -count=1
+GOENV=off GOFLAGS='' go test -p 1 ./... -count=1
+GOENV=off GOFLAGS='' go test -race -p 1 ./... -count=1
 ```
 
 This aligns package scheduling with the repository's existing global PostgreSQL
-test lock. Individual tests keep their current isolation mechanism, and no
+test lock. `GOENV=off` prevents user-level `go env -w GOFLAGS=...` state from
+changing test selection, while `GOFLAGS=''` neutralizes inherited process and
+workflow flags. Individual tests keep their current isolation mechanism, and no
 application runtime behavior changes.
 
 ### Use MinIO readiness semantics
@@ -52,7 +54,8 @@ license contents, or credentials.
 
 Repository contract tests will verify that:
 
-- both workflow Go test commands include `-p 1`;
+- both workflow Go test commands use `GOENV=off`, clear `GOFLAGS`, and include
+  `-p 1`;
 - the MinIO health check uses `/minio/health/ready` and not `/live`;
 - the authenticated readiness probe occurs after dependency startup and before Go
   tests;

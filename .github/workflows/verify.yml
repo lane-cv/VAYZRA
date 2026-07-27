@@ -48,8 +48,8 @@ jobs:
       - name: Verify authenticated MinIO readiness
         run: |
           timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'until mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1; do sleep 1; done' || { echo 'MinIO did not accept an authenticated ListBuckets request within 30s.' >&2; exit 1; }
-      - run: GOFLAGS='' go test -p 1 ./... -count=1
-      - run: GOFLAGS='' go test -race -p 1 ./... -count=1
+      - run: GOENV=off GOFLAGS='' go test -p 1 ./... -count=1
+      - run: GOENV=off GOFLAGS='' go test -race -p 1 ./... -count=1
       - run: go vet ./...
       - run: govulncheck ./...
       - run: pnpm --dir web test

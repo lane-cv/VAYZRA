@@ -45,6 +45,7 @@ e2e-phase4:
 e2e-contracts:
 	bash scripts/ci-compose_contract_test.sh
 	bash scripts/ci-compose_contract_mutation_test.sh
+	bash scripts/ci-goenv_contract_test.sh
 	bash scripts/copy-e2e-workspace_test.sh
 	bash scripts/e2e-phase2_contract_test.sh
 	bash scripts/e2e-phase3_contract_test.sh

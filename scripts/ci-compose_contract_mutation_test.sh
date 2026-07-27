@@ -86,7 +86,7 @@ cp "$source_workflow" "$pristine"
 HAPPYLEARN_CI_COMPOSE_CONTRACT_WORKFLOW="$pristine" bash "$contract" >/dev/null ||
   fail "unmodified workflow copy does not satisfy the contract"
 
-ordinary_go_step="      - run: GOFLAGS='' go test -p 1 ./... -count=1"
+ordinary_go_step="      - run: GOENV=off GOFLAGS='' go test -p 1 ./... -count=1"
 
 verify_continue_on_error="$tmp_dir/verify-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_continue_on_error" '  verify:' \
@@ -104,6 +104,12 @@ verify_flow_continue_on_error="$tmp_dir/verify-flow-continue-on-error.yml"
 insert_after "$source_workflow" "$verify_flow_continue_on_error" '  verify:' \
   '    <<: {"continue-on-error": true}'
 expect_rejected "verify-flow-continue-on-error" "$verify_flow_continue_on_error" \
+  "verify job must not set continue-on-error"
+
+verify_explicit_continue_on_error="$tmp_dir/verify-explicit-continue-on-error.yml"
+insert_after "$source_workflow" "$verify_explicit_continue_on_error" '  verify:' \
+  $'    ? "continue-on-error"\n    : true'
+expect_rejected "verify-explicit-continue-on-error" "$verify_explicit_continue_on_error" \
   "verify job must not set continue-on-error"
 
 step_if_false="$tmp_dir/step-if-false.yml"
@@ -136,10 +142,46 @@ insert_after "$source_workflow" "$verify_if" '  verify:' \
 expect_rejected "verify-if" "$verify_if" \
   "verify job must not have an if condition"
 
+verify_quoted_if="$tmp_dir/verify-quoted-if.yml"
+insert_after "$source_workflow" "$verify_quoted_if" '  verify:' \
+  '    "if": false'
+expect_rejected "verify-quoted-if" "$verify_quoted_if" \
+  "verify job must not have an if condition"
+
+verify_single_quoted_if="$tmp_dir/verify-single-quoted-if.yml"
+insert_after "$source_workflow" "$verify_single_quoted_if" '  verify:' \
+  "    'if': false"
+expect_rejected "verify-single-quoted-if" "$verify_single_quoted_if" \
+  "verify job must not have an if condition"
+
+verify_flow_if="$tmp_dir/verify-flow-if.yml"
+insert_after "$source_workflow" "$verify_flow_if" '  verify:' \
+  '    <<: {"if": false}'
+expect_rejected "verify-flow-if" "$verify_flow_if" \
+  "verify job must not have an if condition"
+
+verify_explicit_if="$tmp_dir/verify-explicit-if.yml"
+insert_after "$source_workflow" "$verify_explicit_if" '  verify:' \
+  $'    ? "if"\n    : false'
+expect_rejected "verify-explicit-if" "$verify_explicit_if" \
+  "verify job must not have an if condition"
+
 root_defaults="$tmp_dir/root-defaults.yml"
 insert_before "$source_workflow" "$root_defaults" 'jobs:' \
   $'defaults:\n  run:\n    working-directory: web\n'
 expect_rejected "root-defaults" "$root_defaults" \
+  "workflow must not override the run working directory"
+
+root_quoted_defaults="$tmp_dir/root-quoted-defaults.yml"
+insert_before "$source_workflow" "$root_quoted_defaults" 'jobs:' \
+  $'"defaults":\n  "run":\n    "working-directory": internal/aiqa\n'
+expect_rejected "root-quoted-defaults" "$root_quoted_defaults" \
+  "workflow must not override the run working directory"
+
+root_flow_defaults="$tmp_dir/root-flow-defaults.yml"
+insert_before "$source_workflow" "$root_flow_defaults" 'jobs:' \
+  $'"defaults": {"run": {"working-directory": "internal/aiqa"}}\n'
+expect_rejected "root-flow-defaults" "$root_flow_defaults" \
   "workflow must not override the run working directory"
 
 verify_goflags="$tmp_dir/verify-goflags.yml"
@@ -165,6 +207,18 @@ insert_before "$source_workflow" "$root_inline_quoted_goflags" 'jobs:' \
   $'env: {"GOFLAGS": "-run=^$"}\n'
 expect_rejected "root-inline-quoted-goflags" "$root_inline_quoted_goflags" \
   "workflow and verify job must not set GOFLAGS"
+
+verify_quoted_defaults="$tmp_dir/verify-quoted-defaults.yml"
+insert_after "$source_workflow" "$verify_quoted_defaults" '  verify:' \
+  $'    "defaults":\n      "run":\n        "working-directory": internal/aiqa'
+expect_rejected "verify-quoted-defaults" "$verify_quoted_defaults" \
+  "verify job must not override the run working directory"
+
+verify_flow_defaults="$tmp_dir/verify-flow-defaults.yml"
+insert_after "$source_workflow" "$verify_flow_defaults" '  verify:' \
+  '    "defaults": {"run": {"working-directory": "internal/aiqa"}}'
+expect_rejected "verify-flow-defaults" "$verify_flow_defaults" \
+  "verify job must not override the run working directory"
 
 verify_quoted_parent_env="$tmp_dir/verify-quoted-parent-env.yml"
 insert_after "$source_workflow" "$verify_quoted_parent_env" '  verify:' \

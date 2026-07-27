@@ -106,7 +106,7 @@ test -n "$verify_job_end" || fail "verify job has no following job boundary"
 workflow_bypass="$(
   awk -v verify_first="$verify_job_line" -v verify_last="$verify_job_end" '
     /^[^[:space:]]/ {
-      if ($0 != "defaults:" && $0 !~ /^defaults:[[:space:]]*\{/) {
+      if ($0 !~ /^["\047]?defaults["\047]?[[:space:]]*:/) {
         in_root_defaults = 0
         in_root_defaults_run = 0
       }
@@ -115,18 +115,20 @@ workflow_bypass="$(
       }
     }
 
-    $0 == "defaults:" {
+    /^["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*$/ {
       in_root_defaults = 1
       in_root_defaults_run = 0
     }
-    /^defaults:[[:space:]]*\{/ && /working-directory[[:space:]]*:/ {
+    /^["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*\{/ &&
+      /["\047]?working-directory["\047]?[[:space:]]*:/ {
       print "workflow must not override the run working directory"
       exit
     }
-    in_root_defaults && $0 == "  run:" {
+    in_root_defaults && /^  ["\047]?run["\047]?[[:space:]]*:[[:space:]]*$/ {
       in_root_defaults_run = 1
     }
-    in_root_defaults_run && /^    working-directory[[:space:]]*:/ {
+    in_root_defaults_run &&
+      /^    ["\047]?working-directory["\047]?[[:space:]]*:/ {
       print "workflow must not override the run working directory"
       exit
     }
@@ -145,7 +147,15 @@ workflow_bypass="$(
 
     NR < verify_first || NR > verify_last { next }
 
-    /^    if[[:space:]]*:/ {
+    /^    ["\047]?if["\047]?[[:space:]]*:/ {
+      print "verify job must not have an if condition"
+      exit
+    }
+    /^    <<[[:space:]]*:/ && /["\047]?if["\047]?[[:space:]]*:/ {
+      print "verify job must not have an if condition"
+      exit
+    }
+    /^    \?[[:space:]]*["\047]?if["\047]?[[:space:]]*$/ {
       print "verify job must not have an if condition"
       exit
     }
@@ -162,11 +172,12 @@ workflow_bypass="$(
       exit
     }
 
-    /^    defaults:[[:space:]]*\{/ && /working-directory[[:space:]]*:/ {
+    /^    ["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*\{/ &&
+      /["\047]?working-directory["\047]?[[:space:]]*:/ {
       print "verify job must not override the run working directory"
       exit
     }
-    $0 == "    defaults:" {
+    /^    ["\047]?defaults["\047]?[[:space:]]*:[[:space:]]*$/ {
       in_verify_defaults = 1
       in_verify_defaults_run = 0
       next
@@ -175,10 +186,12 @@ workflow_bypass="$(
       in_verify_defaults = 0
       in_verify_defaults_run = 0
     }
-    in_verify_defaults && $0 == "      run:" {
+    in_verify_defaults &&
+      /^      ["\047]?run["\047]?[[:space:]]*:[[:space:]]*$/ {
       in_verify_defaults_run = 1
     }
-    in_verify_defaults_run && /^        working-directory[[:space:]]*:/ {
+    in_verify_defaults_run &&
+      /^        ["\047]?working-directory["\047]?[[:space:]]*:/ {
       print "verify job must not override the run working directory"
       exit
     }
@@ -209,8 +222,8 @@ probe_run_line="$((probe_name_line + 1))"
 probe_for_line="$((probe_name_line + 2))"
 probe_timeout_line="$((probe_name_line + 3))"
 probe_done_line="$((probe_name_line + 4))"
-go_test_line="$(exact_line_between "      - run: GOFLAGS='' go test -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
-go_race_test_line="$(exact_line_between "      - run: GOFLAGS='' go test -race -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
+go_test_line="$(exact_line_between "      - run: GOENV=off GOFLAGS='' go test -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
+go_race_test_line="$(exact_line_between "      - run: GOENV=off GOFLAGS='' go test -race -p 1 ./... -count=1" "$verify_job_line" "$verify_job_end")"
 minio_probe_name_line="$(exact_line_between '      - name: Verify authenticated MinIO readiness' "$verify_job_line" "$verify_job_end")"
 minio_probe_run_line="$((minio_probe_name_line + 1))"
 minio_probe_command_line="$((minio_probe_name_line + 2))"
@@ -288,8 +301,8 @@ noncanonical_repository_go_test_line="$(
         run_line = NR
         block_command = ""
       } else {
-        canonical = run_yaml == "      - run: GOFLAGS=\047\047 go test -p 1 ./... -count=1" ||
-          run_yaml == "      - run: GOFLAGS=\047\047 go test -race -p 1 ./... -count=1"
+        canonical = run_yaml == "      - run: GOENV=off GOFLAGS=\047\047 go test -p 1 ./... -count=1" ||
+          run_yaml == "      - run: GOENV=off GOFLAGS=\047\047 go test -race -p 1 ./... -count=1"
         inspect_run(command, NR, canonical)
       }
     }
