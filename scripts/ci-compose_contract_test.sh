@@ -79,7 +79,6 @@ probe_run_line="$((probe_name_line + 1))"
 probe_for_line="$((probe_name_line + 2))"
 probe_timeout_line="$((probe_name_line + 3))"
 probe_done_line="$((probe_name_line + 4))"
-first_go_test_line="$(exact_line '      - run: go test ./... -count=1')"
 merged_validation_line="$(exact_line '      - run: docker compose -f deploy/compose.dev.yml -f deploy/compose.ci.yml config --quiet')"
 cleanup_name_line="$(exact_line '      - name: Stop integration dependencies')"
 cleanup_if_line="$(exact_line '        if: always()')"
@@ -93,8 +92,43 @@ line_is "$probe_run_line" '        run: |'
 line_is "$probe_for_line" '          for port in 54329 56379 59000; do'
 line_is "$probe_timeout_line" '            timeout 30 bash -c "until </dev/tcp/127.0.0.1/$port; do sleep 1; done"'
 line_is "$probe_done_line" '          done'
-test "$probe_done_line" -lt "$first_go_test_line" ||
-  fail "host-port probe must complete before the first go test"
+go_test_before_probe_line="$(
+  awk -v probe_line="$probe_name_line" '
+    function starts_go_test(command) {
+      sub(/^[[:space:]]+/, "", command)
+      sub(/^["\047]/, "", command)
+      return command ~ /^go[[:space:]]+test([[:space:]]|$)/
+    }
+
+    NR >= probe_line { next }
+
+    in_run_block {
+      if ($0 ~ /^          /) {
+        command = $0
+        sub(/^          /, "", command)
+        if (command !~ /^[[:space:]]*#/ && starts_go_test(command)) {
+          print NR
+          exit
+        }
+        next
+      }
+      in_run_block = 0
+    }
+
+    /^(      - |        )run:[[:space:]]*/ {
+      command = $0
+      sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", command)
+      if (command ~ /^[|>][+-]?([[:space:]]+#.*)?$/) {
+        in_run_block = 1
+      } else if (starts_go_test(command)) {
+        print NR
+        exit
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$go_test_before_probe_line" ||
+  fail "go test run step at line $go_test_before_probe_line precedes host-port verification"
 test "$merged_validation_line" -lt "$cleanup_name_line" ||
   fail "merged Compose validation must precede cleanup"
 test "$cleanup_if_line" -eq "$((cleanup_name_line + 1))" &&
