@@ -509,7 +509,12 @@ func (s *appendProbeStore) AppendEvents(ctx context.Context, id uuid.UUID, owner
 
 func waitRunner(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	waitRunnerWithin(t, 2*time.Second, condition)
+}
+
+func waitRunnerWithin(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return

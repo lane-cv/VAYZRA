@@ -560,7 +560,7 @@ WHERE id=$1`, fixture.model, fixture.cfg.Model.InputPriceMicroUSD, fixture.cfg.M
 		PollInterval: time.Millisecond, LeaseDuration: 90 * time.Millisecond,
 		FlushInterval: time.Millisecond, FlushBytes: 4096,
 	})
-	waitRunner(t, func() bool {
+	waitRunnerWithin(t, 5*time.Second, func() bool {
 		var status RunStatus
 		_ = pool.QueryRow(ctx, `SELECT status FROM ai_runs WHERE id=$1`, run.ID).Scan(&status)
 		return status == RunSucceeded
