@@ -53,7 +53,7 @@ test "$minio_probe_name_line" -eq "$((probe_done_line + 1))" ||
   fail "authenticated MinIO readiness must immediately follow host-port verification"
 line_is "$minio_probe_run_line" '        run: |'
 line_is "$minio_probe_timeout_line" \
-  "          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'mc alias set local http://127.0.0.1:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'"
+  "          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'until mc alias set local http://127.0.0.1:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1; do sleep 1; done' || { echo 'MinIO did not accept an authenticated ListBuckets request within 30s.' >&2; exit 1; }"
 test "$go_test_line" -gt "$minio_probe_timeout_line" ||
   fail "Go tests must run after authenticated MinIO readiness"
 ```
@@ -153,7 +153,7 @@ Immediately after `Verify host integration ports` in `.github/workflows/verify.y
 ```yaml
       - name: Verify authenticated MinIO readiness
         run: |
-          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'
+          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'until mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1; do sleep 1; done' || { echo 'MinIO did not accept an authenticated ListBuckets request within 30s.' >&2; exit 1; }
 ```
 
 - [ ] **Step 3: Serialize both repository Go test commands**
@@ -254,7 +254,7 @@ HAPPYLEARN_AISTOR_LICENSE_FILE=/Users/lane/Downloads/minio.license \
 
 Expected: both services report healthy.
 
-- [ ] **Step 2: Verify authenticated MinIO readiness exactly as CI does**
+- [ ] **Step 2: Verify authenticated MinIO readiness with CI's retry and sanitized timeout behavior**
 
 Run:
 
@@ -264,7 +264,8 @@ timeout 30 docker compose -p happylearn-ci-readiness \
   -f deploy/compose.ci.yml \
   -f /private/tmp/vayzra-ci-readiness-override.yml \
   exec -T minio /bin/sh -ceu \
-  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'
+  'until mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1; do sleep 1; done' || \
+  { echo 'MinIO did not accept an authenticated ListBuckets request within 30s.' >&2; exit 1; }
 ```
 
 Expected: exit 0 without credential or license output.
