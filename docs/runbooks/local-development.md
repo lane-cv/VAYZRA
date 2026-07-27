@@ -16,11 +16,9 @@ Use the fixed Compose project name below so network and cleanup targets stay nar
 ```bash
 export HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license"
 test -r "$HAPPYLEARN_AISTOR_LICENSE_FILE"
-docker compose -p happylearn-dev -f deploy/compose.dev.yml up -d --build
-docker compose -p happylearn-dev -f deploy/compose.dev.yml ps
 ```
 
-Wait until all services report `healthy`. The application is available at `127.0.0.1:8080`; PostgreSQL, Redis, and the AIStor S3/console development ports bind only to loopback. The worker health endpoint is private to the Compose network and is not published on the host. Production deployment must remove every database, Redis, S3, and S3-console host mapping.
+Complete the protected environment-file setup below before the first stack startup. After startup, wait until all services report `healthy`. The application is available at `127.0.0.1:8080`; PostgreSQL, Redis, and the AIStor S3/console development ports bind only to loopback. The worker health endpoint is private to the Compose network and is not published on the host. Production deployment must remove every database, Redis, S3, and S3-console host mapping.
 
 The worker runs as UID/GID `10002`, with a read-only root filesystem, no Linux capabilities, and a 1024 MiB tmpfs work directory. It has no published port and its network has no public route. Each uploaded version is processed serially through type validation, ClamAV scanning, bounded Office conversion or video probing, and private preview storage. Processing fails closed when the baked-in daily ClamAV definitions are missing or older than seven days. Rebuild and redeploy `Dockerfile.worker` at least weekly (and immediately for urgent signature releases):
 
@@ -55,15 +53,19 @@ HAPPYLEARN_DATABASE_URL=postgres://happylearn:happylearn_dev@127.0.0.1:54329/hap
 HAPPYLEARN_REDIS_URL=redis://127.0.0.1:56379/0
 HAPPYLEARN_LOGIN_THROTTLE_SECRET=$(cat .secrets/login-throttle-secret)
 HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:8080
-HAPPYLEARN_AI_MASTER_KEY=$(tr -d '\n' < .secrets/ai-master-key)
-HAPPYLEARN_AI_MASTER_KEY_VERSION=1
-HAPPYLEARN_AI_BUSINESS_TIMEZONE=Asia/Shanghai
-HAPPYLEARN_AI_GLOBAL_CONCURRENCY=2
-HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY=1
-HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER=false
 HAPPYLEARN_TRUSTED_PROXY_CIDRS=
 EOF
 chmod 600 .env .secrets/login-throttle-secret .secrets/ai-master-key
+scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secrets/ai.env
+```
+
+The AI helper never edits `.env`; it atomically creates the separate owner-only `.secrets/ai.env`. Start or re-create the Compose stack with both files in this order:
+
+```bash
+docker compose --env-file .env --env-file .secrets/ai.env \
+  -p happylearn-dev -f deploy/compose.dev.yml up -d --build
+docker compose --env-file .env --env-file .secrets/ai.env \
+  -p happylearn-dev -f deploy/compose.dev.yml ps
 ```
 
 Build the console before starting the Go server; server startup applies the embedded migrations. Create the sole teacher once using a password file with owner-only permissions.

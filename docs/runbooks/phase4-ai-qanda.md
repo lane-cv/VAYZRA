@@ -26,22 +26,18 @@ chmod 0600 .secrets/ai-master-key
 test "$(wc -c < .secrets/ai-master-key)" -eq 45
 ```
 
-把文件交给部署平台的文件型 Secret 或凭据管理器，并由入口脚本读取后导出给 `app`；不要把文件挂入 Web 根目录、镜像或 Git。Compose 本地开发可把值写入权限为 `0600` 的 `.env`，不要执行会把值显示到屏幕的检查命令：
+把文件交给部署平台的文件型 Secret 或凭据管理器，并由入口脚本读取后导出给 `app`；不要把文件挂入 Web 根目录、镜像或 Git。Compose 本地开发使用独立的 `.secrets/ai.env`，绝不改写已有 `.env`。辅助脚本先验证密钥，再写入同目录的 `0600` 临时文件并原子替换目标；任一步失败都会保留原文件，也不会向标准输出打印密钥：
 
 ```bash
-install -m 0600 /dev/null .env
-printf '%s' 'HAPPYLEARN_AI_MASTER_KEY=' >> .env
-tr -d '\n' < .secrets/ai-master-key >> .env
-printf '\n%s\n' \
-  'HAPPYLEARN_AI_MASTER_KEY_VERSION=1' \
-  'HAPPYLEARN_AI_BUSINESS_TIMEZONE=Asia/Shanghai' \
-  'HAPPYLEARN_AI_GLOBAL_CONCURRENCY=2' \
-  'HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY=1' \
-  'HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER=false' >> .env
-chmod 0600 .env
+scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secrets/ai.env
+test "$(stat -f '%Lp' .secrets/ai.env 2>/dev/null || stat -c '%a' .secrets/ai.env)" = 600
+docker compose --env-file .env --env-file .secrets/ai.env \
+  -p happylearn-dev -f deploy/compose.dev.yml config --quiet
+docker compose --env-file .env --env-file .secrets/ai.env \
+  -p happylearn-dev -f deploy/compose.dev.yml up -d --build
 ```
 
-开发模式在密钥为空时会使用固定的一次性密钥，仅方便首次启动，不得把这种状态带到共享或生产环境。供应商服务地址没有环境默认值，必须经教师控制台配置。生产必须保持私网供应商开关为 `false`。
+当前 Docker Compose 的 `--env-file` 是可重复选项，后面的文件覆盖前面的同名值；这里先加载保留数据库、Redis、对象存储等设置的 `.env`，再加载只含六个 AI 设置的 `.secrets/ai.env`。用 `docker compose --help` 确认本机版本显示 `--env-file stringArray`；若部署工具不支持重复选项，不得继续，先升级 Compose。开发模式在密钥为空时会使用固定的一次性密钥，仅方便首次启动，不得把这种状态带到共享或生产环境。供应商服务地址没有环境默认值，必须经教师控制台配置。生产必须保持私网供应商开关为 `false`。
 
 ### 主密钥轮换
 
@@ -49,7 +45,7 @@ chmod 0600 .env
 
 1. 在“AI 管理 → 额度策略”记录现有全局额度及学生覆盖项，把四项全局额度全部设为“停用”，并逐一把所有学生覆盖项设为“继承”或“停用”，阻止新运行；等待 `queued` 和 `streaming` 计数归零，必要时让学生在详情页显式取消运行。
 2. 备份数据库与对象存储，并保留旧主密钥的受控恢复副本。不要运行 down migration。
-3. 用上面的方式生成新文件，将版本加一，原子更新部署 Secret，然后只重启 `app`。
+3. 用上面的方式生成新文件，将版本加一；本地示例为 `scripts/phase4-ai-operations.sh write-env .secrets/ai-master-key .secrets/ai.env 2`。原子更新部署 Secret，然后只重启 `app`。
 4. 登录教师控制台，在“AI 管理 → 供应商配置”逐个编辑供应商，选择“替换 API Key”，重新输入对应上游凭据并保存。此操作使用新主密钥和新版本重新加密；已完成历史不需要解密。
 5. 为每个供应商执行“测试连接”，确认文本/视觉模型和数学/物理提示词配置后，将目标供应商设为当前。
 6. 恢复轮换前的全局额度和学生覆盖项，提交一个合成问题并检查运行、用量和日志。验证后按密钥管理制度销毁旧主密钥。
@@ -160,30 +156,15 @@ docker compose -p happylearn-dev -f deploy/compose.dev.yml exec -T postgres \
 
 ## API 与日志泄漏检查
 
-仅在隔离的合成账号环境执行。把专用供应商测试密钥保存到 `.secrets/provider-key`（`0600`），使用权限为 `0600` 的管理员 Cookie 文件请求只读配置 API，并把响应落到受保护文件。以下检查为 quiet 模式，发现命中时只打印固定告警，不打印命中内容：
+仅在隔离的合成账号环境执行。把专用供应商测试密钥保存到 `.secrets/provider-key`（`0600`），并准备权限为 `0600` 的管理员 Cookie 文件。辅助脚本会以 `umask 077` 创建临时 API/日志文件，并在第一个 `mktemp` 后立即注册清理 trap。`curl --fail-with-body` 与 `docker compose logs` 的生产状态分别检查；任一生产命令失败都会以非零状态中止，响应体、日志和生产命令错误都只写入临时文件。随后 quiet 扫描会区分“未命中”和扫描器故障，退出时删除全部临时产物：
 
 ```bash
 chmod 0600 .secrets/provider-key .secrets/admin.cookies
-umask 077
-curl --fail --silent --show-error \
-  --cookie .secrets/admin.cookies \
-  http://127.0.0.1:8080/api/v1/admin/ai/providers > .secrets/providers-response.json
-if grep -qFf .secrets/provider-key .secrets/providers-response.json; then
-  printf '%s\n' 'secret found in provider API response' >&2
-  exit 1
-fi
-if grep -Eqi '"[^"]*(encrypted|cipher)[^"]*"[[:space:]]*:' .secrets/providers-response.json; then
-  printf '%s\n' 'secret-bearing field found in provider API response' >&2
-  exit 1
-fi
-if docker compose -p happylearn-dev -f deploy/compose.dev.yml logs --no-color --no-log-prefix app |
-  grep -qFf .secrets/provider-key; then
-  printf '%s\n' 'secret found in app logs' >&2
-  exit 1
-fi
+scripts/phase4-ai-operations.sh verify-secret-absence \
+  .secrets/provider-key .secrets/admin.cookies
 ```
 
-随后在浏览器开发者工具中确认读取响应只含 `hasKey` 和更新时间，不含明文或密文。`apiKey`、`Authorization`、`body_text`、`payload_text`、`object_key` 以及供应商地址查询串都禁止出现在诊断 SELECT 或日志命令中。测试结束后安全删除合成凭据和响应文件。
+命令退出 `0` 才表示 API 与日志来源均成功读取且未发现测试密钥/密文字段；任何固定错误消息都必须按泄漏事件或诊断源故障处理，不能勾选核对项。随后在浏览器开发者工具中确认读取响应只含 `hasKey` 和更新时间，不含明文或密文。`apiKey`、`Authorization`、`body_text`、`payload_text`、`object_key` 以及供应商地址查询串都禁止出现在诊断 SELECT 或日志命令中。测试结束后安全删除合成密钥与 Cookie 文件；临时响应和日志已由 trap 删除。
 
 ## 回滚到 Phase 3 镜像
 

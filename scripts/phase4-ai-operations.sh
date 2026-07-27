@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+write_env() {
+  [[ $# -eq 2 || $# -eq 3 ]] || fail 'usage: phase4-ai-operations.sh write-env KEY_FILE AI_ENV_FILE [KEY_VERSION]'
+  local key_file="$1" ai_env_file="$2" key_version="${3:-1}" ai_env_dir ai_work_dir ai_env_tmp=''
+  [[ -f "$key_file" && -r "$key_file" ]] || fail 'AI master-key file is not readable'
+  [[ "$key_version" =~ ^[1-9][0-9]*$ ]] && (( key_version <= 32767 )) ||
+    fail 'AI master-key version must be between 1 and 32767'
+  [[ "$(basename "$ai_env_file")" == ai.env ]] || fail 'AI environment target must be a dedicated ai.env file'
+  ai_env_dir="$(dirname "$ai_env_file")"
+  [[ -d "$ai_env_dir" ]] || fail 'AI environment directory does not exist'
+  [[ ! -L "$ai_env_file" ]] || fail 'AI environment target must not be a symbolic link'
+
+  umask 077
+  ai_work_dir="$(mktemp -d "${TMPDIR:-/tmp}/happylearn-ai-env.XXXXXX")"
+  cleanup_write_env() {
+    [[ -z "$ai_env_tmp" ]] || rm -f -- "$ai_env_tmp"
+    rm -rf -- "$ai_work_dir"
+  }
+  trap cleanup_write_env EXIT INT TERM HUP
+  chmod 0700 "$ai_work_dir"
+  tr -d '\r\n' < "$key_file" > "$ai_work_dir/normalized"
+  chmod 0600 "$ai_work_dir/normalized"
+  grep -Eq '^[A-Za-z0-9+/]{43}=$' "$ai_work_dir/normalized" ||
+    fail 'AI master-key file must contain standard base64 of exactly 32 bytes'
+  if ! openssl base64 -d -A -in "$ai_work_dir/normalized" -out "$ai_work_dir/decoded" 2>/dev/null; then
+    fail 'AI master-key file must contain standard base64 of exactly 32 bytes'
+  fi
+  chmod 0600 "$ai_work_dir/decoded"
+  [[ "$(wc -c < "$ai_work_dir/decoded" | tr -d '[:space:]')" == 32 ]] ||
+    fail 'AI master-key file must contain standard base64 of exactly 32 bytes'
+
+  ai_env_tmp="$(mktemp "$ai_env_dir/.ai.env.XXXXXX")"
+  chmod 0600 "$ai_env_tmp"
+  {
+    printf '%s' 'HAPPYLEARN_AI_MASTER_KEY='
+    tr -d '\r\n' < "$ai_work_dir/normalized"
+    printf '\nHAPPYLEARN_AI_MASTER_KEY_VERSION=%s\n' "$key_version"
+    printf '%s\n' \
+      'HAPPYLEARN_AI_BUSINESS_TIMEZONE=Asia/Shanghai' \
+      'HAPPYLEARN_AI_GLOBAL_CONCURRENCY=2' \
+      'HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY=1' \
+      'HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER=false'
+  } > "$ai_env_tmp"
+  rm -rf -- "$ai_work_dir"
+  mv -f -- "$ai_env_tmp" "$ai_env_file"
+  ai_env_tmp=''
+  trap - EXIT INT TERM HUP
+}
+
+scan_fixed_secret() {
+  local pattern_file="$1" input_file="$2" scan_exit=0
+  grep -qFf "$pattern_file" "$input_file" || scan_exit=$?
+  case "$scan_exit" in
+    0) return 10 ;;
+    1) return 0 ;;
+    *) return 11 ;;
+  esac
+}
+
+scan_secret_fields() {
+  local input_file="$1" scan_exit=0
+  grep -Eqi '"[^"]*(encrypted|cipher)[^"]*"[[:space:]]*:' "$input_file" || scan_exit=$?
+  case "$scan_exit" in
+    0) return 10 ;;
+    1) return 0 ;;
+    *) return 11 ;;
+  esac
+}
+
+verify_secret_absence() {
+  [[ $# -eq 2 ]] || fail 'usage: phase4-ai-operations.sh verify-secret-absence PROVIDER_KEY_FILE ADMIN_COOKIE_FILE'
+  local provider_key_file="$1" cookie_file="$2"
+  local api_response='' app_logs='' producer_error='' scan_exit=0
+  [[ -s "$provider_key_file" && -r "$provider_key_file" ]] || fail 'provider-key file is not readable'
+  [[ -s "$cookie_file" && -r "$cookie_file" ]] || fail 'admin cookie file is not readable'
+
+  umask 077
+  cleanup_verification() {
+    [[ -z "$api_response" ]] || rm -f -- "$api_response"
+    [[ -z "$app_logs" ]] || rm -f -- "$app_logs"
+    [[ -z "$producer_error" ]] || rm -f -- "$producer_error"
+  }
+  api_response="$(mktemp "${TMPDIR:-/tmp}/happylearn-ai-api.XXXXXX")"
+  trap cleanup_verification EXIT INT TERM HUP
+  app_logs="$(mktemp "${TMPDIR:-/tmp}/happylearn-ai-logs.XXXXXX")"
+  producer_error="$(mktemp "${TMPDIR:-/tmp}/happylearn-ai-producer.XXXXXX")"
+  chmod 0600 "$api_response" "$app_logs" "$producer_error"
+
+  if ! curl --fail-with-body --silent --show-error \
+    --cookie "$cookie_file" \
+    http://127.0.0.1:8080/api/v1/admin/ai/providers \
+    >"$api_response" 2>"$producer_error"; then
+    fail 'provider API verification source failed'
+  fi
+  scan_fixed_secret "$provider_key_file" "$api_response" || scan_exit=$?
+  case "$scan_exit" in
+    0) ;;
+    10) fail 'secret found in provider API response' ;;
+    *) fail 'provider API response scan failed' ;;
+  esac
+  scan_exit=0
+  scan_secret_fields "$api_response" || scan_exit=$?
+  case "$scan_exit" in
+    0) ;;
+    10) fail 'secret-bearing field found in provider API response' ;;
+    *) fail 'provider API response field scan failed' ;;
+  esac
+
+  : > "$producer_error"
+  if ! (
+    cd "$repo_root"
+    docker compose --env-file .env --env-file .secrets/ai.env \
+      -p happylearn-dev -f deploy/compose.dev.yml \
+      logs --no-color --no-log-prefix app
+  ) >"$app_logs" 2>"$producer_error"; then
+    fail 'app log verification source failed'
+  fi
+  scan_exit=0
+  scan_fixed_secret "$provider_key_file" "$app_logs" || scan_exit=$?
+  case "$scan_exit" in
+    0) ;;
+    10) fail 'secret found in app logs' ;;
+    *) fail 'app log scan failed' ;;
+  esac
+  cleanup_verification
+  trap - EXIT INT TERM HUP
+}
+
+case "${1:-}" in
+  write-env)
+    shift
+    write_env "$@"
+    ;;
+  verify-secret-absence)
+    shift
+    verify_secret_absence "$@"
+    ;;
+  *)
+    fail 'usage: phase4-ai-operations.sh write-env|verify-secret-absence ...'
+    ;;
+esac
