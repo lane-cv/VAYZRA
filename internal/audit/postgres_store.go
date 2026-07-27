@@ -133,6 +133,11 @@ func validateAndMarshal(event Event) ([]byte, error) {
 			return nil, ErrInvalidEvent
 		}
 	}
+	if strings.HasPrefix(event.Action, "operations.") {
+		if !validOperationsEvent(event) {
+			return nil, ErrInvalidEvent
+		}
+	}
 	return json.Marshal(event.Metadata)
 }
 
@@ -165,7 +170,7 @@ var allowedMetadata = map[string]map[string]bool{
 	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
 	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.provider_tested": {"providerId": true, "protocol": true, "ok": true, "errorCategory": true, "latencyMs": true}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
 	"ai.file_access_rejected":     {"reason": true},
-	"operations.settings_updated": {}, "operations.lease_taken_over": {},
+	"operations.settings_updated": {}, "operations.settings_rejected": {"category": true, "reason": true}, "operations.lease_taken_over": {},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -178,7 +183,22 @@ var allowedTargetTypes = map[string]string{
 	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
 	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
 	"ai.file_access_rejected":     "ai_file_request",
-	"operations.settings_updated": "system_settings", "operations.lease_taken_over": "operational_mode",
+	"operations.settings_updated": "system_settings", "operations.settings_rejected": "system_settings", "operations.lease_taken_over": "operational_mode",
+}
+
+func validOperationsEvent(event Event) bool {
+	switch event.Action {
+	case "operations.settings_updated", "operations.lease_taken_over":
+		return len(event.Metadata) == 0
+	case "operations.settings_rejected":
+		category, categoryOK := event.Metadata["category"].(string)
+		reason, reasonOK := event.Metadata["reason"].(string)
+		return len(event.Metadata) == 2 &&
+			categoryOK && category == "high_risk" &&
+			reasonOK && (reason == "retention" || reason == "backup_schedule" || reason == "threshold")
+	default:
+		return false
+	}
 }
 
 func validAIEvent(e Event) bool {

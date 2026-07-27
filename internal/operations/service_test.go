@@ -132,6 +132,68 @@ func TestSettingsServiceRequiresActiveAdminWithAuditContext(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceAuditsOnlyAuthenticatedHighRiskRejections(t *testing.T) {
+	admin := operationsAdmin(uuid.New())
+	for name, tc := range map[string]struct {
+		mutate func(*Settings)
+		reason string
+	}{
+		"soft delete retention": {func(s *Settings) { s.SoftDeleteRetentionDays = 29 }, "retention"},
+		"audit retention":       {func(s *Settings) { s.AuditRetentionDays = 364 }, "retention"},
+		"sample retention":      {func(s *Settings) { s.OperationalSampleRetentionDays = 0 }, "retention"},
+		"backup hour":           {func(s *Settings) { s.BackupHour = 24 }, "backup_schedule"},
+		"backup minute":         {func(s *Settings) { s.BackupMinute = 60 }, "backup_schedule"},
+		"backup timezone":       {func(s *Settings) { s.BackupTimezone = "UTC" }, "backup_schedule"},
+		"disk threshold":        {func(s *Settings) { s.DiskCriticalPercent = s.DiskWarningPercent }, "threshold"},
+		"AI threshold":          {func(s *Settings) { s.AIErrorCriticalPercent = s.AIErrorWarningPercent }, "threshold"},
+		"queue threshold":       {func(s *Settings) { s.ProcessingQueueCritical = s.ProcessingQueueWarning }, "threshold"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeStore{settings: validSettings()}
+			service := NewService(store)
+			highRisk := validSettings()
+			tc.mutate(&highRisk)
+			if _, err := service.UpdateSettings(context.Background(), admin, highRisk); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("high-risk error=%v", err)
+			}
+			if store.rejectionCalls != 1 || store.rejectionReason != tc.reason {
+				t.Fatalf("rejections=%d reason=%q", store.rejectionCalls, store.rejectionReason)
+			}
+		})
+	}
+
+	store := &fakeStore{settings: validSettings()}
+	service := NewService(store)
+	mundane := validSettings()
+	mundane.SiteName = ""
+	if _, err := service.UpdateSettings(context.Background(), admin, mundane); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("mundane error=%v", err)
+	}
+	if store.rejectionCalls != 0 {
+		t.Fatalf("mundane invalid input was audited as high risk: %d", store.rejectionCalls)
+	}
+
+	student := admin
+	student.User.Role = auth.RoleStudent
+	highRisk := validSettings()
+	highRisk.AuditRetentionDays = 0
+	if _, err := service.UpdateSettings(context.Background(), student, highRisk); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("unauthorized error=%v", err)
+	}
+	if store.rejectionCalls != 0 {
+		t.Fatalf("unauthorized rejection was audited: %d", store.rejectionCalls)
+	}
+
+	auditFailure := errors.New("settings rejection audit unavailable")
+	failingStore := &fakeStore{settings: validSettings(), rejectionErr: auditFailure}
+	if _, err := NewService(failingStore).UpdateSettings(context.Background(), admin, highRisk); !errors.Is(err, auditFailure) {
+		t.Fatalf("audit failure error=%v", err)
+	}
+	if failingStore.updateCalls != 0 {
+		t.Fatal("audit failure reached settings mutation")
+	}
+}
+
 func TestPostgresSettingsDefaultsConflictAuditAndRollback(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
@@ -211,6 +273,62 @@ DROP FUNCTION IF EXISTS operations_reject_audit()`)
 	}
 	if version != updated.Version || announcement != updated.SiteAnnouncement {
 		t.Fatalf("mutation escaped rollback: version=%d announcement=%q", version, announcement)
+	}
+}
+
+func TestPostgresHighRiskSettingsRejectionAuditIsRedacted(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	admin := seedOperationsAdmin(t, ctx, pool)
+	service := NewService(NewPostgresStore(pool))
+	for name, tc := range map[string]struct {
+		mutate func(*Settings)
+		reason string
+	}{
+		"soft delete retention": {func(s *Settings) { s.SoftDeleteRetentionDays = 29 }, "retention"},
+		"audit retention":       {func(s *Settings) { s.AuditRetentionDays = 364 }, "retention"},
+		"sample retention":      {func(s *Settings) { s.OperationalSampleRetentionDays = 0 }, "retention"},
+		"backup hour":           {func(s *Settings) { s.BackupHour = 24 }, "backup_schedule"},
+		"backup minute":         {func(s *Settings) { s.BackupMinute = 60 }, "backup_schedule"},
+		"backup timezone":       {func(s *Settings) { s.BackupTimezone = "UTC" }, "backup_schedule"},
+		"disk threshold":        {func(s *Settings) { s.DiskCriticalPercent = s.DiskWarningPercent }, "threshold"},
+		"AI threshold":          {func(s *Settings) { s.AIErrorCriticalPercent = s.AIErrorWarningPercent }, "threshold"},
+		"queue threshold":       {func(s *Settings) { s.ProcessingQueueCritical = s.ProcessingQueueWarning }, "threshold"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			settings := validSettings()
+			settings.SiteAnnouncement = "submitted-marker-must-not-leak"
+			tc.mutate(&settings)
+			if _, err := service.UpdateSettings(ctx, admin, settings); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("rejection error=%v", err)
+			}
+			var metadata []byte
+			if err := pool.QueryRow(ctx, `
+SELECT metadata FROM audit_logs
+WHERE action='operations.settings_rejected'
+  AND target_type='system_settings' AND target_id='global'
+  AND actor_user_id=$1 AND request_id=$2 AND ip=$3
+ORDER BY id DESC LIMIT 1`,
+				admin.User.ID, admin.RequestID, admin.IP).Scan(&metadata); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(metadata, []byte(`"category": "high_risk"`)) ||
+				!bytes.Contains(metadata, []byte(`"reason": "`+tc.reason+`"`)) {
+				t.Fatalf("unexpected rejection metadata=%s", metadata)
+			}
+			if bytes.Contains(metadata, []byte(settings.SiteAnnouncement)) ||
+				bytes.Contains(metadata, []byte(settings.SiteName)) ||
+				bytes.Contains(metadata, []byte("365")) {
+				t.Fatalf("settings values leaked in rejection metadata=%s", metadata)
+			}
+		})
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT version FROM system_settings WHERE singleton_id=true`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 {
+		t.Fatalf("rejected settings mutated version=%d", version)
 	}
 }
 
@@ -386,11 +504,30 @@ FROM operational_modes WHERE singleton_id=true`).
 	if mode != "backup" || owner != oldOwner || !bytes.Equal(hash, oldHash[:]) || version != 8 {
 		t.Fatalf("takeover escaped rollback: mode=%q owner=%s hash=%x version=%d", mode, owner, hash, version)
 	}
-	release, err := store.AcquireShared(ctx)
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		t.Fatalf("failed takeover retained exclusive lock: %v", err)
+		t.Fatal(err)
 	}
-	release()
+	var acquired bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, operationsAdvisoryKey).Scan(&acquired); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	if !acquired {
+		conn.Release()
+		t.Fatal("failed takeover retained exclusive advisory lock")
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, operationsAdvisoryKey); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	conn.Release()
+	if release, err := store.AcquireShared(ctx); !errors.Is(err, ErrLeaseHeld) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("durable non-normal mode did not fail closed: %v", err)
+	}
 }
 
 func TestPostgresLeaseRejectsStaleOwnerWithoutClearingCurrentLease(t *testing.T) {
@@ -460,7 +597,7 @@ SELECT count(*) FROM pg_stat_activity WHERE pid=$1`, backendPID).
 	}
 }
 
-func TestCanceledLeaseMutationReleasesExclusiveSession(t *testing.T) {
+func TestCanceledLeaseMutationRetainsExclusiveSessionAndCanRetry(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
 	store := NewPostgresStore(pool)
@@ -479,38 +616,222 @@ SET mode='normal',owner_id=NULL,lease_token_hash=NULL,lease_expires_at=NULL,
 WHERE singleton_id=true`)
 	})
 
-	blocker, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := blocker.Exec(ctx, `
-SELECT singleton_id FROM operational_modes WHERE singleton_id=true FOR UPDATE`); err != nil {
-		_ = blocker.Rollback(ctx)
-		t.Fatal(err)
-	}
-	canceled, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	if _, err := store.RenewLease(canceled, lease, time.Now().UTC().Add(2*time.Minute)); !errors.Is(err, context.DeadlineExceeded) {
-		_ = blocker.Rollback(ctx)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := store.RenewLease(canceled, lease, time.Now().UTC().Add(2*time.Minute)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("renew error=%v", err)
-	}
-	if err := blocker.Rollback(ctx); err != nil {
-		t.Fatal(err)
 	}
 	store.mu.Lock()
 	heldSessions := len(store.sessions)
 	store.mu.Unlock()
-	if heldSessions != 0 {
+	if heldSessions != 1 {
 		t.Fatalf("canceled mutation retained %d lease session entries", heldSessions)
 	}
 
-	probeCtx, probeCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	probeCtx, probeCancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer probeCancel()
-	release, err := store.AcquireShared(probeCtx)
-	if err != nil {
-		t.Fatalf("canceled mutation retained exclusive session: %v", err)
+	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("canceled mutation opened shared gate: %v", err)
 	}
-	release()
+	mode, err := store.GetMode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode.Mode != "draining" || mode.OwnerID != lease.OwnerID {
+		t.Fatalf("canceled mutation changed durable mode: %#v", mode)
+	}
+	renewed, err := store.RenewLease(ctx, lease, time.Now().UTC().Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("retry renew: %v", err)
+	}
+	if err := store.ReleaseLease(ctx, renewed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledLeaseReleaseRetainsExclusiveSessionAndCanRetry(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "backup", OwnerID: uuid.New(), ExpiresAt: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := store.ReleaseLease(canceled, lease); !errors.Is(err, context.Canceled) {
+		t.Fatalf("release error=%v", err)
+	}
+	mode, err := store.GetMode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode.Mode != "backup" || mode.OwnerID != lease.OwnerID {
+		t.Fatalf("canceled release changed non-normal mode: %#v", mode)
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer probeCancel()
+	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("canceled release opened shared gate: %v", err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenewLeasePreservesCurrentTransitionedMode(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	original, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitioned, err := store.TransitionLease(ctx, original, "backup", time.Now().UTC().Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), transitioned) })
+
+	renewed, err := store.RenewLease(ctx, original, time.Now().UTC().Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Mode != "backup" {
+		t.Fatalf("renewal reverted current mode: %#v", renewed)
+	}
+	mode, err := store.GetMode(ctx)
+	if err != nil || mode.Mode != "backup" {
+		t.Fatalf("durable mode=%#v err=%v", mode, err)
+	}
+	if err := store.ReleaseLease(ctx, renewed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpiredLeaseOwnerCannotRenewAndTakeoverCanAcquire(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	oldStore := NewPostgresStore(pool)
+	expiresAt := time.Now().UTC().Add(150 * time.Millisecond)
+	oldLease, err := oldStore.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = oldStore.ReleaseLease(context.Background(), oldLease) })
+	timer := time.NewTimer(time.Until(expiresAt) + 50*time.Millisecond)
+	defer timer.Stop()
+	<-timer.C
+
+	sharedCtx, sharedCancel := context.WithTimeout(ctx, time.Second)
+	defer sharedCancel()
+	if release, err := oldStore.AcquireShared(sharedCtx); !errors.Is(err, ErrLeaseHeld) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("shared gate did not fail closed after expiry: %v", err)
+	}
+	newStore := NewPostgresStore(pool)
+	takeoverCtx, takeoverCancel := context.WithTimeout(ctx, time.Second)
+	defer takeoverCancel()
+	takeover, err := newStore.AcquireLease(takeoverCtx, LeaseRequest{
+		Mode: "release", OwnerID: uuid.New(), ExpiresAt: time.Now().UTC().Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("takeover after stale renewal: %v", err)
+	}
+	if takeover.Mode != "release" || takeover.OwnerID == oldLease.OwnerID {
+		t.Fatalf("takeover=%#v", takeover)
+	}
+	if _, err := oldStore.RenewLease(ctx, oldLease, time.Now().UTC().Add(2*time.Minute)); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("expired owner renewal error=%v", err)
+	}
+	if err := newStore.ReleaseLease(ctx, takeover); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenewedLeaseIgnoresAlreadyWaitingExpiryCallback(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), lease) })
+	tokenHash := sha256.Sum256(lease.Token)
+	store.mu.Lock()
+	session := store.sessions[tokenHash]
+	store.mu.Unlock()
+	if session == nil {
+		t.Fatal("missing acquired lease session")
+	}
+
+	session.mu.Lock()
+	store.scheduleLeaseExpiryLocked(tokenHash, session, time.Now().UTC().Add(40*time.Millisecond))
+	newExpiry := time.Now().UTC().Add(300 * time.Millisecond)
+	type renewResult struct {
+		lease Lease
+		err   error
+	}
+	renewed := make(chan renewResult, 1)
+	go func() {
+		next, err := store.RenewLease(ctx, lease, newExpiry)
+		renewed <- renewResult{lease: next, err: err}
+	}()
+	time.Sleep(80 * time.Millisecond)
+	session.mu.Unlock()
+
+	var result renewResult
+	select {
+	case result = <-renewed:
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not complete")
+	}
+	if result.err != nil {
+		t.Fatalf("renew lease: %v", result.err)
+	}
+	lease = result.lease
+	time.Sleep(30 * time.Millisecond)
+	store.mu.Lock()
+	_, retained := store.sessions[tokenHash]
+	store.mu.Unlock()
+	if !retained {
+		t.Fatal("stale expiry callback released the rescheduled lease")
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer probeCancel()
+	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("stale expiry callback opened shared gate: %v", err)
+	}
+
+	timer := time.NewTimer(time.Until(newExpiry) + 50*time.Millisecond)
+	defer timer.Stop()
+	<-timer.C
+	store.mu.Lock()
+	_, retained = store.sessions[tokenHash]
+	store.mu.Unlock()
+	if retained {
+		t.Fatal("rescheduled lease remained after its new expiry")
+	}
 }
 
 func validSettings() Settings {
@@ -578,6 +899,9 @@ VALUES($1,$2,'Operations Admin','admin','active','x',false)`,
 type fakeStore struct {
 	settings              Settings
 	getCalls, updateCalls int
+	rejectionCalls        int
+	rejectionReason       string
+	rejectionErr          error
 }
 
 func (s *fakeStore) GetSettings(context.Context) (Settings, error) {
@@ -587,6 +911,11 @@ func (s *fakeStore) GetSettings(context.Context) (Settings, error) {
 func (s *fakeStore) UpdateSettings(_ context.Context, _ Principal, settings Settings) (Settings, error) {
 	s.updateCalls++
 	return settings, nil
+}
+func (s *fakeStore) AuditSettingsRejection(_ context.Context, _ Principal, reason string) error {
+	s.rejectionCalls++
+	s.rejectionReason = reason
+	return s.rejectionErr
 }
 func (*fakeStore) GetMode(context.Context) (ModeSnapshot, error) { return ModeSnapshot{}, nil }
 func (*fakeStore) AcquireLease(context.Context, LeaseRequest) (Lease, error) {

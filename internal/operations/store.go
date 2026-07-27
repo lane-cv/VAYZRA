@@ -42,6 +42,15 @@ type WriteGate interface {
 	AcquireShared(context.Context) (release func(), err error)
 }
 
+type SettingsRejectionAuditor interface {
+	AuditSettingsRejection(context.Context, Principal, string) error
+}
+
+type ServiceStore interface {
+	Store
+	SettingsRejectionAuditor
+}
+
 type HTTPService interface {
 	GetSettings(context.Context, Principal) (Settings, error)
 	UpdateSettings(context.Context, Principal, Settings) (Settings, error)

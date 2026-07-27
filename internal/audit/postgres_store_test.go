@@ -81,6 +81,39 @@ func TestOperationsSystemAuditActorExceptionIsExact(t *testing.T) {
 	}
 }
 
+func TestOperationsSettingsRejectionAuditAllowsOnlyRedactedClassification(t *testing.T) {
+	event := Event{
+		ActorUserID: uuid.New(), Action: "operations.settings_rejected",
+		TargetType: "system_settings", TargetID: "global",
+		Metadata:  map[string]any{"category": "high_risk", "reason": "retention"},
+		RequestID: "operations-rejection", IP: net.ParseIP("192.0.2.41"),
+	}
+	if _, err := validateAndMarshal(event); err != nil {
+		t.Fatalf("redacted rejection event rejected: %v", err)
+	}
+	for name, metadata := range map[string]map[string]any{
+		"submitted value":  {"category": "high_risk", "reason": "retention", "value": "0"},
+		"prior value":      {"category": "high_risk", "reason": "retention", "prior": "365"},
+		"unknown reason":   {"category": "high_risk", "reason": "timezone"},
+		"unknown category": {"category": "invalid", "reason": "retention"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := event
+			changed.Metadata = metadata
+			if _, err := validateAndMarshal(changed); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("unsafe rejection metadata error=%v", err)
+			}
+		})
+	}
+	for _, reason := range []string{"retention", "backup_schedule", "threshold"} {
+		changed := event
+		changed.Metadata = map[string]any{"category": "high_risk", "reason": reason}
+		if _, err := validateAndMarshal(changed); err != nil {
+			t.Fatalf("approved reason %q rejected: %v", reason, err)
+		}
+	}
+}
+
 func TestPostgresWriterListsSystemEventWithNilActor(t *testing.T) {
 	pool := integration.StartPostgres(t)
 	ctx := context.Background()
