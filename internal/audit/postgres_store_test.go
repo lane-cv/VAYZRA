@@ -43,6 +43,72 @@ func TestPostgresWriterSanitizesAndAuditRowsAreImmutable(t *testing.T) {
 	}
 }
 
+func TestOperationsSystemAuditActorExceptionIsExact(t *testing.T) {
+	event := Event{
+		Action: "operations.lease_taken_over", TargetType: "operational_mode",
+		TargetID: "global", Metadata: map[string]any{},
+		RequestID: "operations-lease-takeover", IP: net.ParseIP("127.0.0.1"),
+	}
+	if _, err := validateAndMarshal(event); err != nil {
+		t.Fatalf("exact system event rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Event){
+		"action":      func(e *Event) { e.Action = "operations.settings_updated" },
+		"target type": func(e *Event) { e.TargetType = "system_settings" },
+		"target ID":   func(e *Event) { e.TargetID = "other" },
+		"request ID":  func(e *Event) { e.RequestID = "other-system-request" },
+		"IP":          func(e *Event) { e.IP = net.ParseIP("127.0.0.2") },
+		"metadata":    func(e *Event) { e.Metadata = map[string]any{"token": "secret"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := event
+			mutate(&changed)
+			if _, err := validateAndMarshal(changed); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("inexact system event error=%v", err)
+			}
+		})
+	}
+	for action, targetType := range allowedTargetTypes {
+		if action == event.Action {
+			continue
+		}
+		candidate := event
+		candidate.Action = action
+		candidate.TargetType = targetType
+		if systemActorAllowed(candidate) {
+			t.Fatalf("nil actor allowed for non-system action %q", action)
+		}
+	}
+}
+
+func TestPostgresWriterListsSystemEventWithNilActor(t *testing.T) {
+	pool := integration.StartPostgres(t)
+	ctx := context.Background()
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE audit_logs"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		Action: "operations.lease_taken_over", TargetType: "operational_mode",
+		TargetID: "global", Metadata: map[string]any{},
+		RequestID: "operations-lease-takeover", IP: net.ParseIP("127.0.0.1"),
+	}
+	writer := NewPostgresWriter(pool)
+	if err := writer.Write(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	records, err := writer.List(ctx, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].ActorUserID != uuid.Nil ||
+		records[0].Action != event.Action {
+		t.Fatalf("records=%#v", records)
+	}
+}
+
 func TestQandaStudentAuditEventsAcceptOnlySafeCounts(t *testing.T) {
 	base := Event{
 		ActorUserID: uuid.New(), TargetType: "qa_thread", TargetID: uuid.NewString(),

@@ -29,7 +29,11 @@ func (s *PostgresWriter) Write(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(ctx, `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, metadata, request_id, ip) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`, event.ActorUserID, event.Action, event.TargetType, event.TargetID, metadata, event.RequestID, event.IP)
+	var actorUserID any = event.ActorUserID
+	if event.ActorUserID == uuid.Nil {
+		actorUserID = nil
+	}
+	_, err = s.db.Exec(ctx, `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, metadata, request_id, ip) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`, actorUserID, event.Action, event.TargetType, event.TargetID, metadata, event.RequestID, event.IP)
 	if err != nil {
 		return fmt.Errorf("write audit event: %w", err)
 	}
@@ -57,8 +61,12 @@ func (s *PostgresWriter) List(ctx context.Context, limit int, beforeID int64) ([
 		var record Record
 		var metadata []byte
 		var ip net.IP
-		if err := rows.Scan(&record.ID, &record.ActorUserID, &record.Action, &record.TargetType, &record.TargetID, &metadata, &record.RequestID, &ip, &record.OccurredAt); err != nil {
+		var actorUserID *uuid.UUID
+		if err := rows.Scan(&record.ID, &actorUserID, &record.Action, &record.TargetType, &record.TargetID, &metadata, &record.RequestID, &ip, &record.OccurredAt); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
+		}
+		if actorUserID != nil {
+			record.ActorUserID = *actorUserID
 		}
 		if err := json.Unmarshal(metadata, &record.Metadata); err != nil {
 			return nil, fmt.Errorf("decode audit metadata: %w", err)
@@ -74,7 +82,7 @@ func (s *PostgresWriter) List(ctx context.Context, limit int, beforeID int64) ([
 }
 
 func validateAndMarshal(event Event) ([]byte, error) {
-	if event.ActorUserID == [16]byte{} || !identifier.MatchString(event.Action) || !identifier.MatchString(event.TargetType) || strings.TrimSpace(event.TargetID) == "" || len(event.TargetID) > 128 || strings.TrimSpace(event.RequestID) == "" || len(event.RequestID) > 64 || event.IP == nil {
+	if (event.ActorUserID == uuid.Nil && !systemActorAllowed(event)) || !identifier.MatchString(event.Action) || !identifier.MatchString(event.TargetType) || strings.TrimSpace(event.TargetID) == "" || len(event.TargetID) > 128 || strings.TrimSpace(event.RequestID) == "" || len(event.RequestID) > 64 || event.IP == nil {
 		return nil, ErrInvalidEvent
 	}
 	allowed, ok := allowedMetadata[event.Action]
@@ -128,6 +136,15 @@ func validateAndMarshal(event Event) ([]byte, error) {
 	return json.Marshal(event.Metadata)
 }
 
+func systemActorAllowed(event Event) bool {
+	return event.Action == "operations.lease_taken_over" &&
+		event.TargetType == "operational_mode" &&
+		event.TargetID == "global" &&
+		len(event.Metadata) == 0 &&
+		event.RequestID == "operations-lease-takeover" &&
+		event.IP.Equal(net.ParseIP("127.0.0.1"))
+}
+
 func safeQAStatus(status string) bool {
 	switch status {
 	case "pending", "in_progress", "waiting_student", "completed":
@@ -147,7 +164,8 @@ var allowedMetadata = map[string]map[string]bool{
 	"qa.thread_created": {"messageCount": true, "attachmentCount": true}, "qa.student_followed_up": {"messageCount": true, "attachmentCount": true},
 	"qa.admin_replied": {"messageCount": true, "attachmentCount": true, "oldStatus": true, "newStatus": true}, "qa.status_changed": {"oldStatus": true, "newStatus": true}, "qa.teacher_note_added": {"noteCount": true},
 	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.provider_tested": {"providerId": true, "protocol": true, "ok": true, "errorCategory": true, "latencyMs": true}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
-	"ai.file_access_rejected": {"reason": true},
+	"ai.file_access_rejected":     {"reason": true},
+	"operations.settings_updated": {}, "operations.lease_taken_over": {},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -159,7 +177,8 @@ var allowedTargetTypes = map[string]string{
 	"file.processing_artifact_cleanup_scheduled": "file_version", "file.processing_artifact_cleanup_completed": "file_version",
 	"qa.thread_created": "qa_thread", "qa.student_followed_up": "qa_thread", "qa.admin_replied": "qa_thread", "qa.status_changed": "qa_thread", "qa.teacher_note_added": "qa_thread",
 	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
-	"ai.file_access_rejected": "ai_file_request",
+	"ai.file_access_rejected":     "ai_file_request",
+	"operations.settings_updated": "system_settings", "operations.lease_taken_over": "operational_mode",
 }
 
 func validAIEvent(e Event) bool {
