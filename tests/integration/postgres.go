@@ -11,12 +11,28 @@ import (
 const defaultPostgresURL = "postgres://happylearn:happylearn_dev@127.0.0.1:54329/happylearn?sslmode=disable"
 
 func StartPostgres(t *testing.T) *pgxpool.Pool {
+	return startPostgres(t, 0)
+}
+
+func StartPostgresWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+	return startPostgres(t, maxConns)
+}
+
+func startPostgres(t *testing.T, maxConns int32) *pgxpool.Pool {
 	t.Helper()
 	url := os.Getenv("HAPPYLEARN_TEST_DATABASE_URL")
 	if url == "" {
 		url = defaultPostgresURL
 	}
-	pool, err := pgxpool.New(context.Background(), url)
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("parse postgres test pool config: %v", err)
+	}
+	if maxConns > 0 {
+		config.MaxConns = maxConns
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		t.Fatalf("open postgres test pool: %v", err)
 	}

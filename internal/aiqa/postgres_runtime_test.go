@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"happylearn.local/app/internal/auth"
@@ -543,7 +544,7 @@ func TestPostgresRuntimeAnomalyStoresActualAndBlocksModel(t *testing.T) {
 
 func TestPostgresRuntimeAnomalySettlementBlocksCrossStudentAdmission(t *testing.T) {
 	ctx := context.Background()
-	pool := integration.StartPostgres(t)
+	pool := integration.StartPostgresWithMaxConns(t, 4)
 	if err := database.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +602,7 @@ EXECUTE FUNCTION aiqa_test_pause_anomaly()`); err != nil {
 		}, now.Add(time.Second))
 		settleDone <- settleErr
 	}()
-	waitForDatabaseWait(t, ctx, pool, "advisory", "UPDATE ai_models SET quota_blocked_at")
+	waitForDatabaseWait(t, ctx, blocker, "advisory", "UPDATE ai_models SET quota_blocked_at")
 
 	admissionDone := make(chan error, 1)
 	go func() {
@@ -611,7 +612,7 @@ EXECUTE FUNCTION aiqa_test_pause_anomaly()`); err != nil {
 		_, _, admissionErr := store.AdmitRun(ctx, other)
 		admissionDone <- admissionErr
 	}()
-	waitForDatabaseWait(t, ctx, pool, "transactionid", "FROM ai_models WHERE id")
+	waitForDatabaseWait(t, ctx, blocker, "transactionid", "FROM ai_models WHERE id")
 
 	if _, err = blocker.Exec(ctx, `SELECT pg_advisory_unlock($1)`, pauseLock); err != nil {
 		t.Fatal(err)
@@ -625,12 +626,14 @@ EXECUTE FUNCTION aiqa_test_pause_anomaly()`); err != nil {
 	}
 }
 
-func waitForDatabaseWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, event, queryFragment string) {
+func waitForDatabaseWait(t *testing.T, ctx context.Context, querier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, event, queryFragment string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var found bool
-		err := pool.QueryRow(ctx, `SELECT EXISTS(
+		err := querier.QueryRow(ctx, `SELECT EXISTS(
 SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() AND wait_event=$1 AND query LIKE '%'||$2||'%'
 )`, event, queryFragment).Scan(&found)
 		if err != nil {
