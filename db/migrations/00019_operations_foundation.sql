@@ -55,7 +55,7 @@ CREATE TABLE operational_modes (
       AND lease_expires_at IS NULL AND entered_at IS NULL)
     OR
     (mode<>'normal' AND owner_id IS NOT NULL
-      AND octet_length(lease_token_hash)=32
+      AND lease_token_hash IS NOT NULL AND octet_length(lease_token_hash)=32
       AND lease_expires_at IS NOT NULL AND entered_at IS NOT NULL))
 );
 INSERT INTO operational_modes(singleton_id) VALUES(true);

@@ -2,8 +2,10 @@ package database_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
@@ -12,6 +14,14 @@ func TestOperationsFoundationMigrationContracts(t *testing.T) {
 	pool := integration.StartPostgres(t)
 	ctx := context.Background()
 	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
+	registerMigrationProviderCleanup(t, provider, closeProvider)
+	if _, err := provider.DownTo(ctx, 18); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -44,9 +54,19 @@ WHERE schemaname='public' AND indexname IN ('system_settings_pkey','operational_
 	if indexes != 2 {
 		t.Fatalf("indexes=%d", indexes)
 	}
+	if _, err := pool.Exec(ctx, `
+UPDATE operational_modes
+SET mode='draining', owner_id=gen_random_uuid(), lease_token_hash=NULL,
+    lease_expires_at=now(), entered_at=now()
+WHERE singleton_id=true`); err == nil {
+		t.Fatal("lease shape constraint accepted a maintenance mode without a lease hash")
+	} else {
+		var postgresErr *pgconn.PgError
+		if !errors.As(err, &postgresErr) || postgresErr.Code != "23514" || postgresErr.ConstraintName != "operational_modes_lease_shape_check" {
+			t.Fatalf("expected lease shape check violation, got %v", err)
+		}
+	}
 
-	provider, closeProvider := migrationProvider(t, pool.Config().ConnString())
-	registerMigrationProviderCleanup(t, provider, closeProvider)
 	if _, err := provider.DownTo(ctx, 18); err != nil {
 		t.Fatal(err)
 	}
