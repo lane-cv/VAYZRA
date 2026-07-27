@@ -133,7 +133,7 @@ line_is "$probe_done_line" '          done'
 test "$minio_probe_name_line" -eq "$((probe_done_line + 1))" ||
   fail "authenticated MinIO readiness must immediately follow host-port verification"
 line_is "$minio_probe_run_line" '        run: |'
-line_is "$minio_probe_command_line" "          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'mc alias set local http://127.0.0.1:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null; until mc ls local >/dev/null 2>&1; do sleep 1; done'"
+line_is "$minio_probe_command_line" "          timeout 30 docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml exec -T minio /bin/sh -ceu 'until mc alias set local http://127.0.0.1:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1; do sleep 1; done' || { echo 'MinIO did not accept an authenticated ListBuckets request within 30s.' >&2; exit 1; }"
 test "$go_test_line" -gt "$minio_probe_command_line" ||
   fail "ordinary Go tests must follow authenticated MinIO readiness"
 test "$go_race_test_line" -gt "$go_test_line" ||
