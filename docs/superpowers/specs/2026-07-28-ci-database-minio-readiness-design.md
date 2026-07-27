@@ -23,8 +23,8 @@ by CI scheduling rather than a deterministic runtime-store deadlock.
 Run both ordinary and race-enabled repository tests with `-p 1`:
 
 ```sh
-go test -p 1 ./... -count=1
-go test -race -p 1 ./... -count=1
+GOFLAGS='' go test -p 1 ./... -count=1
+GOFLAGS='' go test -race -p 1 ./... -count=1
 ```
 
 This aligns package scheduling with the repository's existing global PostgreSQL
