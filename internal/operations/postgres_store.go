@@ -30,18 +30,34 @@ type leaseSession struct {
 	released         bool
 }
 
+type sharedSession struct {
+	once sync.Once
+	conn *pgxpool.Conn
+}
+
 type PostgresStore struct {
 	pool *pgxpool.Pool
 
-	mu       sync.Mutex
-	sessions map[[32]byte]*leaseSession
-	closed   bool
+	mu             sync.Mutex
+	sessions       map[[32]byte]*leaseSession
+	sharedSessions map[uint64]*sharedSession
+	nextSharedID   uint64
+	closed         bool
+	lifecycleCtx   context.Context
+	lifecycleStop  context.CancelFunc
+	admitted       sync.WaitGroup
+
+	afterCommit func(string, *pgxpool.Conn) error
 }
 
 func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
+	lifecycleCtx, lifecycleStop := context.WithCancel(context.Background())
 	return &PostgresStore{
-		pool:     pool,
-		sessions: make(map[[32]byte]*leaseSession),
+		pool:           pool,
+		sessions:       make(map[[32]byte]*leaseSession),
+		sharedSessions: make(map[uint64]*sharedSession),
+		lifecycleCtx:   lifecycleCtx,
+		lifecycleStop:  lifecycleStop,
 	}
 }
 
@@ -213,35 +229,47 @@ FROM operational_modes WHERE singleton_id=true`).
 }
 
 func (s *PostgresStore) AcquireShared(ctx context.Context) (func(), error) {
-	if s.leaseStoreClosed() {
-		return nil, errStoreClosed
-	}
-	conn, err := s.pool.Acquire(ctx)
+	waitCtx, _, done, err := s.admit(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock_shared($1)`, operationsAdvisoryKey); err != nil {
-		releaseSharedConnection(conn)
-		return nil, err
+	defer done()
+	conn, err := s.pool.Acquire(waitCtx)
+	if err != nil {
+		return nil, s.mapLifecycleError(err)
+	}
+	if _, err := conn.Exec(waitCtx, `SELECT pg_advisory_lock_shared($1)`, operationsAdvisoryKey); err != nil {
+		closeHijackedConnection(conn)
+		return nil, s.mapLifecycleError(err)
 	}
 	var mode string
-	if err := conn.QueryRow(ctx, `
+	if err := conn.QueryRow(waitCtx, `
 SELECT mode FROM operational_modes WHERE singleton_id=true`).Scan(&mode); err != nil {
 		releaseSharedConnection(conn)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrConflict
 		}
-		return nil, err
+		return nil, s.mapLifecycleError(err)
 	}
 	if mode != "normal" {
 		releaseSharedConnection(conn)
 		return nil, ErrLeaseHeld
 	}
-	var once sync.Once
+	shared := &sharedSession{conn: conn}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		releaseSharedConnection(conn)
+		return nil, errStoreClosed
+	}
+	s.nextSharedID++
+	id := s.nextSharedID
+	s.sharedSessions[id] = shared
+	s.mu.Unlock()
 	return func() {
-		once.Do(func() {
-			releaseSharedConnection(conn)
-		})
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s.releaseSharedSession(releaseCtx, id, shared)
 	}, nil
 }
 
@@ -249,11 +277,13 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, request LeaseRequest) 
 	if !maintenanceMode(request.Mode) || request.OwnerID == uuid.Nil {
 		return Lease{}, ErrInvalid
 	}
-	if s.leaseStoreClosed() {
-		return Lease{}, errStoreClosed
-	}
-	if err := s.preflightLeaseAvailability(ctx); err != nil {
+	waitCtx, lifecycleCtx, done, err := s.admit(ctx)
+	if err != nil {
 		return Lease{}, err
+	}
+	defer done()
+	if err := s.preflightLeaseAvailability(waitCtx); err != nil {
+		return Lease{}, s.mapLifecycleError(err)
 	}
 
 	token := make([]byte, 32)
@@ -261,9 +291,9 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, request LeaseRequest) 
 		return Lease{}, err
 	}
 	tokenHash := sha256.Sum256(token)
-	conn, err := s.pool.Acquire(ctx)
+	conn, err := s.pool.Acquire(waitCtx)
 	if err != nil {
-		return Lease{}, err
+		return Lease{}, s.mapLifecycleError(err)
 	}
 	lockAttempted := false
 	keepConnection := false
@@ -277,18 +307,18 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, request LeaseRequest) 
 		}
 	}()
 	lockAttempted = true
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, operationsAdvisoryKey); err != nil {
-		return Lease{}, err
+	if _, err := conn.Exec(waitCtx, `SELECT pg_advisory_lock($1)`, operationsAdvisoryKey); err != nil {
+		return Lease{}, s.mapLifecycleError(err)
 	}
-	if err := ctx.Err(); err != nil {
-		return Lease{}, err
+	if err := waitCtx.Err(); err != nil {
+		return Lease{}, s.mapLifecycleError(err)
 	}
 
-	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	dbCtx, cancel := context.WithTimeout(lifecycleCtx, 3*time.Second)
 	defer cancel()
 	tx, err := conn.Begin(dbCtx)
 	if err != nil {
-		return Lease{}, err
+		return Lease{}, s.mapLifecycleError(err)
 	}
 	defer tx.Rollback(dbCtx)
 	var currentMode string
@@ -298,13 +328,13 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, request LeaseRequest) 
 	var currentVersion int64
 	if err := tx.QueryRow(dbCtx, `
 SELECT mode,owner_id,lease_token_hash,lease_expires_at,version
-FROM operational_modes WHERE singleton_id=true FOR UPDATE`).
+	FROM operational_modes WHERE singleton_id=true FOR UPDATE`).
 		Scan(&currentMode, &currentOwner, &currentHash, &currentExpiry, &currentVersion); err != nil {
-		return Lease{}, mapLeaseError(err)
+		return Lease{}, s.mapLifecycleError(mapLeaseError(err))
 	}
 	var databaseNow time.Time
 	if err := tx.QueryRow(dbCtx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
-		return Lease{}, mapLeaseError(err)
+		return Lease{}, s.mapLifecycleError(mapLeaseError(err))
 	}
 	if !request.ExpiresAt.After(databaseNow) {
 		return Lease{}, ErrInvalid
@@ -325,7 +355,7 @@ WHERE singleton_id=true AND version=$5
 RETURNING lease_expires_at,version`,
 		request.Mode, request.OwnerID, tokenHash[:], request.ExpiresAt, currentVersion,
 	).Scan(&lease.ExpiresAt, &lease.Version); err != nil {
-		return Lease{}, mapLeaseError(err)
+		return Lease{}, s.mapLifecycleError(mapLeaseError(err))
 	}
 	if takeover {
 		if err := audit.NewPostgresWriter(tx).Write(dbCtx, audit.Event{
@@ -336,27 +366,38 @@ RETURNING lease_expires_at,version`,
 			RequestID:  "operations-lease-takeover",
 			IP:         net.IPv4(127, 0, 0, 1).To4(),
 		}); err != nil {
-			return Lease{}, err
+			return Lease{}, s.mapLifecycleError(err)
 		}
 	}
-	remaining := lease.ExpiresAt.Sub(databaseNow)
-	if commitErr := tx.Commit(dbCtx); commitErr != nil {
-		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer reconcileCancel()
-		reconciledConn, reconciledRemaining, matched, reconcileErr :=
-			s.reconcileAcquiredLease(reconcileCtx, conn, lease, tokenHash)
-		conn = reconciledConn
-		if conn == nil {
-			keepConnection = true
-		}
-		if reconcileErr != nil || !matched {
-			return Lease{}, mapLeaseError(commitErr)
-		}
-		remaining = reconciledRemaining
+	commitErr := s.commitLeaseTx(dbCtx, "acquire", tx, conn)
+	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer reconcileCancel()
+	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, conn)
+	conn = reconciledConn
+	if conn == nil {
+		keepConnection = true
 	}
-	lease.ExpiresAt = lease.ExpiresAt.UTC()
+	if reconcileErr != nil {
+		if commitErr != nil {
+			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return Lease{}, s.mapLifecycleError(mapLeaseError(reconcileErr))
+	}
+	if !state.ownedBy(lease.OwnerID, tokenHash) ||
+		state.mode != lease.Mode ||
+		state.version != lease.Version ||
+		state.expiresAt == nil ||
+		!state.expiresAt.Equal(lease.ExpiresAt) {
+		if commitErr != nil {
+			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return Lease{}, ErrStaleLease
+	}
+	lease.Mode = state.mode
+	lease.Version = state.version
+	lease.ExpiresAt = state.expiresAt.UTC()
 	keepConnection = true
-	if err := s.registerLeaseSession(tokenHash, lease.OwnerID, conn, remaining); err != nil {
+	if err := s.registerLeaseSession(tokenHash, lease.OwnerID, conn, state.remaining); err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cleanupCancel()
 		_ = normalizeOwnedLease(cleanupCtx, conn, lease.OwnerID, tokenHash)
@@ -366,56 +407,86 @@ RETURNING lease_expires_at,version`,
 	return lease, nil
 }
 
-func (s *PostgresStore) reconcileAcquiredLease(
+func (s *PostgresStore) commitLeaseTx(
+	ctx context.Context,
+	operation string,
+	tx pgx.Tx,
+	conn *pgxpool.Conn,
+) error {
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.afterCommit != nil {
+		return s.afterCommit(operation, conn)
+	}
+	return nil
+}
+
+type leaseDBState struct {
+	mode      string
+	ownerID   *uuid.UUID
+	tokenHash []byte
+	expiresAt *time.Time
+	version   int64
+	remaining time.Duration
+}
+
+func (state leaseDBState) ownedBy(ownerID uuid.UUID, tokenHash [32]byte) bool {
+	return state.ownerID != nil &&
+		*state.ownerID == ownerID &&
+		bytes.Equal(state.tokenHash, tokenHash[:])
+}
+
+func (s *PostgresStore) authoritativeLeaseState(
 	ctx context.Context,
 	conn *pgxpool.Conn,
-	lease Lease,
-	tokenHash [32]byte,
-) (*pgxpool.Conn, time.Duration, bool, error) {
-	remaining, matched, err := acquiredLeaseState(ctx, conn, lease, tokenHash)
+) (*pgxpool.Conn, leaseDBState, error) {
+	state, err := queryLeaseDBState(ctx, conn)
 	if err == nil {
-		return conn, remaining, matched, nil
+		return conn, state, nil
 	}
-
 	closeHijackedConnection(conn)
 	fresh, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, leaseDBState{}, err
 	}
 	if _, err := fresh.Exec(ctx, `SELECT pg_advisory_lock($1)`, operationsAdvisoryKey); err != nil {
 		closeHijackedConnection(fresh)
-		return nil, 0, false, err
+		return nil, leaseDBState{}, err
 	}
-	remaining, matched, err = acquiredLeaseState(ctx, fresh, lease, tokenHash)
+	state, err = queryLeaseDBState(ctx, fresh)
 	if err != nil {
 		releaseExclusiveConnection(fresh)
-		return nil, 0, false, err
+		return nil, leaseDBState{}, err
 	}
-	return fresh, remaining, matched, nil
+	return fresh, state, nil
 }
 
-func acquiredLeaseState(
+func queryLeaseDBState(
 	ctx context.Context,
 	conn *pgxpool.Conn,
-	lease Lease,
-	tokenHash [32]byte,
-) (time.Duration, bool, error) {
+) (leaseDBState, error) {
+	var state leaseDBState
 	var ownerID *uuid.UUID
-	var storedHash []byte
-	var expiresAt *time.Time
 	var databaseNow time.Time
 	if err := conn.QueryRow(ctx, `
-SELECT owner_id,lease_token_hash,lease_expires_at,clock_timestamp()
+SELECT mode,owner_id,lease_token_hash,lease_expires_at,version,clock_timestamp()
 FROM operational_modes WHERE singleton_id=true`).
-		Scan(&ownerID, &storedHash, &expiresAt, &databaseNow); err != nil {
-		return 0, false, err
+		Scan(
+			&state.mode,
+			&ownerID,
+			&state.tokenHash,
+			&state.expiresAt,
+			&state.version,
+			&databaseNow,
+		); err != nil {
+		return leaseDBState{}, err
 	}
-	matched := ownerID != nil && *ownerID == lease.OwnerID &&
-		bytes.Equal(storedHash, tokenHash[:])
-	if !matched || expiresAt == nil {
-		return 0, matched, nil
+	state.ownerID = ownerID
+	if state.expiresAt != nil {
+		state.remaining = state.expiresAt.Sub(databaseNow)
 	}
-	return expiresAt.Sub(databaseNow), true, nil
+	return state, nil
 }
 
 func (s *PostgresStore) preflightLeaseAvailability(ctx context.Context) error {
@@ -446,20 +517,27 @@ func (s *PostgresStore) TransitionLease(ctx context.Context, lease Lease, mode s
 }
 
 func (s *PostgresStore) mutateLease(ctx context.Context, lease Lease, mode string, expiresAt time.Time, transition bool) (Lease, error) {
+	waitCtx, lifecycleCtx, done, err := s.admit(ctx)
+	if err != nil {
+		return Lease{}, err
+	}
+	defer done()
 	tokenHash, session, ok := s.sessionFor(lease)
 	if !ok {
 		return Lease{}, ErrStaleLease
 	}
-	session.mu.Lock()
+	if err := lockMutexContext(waitCtx, &session.mu); err != nil {
+		return Lease{}, s.mapLifecycleError(err)
+	}
 	defer session.mu.Unlock()
 	if session.released {
 		return Lease{}, ErrStaleLease
 	}
-	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-	defer cancel()
-	if err := ctx.Err(); err != nil {
-		return Lease{}, err
+	if err := waitCtx.Err(); err != nil {
+		return Lease{}, s.mapLifecycleError(err)
 	}
+	dbCtx, cancel := context.WithTimeout(lifecycleCtx, 3*time.Second)
+	defer cancel()
 	tx, err := session.conn.Begin(dbCtx)
 	if err != nil {
 		return Lease{}, err
@@ -532,12 +610,47 @@ RETURNING mode,lease_expires_at,version`,
 		}
 		return Lease{}, mapLeaseError(updateErr)
 	}
-	if err := tx.Commit(dbCtx); err != nil {
-		return Lease{}, mapLeaseError(err)
+	operation := "renew"
+	if transition {
+		operation = "transition"
 	}
-	remaining := updated.ExpiresAt.Sub(databaseNow)
-	updated.ExpiresAt = updated.ExpiresAt.UTC()
-	s.scheduleLeaseExpiryLocked(tokenHash, session, remaining)
+	commitErr := s.commitLeaseTx(dbCtx, operation, tx, session.conn)
+	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer reconcileCancel()
+	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, session.conn)
+	if reconciledConn == nil {
+		s.removeSessionLocked(tokenHash, session)
+		if commitErr != nil {
+			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return Lease{}, mapLeaseError(reconcileErr)
+	}
+	session.conn = reconciledConn
+	if reconcileErr != nil {
+		s.releaseSessionLocked(tokenHash, session)
+		if commitErr != nil {
+			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return Lease{}, mapLeaseError(reconcileErr)
+	}
+	if !state.ownedBy(lease.OwnerID, tokenHash) {
+		s.releaseSessionLocked(tokenHash, session)
+		return Lease{}, ErrStaleLease
+	}
+	intendedCommitted := state.mode == updated.Mode &&
+		state.version == updated.Version &&
+		state.expiresAt != nil &&
+		state.expiresAt.Equal(updated.ExpiresAt)
+	s.scheduleLeaseExpiryLocked(tokenHash, session, state.remaining)
+	if !intendedCommitted {
+		if commitErr != nil {
+			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return Lease{}, ErrConflict
+	}
+	updated.Mode = state.mode
+	updated.Version = state.version
+	updated.ExpiresAt = state.expiresAt.UTC()
 	return updated, nil
 }
 
@@ -581,37 +694,130 @@ WHERE singleton_id=true AND owner_id=$1 AND lease_token_hash=$2`,
 	if tag.RowsAffected() != 1 {
 		return false, ErrStaleLease
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, err
-	}
-	s.releaseSessionLocked(tokenHash, session)
-	return true, nil
+	return true, s.commitLeaseTx(ctx, "release", tx, session.conn)
 }
 
 func (s *PostgresStore) ReleaseLease(ctx context.Context, lease Lease) error {
+	waitCtx, lifecycleCtx, done, err := s.admit(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
 	tokenHash, session, ok := s.sessionFor(lease)
 	if !ok {
 		return ErrStaleLease
 	}
-	session.mu.Lock()
+	if err := lockMutexContext(waitCtx, &session.mu); err != nil {
+		return s.mapLifecycleError(err)
+	}
 	defer session.mu.Unlock()
 	if session.released {
 		return ErrStaleLease
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	if err := waitCtx.Err(); err != nil {
+		return s.mapLifecycleError(err)
 	}
-	callerErr := ctx.Err()
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(lifecycleCtx, 3*time.Second)
 	defer cancel()
-	matched, err := s.clearLeaseAndReleaseLocked(cleanupCtx, tokenHash, session, lease)
-	if err != nil {
-		return mapLeaseError(err)
-	}
+	matched, commitErr := s.clearLeaseAndReleaseLocked(cleanupCtx, tokenHash, session, lease)
 	if !matched {
+		if commitErr != nil {
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
 		return ErrStaleLease
 	}
-	return callerErr
+	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer reconcileCancel()
+	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, session.conn)
+	if reconciledConn == nil {
+		s.removeSessionLocked(tokenHash, session)
+		if commitErr != nil {
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return mapLeaseError(reconcileErr)
+	}
+	session.conn = reconciledConn
+	if reconcileErr != nil {
+		s.releaseSessionLocked(tokenHash, session)
+		if commitErr != nil {
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return mapLeaseError(reconcileErr)
+	}
+	if state.mode == "normal" && state.ownerID == nil && state.expiresAt == nil {
+		s.releaseSessionLocked(tokenHash, session)
+		return nil
+	}
+	if state.ownedBy(lease.OwnerID, tokenHash) {
+		s.scheduleLeaseExpiryLocked(tokenHash, session, state.remaining)
+		if commitErr != nil {
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		return ErrConflict
+	}
+	s.releaseSessionLocked(tokenHash, session)
+	return ErrStaleLease
+}
+
+func (s *PostgresStore) admit(
+	callerCtx context.Context,
+) (context.Context, context.Context, func(), error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, nil, nil, errStoreClosed
+	}
+	s.admitted.Add(1)
+	lifecycleCtx := s.lifecycleCtx
+	s.mu.Unlock()
+
+	waitCtx, cancelWait := context.WithCancel(callerCtx)
+	stopLifecycle := context.AfterFunc(lifecycleCtx, cancelWait)
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			stopLifecycle()
+			cancelWait()
+			s.admitted.Done()
+		})
+	}
+	return waitCtx, lifecycleCtx, done, nil
+}
+
+func (s *PostgresStore) mapLifecycleError(err error) error {
+	if s.lifecycleCtx.Err() != nil {
+		return errStoreClosed
+	}
+	return err
+}
+
+func (s *PostgresStore) releaseSharedSession(
+	ctx context.Context,
+	id uint64,
+	session *sharedSession,
+) {
+	session.once.Do(func() {
+		s.mu.Lock()
+		if s.sharedSessions[id] == session {
+			delete(s.sharedSessions, id)
+		}
+		s.mu.Unlock()
+		releaseSharedConnectionWithContext(ctx, session.conn)
+	})
+}
+
+func (s *PostgresStore) waitForAdmissions(ctx context.Context) error {
+	drained := make(chan struct{})
+	go func() {
+		s.admitted.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *PostgresStore) Close(ctx context.Context) error {
@@ -619,6 +825,26 @@ func (s *PostgresStore) Close(ctx context.Context) error {
 		return err
 	}
 	s.closed = true
+	s.lifecycleStop()
+	type sharedEntry struct {
+		id      uint64
+		session *sharedSession
+	}
+	sharedEntries := make([]sharedEntry, 0, len(s.sharedSessions))
+	for id, session := range s.sharedSessions {
+		sharedEntries = append(sharedEntries, sharedEntry{id: id, session: session})
+	}
+	s.mu.Unlock()
+	for _, entry := range sharedEntries {
+		s.releaseSharedSession(ctx, entry.id, entry.session)
+	}
+	if err := s.waitForAdmissions(ctx); err != nil {
+		return err
+	}
+
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return err
+	}
 	type sessionEntry struct {
 		tokenHash [32]byte
 		session   *leaseSession
@@ -693,12 +919,6 @@ func (s *PostgresStore) registerLeaseSession(
 	return nil
 }
 
-func (s *PostgresStore) leaseStoreClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
-}
-
 func normalizeOwnedLease(
 	ctx context.Context,
 	conn *pgxpool.Conn,
@@ -769,6 +989,14 @@ func (s *PostgresStore) releaseSessionLocked(tokenHash [32]byte, session *leaseS
 	if session.released {
 		return
 	}
+	s.removeSessionLocked(tokenHash, session)
+	releaseExclusiveConnection(session.conn)
+}
+
+func (s *PostgresStore) removeSessionLocked(tokenHash [32]byte, session *leaseSession) {
+	if session.released {
+		return
+	}
 	session.released = true
 	if session.timer != nil {
 		session.timer.Stop()
@@ -777,7 +1005,6 @@ func (s *PostgresStore) releaseSessionLocked(tokenHash [32]byte, session *leaseS
 	s.mu.Lock()
 	delete(s.sessions, tokenHash)
 	s.mu.Unlock()
-	releaseExclusiveConnection(session.conn)
 }
 
 func (s *PostgresStore) scheduleLeaseExpiryLocked(tokenHash [32]byte, session *leaseSession, remaining time.Duration) {
@@ -819,10 +1046,14 @@ func maintenanceMode(mode string) bool {
 func releaseSharedConnection(conn *pgxpool.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	releaseSharedConnectionWithContext(ctx, conn)
+}
+
+func releaseSharedConnectionWithContext(ctx context.Context, conn *pgxpool.Conn) {
 	var unlocked bool
 	if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock_shared($1)`, operationsAdvisoryKey).
 		Scan(&unlocked); err != nil || !unlocked {
-		closeHijackedConnection(conn)
+		closeHijackedConnectionWithContext(ctx, conn)
 		return
 	}
 	conn.Release()
@@ -841,15 +1072,18 @@ func releaseExclusiveConnection(conn *pgxpool.Conn) {
 }
 
 func closeHijackedConnection(conn *pgxpool.Conn) {
-	raw := conn.Hijack()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = raw.Close(ctx)
+	closeHijackedConnectionWithContext(ctx, conn)
 }
 
 func closeHijackedConnectionWithContext(ctx context.Context, conn *pgxpool.Conn) {
 	raw := conn.Hijack()
 	_ = raw.Close(ctx)
+	select {
+	case <-raw.PgConn().CleanupDone():
+	case <-ctx.Done():
+	}
 }
 
 func mapSettingsError(err error) error {
