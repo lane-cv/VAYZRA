@@ -105,6 +105,23 @@ const publicReasons = new Set([
 ])
 const publicFilePurposes = new Set(['teaching', 'qa_attachment', 'ai_attachment'])
 const canonicalUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const maxAuditVersion = '9223372036854775807'
+const maxAuditCount = '1000000000'
+
+function boundedAuditInteger(value: unknown, minimum: number, maximum: string): value is number | string {
+  let canonical: string
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0) || value < minimum) return false
+    canonical = String(value)
+  } else if (typeof value === 'string') {
+    if (!/^(0|[1-9]\d*)$/.test(value) || (minimum === 1 && value === '0')) return false
+    canonical = value
+  } else {
+    return false
+  }
+  return canonical.length < maximum.length
+    || (canonical.length === maximum.length && canonical <= maximum)
+}
 
 function parseMetadata(value: unknown): AuditMetadata {
   const source = record(value)
@@ -112,11 +129,12 @@ function parseMetadata(value: unknown): AuditMetadata {
   for (const key of metadataKeys) {
     const field = source[key]
     if (field === undefined) continue
-    if ((key === 'version' || key === 'count') && (
-      (typeof field === 'number' && Number.isInteger(field) && field >= 0)
-      || (typeof field === 'string' && /^(0|[1-9]\d*)$/.test(field))
-    )) {
-      result[key] = field
+    if (key === 'version') {
+      if (boundedAuditInteger(field, 1, maxAuditVersion)) result.version = field
+      continue
+    }
+    if (key === 'count') {
+      if (boundedAuditInteger(field, 0, maxAuditCount)) result.count = field
       continue
     }
     if (typeof field !== 'string' || !field) continue

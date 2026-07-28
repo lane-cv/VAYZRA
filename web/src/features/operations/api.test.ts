@@ -174,6 +174,52 @@ describe('operations API', () => {
     expect(page.items[0]).toMatchObject({ actorId: '', targetId: '', metadata: {} })
     expect(JSON.stringify(page)).not.toContain(secret)
   })
+
+  it('enforces server integer bounds without losing precision', async () => {
+    const metadata = [
+      { version: 0 },
+      { version: '0' },
+      { version: Number.MAX_SAFE_INTEGER + 1 },
+      { version: '9223372036854775808' },
+      { count: 1_000_000_001 },
+      { count: '1000000001' },
+      { version: '9999999999999999999999999999999999999999' },
+      { count: '0000000001' },
+      { version: '+1' },
+      { count: '1.0' },
+      { version: 1 },
+      { version: '9223372036854775807' },
+      { count: 0 },
+      { count: '1000000000' },
+      { version: '1' },
+      { version: Number.MAX_SAFE_INTEGER },
+      { count: '0' },
+      { count: 1_000_000_000 },
+    ]
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: metadata.map((value, index) => ({
+        id: index + 1,
+        action: 'operations.settings_updated',
+        targetType: 'system_settings',
+        metadata: value,
+        occurredAt: '2026-07-28T01:02:03Z',
+      })),
+      meta: {},
+    })))
+
+    const page = await listAudit({})
+    expect(page.items.map((item) => item.metadata)).toStrictEqual([
+      {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+      { version: 1 },
+      { version: '9223372036854775807' },
+      { count: 0 },
+      { count: '1000000000' },
+      { version: '1' },
+      { version: Number.MAX_SAFE_INTEGER },
+      { count: '0' },
+      { count: 1_000_000_000 },
+    ])
+  })
 })
 
 async function readSettingsFrom(value: OperationsSettings): Promise<OperationsSettings> {
