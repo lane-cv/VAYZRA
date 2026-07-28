@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -563,6 +564,7 @@ func (executor Executor) resticBackup(
 	paths []string,
 ) (resticSummary, error) {
 	args := []string{
+		"--no-cache",
 		"backup",
 		"--json",
 		"--quiet",
@@ -618,14 +620,16 @@ func (executor Executor) Verify(
 		return VerifyResult{}, ErrIntegrity
 	}
 	var manifestBytes []byte
-	for _, args := range [][]string{
+	for _, operationArgs := range [][]string{
 		{"check", "--read-data"},
 		{"snapshots", "--json", input.SnapshotID},
 		{"stats", "--json", "--mode=raw-data", input.SnapshotID},
 		{"dump", input.SnapshotID, "manifest.json"},
 	} {
+		operation := operationArgs[0]
+		args := append([]string{"--no-cache"}, operationArgs...)
 		stdoutLimit := CommandOutputLimit
-		if args[0] == "dump" {
+		if operation == "dump" {
 			stdoutLimit = ManifestMaxBytes
 		}
 		result, runErr := executor.config.Runner.Run(ctx, Command{
@@ -649,7 +653,7 @@ func (executor Executor) Verify(
 		if result.ExitCode != 0 {
 			return VerifyResult{}, ErrIntegrity
 		}
-		switch args[0] {
+		switch operation {
 		case "snapshots":
 			if decodeResticSnapshotBinding(
 				result.Stdout,
@@ -757,6 +761,7 @@ func (executor Executor) Sync(
 		return "", ErrRemoteSync
 	}
 	args := []string{
+		"--no-cache",
 		"copy",
 		"--from-repository-file",
 		localRepositoryFile,
@@ -834,9 +839,13 @@ func decodeResticSummary(encoded []byte) (resticSummary, error) {
 }
 
 type resticStats struct {
-	TotalSize      int64 `json:"total_size"`
-	TotalFileCount int64 `json:"total_file_count"`
-	SnapshotsCount int64 `json:"snapshots_count"`
+	TotalSize              *int64   `json:"total_size"`
+	TotalUncompressedSize  *int64   `json:"total_uncompressed_size"`
+	CompressionRatio       *float64 `json:"compression_ratio"`
+	CompressionProgress    *float64 `json:"compression_progress"`
+	CompressionSpaceSaving *float64 `json:"compression_space_saving"`
+	TotalBlobCount         *int64   `json:"total_blob_count"`
+	SnapshotsCount         *int64   `json:"snapshots_count"`
 }
 
 type resticSnapshotBinding struct {
@@ -901,12 +910,36 @@ func decodeResticStats(encoded []byte) error {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&stats); err != nil ||
 		requireJSONEOF(decoder) != nil ||
-		stats.TotalSize < 0 ||
-		stats.TotalFileCount < 0 ||
-		stats.SnapshotsCount != 1 {
+		stats.TotalSize == nil ||
+		stats.TotalUncompressedSize == nil ||
+		stats.CompressionRatio == nil ||
+		stats.CompressionProgress == nil ||
+		stats.CompressionSpaceSaving == nil ||
+		stats.TotalBlobCount == nil ||
+		stats.SnapshotsCount == nil ||
+		*stats.TotalSize < 0 ||
+		*stats.TotalUncompressedSize < 0 ||
+		*stats.TotalBlobCount < 0 ||
+		*stats.SnapshotsCount != 1 ||
+		!finiteNonnegative(*stats.CompressionRatio) ||
+		!finiteRange(*stats.CompressionProgress, 0, 100) ||
+		math.IsNaN(*stats.CompressionSpaceSaving) ||
+		math.IsInf(*stats.CompressionSpaceSaving, 0) ||
+		*stats.CompressionSpaceSaving > 100 {
 		return ErrIntegrity
 	}
 	return nil
+}
+
+func finiteNonnegative(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func finiteRange(value, minimum, maximum float64) bool {
+	return value >= minimum &&
+		value <= maximum &&
+		!math.IsNaN(value) &&
+		!math.IsInf(value, 0)
 }
 
 func mapExecutorRunError(ctx context.Context, err error, safe error) error {

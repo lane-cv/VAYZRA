@@ -108,6 +108,9 @@ func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing
 			}
 			return CommandResult{ExitCode: 0}, nil
 		case "restic":
+			if len(command.Args) < 2 || command.Args[0] != "--no-cache" {
+				t.Fatalf("restic cache is not disabled: %q", command.Args)
+			}
 			return CommandResult{
 				Stdout: []byte(fmt.Sprintf(
 					`{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":0,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":1,"data_added":128,"data_added_packed":96,"total_files_processed":1,"total_bytes_processed":22,"total_duration":0.1,"snapshot_id":%q}`,
@@ -280,9 +283,10 @@ func TestExecutorCleansPlaintextOnFailureAndCancellation(t *testing.T) {
 
 func TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError(t *testing.T) {
 	runner := &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
-		if len(command.Args) < 2 ||
-			command.Args[0] != "check" ||
-			command.Args[1] != "--read-data" {
+		if !slices.Equal(
+			command.Args,
+			[]string{"--no-cache", "check", "--read-data"},
+		) {
 			t.Fatalf("integrity command=%q", command.Args)
 		}
 		return CommandResult{
@@ -413,12 +417,16 @@ func verifyRunner(
 ) *recordingRunner {
 	t.Helper()
 	return &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
+		if len(command.Args) < 2 || command.Args[0] != "--no-cache" {
+			t.Fatalf("restic cache is not disabled: %q", command.Args)
+		}
+		args := command.Args[1:]
 		switch {
-		case slices.Equal(command.Args, []string{"check", "--read-data"}):
+		case slices.Equal(args, []string{"check", "--read-data"}):
 			return CommandResult{ExitCode: 0}, nil
-		case len(command.Args) == 3 &&
-			command.Args[0] == "snapshots" &&
-			command.Args[1] == "--json":
+		case len(args) == 3 &&
+			args[0] == "snapshots" &&
+			args[1] == "--json":
 			return CommandResult{
 				ExitCode: 0,
 				Stdout: []byte(fmt.Sprintf(
@@ -427,23 +435,82 @@ func verifyRunner(
 					mustJSON(t, tags),
 				)),
 			}, nil
-		case len(command.Args) == 4 &&
-			command.Args[0] == "stats" &&
-			command.Args[1] == "--json":
+		case len(args) == 4 &&
+			args[0] == "stats" &&
+			args[1] == "--json":
 			return CommandResult{
 				ExitCode: 0,
-				Stdout:   []byte(`{"total_size":1,"total_file_count":4,"snapshots_count":1}`),
+				Stdout: []byte(
+					`{"total_size":558,"total_uncompressed_size":1837,"compression_ratio":3.292114695340502,"compression_progress":100,"compression_space_saving":69.62438758845944,"total_blob_count":3,"snapshots_count":1}`,
+				),
 			}, nil
-		case len(command.Args) == 3 &&
-			command.Args[0] == "dump" &&
-			command.Args[1] == executorRecoverySnapshotID &&
-			command.Args[2] == "manifest.json":
+		case len(args) == 3 &&
+			args[0] == "dump" &&
+			args[1] == executorRecoverySnapshotID &&
+			args[2] == "manifest.json":
 			return CommandResult{ExitCode: 0, Stdout: append([]byte(nil), manifest...)}, nil
 		default:
 			t.Fatalf("unexpected verify command: %q", command.Args)
 			return CommandResult{}, nil
 		}
 	}}
+}
+
+func TestDecodeResticStatsMatchesRestic0191RawDataSchema(t *testing.T) {
+	const representative = `{"total_size":558,"total_uncompressed_size":1837,"compression_ratio":3.292114695340502,"compression_progress":100,"compression_space_saving":69.62438758845944,"total_blob_count":3,"snapshots_count":1}`
+	if err := decodeResticStats([]byte(representative)); err != nil {
+		t.Fatalf("representative stats: %v", err)
+	}
+	var valid map[string]any
+	if err := json.Unmarshal([]byte(representative), &valid); err != nil {
+		t.Fatal(err)
+	}
+	for key := range valid {
+		t.Run("missing-"+key, func(t *testing.T) {
+			candidate := cloneJSONMap(valid)
+			delete(candidate, key)
+			if decodeResticStats([]byte(mustJSON(t, candidate))) == nil {
+				t.Fatalf("accepted missing %q", key)
+			}
+		})
+		t.Run("null-"+key, func(t *testing.T) {
+			candidate := cloneJSONMap(valid)
+			candidate[key] = nil
+			if decodeResticStats([]byte(mustJSON(t, candidate))) == nil {
+				t.Fatalf("accepted null %q", key)
+			}
+		})
+	}
+	for name, encoded := range map[string]string{
+		"unknown":                 strings.TrimSuffix(representative, "}") + `,"future_field":1}`,
+		"negative-total-size":     strings.Replace(representative, `"total_size":558`, `"total_size":-1`, 1),
+		"negative-uncompressed":   strings.Replace(representative, `"total_uncompressed_size":1837`, `"total_uncompressed_size":-1`, 1),
+		"negative-blob-count":     strings.Replace(representative, `"total_blob_count":3`, `"total_blob_count":-1`, 1),
+		"fractional-total-size":   strings.Replace(representative, `"total_size":558`, `"total_size":1.5`, 1),
+		"overflow-total-size":     strings.Replace(representative, `"total_size":558`, `"total_size":9223372036854775808`, 1),
+		"negative-ratio":          strings.Replace(representative, `"compression_ratio":3.292114695340502`, `"compression_ratio":-1`, 1),
+		"overflow-ratio":          strings.Replace(representative, `"compression_ratio":3.292114695340502`, `"compression_ratio":1e309`, 1),
+		"negative-progress":       strings.Replace(representative, `"compression_progress":100`, `"compression_progress":-1`, 1),
+		"progress-over-100":       strings.Replace(representative, `"compression_progress":100`, `"compression_progress":101`, 1),
+		"space-saving-over-100":   strings.Replace(representative, `"compression_space_saving":69.62438758845944`, `"compression_space_saving":101`, 1),
+		"wrong-snapshots-count":   strings.Replace(representative, `"snapshots_count":1`, `"snapshots_count":2`, 1),
+		"fractional-blob-count":   strings.Replace(representative, `"total_blob_count":3`, `"total_blob_count":1.5`, 1),
+		"overflow-snapshot-count": strings.Replace(representative, `"snapshots_count":1`, `"snapshots_count":9223372036854775808`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if decodeResticStats([]byte(encoded)) == nil {
+				t.Fatalf("accepted %s", encoded)
+			}
+		})
+	}
+}
+
+func cloneJSONMap(value map[string]any) map[string]any {
+	cloned := make(map[string]any, len(value))
+	for key, item := range value {
+		cloned[key] = item
+	}
+	return cloned
 }
 
 func mustJSON(t *testing.T, value any) string {
@@ -468,7 +535,9 @@ func TestExecutorSyncUsesOwnerOnlySourceFilesAndKeepsRepositoriesOutOfArguments(
 				t.Fatalf("sync argv leaked %q", forbidden)
 			}
 		}
-		if len(command.Args) < 1 || command.Args[0] != "copy" {
+		if len(command.Args) < 2 ||
+			command.Args[0] != "--no-cache" ||
+			command.Args[1] != "copy" {
 			t.Fatalf("args=%q", command.Args)
 		}
 		return CommandResult{ExitCode: 0}, nil
