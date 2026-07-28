@@ -128,6 +128,7 @@ type workflowServiceFixture struct {
 	genericClaims            int
 	targetClaims             []uuid.UUID
 	workflowCalls            int
+	renewAttempts            int
 	renewCalls               int
 	transitions              []backup.TransitionInput
 	transitionResponseLossAt int
@@ -231,6 +232,7 @@ func (service *workflowServiceFixture) Renew(
 	generation int64,
 	_ time.Duration,
 ) (backup.Run, error) {
+	service.renewAttempts++
 	if service.renewErr != nil {
 		return backup.Run{}, service.renewErr
 	}
@@ -358,6 +360,7 @@ func (executor *workflowExecutorFixture) Sync(
 
 type memoryWorkflowStates struct {
 	state        *workflowState
+	loadErr      error
 	saveCalls    int
 	failSaveAt   int
 	failSave     func(workflowState, int) bool
@@ -366,8 +369,11 @@ type memoryWorkflowStates struct {
 }
 
 func (states *memoryWorkflowStates) Load(uuid.UUID) (workflowState, error) {
+	if states.loadErr != nil {
+		return workflowState{}, states.loadErr
+	}
 	if states.state == nil {
-		return workflowState{}, errWorkflowState
+		return workflowState{}, errWorkflowStateAbsent
 	}
 	return *states.state, nil
 }
@@ -583,6 +589,64 @@ func TestCommandApplicationRemoteFailureCompletesDegradedWithSameFence(t *testin
 	}
 }
 
+func TestCommandApplicationClearsRemoteFailureAfterVerifiedRetry(t *testing.T) {
+	runID := uuid.MustParse(commandRunID)
+	owner := uuid.New()
+	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+	result := commandSnapshotResult(t, now)
+	evidence := commandEvidence(result, now)
+	service := &workflowServiceFixture{
+		runID: runID, owner: owner, generation: 5,
+		state: backup.StateVerifying, evidence: evidence, leaseActive: true,
+	}
+	states := &memoryWorkflowStates{state: &workflowState{
+		RunID: runID, OwnerID: owner, LeaseGeneration: 5,
+		State: backup.StateVerifying, Evidence: evidence,
+		ObjectSnapshotID:   result.Manifest.ObjectSnapshotID,
+		DatabaseDumpSHA256: result.Manifest.DatabaseDumpSHA256,
+		DatabaseDumpBytes:  result.DatabaseDumpBytes,
+		ReferencedBytes:    result.Manifest.ReferencedBytes,
+		ManifestBytes:      int64(len(mustManifestBytes(t, result.Manifest))),
+	}}
+	executor := &workflowExecutorFixture{
+		snapshotResult: result,
+		remote:         true,
+		syncErr:        backup.ErrRemoteSync,
+		syncResult:     strings.Repeat("3", sha256.Size*2),
+	}
+	application := commandApplication{
+		service: service, executor: executor, states: states,
+		newOwner: uuid.New,
+		migrationVersion: func(context.Context) (int64, error) {
+			return 20, nil
+		},
+		now: func() time.Time { return now },
+	}
+	if err := application.Sync(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	if states.state == nil ||
+		states.state.ErrorCategory != "remote_unavailable" ||
+		len(service.artifacts) != 0 {
+		t.Fatalf("failed sync state=%+v artifacts=%+v", states.state, service.artifacts)
+	}
+	executor.syncErr = nil
+	if err := application.Sync(context.Background(), runID); err != nil {
+		t.Fatalf("retry sync: %v", err)
+	}
+	if states.state == nil || states.state.ErrorCategory != "" {
+		t.Fatalf("successful retry retained failure: %+v", states.state)
+	}
+	if err := application.Finish(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	if len(service.completions) != 1 ||
+		service.completions[0].ErrorCategory != "" ||
+		!service.completions[0].RemoteSucceeded {
+		t.Fatalf("completions=%+v", service.completions)
+	}
+}
+
 func TestCommandApplicationDoesNotConvertCancellationToRemoteDegradation(t *testing.T) {
 	runID := uuid.MustParse(commandRunID)
 	owner := uuid.MustParse("20000000-0000-4000-8000-000000000002")
@@ -698,6 +762,107 @@ func TestCommandApplicationPrepareClaimsOnlyTheExactTargetRun(t *testing.T) {
 			service.genericClaims,
 			service.targetClaims,
 		)
+	}
+}
+
+func TestCommandApplicationPrepareRenewsExistingLocalFenceBeforeClaim(t *testing.T) {
+	for _, scenario := range []string{
+		"same-live-owner",
+		"other-live-owner",
+		"expired-owner",
+		"corrupt-state",
+		"mismatched-run",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			runID := uuid.MustParse(commandRunID)
+			localOwner := uuid.New()
+			durableOwner := localOwner
+			service := &workflowServiceFixture{
+				runID: runID, owner: durableOwner, generation: 4,
+				state: backup.StateDraining, leaseActive: true,
+			}
+			states := &memoryWorkflowStates{state: &workflowState{
+				RunID: runID, OwnerID: localOwner, LeaseGeneration: 4,
+				State: backup.StateDraining,
+			}}
+			switch scenario {
+			case "other-live-owner":
+				service.owner = uuid.New()
+			case "expired-owner":
+				service.leaseActive = false
+				service.renewErr = backup.ErrStaleOwner
+			case "corrupt-state":
+				states.loadErr = errWorkflowState
+			case "mismatched-run":
+				states.state.RunID = uuid.New()
+			}
+			newOwnerCalls := 0
+			newOwner := uuid.New()
+			application := commandApplication{
+				service: service, executor: &workflowExecutorFixture{},
+				states: states,
+				newOwner: func() uuid.UUID {
+					newOwnerCalls++
+					return newOwner
+				},
+				migrationVersion: func(context.Context) (int64, error) {
+					return 20, nil
+				},
+				now: time.Now,
+			}
+			err := application.Prepare(context.Background(), runID)
+			switch scenario {
+			case "same-live-owner":
+				if err != nil ||
+					service.renewAttempts != 1 ||
+					len(service.targetClaims) != 0 ||
+					newOwnerCalls != 0 {
+					t.Fatalf(
+						"err=%v renew=%d claims=%v newOwners=%d",
+						err,
+						service.renewAttempts,
+						service.targetClaims,
+						newOwnerCalls,
+					)
+				}
+			case "expired-owner":
+				if err != nil ||
+					service.renewAttempts != 1 ||
+					len(service.targetClaims) != 1 ||
+					states.state == nil ||
+					states.state.OwnerID != newOwner ||
+					states.state.LeaseGeneration != 5 {
+					t.Fatalf(
+						"err=%v renew=%d claims=%v state=%+v",
+						err,
+						service.renewAttempts,
+						service.targetClaims,
+						states.state,
+					)
+				}
+			default:
+				if !errors.Is(err, errWorkflowUnavailable) &&
+					!errors.Is(err, errWorkflowState) {
+					t.Fatalf("err=%v", err)
+				}
+				if len(service.transitions) != 0 {
+					t.Fatalf("transitions=%+v", service.transitions)
+				}
+				if scenario == "other-live-owner" &&
+					service.renewAttempts != 1 {
+					t.Fatalf("renew attempts=%d", service.renewAttempts)
+				}
+				if (scenario == "corrupt-state" ||
+					scenario == "mismatched-run") &&
+					(len(service.targetClaims) != 0 || newOwnerCalls != 0) {
+					t.Fatalf(
+						"claims=%v newOwners=%d",
+						service.targetClaims,
+						newOwnerCalls,
+					)
+				}
+			}
+		})
 	}
 }
 

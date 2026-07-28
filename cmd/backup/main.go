@@ -38,6 +38,7 @@ const (
 var (
 	errInvalidCommand      = errors.New("invalid backup command")
 	errWorkflowState       = errors.New("invalid backup workflow state")
+	errWorkflowStateAbsent = errors.New("backup workflow state absent")
 	errWorkflowUnavailable = errors.New("backup workflow unavailable")
 )
 
@@ -198,6 +199,22 @@ func (application *commandApplication) Prepare(
 ) error {
 	if !application.ready() || runID == uuid.Nil {
 		return errWorkflowUnavailable
+	}
+	local, loadErr := application.states.Load(runID)
+	if loadErr == nil {
+		if !validWorkflowState(local) ||
+			local.RunID != runID ||
+			local.State != backup.StateDraining {
+			return errWorkflowState
+		}
+		resumed, terminal, err := application.resume(ctx, runID)
+		if err != nil || terminal || resumed.State != backup.StateDraining {
+			return errWorkflowUnavailable
+		}
+		return nil
+	}
+	if !errors.Is(loadErr, errWorkflowStateAbsent) {
+		return errWorkflowState
 	}
 	owner := application.newOwner()
 	if owner == uuid.Nil {
@@ -412,6 +429,7 @@ func (application *commandApplication) Sync(
 		return errWorkflowUnavailable
 	}
 	state.RemoteSucceeded = true
+	state.ErrorCategory = ""
 	state.Evidence.RemoteSnapshotID = remoteSnapshotID
 	if state.RemoteVerifiedAt.IsZero() {
 		if state.Evidence.RemoteExpiresAt == nil {
@@ -867,6 +885,9 @@ func (states fileWorkflowStates) Load(runID uuid.UUID) (workflowState, error) {
 	}
 	path := states.path(runID)
 	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return workflowState{}, errWorkflowStateAbsent
+	}
 	if err != nil ||
 		!info.Mode().IsRegular() ||
 		info.Mode().Perm() != 0o600 ||
