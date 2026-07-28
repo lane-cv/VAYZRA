@@ -1,6 +1,40 @@
 services:
+  postgres-tls-init:
+    image: postgres:18.4
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=10s
+      - 300s
+      - /bin/sh
+      - -eu
+      - -c
+    command:
+      - |
+        if [ ! -s /tls/server.crt ] || [ ! -s /tls/server.key ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj /CN=postgres \
+            -keyout /tls/server.key -out /tls/server.crt
+        fi
+        chown postgres:postgres /tls/server.crt /tls/server.key
+        chmod 0600 /tls/server.key
+        chmod 0644 /tls/server.crt
+    volumes:
+      - postgres_tls:/tls
+    network_mode: "none"
+    restart: "no"
+
   postgres:
     image: postgres:18.4
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/tls/server.crt
+      - -c
+      - ssl_key_file=/tls/server.key
     environment:
       POSTGRES_USER: happylearn
       POSTGRES_PASSWORD: happylearn_dev
@@ -14,6 +48,11 @@ services:
       retries: 10
     networks:
       - happylearn
+    volumes:
+      - postgres_tls:/tls:ro
+    depends_on:
+      postgres-tls-init:
+        condition: service_completed_successfully
     mem_limit: 512m
     cpus: 0.35
 
@@ -173,6 +212,132 @@ services:
     networks:
       - happylearn
 
+  backup-storage-init:
+    profiles: ["backup"]
+    image: happylearn-backup:phase5
+    build:
+      context: ..
+      dockerfile: Dockerfile.backup
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=10s
+      - 300s
+      - /bin/sh
+      - -eu
+      - -c
+    command:
+      - |
+        chown 10003:0 /repository /state
+        chmod 0700 /repository /state
+        test "$(stat -c '%u:%g:%a' /repository)" = '10003:0:700'
+        test "$(stat -c '%u:%g:%a' /state)" = '10003:0:700'
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY:-/var/lib/happylearn/backup/repository}:/repository:rw
+      - ${HAPPYLEARN_BACKUP_STATE_DIRECTORY:-/var/lib/happylearn/backup/state}:/state:rw
+    network_mode: "none"
+    restart: "no"
+
+  backup-secrets-init:
+    profiles: ["backup"]
+    image: happylearn-backup:phase5
+    build:
+      context: ..
+      dockerfile: Dockerfile.backup
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=10s
+      - 300s
+      - /bin/sh
+      - -eu
+      - -c
+    command:
+      - |
+        for name in database_password local_repository local_password; do
+          test -f "/source/$${name}"
+        done
+        for name in database_password local_repository local_password \
+          remote_repository remote_password remote_access_key_id \
+          remote_secret_access_key; do
+          rm -f "/secrets/.$${name}.new"
+          if [ -f "/source/$${name}" ]; then
+            cp "/source/$${name}" "/secrets/.$${name}.new"
+            chown 10003:0 "/secrets/.$${name}.new"
+            chmod 0400 "/secrets/.$${name}.new"
+            mv -f "/secrets/.$${name}.new" "/secrets/$${name}"
+          else
+            rm -f "/secrets/$${name}"
+          fi
+        done
+        chown 10003:0 /secrets
+        chmod 0700 /secrets
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,mode=0700
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${HAPPYLEARN_BACKUP_SECRET_DIRECTORY:-/var/lib/happylearn/backup/secrets}:/source:ro
+      - backup_secrets:/secrets:rw
+    network_mode: "none"
+    restart: "no"
+
+  backup:
+    profiles: ["backup"]
+    image: happylearn-backup:phase5
+    build:
+      context: ..
+      dockerfile: Dockerfile.backup
+    user: "10003:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=10s
+      - ${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}s
+      - /app/happylearn-backup
+    environment:
+      HAPPYLEARN_DATABASE_HOST: ${HAPPYLEARN_BACKUP_DATABASE_HOST:-postgres}
+      HAPPYLEARN_DATABASE_PORT: ${HAPPYLEARN_BACKUP_DATABASE_PORT:-5432}
+      HAPPYLEARN_DATABASE_USER: ${HAPPYLEARN_BACKUP_DATABASE_USER:-happylearn}
+      HAPPYLEARN_DATABASE_NAME: ${HAPPYLEARN_BACKUP_DATABASE_NAME:-happylearn}
+      HAPPYLEARN_DATABASE_SSLMODE: ${HAPPYLEARN_BACKUP_DATABASE_SSLMODE:-require}
+      HAPPYLEARN_BACKUP_AGE_RECIPIENT: ${HAPPYLEARN_BACKUP_AGE_RECIPIENT:-age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp5m40h}
+      HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID: ${HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID:-development-backup-key}
+    read_only: true
+    tmpfs:
+      - /work:rw,noexec,nosuid,size=1024m,uid=10003,gid=0,mode=0700
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10003,gid=0,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - minio_data:/source/aistor:ro
+      - ${HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY:-/var/lib/happylearn/backup/repository}:/repository:rw
+      - ${HAPPYLEARN_BACKUP_STATE_DIRECTORY:-/var/lib/happylearn/backup/state}:/state:rw
+      - backup_secrets:/run/secrets:ro
+    restart: "no"
+    networks:
+      - happylearn
+
 networks:
   happylearn:
     driver: bridge
@@ -180,7 +345,20 @@ networks:
 
 volumes:
   minio_data:
+  postgres_tls:
+  backup_secrets:
 
 secrets:
   aistor_license:
     file: ${HAPPYLEARN_AISTOR_LICENSE_FILE:?set HAPPYLEARN_AISTOR_LICENSE_FILE to the downloaded AIStor Free minio.license path}
+
+x-happylearn-backup-secret-files:
+  required:
+    - database_password
+    - local_repository
+    - local_password
+  optional-remote:
+    - remote_repository
+    - remote_password
+    - remote_access_key_id
+    - remote_secret_access_key

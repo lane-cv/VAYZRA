@@ -586,7 +586,38 @@ func (application *commandApplication) Fail(
 		if state.State == backup.StateFailed {
 			return nil
 		}
+		if state.State == backup.StateDegraded &&
+			category == "remote_unavailable" {
+			return nil
+		}
 		return errWorkflowUnavailable
+	}
+	if category == "remote_unavailable" &&
+		state.State == backup.StateSyncing &&
+		state.RemoteConfigured &&
+		state.RemoteSucceeded {
+		completed, completionErr := application.service.Complete(
+			ctx,
+			backup.CompletionInput{
+				RunID:            runID,
+				OwnerID:          state.OwnerID,
+				LeaseGeneration:  state.LeaseGeneration,
+				From:             state.State,
+				Evidence:         cloneEvidence(state.Evidence),
+				RemoteConfigured: true,
+				RemoteSucceeded:  false,
+				ErrorCategory:    category,
+			},
+		)
+		if completionErr != nil ||
+			completed.ID != runID ||
+			completed.State != backup.StateDegraded {
+			return errWorkflowUnavailable
+		}
+		if err := application.states.Delete(runID); err != nil {
+			return errWorkflowState
+		}
+		return nil
 	}
 	_, err = application.service.Transition(ctx, backup.TransitionInput{
 		RunID: runID, OwnerID: state.OwnerID,

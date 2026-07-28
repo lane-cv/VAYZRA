@@ -3,7 +3,9 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts phase5-backup-contract phase5-backup
+
+BACKUP_TRIGGER ?= manual
 
 test-go:
 	$(GO) test ./...
@@ -52,3 +54,9 @@ e2e-contracts:
 	bash scripts/e2e-phase4_contract_test.sh
 	bash scripts/e2e-harness_semantics_contract_test.sh
 	bash scripts/e2e-artifact-sanitization_contract_test.sh
+
+phase5-backup-contract:
+	bash scripts/phase5-backup_contract_test.sh
+
+phase5-backup:
+	bash scripts/phase5-backup.sh --project happylearn-dev --trigger $(BACKUP_TRIGGER)

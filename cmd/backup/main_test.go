@@ -287,10 +287,13 @@ func (service *workflowServiceFixture) Complete(
 	}
 	service.completions = append(service.completions, input)
 	service.state = backup.StateSucceeded
+	if input.RemoteConfigured && !input.RemoteSucceeded {
+		service.state = backup.StateDegraded
+	}
 	service.evidence = cloneEvidence(input.Evidence)
 	service.owner = uuid.Nil
 	service.leaseActive = false
-	return backup.Run{ID: input.RunID, State: backup.StateSucceeded}, nil
+	return backup.Run{ID: input.RunID, State: service.state}, nil
 }
 
 func (service *workflowServiceFixture) AddArtifact(
@@ -589,6 +592,153 @@ func TestCommandApplicationRemoteFailureCompletesDegradedWithSameFence(t *testin
 		service.completions[0].ErrorCategory != "remote_unavailable" {
 		t.Fatalf("completions=%+v", service.completions)
 	}
+}
+
+func TestCommandApplicationPostSyncRemoteFailureCompletesDegradedWithSameFence(t *testing.T) {
+	runID := uuid.MustParse(commandRunID)
+	owner := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+	remoteExpiry := now.Add(30 * 24 * time.Hour)
+	evidence := backup.RecoveryEvidence{
+		DatabaseMigrationVersion: 20,
+		EncryptionKeyID:          "key-2026-07",
+		LocalSnapshotID:          commandRecoveryID,
+		RemoteSnapshotID:         strings.Repeat("3", sha256.Size*2),
+		ManifestSHA256:           make([]byte, sha256.Size),
+		LocalExpiresAt:           now.Add(7 * 24 * time.Hour),
+		RemoteExpiresAt:          &remoteExpiry,
+	}
+	service := &workflowServiceFixture{
+		runID: runID, owner: owner, generation: 6,
+		state: backup.StateSyncing, evidence: evidence, leaseActive: true,
+	}
+	states := &memoryWorkflowStates{state: &workflowState{
+		RunID: runID, OwnerID: owner, LeaseGeneration: 6,
+		State: backup.StateSyncing, Evidence: evidence,
+		RemoteConfigured: true, RemoteSucceeded: true,
+	}}
+	application := &commandApplication{
+		service: service, executor: &workflowExecutorFixture{}, states: states,
+		newOwner: uuid.New,
+		migrationVersion: func(context.Context) (int64, error) {
+			return 20, nil
+		},
+		now: func() time.Time { return now },
+	}
+
+	if err := application.Fail(
+		context.Background(),
+		runID,
+		"remote_unavailable",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(service.transitions) != 0 {
+		t.Fatalf("unexpected failed transition=%+v", service.transitions)
+	}
+	if len(service.completions) != 1 {
+		t.Fatalf("completions=%+v", service.completions)
+	}
+	completion := service.completions[0]
+	if completion.OwnerID != owner ||
+		completion.LeaseGeneration != 6 ||
+		completion.From != backup.StateSyncing ||
+		!completion.RemoteConfigured ||
+		completion.RemoteSucceeded ||
+		completion.ErrorCategory != "remote_unavailable" {
+		t.Fatalf("completion=%+v", completion)
+	}
+	if states.state != nil {
+		t.Fatalf("terminal state file remains: %+v", states.state)
+	}
+}
+
+func TestCommandApplicationRetriesPostSyncRemoteDegradedTerminal(t *testing.T) {
+	runID := uuid.MustParse(commandRunID)
+	owner := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+	evidence := backup.RecoveryEvidence{
+		DatabaseMigrationVersion: 20,
+		EncryptionKeyID:          "key-2026-07",
+		LocalSnapshotID:          commandRecoveryID,
+		ManifestSHA256:           make([]byte, sha256.Size),
+		LocalExpiresAt:           now.Add(7 * 24 * time.Hour),
+	}
+	newApplication := func(
+		service *workflowServiceFixture,
+		states *memoryWorkflowStates,
+	) commandApplication {
+		return commandApplication{
+			service: service, executor: &workflowExecutorFixture{}, states: states,
+			newOwner: uuid.New,
+			migrationVersion: func(context.Context) (int64, error) {
+				return 20, nil
+			},
+			now: func() time.Time { return now },
+		}
+	}
+
+	t.Run("stale-state-file-after-durable-completion", func(t *testing.T) {
+		service := &workflowServiceFixture{
+			runID: runID, owner: owner, generation: 6,
+			state: backup.StateSyncing, evidence: evidence, leaseActive: true,
+		}
+		states := &memoryWorkflowStates{
+			state: &workflowState{
+				RunID: runID, OwnerID: owner, LeaseGeneration: 6,
+				State: backup.StateSyncing, Evidence: evidence,
+				RemoteConfigured: true, RemoteSucceeded: true,
+			},
+			failDeleteAt: 1,
+		}
+		application := newApplication(service, states)
+		if err := application.Fail(
+			context.Background(),
+			runID,
+			"remote_unavailable",
+		); !errors.Is(err, errWorkflowState) {
+			t.Fatalf("first fail err=%v", err)
+		}
+		if service.state != backup.StateDegraded || states.state == nil {
+			t.Fatalf("durable=%s state=%+v", service.state, states.state)
+		}
+		if err := application.Fail(
+			context.Background(),
+			runID,
+			"remote_unavailable",
+		); err != nil {
+			t.Fatalf("retry fail: %v", err)
+		}
+		if states.state != nil || states.deleteCalls != 2 {
+			t.Fatalf("state=%+v deletes=%d", states.state, states.deleteCalls)
+		}
+		if len(service.completions) != 1 {
+			t.Fatalf("completions=%+v", service.completions)
+		}
+	})
+
+	t.Run("missing-state-file-after-durable-completion", func(t *testing.T) {
+		service := &workflowServiceFixture{
+			runID: runID, generation: 6,
+			state: backup.StateDegraded, evidence: evidence,
+		}
+		states := &memoryWorkflowStates{}
+		application := newApplication(service, states)
+		if err := application.Fail(
+			context.Background(),
+			runID,
+			"remote_unavailable",
+		); err != nil {
+			t.Fatalf("retry fail: %v", err)
+		}
+		if err := application.Fail(
+			context.Background(),
+			runID,
+			"integrity",
+		); !errors.Is(err, errWorkflowUnavailable) {
+			t.Fatalf("ordinary fail err=%v", err)
+		}
+	})
 }
 
 func TestCommandApplicationClearsRemoteFailureAfterVerifiedRetry(t *testing.T) {
