@@ -136,27 +136,6 @@ WHERE singleton_id=true`); err != nil {
 func TestPostgresClaimAdmissionRejectsDurableNonNormalMode(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
-	var admissionTx pgx.Tx
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if admissionTx != nil {
-			if err := admissionTx.Rollback(cleanupCtx); err != nil &&
-				!errors.Is(err, pgx.ErrTxClosed) {
-				t.Errorf("rollback admission transaction: %v", err)
-			}
-		}
-		tag, err := pool.Exec(cleanupCtx, `
-UPDATE operational_modes
-SET mode='normal',owner_id=NULL,lease_token_hash=NULL,lease_expires_at=NULL,
-    entered_at=NULL,updated_at=clock_timestamp(),version=version+1
-WHERE singleton_id=true`)
-		if err != nil {
-			t.Errorf("restore operational mode: %v", err)
-		} else if tag.RowsAffected() != 1 {
-			t.Errorf("restore operational mode rows=%d", tag.RowsAffected())
-		}
-	})
 	tokenHash := sha256.Sum256([]byte("durable-maintenance-mode"))
 	if _, err := pool.Exec(ctx, `
 UPDATE operational_modes
@@ -170,7 +149,14 @@ WHERE singleton_id=true`, uuid.New(), tokenHash[:]); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	admissionTx = tx
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanupCtx); err != nil &&
+			!errors.Is(err, pgx.ErrTxClosed) {
+			t.Errorf("rollback admission transaction: %v", err)
+		}
+	})
 	started := time.Now()
 	if err := AdmitClaim(ctx, tx); !errors.Is(err, ErrLeaseHeld) {
 		t.Fatalf("admission error=%v", err)
@@ -2135,6 +2121,23 @@ func migratedOperationsStore(t *testing.T) *pgxpool.Pool {
 	if err := database.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		tag, err := pool.Exec(cleanupCtx, `
+UPDATE operational_modes
+SET mode='normal',owner_id=NULL,lease_token_hash=NULL,lease_expires_at=NULL,
+    entered_at=NULL,updated_at=clock_timestamp(),version=version+1
+WHERE singleton_id=true`)
+		if err != nil {
+			t.Errorf("restore operational mode fixture: %v", err)
+		} else if tag.RowsAffected() != 1 {
+			t.Errorf(
+				"restore operational mode fixture rows=%d",
+				tag.RowsAffected(),
+			)
+		}
+	})
 	if _, err := pool.Exec(ctx, `
 DROP TRIGGER IF EXISTS operations_reject_audit ON audit_logs;
 DROP FUNCTION IF EXISTS operations_reject_audit();
