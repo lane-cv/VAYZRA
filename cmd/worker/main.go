@@ -103,37 +103,65 @@ func run() error {
 
 	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return coordinateWorkerRuntime(
+		signalCtx,
+		cancel,
+		health,
+		workerDone,
+		healthDone,
+		workerShutdownLimit,
+	)
+}
+
+type workerHealthLifecycle interface {
+	Shutdown(context.Context) error
+}
+
+func coordinateWorkerRuntime(
+	signalCtx context.Context,
+	cancel context.CancelFunc,
+	health workerHealthLifecycle,
+	workerDone <-chan error,
+	healthDone <-chan error,
+	shutdownTimeout time.Duration,
+) error {
 	workerExited := false
-	var workerErr error
+	var result error
 	select {
 	case <-signalCtx.Done():
-		cancel()
-	case workerErr = <-workerDone:
+	case workerErr := <-workerDone:
 		workerExited = true
-		cancel()
+		if workerErr != nil {
+			result = errors.New("worker lifecycle")
+		}
 	case err := <-healthDone:
-		cancel()
 		if !errors.Is(err, http.ErrServerClosed) {
-			return errors.New("worker health")
+			result = errors.New("worker health")
 		}
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), workerShutdownLimit)
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		shutdownTimeout,
+	)
 	defer shutdownCancel()
-	_ = health.Shutdown(shutdownCtx)
+	if err := health.Shutdown(shutdownCtx); err != nil && result == nil {
+		result = errors.New("worker health shutdown")
+	}
 	if workerExited {
-		if workerErr != nil {
-			return errors.New("worker lifecycle")
-		}
-		return nil
+		return result
 	}
 	select {
 	case err := <-workerDone:
-		if err != nil {
-			return errors.New("worker shutdown")
+		if err != nil && result == nil {
+			result = errors.New("worker shutdown")
 		}
-		return nil
+		return result
 	case <-shutdownCtx.Done():
+		if result != nil {
+			return result
+		}
 		return errors.New("worker shutdown timeout")
 	}
 }

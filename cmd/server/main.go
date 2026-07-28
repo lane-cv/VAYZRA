@@ -43,28 +43,43 @@ func main() {
 		log.Printf("startup_error stage=%s", err)
 		os.Exit(1)
 	}
-	defer closeResources()
 	server := newServer(cfg.ListenAddress, handler)
 
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := runServerLifecycle(signals, server, closeResources); err != nil {
+		log.Printf("server_error stage=%s", err)
+		os.Exit(1)
+	}
+}
+
+type serverLifecycle interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+}
+
+func runServerLifecycle(
+	signals context.Context,
+	server serverLifecycle,
+	closeResources func(),
+) error {
+	defer closeResources()
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.ListenAndServe() }()
 
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Print("server_start_error")
-			os.Exit(1)
+			return errors.New("server start")
 		}
 	case <-signals.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Print("server_shutdown_error")
-			os.Exit(1)
+			return errors.New("server shutdown")
 		}
 	}
+	return nil
 }
 
 func newServer(address string, handler http.Handler) *http.Server {
