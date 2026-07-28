@@ -13,10 +13,8 @@ CREATE TABLE backup_runs (
   local_snapshot_id text,
   remote_snapshot_id text,
   manifest_sha256 bytea,
-  logical_bytes bigint
-    CHECK (logical_bytes IS NULL OR logical_bytes >= 0),
-  stored_bytes bigint
-    CHECK (stored_bytes IS NULL OR stored_bytes >= 0),
+  logical_bytes bigint,
+  stored_bytes bigint,
   local_expires_at timestamptz,
   remote_expires_at timestamptz,
   error_category text NOT NULL DEFAULT '',
@@ -41,6 +39,31 @@ CREATE TABLE backup_runs (
       'degraded',
       'failed'
     )),
+  CONSTRAINT backup_runs_database_migration_version_check
+    CHECK (
+      database_migration_version IS NULL
+      OR database_migration_version >= 1
+    ),
+  CONSTRAINT backup_runs_manifest_sha256_check
+    CHECK (
+      manifest_sha256 IS NULL
+      OR octet_length(manifest_sha256) = 32
+    ),
+  CONSTRAINT backup_runs_logical_bytes_check
+    CHECK (logical_bytes IS NULL OR logical_bytes >= 0),
+  CONSTRAINT backup_runs_stored_bytes_check
+    CHECK (stored_bytes IS NULL OR stored_bytes >= 0),
+  CONSTRAINT backup_runs_lease_shape_check CHECK (
+    (
+      owner_id IS NULL
+      AND lease_expires_at IS NULL
+    )
+    OR
+    (
+      owner_id IS NOT NULL
+      AND lease_expires_at IS NOT NULL
+    )
+  ),
   CONSTRAINT backup_runs_terminal_check CHECK (
     (
       state IN ('succeeded', 'degraded', 'failed')
@@ -50,6 +73,29 @@ CREATE TABLE backup_runs (
     (
       state NOT IN ('succeeded', 'degraded', 'failed')
       AND finished_at IS NULL
+    )
+  ),
+  CONSTRAINT backup_runs_terminal_lease_check CHECK (
+    state NOT IN ('succeeded', 'degraded', 'failed')
+    OR
+    (
+      owner_id IS NULL
+      AND lease_expires_at IS NULL
+    )
+  ),
+  CONSTRAINT backup_runs_recovery_evidence_check CHECK (
+    state NOT IN ('succeeded', 'degraded')
+    OR
+    (
+      local_snapshot_id IS NOT NULL
+      AND btrim(local_snapshot_id) <> ''
+      AND manifest_sha256 IS NOT NULL
+      AND octet_length(manifest_sha256) = 32
+      AND database_migration_version IS NOT NULL
+      AND database_migration_version >= 1
+      AND encryption_key_id IS NOT NULL
+      AND btrim(encryption_key_id) <> ''
+      AND local_expires_at IS NOT NULL
     )
   )
 );
@@ -68,12 +114,14 @@ CREATE TABLE backup_artifacts (
   repository text NOT NULL,
   snapshot_id text NOT NULL,
   sha256 bytea NOT NULL,
-  size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
+  size_bytes bigint NOT NULL,
   verified_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
   PRIMARY KEY(backup_run_id, kind, repository),
   CONSTRAINT backup_artifacts_sha256_check
     CHECK (octet_length(sha256) = 32),
+  CONSTRAINT backup_artifacts_size_bytes_check
+    CHECK (size_bytes >= 0),
   CONSTRAINT backup_artifacts_kind_check
     CHECK (kind IN (
       'database_dump',
@@ -102,7 +150,47 @@ CREATE TABLE restore_verifications (
   error_category text NOT NULL DEFAULT '',
   error_trace_id text NOT NULL DEFAULT '',
   CONSTRAINT restore_verifications_state_check
-    CHECK (state IN ('queued', 'restoring', 'checking', 'succeeded', 'failed'))
+    CHECK (state IN ('queued', 'restoring', 'checking', 'succeeded', 'failed')),
+  CONSTRAINT restore_verifications_counts_check CHECK (
+    checked_object_count >= 0
+    AND missing_object_count >= 0
+    AND unexpected_object_count >= 0
+  ),
+  CONSTRAINT restore_verifications_rto_seconds_check
+    CHECK (rto_seconds IS NULL OR rto_seconds >= 0),
+  CONSTRAINT restore_verifications_migration_version_check CHECK (
+    restored_migration_version IS NULL
+    OR restored_migration_version >= 1
+  ),
+  CONSTRAINT restore_verifications_report_sha256_check CHECK (
+    report_sha256 IS NULL
+    OR octet_length(report_sha256) = 32
+  ),
+  CONSTRAINT restore_verifications_row_counts_check
+    CHECK (jsonb_typeof(database_row_counts) = 'object'),
+  CONSTRAINT restore_verifications_terminal_check CHECK (
+    (
+      state IN ('succeeded', 'failed')
+      AND finished_at IS NOT NULL
+    )
+    OR
+    (
+      state NOT IN ('succeeded', 'failed')
+      AND finished_at IS NULL
+    )
+  ),
+  CONSTRAINT restore_verifications_success_check CHECK (
+    state <> 'succeeded'
+    OR
+    (
+      session_revocation_verified
+      AND missing_object_count = 0
+      AND restored_migration_version IS NOT NULL
+      AND restored_migration_version >= 1
+      AND report_sha256 IS NOT NULL
+      AND octet_length(report_sha256) = 32
+    )
+  )
 );
 
 CREATE INDEX restore_verifications_backup_idx
