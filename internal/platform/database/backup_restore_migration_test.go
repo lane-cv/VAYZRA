@@ -143,6 +143,7 @@ WITH expected(table_name,constraint_name) AS (
     ('backup_runs','backup_runs_manifest_sha256_check'),
     ('backup_runs','backup_runs_logical_bytes_check'),
     ('backup_runs','backup_runs_stored_bytes_check'),
+    ('backup_runs','backup_runs_lease_generation_check'),
     ('backup_runs','backup_runs_lease_shape_check'),
     ('backup_runs','backup_runs_terminal_lease_check'),
     ('backup_runs','backup_runs_recovery_evidence_check'),
@@ -170,8 +171,8 @@ JOIN pg_constraint c
   AND c.contype='c'`).Scan(&matched); err != nil {
 		t.Fatal(err)
 	}
-	if matched != 24 {
-		t.Fatalf("matched named check constraints=%d want=24", matched)
+	if matched != 25 {
+		t.Fatalf("matched named check constraints=%d want=25", matched)
 	}
 }
 
@@ -517,6 +518,48 @@ VALUES('same-key-different-trigger','manual'),
 	})
 }
 
+func TestBackupRestoreMigrationFencesLeaseGenerations(t *testing.T) {
+	pool, ctx := migratedBackupRestore(t)
+
+	var nullable, dataType, defaultValue string
+	if err := pool.QueryRow(ctx, `
+SELECT is_nullable,data_type,column_default
+FROM information_schema.columns
+WHERE table_schema='public'
+  AND table_name='backup_runs'
+  AND column_name='lease_generation'`).
+		Scan(&nullable, &dataType, &defaultValue); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "NO" || dataType != "bigint" || defaultValue != "0" {
+		t.Fatalf(
+			"lease_generation nullable=%q type=%q default=%q",
+			nullable,
+			dataType,
+			defaultValue,
+		)
+	}
+	assertBackupRestoreCheckDefinition(
+		t,
+		ctx,
+		pool,
+		"backup_runs_lease_generation_check",
+		"CHECK (lease_generation >= 0)",
+	)
+
+	backupRestoreTx(t, ctx, pool, func(tx pgx.Tx) {
+		_, err := tx.Exec(ctx, `
+INSERT INTO backup_runs(idempotency_key,trigger_kind,lease_generation)
+VALUES('negative-lease-generation','manual',-1)`)
+		assertBackupRestorePostgresError(
+			t,
+			err,
+			"23514",
+			"backup_runs_lease_generation_check",
+		)
+	})
+}
+
 func TestBackupRestoreMigrationRequiresValidArtifacts(t *testing.T) {
 	pool, ctx := migratedBackupRestore(t)
 
@@ -576,6 +619,77 @@ INSERT INTO backup_artifacts(
 SELECT id,'manifest','local','opaque-snapshot',decode(repeat('00',32),'hex'),0,now(),now()
 FROM run`); err != nil {
 			t.Fatalf("insert valid artifact hash: %v", err)
+		}
+	})
+}
+
+func TestBackupRestoreMigrationRequiresAllowlistedIntegerRowCounts(t *testing.T) {
+	pool, ctx := migratedBackupRestore(t)
+
+	for _, tc := range []struct {
+		name, counts string
+	}{
+		{name: "unknown key", counts: `{"secret_table":1}`},
+		{name: "negative", counts: `{"users":-1}`},
+		{name: "fraction", counts: `{"users":1.5}`},
+		{name: "string", counts: `{"users":"1"}`},
+		{name: "bigint overflow", counts: `{"users":9223372036854775808}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backupRestoreTx(t, ctx, pool, func(tx pgx.Tx) {
+				_, err := tx.Exec(ctx, `
+WITH run AS (
+  INSERT INTO backup_runs(idempotency_key,trigger_kind)
+  VALUES($1,'manual') RETURNING id
+)
+INSERT INTO restore_verifications(backup_run_id,database_row_counts)
+SELECT id,$2::jsonb FROM run`,
+					"row-counts-"+strings.ReplaceAll(tc.name, " ", "-"),
+					tc.counts,
+				)
+				assertBackupRestorePostgresError(
+					t,
+					err,
+					"23514",
+					"restore_verifications_row_counts_check",
+				)
+			})
+		})
+	}
+
+	backupRestoreTx(t, ctx, pool, func(tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `
+WITH runs AS (
+  INSERT INTO backup_runs(idempotency_key,trigger_kind)
+  VALUES('row-counts-empty','manual'),('row-counts-boundaries','manual')
+  RETURNING id,idempotency_key
+)
+INSERT INTO restore_verifications(backup_run_id,database_row_counts)
+SELECT
+  id,
+  CASE idempotency_key
+    WHEN 'row-counts-empty' THEN '{}'::jsonb
+    ELSE '{
+      "users":0,
+      "sessions":9223372036854775807,
+      "subjects":0,
+      "grades":0,
+      "terms":0,
+      "chapters":0,
+      "lessons":0,
+      "lesson_revisions":0,
+      "files":0,
+      "file_versions":0,
+      "file_previews":0,
+      "qa_threads":0,
+      "qa_messages":0,
+      "ai_threads":0,
+      "ai_messages":0,
+      "ai_runs":0
+    }'::jsonb
+  END
+FROM runs`); err != nil {
+			t.Fatalf("insert valid row-count boundaries: %v", err)
 		}
 	})
 }
@@ -818,6 +932,7 @@ func TestBackupRestoreMigrationDownTo19RemovesOnlyBackupSchema(t *testing.T) {
 
 	var backupTables, foundationTables int
 	var migration19Applied, migration20Applied bool
+	var rowCountValidatorRemoved bool
 	if err := pool.QueryRow(ctx, `
 SELECT
   (SELECT count(*) FROM information_schema.tables
@@ -827,17 +942,26 @@ SELECT
    WHERE table_schema='public' AND table_name IN
      ('system_settings','operational_modes')),
   EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=19 AND is_applied),
-  EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=20 AND is_applied)`).
-		Scan(&backupTables, &foundationTables, &migration19Applied, &migration20Applied); err != nil {
+  EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=20 AND is_applied),
+  to_regprocedure('happylearn_valid_restore_row_counts(jsonb)') IS NULL`).
+		Scan(
+			&backupTables,
+			&foundationTables,
+			&migration19Applied,
+			&migration20Applied,
+			&rowCountValidatorRemoved,
+		); err != nil {
 		t.Fatal(err)
 	}
-	if backupTables != 0 || foundationTables != 2 || !migration19Applied || migration20Applied {
+	if backupTables != 0 || foundationTables != 2 || !migration19Applied ||
+		migration20Applied || !rowCountValidatorRemoved {
 		t.Fatalf(
-			"backup_tables=%d foundation_tables=%d migration19=%t migration20=%t",
+			"backup_tables=%d foundation_tables=%d migration19=%t migration20=%t row_count_validator_removed=%t",
 			backupTables,
 			foundationTables,
 			migration19Applied,
 			migration20Applied,
+			rowCountValidatorRemoved,
 		)
 	}
 }

@@ -19,6 +19,9 @@ type serviceStore struct {
 	claims        []claimCall
 	claimResult   Run
 	claimErr      error
+	renewCalls    []renewCall
+	renewResult   Run
+	renewErr      error
 	transitions   []TransitionInput
 	transitionRun Run
 	transitionErr error
@@ -26,6 +29,7 @@ type serviceStore struct {
 	listFilter    Filter
 	page          Page
 	detail        RunDetail
+	detailErr     error
 	retention     RetentionPolicy
 	candidates    []Artifact
 }
@@ -33,6 +37,13 @@ type serviceStore struct {
 type claimCall struct {
 	owner uuid.UUID
 	lease time.Duration
+}
+
+type renewCall struct {
+	runID      uuid.UUID
+	owner      uuid.UUID
+	generation int64
+	lease      time.Duration
 }
 
 func (s *serviceStore) Create(_ context.Context, input CreateInput) (Run, error) {
@@ -51,6 +62,19 @@ func (s *serviceStore) Claim(_ context.Context, owner uuid.UUID, lease time.Dura
 	return s.claimResult, s.claimErr
 }
 
+func (s *serviceStore) Renew(
+	_ context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	generation int64,
+	lease time.Duration,
+) (Run, error) {
+	s.renewCalls = append(s.renewCalls, renewCall{
+		runID: runID, owner: owner, generation: generation, lease: lease,
+	})
+	return s.renewResult, s.renewErr
+}
+
 func (s *serviceStore) Transition(_ context.Context, input TransitionInput) (Run, error) {
 	s.transitions = append(s.transitions, input)
 	return s.transitionRun, s.transitionErr
@@ -67,7 +91,7 @@ func (s *serviceStore) List(_ context.Context, filter Filter) ([]RunSummary, Cur
 }
 
 func (s *serviceStore) Get(context.Context, uuid.UUID) (RunDetail, error) {
-	return s.detail, nil
+	return s.detail, s.detailErr
 }
 
 func (s *serviceStore) RetentionCandidates(_ context.Context, policy RetentionPolicy) ([]Artifact, error) {
@@ -187,6 +211,26 @@ func TestBackupServiceRejectsInvalidPrincipalAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestBackupServiceRenewsCurrentLeaseGeneration(t *testing.T) {
+	runID, owner := uuid.New(), uuid.New()
+	store := &serviceStore{renewResult: Run{
+		ID: runID, OwnerID: owner, LeaseGeneration: 7,
+		LeaseExpiresAt: timePointer(time.Now().UTC().Add(time.Minute)),
+	}}
+	service := NewService(store, time.Now)
+	renewed, err := service.Renew(context.Background(), runID, owner, 7, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.LeaseGeneration != 7 ||
+		len(store.renewCalls) != 1 ||
+		store.renewCalls[0] != (renewCall{
+			runID: runID, owner: owner, generation: 7, lease: 2 * time.Minute,
+		}) {
+		t.Fatalf("renewed=%+v calls=%+v", renewed, store.renewCalls)
+	}
+}
+
 func TestCompleteChoosesSucceededOrDegradedFromRemoteOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
@@ -212,7 +256,7 @@ func TestCompleteChoosesSucceededOrDegradedFromRemoteOutcome(t *testing.T) {
 				LocalExpiresAt:           now.Add(7 * 24 * time.Hour),
 			}
 			_, err := service.Complete(context.Background(), CompletionInput{
-				RunID: uuid.New(), OwnerID: uuid.New(), From: tc.from,
+				RunID: uuid.New(), OwnerID: uuid.New(), LeaseGeneration: 1, From: tc.from,
 				Evidence: evidence, RemoteConfigured: tc.remoteConfigured,
 				RemoteSucceeded: tc.remoteSucceeded,
 				ErrorCategory: func() string {
@@ -260,7 +304,7 @@ func TestCompleteRequiresMigrationManifestKeySnapshotAndLocalExpiry(t *testing.T
 		evidence := valid
 		mutate(&evidence)
 		_, err := service.Complete(context.Background(), CompletionInput{
-			RunID: uuid.New(), OwnerID: uuid.New(), From: StateVerifying,
+			RunID: uuid.New(), OwnerID: uuid.New(), LeaseGeneration: 1, From: StateVerifying,
 			Evidence: evidence,
 		})
 		if !errors.Is(err, ErrInvalid) {
@@ -268,6 +312,30 @@ func TestCompleteRequiresMigrationManifestKeySnapshotAndLocalExpiry(t *testing.T
 		}
 		if len(store.transitions) != 0 {
 			t.Fatalf("case %d transitioned", i)
+		}
+	}
+}
+
+func TestBackupServiceFailsClosedOnInvalidRestoreRowCounts(t *testing.T) {
+	for _, counts := range []map[string]int64{
+		nil,
+		{"secret_table": 1},
+		{"users": -1},
+	} {
+		store := &serviceStore{detail: RunDetail{
+			Run: Run{ID: uuid.New(), RequestedAt: time.Now().UTC()},
+			RestoreVerifications: []RestoreVerification{{
+				ID: uuid.New(), DatabaseRowCounts: counts,
+			}},
+		}}
+		service := NewService(store, time.Now)
+		_, err := service.Get(
+			context.Background(),
+			adminPrincipal(),
+			store.detail.Run.ID,
+		)
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("counts=%v err=%v", counts, err)
 		}
 	}
 }

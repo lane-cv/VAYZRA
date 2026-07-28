@@ -84,9 +84,28 @@ func (s *Service) Claim(ctx context.Context, owner uuid.UUID, lease time.Duratio
 	return normalizeRun(run), nil
 }
 
+func (s *Service) Renew(
+	ctx context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	generation int64,
+	lease time.Duration,
+) (Run, error) {
+	if s == nil || s.store == nil || runID == uuid.Nil || owner == uuid.Nil ||
+		generation < 1 || lease < time.Second || lease > 24*time.Hour {
+		return Run{}, ErrInvalid
+	}
+	run, err := s.store.Renew(ctx, runID, owner, generation, lease)
+	if err != nil {
+		return Run{}, mapStoreError(err)
+	}
+	return normalizeRun(run), nil
+}
+
 func (s *Service) Transition(ctx context.Context, input TransitionInput) (Run, error) {
 	if s == nil || s.store == nil ||
 		input.RunID == uuid.Nil || input.OwnerID == uuid.Nil ||
+		input.LeaseGeneration < 1 ||
 		!validState(input.From) || !validState(input.To) ||
 		!ValidTransition(input.From, input.To) ||
 		!validSafeError(input.ErrorCategory, input.ErrorTraceID) {
@@ -118,6 +137,7 @@ func (s *Service) Transition(ctx context.Context, input TransitionInput) (Run, e
 func (s *Service) Complete(ctx context.Context, input CompletionInput) (Run, error) {
 	if validateEvidence(input.Evidence) != nil ||
 		input.RunID == uuid.Nil || input.OwnerID == uuid.Nil ||
+		input.LeaseGeneration < 1 ||
 		!validSafeError(input.ErrorCategory, input.ErrorTraceID) {
 		return Run{}, ErrInvalid
 	}
@@ -137,7 +157,8 @@ func (s *Service) Complete(ctx context.Context, input CompletionInput) (Run, err
 		return Run{}, ErrInvalid
 	}
 	return s.Transition(ctx, TransitionInput{
-		RunID: input.RunID, OwnerID: input.OwnerID, From: input.From, To: to,
+		RunID: input.RunID, OwnerID: input.OwnerID,
+		LeaseGeneration: input.LeaseGeneration, From: input.From, To: to,
 		At: s.now().UTC(), Evidence: &input.Evidence,
 		ErrorCategory: input.ErrorCategory, ErrorTraceID: input.ErrorTraceID,
 	})
@@ -206,6 +227,9 @@ func (s *Service) Get(
 	}
 	for i := range detail.RestoreVerifications {
 		verification := &detail.RestoreVerifications[i]
+		if !validRestoreRowCounts(verification.DatabaseRowCounts) {
+			return RunDetail{}, ErrUnavailable
+		}
 		verification.StartedAt = cloneTime(verification.StartedAt)
 		verification.FinishedAt = cloneTime(verification.FinishedAt)
 		verification.DatabaseRowCounts = safeRowCounts(verification.DatabaseRowCounts)

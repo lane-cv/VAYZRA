@@ -324,7 +324,7 @@ func TestBackupAdminDetailIsSafeAndContainsArtifactsAndRestoreEvidence(t *testin
 		}},
 		RestoreVerifications: []RestoreVerification{{
 			ID: verificationID, BackupRunID: runID, State: RestoreSucceeded,
-			DatabaseRowCounts:  map[string]int64{"users": 3, "secret_table": 99},
+			DatabaseRowCounts:  map[string]int64{"users": 3},
 			CheckedObjectCount: 5, MissingObjectCount: 0, UnexpectedObjectCount: 0,
 			SessionRevocationVerified: true, RTOSeconds: int64Pointer(90),
 			ReportSHA256: []byte("01234567890123456789012345678901"),
@@ -353,6 +353,38 @@ func TestBackupAdminDetailIsSafeAndContainsArtifactsAndRestoreEvidence(t *testin
 	} {
 		if !strings.Contains(body, required) {
 			t.Errorf("response missing %q: %s", required, body)
+		}
+	}
+}
+
+func TestBackupAdminDetailFailsClosedOnInvalidRestoreRowCounts(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	for _, counts := range []map[string]int64{
+		nil,
+		{"secret_table": 1},
+		{"users": -1},
+	} {
+		service := &backupHTTPService{getDetail: RunDetail{
+			Run: Run{ID: runID, RequestedAt: time.Now().UTC()},
+			RestoreVerifications: []RestoreVerification{{
+				ID: uuid.New(), DatabaseRowCounts: counts,
+			}},
+		}}
+		handler := NewAdminHandler(service, nil).Routes()
+		result, _ := backupRequest(
+			handler,
+			http.MethodGet,
+			"/"+runID.String(),
+			activeAdmin(),
+		)
+		if result.Code != http.StatusServiceUnavailable ||
+			!strings.Contains(result.Body.String(), `"code":"backup_unavailable"`) {
+			t.Fatalf(
+				"counts=%v status=%d body=%s",
+				counts,
+				result.Code,
+				result.Body.String(),
+			)
 		}
 	}
 }

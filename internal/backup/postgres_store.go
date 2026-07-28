@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,10 +18,40 @@ const backupClaimAdvisoryKey int64 = 845103121
 
 type PostgresStore struct {
 	pool *pgxpool.Pool
+
+	beforeCommit func(string, *pgxpool.Conn) error
+	afterCommit  func(string, *pgxpool.Conn) error
 }
 
 func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
+}
+
+func (s *PostgresStore) commit(
+	ctx context.Context,
+	operation string,
+	tx pgx.Tx,
+	conn *pgxpool.Conn,
+) error {
+	if s.beforeCommit != nil {
+		if err := s.beforeCommit(operation, conn); err != nil {
+			rollbackBackupTx(tx)
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.afterCommit != nil {
+		return s.afterCommit(operation, conn)
+	}
+	return nil
+}
+
+func rollbackBackupTx(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = tx.Rollback(ctx)
 }
 
 func (s *PostgresStore) Create(ctx context.Context, input CreateInput) (Run, error) {
@@ -101,7 +132,16 @@ func (s *PostgresStore) Claim(
 		lease < time.Second || lease > 24*time.Hour {
 		return Run{}, ErrInvalid
 	}
-	tx, err := s.pool.Begin(ctx)
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	defer func() {
+		if conn != nil {
+			conn.Release()
+		}
+	}()
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return Run{}, ErrUnavailable
 	}
@@ -109,55 +149,151 @@ func (s *PostgresStore) Claim(
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, backupClaimAdvisoryKey); err != nil {
 		return Run{}, ErrUnavailable
 	}
-	var active bool
-	if err := tx.QueryRow(ctx, `
-SELECT EXISTS(
-  SELECT 1 FROM backup_runs
-  WHERE state NOT IN ('succeeded','degraded','failed')
-    AND owner_id IS NOT NULL
-    AND lease_expires_at > now()
-)`).Scan(&active); err != nil {
-		return Run{}, ErrUnavailable
-	}
-	if active {
-		return Run{}, ErrActiveClaim
-	}
-	var runID uuid.UUID
-	err = tx.QueryRow(ctx, `
-SELECT id
-FROM backup_runs
+	current, err := scanRun(tx.QueryRow(ctx, runSelect+`
 WHERE state NOT IN ('succeeded','degraded','failed')
-  AND (owner_id IS NULL OR lease_expires_at <= now())
 ORDER BY (owner_id IS NULL),requested_at,id
 FOR UPDATE
-LIMIT 1`).Scan(&runID)
+LIMIT 1`))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNoClaimableRun
 	}
 	if err != nil {
 		return Run{}, ErrUnavailable
 	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return Run{}, ErrUnavailable
+	}
+	if current.OwnerID != uuid.Nil && current.LeaseExpiresAt != nil &&
+		current.LeaseExpiresAt.After(databaseNow) {
+		return Run{}, ErrActiveClaim
+	}
 	run, err := scanRun(tx.QueryRow(ctx, `
 UPDATE backup_runs
 SET owner_id=$2,
-    lease_expires_at=now()+make_interval(secs => $3::double precision),
-    started_at=COALESCE(started_at,now())
+    lease_expires_at=$3,
+    lease_generation=lease_generation+1,
+    started_at=COALESCE(started_at,$4)
 WHERE id=$1
 RETURNING `+runColumns,
-		runID, owner, lease.Seconds(),
+		current.ID, owner, databaseNow.Add(lease), databaseNow,
 	))
+	if err != nil {
+		return Run{}, mapPostgresWriteError(err)
+	}
+	commitErr := s.commit(ctx, "claim", tx, conn)
+	if commitErr == nil {
+		return run, nil
+	}
+	rollbackBackupTx(tx)
+	conn.Release()
+	conn = nil
+	reconciled, err := s.reconcileClaim(owner, run)
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	return reconciled, nil
+}
+
+func (s *PostgresStore) reconcileClaim(owner uuid.UUID, intended Run) (Run, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var durable Run
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var conn *pgxpool.Conn
+		conn, err = s.pool.Acquire(ctx)
+		if err != nil {
+			continue
+		}
+		durable, err = scanRun(conn.QueryRow(ctx, runSelect+`
+WHERE owner_id=$1
+  AND lease_expires_at > clock_timestamp()
+ORDER BY lease_generation DESC,id
+LIMIT 1`, owner))
+		conn.Release()
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return Run{}, err
+	}
+	if durable.ID != intended.ID ||
+		durable.OwnerID != owner ||
+		durable.LeaseGeneration != intended.LeaseGeneration ||
+		durable.State != intended.State ||
+		!equalTimePointer(durable.StartedAt, intended.StartedAt) ||
+		!equalTimePointer(durable.LeaseExpiresAt, intended.LeaseExpiresAt) {
+		return Run{}, ErrUnavailable
+	}
+	return durable, nil
+}
+
+func (s *PostgresStore) Renew(
+	ctx context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	generation int64,
+	lease time.Duration,
+) (Run, error) {
+	if s == nil || s.pool == nil || runID == uuid.Nil || owner == uuid.Nil ||
+		generation < 1 || lease < time.Second || lease > 24*time.Hour {
+		return Run{}, ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	defer tx.Rollback(ctx)
+	current, err := scanRun(tx.QueryRow(
+		ctx,
+		runSelect+`WHERE id=$1 FOR UPDATE`,
+		runID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Run{}, ErrNotFound
+	}
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return Run{}, ErrUnavailable
+	}
+	if current.OwnerID != owner ||
+		current.LeaseGeneration != generation ||
+		current.LeaseExpiresAt == nil ||
+		!current.LeaseExpiresAt.After(databaseNow) {
+		return Run{}, ErrStaleOwner
+	}
+	renewed, err := scanRun(tx.QueryRow(ctx, `
+UPDATE backup_runs
+SET lease_expires_at=$5
+WHERE id=$1
+  AND owner_id=$2
+  AND lease_generation=$3
+  AND state NOT IN ('succeeded','degraded','failed')
+  AND lease_expires_at=$4
+RETURNING `+runColumns,
+		runID, owner, generation, current.LeaseExpiresAt, databaseNow.Add(lease),
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Run{}, ErrStaleOwner
+	}
 	if err != nil {
 		return Run{}, mapPostgresWriteError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Run{}, ErrUnavailable
 	}
-	return run, nil
+	return renewed, nil
 }
 
 func (s *PostgresStore) Transition(ctx context.Context, input TransitionInput) (Run, error) {
 	if s == nil || s.pool == nil ||
 		input.RunID == uuid.Nil || input.OwnerID == uuid.Nil ||
+		input.LeaseGeneration < 1 ||
 		!validState(input.From) || !validState(input.To) ||
 		!ValidTransition(input.From, input.To) ||
 		input.At.IsZero() || !validSafeError(input.ErrorCategory, input.ErrorTraceID) {
@@ -178,16 +314,54 @@ func (s *PostgresStore) Transition(ctx context.Context, input TransitionInput) (
 		return Run{}, ErrInvalid
 	}
 
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	defer func() {
+		if conn != nil {
+			conn.Release()
+		}
+	}()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	defer tx.Rollback(ctx)
+	current, err := scanRun(tx.QueryRow(
+		ctx,
+		runSelect+`WHERE id=$1 FOR UPDATE`,
+		input.RunID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Run{}, ErrNotFound
+	}
+	if err != nil {
+		return Run{}, ErrUnavailable
+	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return Run{}, ErrUnavailable
+	}
+	if current.OwnerID != input.OwnerID ||
+		current.LeaseGeneration != input.LeaseGeneration ||
+		current.LeaseExpiresAt == nil ||
+		!current.LeaseExpiresAt.After(databaseNow) {
+		return Run{}, ErrStaleOwner
+	}
+	if current.State != input.From {
+		return Run{}, ErrInvalidTransition
+	}
+
 	values := transitionEvidence(input.Evidence)
 	terminal := input.To == StateSucceeded || input.To == StateDegraded || input.To == StateFailed
 	var finishedAt any
-	var ownerID any = input.OwnerID
 	var leaseOwner any = input.OwnerID
 	if terminal {
 		finishedAt = input.At.UTC()
 		leaseOwner = nil
 	}
-	run, err := scanRun(s.pool.QueryRow(ctx, `
+	run, err := scanRun(tx.QueryRow(ctx, `
 UPDATE backup_runs
 SET state=$4,
     finished_at=$5::timestamptz,
@@ -207,38 +381,120 @@ SET state=$4,
 WHERE id=$1
   AND state=$2
   AND owner_id=$3
-  AND lease_expires_at > now()
+  AND lease_generation=$18
+  AND lease_expires_at=$19
 RETURNING `+runColumns,
-		input.RunID, input.From, ownerID, input.To, finishedAt,
+		input.RunID, input.From, input.OwnerID, input.To, finishedAt,
 		values.databaseMigrationVersion, values.encryptionKeyID,
 		values.localSnapshotID, values.remoteSnapshotID,
 		values.manifestSHA256, values.logicalBytes, values.storedBytes,
 		values.localExpiresAt, values.remoteExpiresAt,
 		input.ErrorCategory, input.ErrorTraceID, leaseOwner,
+		input.LeaseGeneration, current.LeaseExpiresAt,
 	))
-	if err == nil {
-		return run, nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Run{}, ErrInvalidTransition
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil {
 		return Run{}, mapPostgresWriteError(err)
 	}
-	var currentOwner *uuid.UUID
-	var leaseValid bool
-	err = s.pool.QueryRow(ctx,
-		`SELECT owner_id,COALESCE(lease_expires_at > now(),false)
-		 FROM backup_runs WHERE id=$1`,
-		input.RunID,
-	).Scan(&currentOwner, &leaseValid)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Run{}, ErrNotFound
+	commitErr := s.commit(ctx, "transition", tx, conn)
+	if commitErr == nil {
+		return run, nil
 	}
+	rollbackBackupTx(tx)
+	conn.Release()
+	conn = nil
+	reconciled, err := s.reconcileTransition(input, run)
 	if err != nil {
 		return Run{}, ErrUnavailable
 	}
-	if currentOwner == nil || *currentOwner != input.OwnerID || !leaseValid {
-		return Run{}, ErrStaleOwner
+	return reconciled, nil
+}
+
+func (s *PostgresStore) reconcileTransition(
+	input TransitionInput,
+	intended Run,
+) (Run, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	query := runSelect + `WHERE id=$1`
+	args := []any{input.RunID}
+	if input.To != StateSucceeded &&
+		input.To != StateDegraded &&
+		input.To != StateFailed {
+		query += `
+  AND owner_id=$2
+  AND lease_generation=$3
+  AND lease_expires_at > clock_timestamp()`
+		args = append(args, input.OwnerID, input.LeaseGeneration)
 	}
-	return Run{}, ErrInvalidTransition
+	var durable Run
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var conn *pgxpool.Conn
+		conn, err = s.pool.Acquire(ctx)
+		if err != nil {
+			continue
+		}
+		durable, err = scanRun(conn.QueryRow(ctx, query, args...))
+		conn.Release()
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return Run{}, err
+	}
+	if !transitionRunMatches(durable, intended, input) {
+		return Run{}, ErrUnavailable
+	}
+	return durable, nil
+}
+
+func transitionRunMatches(durable, intended Run, input TransitionInput) bool {
+	if durable.ID != input.RunID ||
+		durable.State != input.To ||
+		durable.LeaseGeneration != input.LeaseGeneration ||
+		durable.ErrorCategory != intended.ErrorCategory ||
+		durable.ErrorTraceID != intended.ErrorTraceID ||
+		!equalTimePointer(durable.FinishedAt, intended.FinishedAt) ||
+		!equalInt64Pointer(
+			durable.DatabaseMigrationVersion,
+			intended.DatabaseMigrationVersion,
+		) ||
+		durable.EncryptionKeyID != intended.EncryptionKeyID ||
+		durable.LocalSnapshotID != intended.LocalSnapshotID ||
+		durable.RemoteSnapshotID != intended.RemoteSnapshotID ||
+		!bytes.Equal(durable.ManifestSHA256, intended.ManifestSHA256) ||
+		!equalInt64Pointer(durable.LogicalBytes, intended.LogicalBytes) ||
+		!equalInt64Pointer(durable.StoredBytes, intended.StoredBytes) ||
+		!equalTimePointer(durable.LocalExpiresAt, intended.LocalExpiresAt) ||
+		!equalTimePointer(durable.RemoteExpiresAt, intended.RemoteExpiresAt) {
+		return false
+	}
+	terminal := input.To == StateSucceeded ||
+		input.To == StateDegraded ||
+		input.To == StateFailed
+	if terminal {
+		return durable.OwnerID == uuid.Nil && durable.LeaseExpiresAt == nil
+	}
+	return durable.OwnerID == input.OwnerID &&
+		equalTimePointer(durable.LeaseExpiresAt, intended.LeaseExpiresAt)
+}
+
+func equalTimePointer(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func equalInt64Pointer(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (s *PostgresStore) AddArtifact(ctx context.Context, artifact Artifact) error {
@@ -253,19 +509,30 @@ func (s *PostgresStore) AddArtifact(ctx context.Context, artifact Artifact) erro
 	}
 	defer tx.Rollback(ctx)
 	var currentOwner *uuid.UUID
-	var leaseValid bool
+	var currentGeneration int64
+	var leaseExpiresAt *time.Time
 	err = tx.QueryRow(ctx, `
-SELECT owner_id,COALESCE(lease_expires_at > now(),false)
+SELECT owner_id,lease_generation,lease_expires_at
 FROM backup_runs
 WHERE id=$1
-FOR UPDATE`, artifact.BackupRunID).Scan(&currentOwner, &leaseValid)
+FOR UPDATE`, artifact.BackupRunID).Scan(
+		&currentOwner,
+		&currentGeneration,
+		&leaseExpiresAt,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return ErrUnavailable
 	}
-	if currentOwner == nil || *currentOwner != artifact.OwnerID || !leaseValid {
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return ErrUnavailable
+	}
+	if currentOwner == nil || *currentOwner != artifact.OwnerID ||
+		currentGeneration != artifact.LeaseGeneration ||
+		leaseExpiresAt == nil || !leaseExpiresAt.After(databaseNow) {
 		return ErrStaleOwner
 	}
 	tag, err := tx.Exec(ctx, `
@@ -439,7 +706,8 @@ ORDER BY started_at DESC NULLS LAST,id DESC`, id)
 		); err != nil {
 			return RunDetail{}, ErrUnavailable
 		}
-		if err := json.Unmarshal(rowCounts, &verification.DatabaseRowCounts); err != nil {
+		if err := json.Unmarshal(rowCounts, &verification.DatabaseRowCounts); err != nil ||
+			!validRestoreRowCounts(verification.DatabaseRowCounts) {
 			return RunDetail{}, ErrUnavailable
 		}
 		verification.StartedAt = cloneTime(verification.StartedAt)
@@ -542,7 +810,7 @@ id,idempotency_key,trigger_kind,state,requested_by,requested_at,
 started_at,finished_at,database_migration_version,encryption_key_id,
 local_snapshot_id,remote_snapshot_id,manifest_sha256,logical_bytes,
 stored_bytes,local_expires_at,remote_expires_at,error_category,error_trace_id,
-owner_id,lease_expires_at`
+owner_id,lease_expires_at,lease_generation`
 
 const runSelect = `SELECT ` + runColumns + ` FROM backup_runs `
 
@@ -557,7 +825,7 @@ func scanRun(row rowScanner) (Run, error) {
 		&localSnapshotID, &remoteSnapshotID, &run.ManifestSHA256,
 		&run.LogicalBytes, &run.StoredBytes, &run.LocalExpiresAt,
 		&run.RemoteExpiresAt, &run.ErrorCategory, &run.ErrorTraceID,
-		&ownerID, &run.LeaseExpiresAt,
+		&ownerID, &run.LeaseExpiresAt, &run.LeaseGeneration,
 	); err != nil {
 		return Run{}, err
 	}

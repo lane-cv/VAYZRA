@@ -21,6 +21,7 @@ CREATE TABLE backup_runs (
   error_trace_id text NOT NULL DEFAULT '',
   owner_id uuid,
   lease_expires_at timestamptz,
+  lease_generation bigint NOT NULL DEFAULT 0,
   CONSTRAINT backup_runs_idempotency_key
     UNIQUE(trigger_kind, idempotency_key),
   CONSTRAINT backup_runs_idempotency_key_check
@@ -53,6 +54,8 @@ CREATE TABLE backup_runs (
     CHECK (logical_bytes IS NULL OR logical_bytes >= 0),
   CONSTRAINT backup_runs_stored_bytes_check
     CHECK (stored_bytes IS NULL OR stored_bytes >= 0),
+  CONSTRAINT backup_runs_lease_generation_check
+    CHECK (lease_generation >= 0),
   CONSTRAINT backup_runs_lease_shape_check CHECK (
     (
       owner_id IS NULL
@@ -133,6 +136,58 @@ CREATE TABLE backup_artifacts (
     CHECK (repository IN ('local', 'remote'))
 );
 
+-- +goose StatementBegin
+CREATE FUNCTION happylearn_valid_restore_row_counts(counts jsonb)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+DECLARE
+  row_count record;
+  numeric_value numeric;
+BEGIN
+  IF jsonb_typeof(counts) <> 'object' THEN
+    RETURN false;
+  END IF;
+  FOR row_count IN SELECT key,value FROM jsonb_each(counts)
+  LOOP
+    IF row_count.key NOT IN (
+      'users',
+      'sessions',
+      'subjects',
+      'grades',
+      'terms',
+      'chapters',
+      'lessons',
+      'lesson_revisions',
+      'files',
+      'file_versions',
+      'file_previews',
+      'qa_threads',
+      'qa_messages',
+      'ai_threads',
+      'ai_messages',
+      'ai_runs'
+    ) THEN
+      RETURN false;
+    END IF;
+    IF jsonb_typeof(row_count.value) <> 'number' THEN
+      RETURN false;
+    END IF;
+    numeric_value := (row_count.value #>> '{}')::numeric;
+    IF numeric_value < 0
+      OR numeric_value > 9223372036854775807::numeric
+      OR trunc(numeric_value) <> numeric_value THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+  RETURN true;
+END;
+$$;
+-- +goose StatementEnd
+
 CREATE TABLE restore_verifications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   backup_run_id uuid NOT NULL REFERENCES backup_runs(id),
@@ -167,7 +222,7 @@ CREATE TABLE restore_verifications (
     OR octet_length(report_sha256) = 32
   ),
   CONSTRAINT restore_verifications_row_counts_check
-    CHECK (jsonb_typeof(database_row_counts) = 'object'),
+    CHECK (happylearn_valid_restore_row_counts(database_row_counts)),
   CONSTRAINT restore_verifications_terminal_check CHECK (
     (
       state IN ('succeeded', 'failed')
@@ -222,3 +277,4 @@ CREATE INDEX restore_verifications_backup_idx
 DROP TABLE restore_verifications;
 DROP TABLE backup_artifacts;
 DROP TABLE backup_runs;
+DROP FUNCTION IF EXISTS happylearn_valid_restore_row_counts(jsonb);

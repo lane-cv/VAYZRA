@@ -124,6 +124,12 @@ func (h *AdminHandler) detail(w http.ResponseWriter, r *http.Request) {
 		backupError(w, r, err)
 		return
 	}
+	for _, verification := range detail.RestoreVerifications {
+		if !validRestoreRowCounts(verification.DatabaseRowCounts) {
+			backupError(w, r, ErrUnavailable)
+			return
+		}
+	}
 	httpx.JSON(w, http.StatusOK, struct {
 		Data runDetailDTO `json:"data"`
 	}{Data: runDetailView(detail)})

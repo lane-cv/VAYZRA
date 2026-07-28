@@ -105,6 +105,7 @@ type Run struct {
 	ErrorTraceID             string
 	OwnerID                  uuid.UUID
 	LeaseExpiresAt           *time.Time
+	LeaseGeneration          int64
 }
 
 type RunSummary struct {
@@ -133,15 +134,16 @@ func (r Run) Summary() RunSummary {
 }
 
 type Artifact struct {
-	BackupRunID uuid.UUID
-	OwnerID     uuid.UUID
-	Kind        ArtifactKind
-	Repository  Repository
-	SnapshotID  string
-	SHA256      []byte
-	SizeBytes   int64
-	VerifiedAt  time.Time
-	ExpiresAt   time.Time
+	BackupRunID     uuid.UUID
+	OwnerID         uuid.UUID
+	LeaseGeneration int64
+	Kind            ArtifactKind
+	Repository      Repository
+	SnapshotID      string
+	SHA256          []byte
+	SizeBytes       int64
+	VerifiedAt      time.Time
+	ExpiresAt       time.Time
 }
 
 type RestoreVerification struct {
@@ -191,19 +193,21 @@ type RecoveryEvidence struct {
 }
 
 type TransitionInput struct {
-	RunID         uuid.UUID
-	OwnerID       uuid.UUID
-	From          State
-	To            State
-	At            time.Time
-	Evidence      *RecoveryEvidence
-	ErrorCategory string
-	ErrorTraceID  string
+	RunID           uuid.UUID
+	OwnerID         uuid.UUID
+	LeaseGeneration int64
+	From            State
+	To              State
+	At              time.Time
+	Evidence        *RecoveryEvidence
+	ErrorCategory   string
+	ErrorTraceID    string
 }
 
 type CompletionInput struct {
 	RunID            uuid.UUID
 	OwnerID          uuid.UUID
+	LeaseGeneration  int64
 	From             State
 	Evidence         RecoveryEvidence
 	RemoteConfigured bool
@@ -251,6 +255,15 @@ var safeErrorCategories = map[string]struct{}{
 	"restore_object_store": {}, "session_revocation": {},
 	"readiness": {}, "reference_check": {}, "authorization_check": {},
 	"timeout": {},
+}
+
+var allowedRestoreRowCountTables = map[string]struct{}{
+	"users": {}, "sessions": {},
+	"subjects": {}, "grades": {}, "terms": {}, "chapters": {},
+	"lessons": {}, "lesson_revisions": {},
+	"files": {}, "file_versions": {}, "file_previews": {},
+	"qa_threads": {}, "qa_messages": {},
+	"ai_threads": {}, "ai_messages": {}, "ai_runs": {},
 }
 
 func validTrigger(trigger Trigger) bool {
@@ -308,6 +321,7 @@ func validateEvidence(evidence RecoveryEvidence) error {
 
 func validateArtifact(artifact Artifact) error {
 	if artifact.BackupRunID == uuid.Nil || artifact.OwnerID == uuid.Nil ||
+		artifact.LeaseGeneration < 1 ||
 		!validArtifactKind(artifact.Kind) || !validRepository(artifact.Repository) ||
 		!safeOpaqueValue.MatchString(artifact.SnapshotID) ||
 		len(artifact.SHA256) != 32 || artifact.SizeBytes < 0 ||
@@ -370,21 +384,25 @@ func safeRowCounts(counts map[string]int64) map[string]int64 {
 	if len(counts) == 0 {
 		return map[string]int64{}
 	}
-	allowed := map[string]struct{}{
-		"users": {}, "sessions": {},
-		"subjects": {}, "grades": {}, "terms": {}, "chapters": {},
-		"lessons": {}, "lesson_revisions": {},
-		"files": {}, "file_versions": {}, "file_previews": {},
-		"qa_threads": {}, "qa_messages": {},
-		"ai_threads": {}, "ai_messages": {}, "ai_runs": {},
-	}
 	safe := make(map[string]int64)
 	for table, count := range counts {
-		if _, ok := allowed[table]; ok && count >= 0 {
+		if _, ok := allowedRestoreRowCountTables[table]; ok && count >= 0 {
 			safe[table] = count
 		}
 	}
 	return safe
+}
+
+func validRestoreRowCounts(counts map[string]int64) bool {
+	if counts == nil {
+		return false
+	}
+	for table, count := range counts {
+		if _, ok := allowedRestoreRowCountTables[table]; !ok || count < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func safeText(value string) string {
