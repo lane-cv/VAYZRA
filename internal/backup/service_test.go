@@ -279,6 +279,30 @@ func TestBackupServiceClaimsOnlyTheExactRunID(t *testing.T) {
 	}
 }
 
+func TestBackupServiceReturnsExactWorkflowRunWithoutAuthorizationDTOs(t *testing.T) {
+	runID := uuid.New()
+	store := &serviceStore{detail: RunDetail{Run: Run{
+		ID: runID, State: StateEncrypting,
+		OwnerID: uuid.New(), LeaseGeneration: 4,
+		ManifestSHA256: make([]byte, 32),
+	}}}
+	service := NewService(store, time.Now)
+	run, err := service.WorkflowRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ID != runID ||
+		run.State != StateEncrypting ||
+		run.LeaseGeneration != 4 ||
+		len(run.ManifestSHA256) != 32 {
+		t.Fatalf("run=%+v", run)
+	}
+	run.ManifestSHA256[0] = 1
+	if store.detail.Run.ManifestSHA256[0] != 0 {
+		t.Fatal("workflow run leaked mutable store evidence")
+	}
+}
+
 func TestCompleteChoosesSucceededOrDegradedFromRemoteOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name             string

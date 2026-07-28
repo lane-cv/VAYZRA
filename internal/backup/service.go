@@ -101,6 +101,23 @@ func (s *Service) ClaimRunByID(
 	return normalizeRun(run), nil
 }
 
+func (s *Service) WorkflowRun(
+	ctx context.Context,
+	runID uuid.UUID,
+) (Run, error) {
+	if s == nil || s.store == nil || runID == uuid.Nil {
+		return Run{}, ErrInvalid
+	}
+	detail, err := s.store.Get(ctx, runID)
+	if err != nil {
+		return Run{}, mapStoreError(err)
+	}
+	if detail.Run.ID != runID {
+		return Run{}, ErrUnavailable
+	}
+	return normalizeRun(detail.Run), nil
+}
+
 func (s *Service) Renew(
 	ctx context.Context,
 	runID uuid.UUID,

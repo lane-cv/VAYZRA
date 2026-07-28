@@ -144,7 +144,8 @@ func (value *singleFlag) Set(input string) error {
 }
 
 type backupWorkflowService interface {
-	Claim(context.Context, uuid.UUID, time.Duration) (backup.Run, error)
+	ClaimRunByID(context.Context, uuid.UUID, uuid.UUID, time.Duration) (backup.Run, error)
+	WorkflowRun(context.Context, uuid.UUID) (backup.Run, error)
 	Renew(context.Context, uuid.UUID, uuid.UUID, int64, time.Duration) (backup.Run, error)
 	Transition(context.Context, backup.TransitionInput) (backup.Run, error)
 	Complete(context.Context, backup.CompletionInput) (backup.Run, error)
@@ -200,21 +201,29 @@ func (application *commandApplication) Prepare(
 	if owner == uuid.Nil {
 		return errWorkflowUnavailable
 	}
-	claimed, err := application.service.Claim(ctx, owner, workflowLease)
+	claimed, err := application.service.ClaimRunByID(
+		ctx,
+		runID,
+		owner,
+		workflowLease,
+	)
 	if err != nil ||
 		claimed.ID != runID ||
 		claimed.OwnerID != owner ||
 		claimed.LeaseGeneration < 1 ||
-		claimed.State != backup.StateQueued {
+		(claimed.State != backup.StateQueued &&
+			claimed.State != backup.StateDraining) {
 		return errWorkflowUnavailable
 	}
 	state := workflowState{
 		RunID: runID, OwnerID: owner,
 		LeaseGeneration: claimed.LeaseGeneration,
-		State:           backup.StateQueued,
+		State:           claimed.State,
 	}
-	if err := application.transition(ctx, &state, backup.StateDraining); err != nil {
-		return err
+	if claimed.State == backup.StateQueued {
+		if err := application.transition(ctx, &state, backup.StateDraining); err != nil {
+			return err
+		}
 	}
 	return application.states.Save(state)
 }
@@ -223,15 +232,23 @@ func (application *commandApplication) Snapshot(
 	ctx context.Context,
 	runID uuid.UUID,
 ) error {
-	state, err := application.renew(ctx, runID)
-	if err != nil || state.State != backup.StateDraining {
+	state, terminal, err := application.resume(ctx, runID)
+	if err != nil || terminal {
 		return errWorkflowUnavailable
 	}
-	if err := application.transition(ctx, &state, backup.StateSnapshotting); err != nil {
-		return err
-	}
-	if err := application.states.Save(state); err != nil {
-		return errWorkflowState
+	switch state.State {
+	case backup.StateDraining:
+		if err := application.transition(ctx, &state, backup.StateSnapshotting); err != nil {
+			return err
+		}
+		if err := application.states.Save(state); err != nil {
+			return errWorkflowState
+		}
+	case backup.StateSnapshotting:
+	case backup.StateEncrypting:
+		return nil
+	default:
+		return errWorkflowUnavailable
 	}
 	migrationVersion, err := application.migrationVersion(ctx)
 	if err != nil || migrationVersion < 1 {
@@ -272,7 +289,12 @@ func (application *commandApplication) Snapshot(
 	state.DatabaseDumpBytes = result.DatabaseDumpBytes
 	state.ReferencedBytes = result.Manifest.ReferencedBytes
 	state.ManifestBytes = int64(len(manifestBytes))
-	if err := application.transition(ctx, &state, backup.StateEncrypting); err != nil {
+	if err := application.transitionWithEvidence(
+		ctx,
+		&state,
+		backup.StateEncrypting,
+		&state.Evidence,
+	); err != nil {
 		return err
 	}
 	return application.states.Save(state)
@@ -282,8 +304,10 @@ func (application *commandApplication) Verify(
 	ctx context.Context,
 	runID uuid.UUID,
 ) error {
-	state, err := application.renew(ctx, runID)
-	if err != nil || state.State != backup.StateEncrypting {
+	state, terminal, err := application.resume(ctx, runID)
+	if err != nil || terminal ||
+		(state.State != backup.StateEncrypting &&
+			state.State != backup.StateVerifying) {
 		return errWorkflowUnavailable
 	}
 	if len(state.Evidence.ManifestSHA256) != sha256.Size ||
@@ -311,6 +335,12 @@ func (application *commandApplication) Verify(
 	state.DatabaseDumpSHA256 = verified.Manifest.DatabaseDumpSHA256
 	state.ReferencedBytes = verified.Manifest.ReferencedBytes
 	state.ManifestBytes = int64(len(manifestBytes))
+	if state.Evidence.LogicalBytes == nil ||
+		*state.Evidence.LogicalBytes < state.ReferencedBytes {
+		return errWorkflowUnavailable
+	}
+	state.DatabaseDumpBytes =
+		*state.Evidence.LogicalBytes - state.ReferencedBytes
 	if application.addArtifacts(
 		ctx,
 		state,
@@ -319,8 +349,10 @@ func (application *commandApplication) Verify(
 	) != nil {
 		return errWorkflowUnavailable
 	}
-	if err := application.transition(ctx, &state, backup.StateVerifying); err != nil {
-		return err
+	if state.State == backup.StateEncrypting {
+		if err := application.transition(ctx, &state, backup.StateVerifying); err != nil {
+			return err
+		}
 	}
 	return application.states.Save(state)
 }
@@ -329,20 +361,26 @@ func (application *commandApplication) Sync(
 	ctx context.Context,
 	runID uuid.UUID,
 ) error {
-	state, err := application.renew(ctx, runID)
-	if err != nil || state.State != backup.StateVerifying {
+	state, terminal, err := application.resume(ctx, runID)
+	if err != nil || terminal ||
+		(state.State != backup.StateVerifying &&
+			state.State != backup.StateSyncing) {
 		return errWorkflowUnavailable
 	}
 	configured, err := application.executor.RemoteConfigured()
 	if err != nil || !configured {
 		return errWorkflowUnavailable
 	}
-	if err := application.transition(ctx, &state, backup.StateSyncing); err != nil {
-		return err
-	}
-	state.RemoteConfigured = true
-	if err := application.states.Save(state); err != nil {
-		return errWorkflowState
+	if state.State == backup.StateVerifying {
+		if err := application.transition(ctx, &state, backup.StateSyncing); err != nil {
+			return err
+		}
+		state.RemoteConfigured = true
+		if err := application.states.Save(state); err != nil {
+			return errWorkflowState
+		}
+	} else {
+		state.RemoteConfigured = true
 	}
 	remoteSnapshotID, syncErr := application.executor.Sync(
 		ctx,
@@ -428,16 +466,25 @@ func (application *commandApplication) Finish(
 	ctx context.Context,
 	runID uuid.UUID,
 ) error {
-	state, err := application.renew(ctx, runID)
-	if err != nil ||
-		(state.State != backup.StateVerifying &&
-			state.State != backup.StateSyncing) {
+	state, terminal, err := application.resume(ctx, runID)
+	if err != nil {
+		return errWorkflowUnavailable
+	}
+	if terminal {
+		if state.State == backup.StateSucceeded ||
+			state.State == backup.StateDegraded {
+			return nil
+		}
+		return errWorkflowUnavailable
+	}
+	if state.State != backup.StateVerifying &&
+		state.State != backup.StateSyncing {
 		return errWorkflowUnavailable
 	}
 	if state.State == backup.StateVerifying && state.RemoteConfigured {
 		return errWorkflowUnavailable
 	}
-	_, err = application.service.Complete(ctx, backup.CompletionInput{
+	completed, err := application.service.Complete(ctx, backup.CompletionInput{
 		RunID:            runID,
 		OwnerID:          state.OwnerID,
 		LeaseGeneration:  state.LeaseGeneration,
@@ -448,6 +495,11 @@ func (application *commandApplication) Finish(
 		ErrorCategory:    state.ErrorCategory,
 	})
 	if err != nil {
+		return errWorkflowUnavailable
+	}
+	if completed.ID != runID ||
+		(completed.State != backup.StateSucceeded &&
+			completed.State != backup.StateDegraded) {
 		return errWorkflowUnavailable
 	}
 	if err := application.states.Delete(runID); err != nil {
@@ -464,8 +516,14 @@ func (application *commandApplication) Fail(
 	if !backup.ValidErrorCategory(category) {
 		return errInvalidCommand
 	}
-	state, err := application.renew(ctx, runID)
+	state, terminal, err := application.resume(ctx, runID)
 	if err != nil {
+		return errWorkflowUnavailable
+	}
+	if terminal {
+		if state.State == backup.StateFailed {
+			return nil
+		}
 		return errWorkflowUnavailable
 	}
 	_, err = application.service.Transition(ctx, backup.TransitionInput{
@@ -493,16 +551,16 @@ func (application *commandApplication) ready() bool {
 		application.now != nil
 }
 
-func (application *commandApplication) renew(
+func (application *commandApplication) resume(
 	ctx context.Context,
 	runID uuid.UUID,
-) (workflowState, error) {
+) (workflowState, bool, error) {
 	if !application.ready() || runID == uuid.Nil {
-		return workflowState{}, errWorkflowUnavailable
+		return workflowState{}, false, errWorkflowUnavailable
 	}
 	state, err := application.states.Load(runID)
 	if err != nil || !validWorkflowState(state) || state.RunID != runID {
-		return workflowState{}, errWorkflowState
+		return workflowState{}, false, errWorkflowState
 	}
 	renewed, err := application.service.Renew(
 		ctx,
@@ -511,14 +569,65 @@ func (application *commandApplication) renew(
 		state.LeaseGeneration,
 		workflowLease,
 	)
-	if err != nil ||
-		renewed.ID != runID ||
-		renewed.OwnerID != state.OwnerID ||
-		renewed.LeaseGeneration != state.LeaseGeneration ||
-		renewed.State != state.State {
-		return workflowState{}, errWorkflowUnavailable
+	if err != nil {
+		owner := application.newOwner()
+		if owner == uuid.Nil {
+			return workflowState{}, false, errWorkflowUnavailable
+		}
+		renewed, err = application.service.ClaimRunByID(
+			ctx,
+			runID,
+			owner,
+			workflowLease,
+		)
+		if err != nil {
+			durable, lookupErr := application.service.WorkflowRun(ctx, runID)
+			if lookupErr == nil && terminalWorkflowState(durable.State) {
+				if application.states.Delete(runID) != nil {
+					return workflowState{}, false, errWorkflowState
+				}
+				return workflowState{
+					RunID: runID,
+					State: durable.State,
+				}, true, nil
+			}
+			return workflowState{}, false, errWorkflowUnavailable
+		}
 	}
-	return state, nil
+	if renewed.ID != runID ||
+		renewed.OwnerID == uuid.Nil ||
+		renewed.LeaseGeneration < 1 ||
+		terminalWorkflowState(renewed.State) ||
+		renewed.LeaseExpiresAt == nil {
+		return workflowState{}, false, errWorkflowUnavailable
+	}
+	if renewed.State != state.State &&
+		!backup.ValidTransition(state.State, renewed.State) {
+		return workflowState{}, false, errWorkflowUnavailable
+	}
+	changed := renewed.OwnerID != state.OwnerID ||
+		renewed.LeaseGeneration != state.LeaseGeneration ||
+		renewed.State != state.State
+	state.OwnerID = renewed.OwnerID
+	state.LeaseGeneration = renewed.LeaseGeneration
+	state.State = renewed.State
+	evidence, hasEvidence, evidenceErr := workflowEvidenceFromRun(renewed)
+	if evidenceErr != nil {
+		return workflowState{}, false, errWorkflowUnavailable
+	}
+	if hasEvidence &&
+		!equalWorkflowEvidence(state.Evidence, evidence) {
+		state.Evidence = evidence
+		changed = true
+	}
+	if state.State == backup.StateSyncing && !state.RemoteConfigured {
+		state.RemoteConfigured = true
+		changed = true
+	}
+	if changed && application.states.Save(state) != nil {
+		return workflowState{}, false, errWorkflowState
+	}
+	return state, false, nil
 }
 
 func (application *commandApplication) transition(
@@ -526,10 +635,20 @@ func (application *commandApplication) transition(
 	state *workflowState,
 	to backup.State,
 ) error {
+	return application.transitionWithEvidence(ctx, state, to, nil)
+}
+
+func (application *commandApplication) transitionWithEvidence(
+	ctx context.Context,
+	state *workflowState,
+	to backup.State,
+	evidence *backup.RecoveryEvidence,
+) error {
 	transitioned, err := application.service.Transition(ctx, backup.TransitionInput{
 		RunID: state.RunID, OwnerID: state.OwnerID,
 		LeaseGeneration: state.LeaseGeneration,
 		From:            state.State, To: to, At: application.now().UTC(),
+		Evidence: evidence,
 	})
 	if err != nil ||
 		transitioned.ID != state.RunID ||
@@ -540,6 +659,82 @@ func (application *commandApplication) transition(
 	}
 	state.State = to
 	return nil
+}
+
+func workflowEvidenceFromRun(
+	run backup.Run,
+) (backup.RecoveryEvidence, bool, error) {
+	hasEvidence := run.DatabaseMigrationVersion != nil ||
+		run.EncryptionKeyID != "" ||
+		run.LocalSnapshotID != "" ||
+		len(run.ManifestSHA256) != 0 ||
+		run.LocalExpiresAt != nil
+	if !hasEvidence {
+		return backup.RecoveryEvidence{}, false, nil
+	}
+	if run.DatabaseMigrationVersion == nil ||
+		*run.DatabaseMigrationVersion < 1 ||
+		run.EncryptionKeyID == "" ||
+		run.LocalSnapshotID == "" ||
+		len(run.ManifestSHA256) != sha256.Size ||
+		run.LocalExpiresAt == nil ||
+		run.LocalExpiresAt.IsZero() {
+		return backup.RecoveryEvidence{}, false, errWorkflowState
+	}
+	evidence := backup.RecoveryEvidence{
+		DatabaseMigrationVersion: *run.DatabaseMigrationVersion,
+		EncryptionKeyID:          run.EncryptionKeyID,
+		LocalSnapshotID:          run.LocalSnapshotID,
+		RemoteSnapshotID:         run.RemoteSnapshotID,
+		ManifestSHA256:           append([]byte(nil), run.ManifestSHA256...),
+		LogicalBytes:             cloneInt64(run.LogicalBytes),
+		StoredBytes:              cloneInt64(run.StoredBytes),
+		LocalExpiresAt:           run.LocalExpiresAt.UTC(),
+	}
+	if run.RemoteExpiresAt != nil {
+		remoteExpiry := run.RemoteExpiresAt.UTC()
+		evidence.RemoteExpiresAt = &remoteExpiry
+	}
+	return evidence, true, nil
+}
+
+func equalWorkflowEvidence(
+	left backup.RecoveryEvidence,
+	right backup.RecoveryEvidence,
+) bool {
+	return left.DatabaseMigrationVersion == right.DatabaseMigrationVersion &&
+		left.EncryptionKeyID == right.EncryptionKeyID &&
+		left.LocalSnapshotID == right.LocalSnapshotID &&
+		left.RemoteSnapshotID == right.RemoteSnapshotID &&
+		bytes.Equal(left.ManifestSHA256, right.ManifestSHA256) &&
+		equalInt64(left.LogicalBytes, right.LogicalBytes) &&
+		equalInt64(left.StoredBytes, right.StoredBytes) &&
+		left.LocalExpiresAt.Equal(right.LocalExpiresAt) &&
+		equalTime(left.RemoteExpiresAt, right.RemoteExpiresAt)
+}
+
+func equalInt64(left *int64, right *int64) bool {
+	return left == nil && right == nil ||
+		left != nil && right != nil && *left == *right
+}
+
+func cloneInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func equalTime(left *time.Time, right *time.Time) bool {
+	return left == nil && right == nil ||
+		left != nil && right != nil && left.Equal(*right)
+}
+
+func terminalWorkflowState(state backup.State) bool {
+	return state == backup.StateSucceeded ||
+		state == backup.StateDegraded ||
+		state == backup.StateFailed
 }
 
 func validWorkflowState(state workflowState) bool {

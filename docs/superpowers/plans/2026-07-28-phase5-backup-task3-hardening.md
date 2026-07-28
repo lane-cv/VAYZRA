@@ -28,7 +28,7 @@ whitespace, or use a noncanonical time representation:
 func TestManifestDecoderRequiresExactCanonicalBytes(t *testing.T) {
 	for _, encoded := range []string{
 		strings.Replace(canonicalManifestJSON, `,"objectCount":12`, "", 1),
-		`{"batchId":"10000000-0000-4000-8000-000000000001","schemaVersion":1,"createdAt":"2026-07-28T01:02:03.000000004Z","databaseMigrationVersion":20,"databaseDumpSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","objectSnapshotId":"8f7e6d5c4b3a2100","objectCount":12,"referencedBytes":3456}`,
+		`{"batchId":"10000000-0000-4000-8000-000000000001","schemaVersion":1,"createdAt":"2026-07-28T01:02:03.000000004Z","databaseMigrationVersion":20,"databaseDumpSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","objectSnapshotId":"8f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a2100","objectCount":12,"referencedBytes":3456}`,
 		" " + canonicalManifestJSON,
 	} {
 		if _, err := DecodeManifest(strings.NewReader(encoded)); !errors.Is(err, ErrInvalidManifest) {
