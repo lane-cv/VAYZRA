@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
@@ -25,6 +27,36 @@ type serverOperationsRuntime struct {
 }
 
 type serverAdminOperationsService struct{}
+
+type serverAdminBackupService struct{}
+
+func (*serverAdminBackupService) RequestManual(
+	context.Context,
+	operations.Principal,
+	string,
+) (backup.Run, error) {
+	return backup.Run{
+		ID:      uuid.MustParse("20000000-0000-4000-8000-000000000001"),
+		Trigger: backup.TriggerManual, State: backup.StateQueued,
+		RequestedAt: time.Date(2026, 7, 28, 3, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+func (*serverAdminBackupService) List(
+	context.Context,
+	operations.Principal,
+	backup.Filter,
+) (backup.Page, error) {
+	return backup.Page{Items: []backup.RunSummary{}}, nil
+}
+
+func (*serverAdminBackupService) Get(
+	context.Context,
+	operations.Principal,
+	uuid.UUID,
+) (backup.RunDetail, error) {
+	return backup.RunDetail{}, backup.ErrNotFound
+}
 
 func newServerAdminOperations(*pgxpool.Pool, operationsRuntime) operations.HTTPService {
 	return &serverAdminOperationsService{}
@@ -112,6 +144,48 @@ func TestProductionApplicationWiresAdminOperationsFromSharedRuntime(t *testing.T
 	if response.Code != http.StatusOK || factoryGate != gate ||
 		!strings.Contains(response.Body.String(), `"siteName":"HappyLearn"`) {
 		t.Fatalf("status=%d same_gate=%t body=%s", response.Code, factoryGate == gate, response.Body.String())
+	}
+	closeResources()
+	if got := strings.Join(events, ","); got != "operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestProductionApplicationWiresAdminBackups(t *testing.T) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	factoryCalled := false
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open:          func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+			migrate:       func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth:       func(*pgxpool.Pool) (auth.HTTPService, error) { return serverAdminAuth{}, nil },
+			newOperations: func(*pgxpool.Pool) operationsRuntime { return gate },
+			newAdminOperations: func(*pgxpool.Pool, operationsRuntime) operations.HTTPService {
+				return &serverAdminOperationsService{}
+			},
+			newAdminBackups: func(*pgxpool.Pool) backup.HTTPService {
+				factoryCalled = true
+				return &serverAdminBackupService{}
+			},
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) { events = append(events, "pool_close") },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/operations/backups", nil)
+	request.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !factoryCalled {
+		t.Fatalf("status=%d factory_called=%t body=%s", response.Code, factoryCalled, response.Body.String())
 	}
 	closeResources()
 	if got := strings.Join(events, ","); got != "operations_close,pool_close" {

@@ -11,6 +11,7 @@ import (
 
 	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
 	"happylearn.local/app/internal/operations"
@@ -46,6 +47,7 @@ type Dependencies struct {
 	Notifications       notifications.HTTPService
 	OperationsWriteGate operations.WriteGate
 	AdminOperations     operations.HTTPService
+	AdminBackups        backup.HTTPService
 	AIFileAccess        files.AIAccessHTTPService
 	PublicOrigin        string
 	CookieSecure        bool
@@ -134,6 +136,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.AdminAIUsage != nil {
 					private.Mount("/admin/ai/usage", aiqa.NewAdminUsageHandler(d.AdminAIUsage, d.TrustedProxyCIDRs).Routes())
+				}
+				if d.AdminBackups != nil {
+					private.Mount("/admin/operations/backups", backup.NewAdminHandler(d.AdminBackups, d.TrustedProxyCIDRs).Routes())
 				}
 				if d.AdminOperations != nil {
 					private.Mount("/admin/operations", operations.NewAdminHandler(d.AdminOperations, d.TrustedProxyCIDRs).Routes())

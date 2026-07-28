@@ -19,6 +19,7 @@ import (
 	"happylearn.local/app/internal/app"
 	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
 	"happylearn.local/app/internal/operations"
@@ -123,6 +124,7 @@ type applicationDependencies struct {
 	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
 	newOperations          func(*pgxpool.Pool) operationsRuntime
 	newAdminOperations     func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
+	newAdminBackups        func(*pgxpool.Pool) backup.HTTPService
 	requireOperations      bool
 	ready                  func(*pgxpool.Pool) func(context.Context) error
 	objectReady            func(context.Context, config.Config) (func(context.Context) error, error)
@@ -170,6 +172,7 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 			return operations.NewPostgresStore(pool)
 		},
 		newAdminOperations: newProductionAdminOperationsService,
+		newAdminBackups:    newProductionAdminBackupService,
 		requireOperations:  true,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
@@ -359,6 +362,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			return nil, nil, errors.New("initialize operations service")
 		}
 	}
+	var adminBackups backup.HTTPService
+	if deps.newAdminBackups != nil {
+		adminBackups = deps.newAdminBackups(pool)
+		if adminBackups == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize backup service")
+		}
+	}
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
 		if err != nil {
@@ -421,6 +432,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		Notifications:       notificationService,
 		OperationsWriteGate: operationalGate,
 		AdminOperations:     adminOperations,
+		AdminBackups:        adminBackups,
 		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
 		CookieSecure:        cfg.CookieSecure,
@@ -647,6 +659,13 @@ func newProductionAdminOperationsService(
 		return nil
 	}
 	return operations.NewService(store, audit.NewPostgresWriter(pool))
+}
+
+func newProductionAdminBackupService(pool *pgxpool.Pool) backup.HTTPService {
+	return backup.NewService(
+		backup.NewPostgresStore(pool),
+		time.Now,
+	)
 }
 
 func newProductionOutboxRunner(pool *pgxpool.Pool, gate operations.ClaimGate) func() {
