@@ -2,12 +2,18 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
@@ -31,60 +37,211 @@ VALUES
 		actorID, otherActorID); err != nil {
 		t.Fatal(err)
 	}
-	base := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
-	for _, row := range []struct {
-		actor     uuid.UUID
-		action    string
-		target    string
-		targetID  string
-		metadata  string
-		occurred  time.Time
-		requestID string
-	}{
-		{actorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"retention","credential":"secret"}`, base, "audit-filter-0001"},
-		{actorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"threshold"}`, base.Add(time.Minute), "audit-filter-0002"},
-		{actorID, "operations.settings_updated", "system_settings", "global", `{"outcome":"succeeded","status":"updated"}`, base.Add(2 * time.Minute), "audit-filter-0003"},
-		{otherActorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"backup_schedule"}`, base.Add(3 * time.Minute), "audit-filter-0004"},
-	} {
-		if _, err := pool.Exec(ctx, `
-INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,metadata,request_id,ip,occurred_at)
-VALUES($1,$2,$3,$4,$5::jsonb,$6,'192.0.2.80',$7)`,
-			row.actor, row.action, row.target, row.targetID, row.metadata, row.requestID, row.occurred); err != nil {
-			t.Fatal(err)
+
+	baseEvent := Event{
+		ActorUserID: actorID, TargetID: "global",
+		RequestID: "audit-filter", IP: net.ParseIP("192.0.2.80"),
+	}
+	events := []Event{
+		baseEvent,
+		baseEvent,
+		baseEvent,
+		baseEvent,
+		baseEvent,
+	}
+	events[0].Action = "operations.settings_rejected"
+	events[0].TargetType = "system_settings"
+	events[0].Metadata = map[string]any{"category": "high_risk", "reason": "retention"}
+	events[0].RequestID = "audit-filter-0001"
+	events[1].Action = "operations.settings_rejected"
+	events[1].TargetType = "system_settings"
+	events[1].Metadata = map[string]any{"category": "high_risk", "reason": "threshold"}
+	events[1].RequestID = "audit-filter-0002"
+	events[2].Action = "operations.settings_updated"
+	events[2].TargetType = "system_settings"
+	events[2].Metadata = map[string]any{}
+	events[2].RequestID = "audit-filter-0003"
+	events[3].ActorUserID = otherActorID
+	events[3].Action = "operations.settings_rejected"
+	events[3].TargetType = "system_settings"
+	events[3].Metadata = map[string]any{"category": "high_risk", "reason": "backup_schedule"}
+	events[3].RequestID = "audit-filter-0004"
+	events[4].Action = "ai.provider_tested"
+	events[4].TargetType = "ai_provider"
+	events[4].TargetID = uuid.NewString()
+	events[4].Metadata = map[string]any{
+		"providerId": uuid.NewString(), "protocol": "responses",
+		"ok": "false", "errorCategory": "auth", "latencyMs": "12",
+	}
+	events[4].RequestID = "audit-filter-0005"
+
+	from := time.Now().UTC().Add(-time.Second)
+	writer := NewPostgresWriter(pool)
+	forgedOutcome := "succeeded"
+	for i, event := range events {
+		eventWriter := writer
+		if i == 0 {
+			eventWriter = NewPostgresWriter(historicalOutcomeDB{pool: pool})
+		} else if i == 1 {
+			eventWriter = NewPostgresWriter(historicalOutcomeDB{
+				pool: pool, storedOutcome: &forgedOutcome,
+			})
+		}
+		if err := eventWriter.Write(ctx, event); err != nil {
+			t.Fatalf("write %s: %v", event.RequestID, err)
 		}
 	}
+	to := time.Now().UTC().Add(time.Second)
 
-	store := NewPostgresWriter(pool)
 	filter := AuditFilter{
 		Action: "operations.settings_rejected", TargetType: "system_settings",
 		Outcome: "rejected", ActorID: actorID,
-		From: base.Add(-time.Second), To: base.Add(2 * time.Minute),
+		From: from, To: to,
 		Limit: 1,
 	}
-	first, err := store.ListFiltered(ctx, filter)
+	first, err := writer.ListFiltered(ctx, filter)
 	if err != nil || len(first.Items) != 1 || first.NextBeforeID == 0 ||
 		first.Items[0].RequestID != "audit-filter-0002" {
 		t.Fatalf("first=%#v err=%v", first, err)
 	}
 	filter.BeforeID = first.NextBeforeID
-	second, err := store.ListFiltered(ctx, filter)
+	second, err := writer.ListFiltered(ctx, filter)
 	if err != nil || len(second.Items) != 1 || second.NextBeforeID != 0 ||
 		second.Items[0].RequestID != "audit-filter-0001" {
 		t.Fatalf("second=%#v err=%v", second, err)
 	}
-	if _, err := store.ListFiltered(ctx, AuditFilter{
+	for _, tc := range []struct {
+		outcome string
+		action  string
+		request string
+	}{
+		{"succeeded", "operations.settings_updated", "audit-filter-0003"},
+		{"failed", "ai.provider_tested", "audit-filter-0005"},
+	} {
+		page, listErr := writer.ListFiltered(ctx, AuditFilter{
+			Action: tc.action, Outcome: tc.outcome, From: from, To: to, Limit: 10,
+		})
+		if listErr != nil || len(page.Items) != 1 || page.Items[0].RequestID != tc.request {
+			t.Fatalf("%s page=%#v err=%v", tc.outcome, page, listErr)
+		}
+	}
+	if _, err := writer.ListFiltered(ctx, AuditFilter{
 		Action: "' OR TRUE --", Limit: 20,
 	}); !errors.Is(err, ErrInvalidFilter) {
 		t.Fatalf("unsafe filter error=%v", err)
 	}
+	if _, err := writer.ListFiltered(ctx, AuditFilter{
+		Outcome: "unknown", Limit: 20,
+	}); !errors.Is(err, ErrInvalidFilter) {
+		t.Fatalf("unknown outcome error=%v", err)
+	}
 
-	compatibility, err := store.List(ctx, 1000, 0)
-	if err != nil || len(compatibility) != 4 {
+	compatibility, err := writer.List(ctx, 1000, 0)
+	if err != nil || len(compatibility) != len(events) {
 		t.Fatalf("compatibility records=%d err=%v", len(compatibility), err)
 	}
-	negativeCursor, err := store.List(ctx, 10, -1)
+	negativeCursor, err := writer.List(ctx, 10, -1)
 	if err != nil || len(negativeCursor) != 0 {
 		t.Fatalf("negative compatibility records=%d err=%v", len(negativeCursor), err)
+	}
+}
+
+type historicalOutcomeDB struct {
+	pool          *pgxpool.Pool
+	storedOutcome *string
+}
+
+func (db historicalOutcomeDB) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (pgconn.CommandTag, error) {
+	if strings.HasPrefix(query, "INSERT INTO audit_logs ") && len(args) > 4 {
+		var metadata map[string]any
+		if raw, ok := args[4].([]byte); ok && json.Unmarshal(raw, &metadata) == nil {
+			if db.storedOutcome == nil {
+				delete(metadata, "outcome")
+			} else {
+				metadata["outcome"] = *db.storedOutcome
+			}
+			args[4], _ = json.Marshal(metadata)
+		}
+	}
+	return db.pool.Exec(ctx, query, args...)
+}
+
+func (db historicalOutcomeDB) Query(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (pgx.Rows, error) {
+	return db.pool.Query(ctx, query, args...)
+}
+
+func TestAuditOutcomeClassificationIsServerOwnedAndComplete(t *testing.T) {
+	base := Event{
+		ActorUserID: uuid.New(), Action: "operations.settings_updated",
+		TargetType: "system_settings", TargetID: "global",
+		Metadata: map[string]any{}, RequestID: "outcome-owned",
+		IP: net.ParseIP("192.0.2.81"),
+	}
+	encoded, err := validateAndMarshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"outcome":"succeeded"`) {
+		t.Fatalf("writer did not classify outcome: %s", encoded)
+	}
+	clientSupplied := base
+	clientSupplied.Metadata = map[string]any{"outcome": "failed"}
+	if _, err := validateAndMarshal(clientSupplied); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("client-owned outcome error=%v", err)
+	}
+
+	if len(auditOutcomeRules) != len(allowedTargetTypes) {
+		t.Fatalf("outcome rules=%d allowed actions=%d", len(auditOutcomeRules), len(allowedTargetTypes))
+	}
+	for action := range allowedTargetTypes {
+		if _, ok := auditOutcomeRules[action]; !ok {
+			t.Errorf("allowed action %q has no outcome rule", action)
+		}
+	}
+	for action := range auditOutcomeRules {
+		if _, ok := allowedTargetTypes[action]; !ok {
+			t.Errorf("outcome rule %q is not an allowed action", action)
+		}
+	}
+	for _, outcome := range []string{"succeeded", "rejected", "failed"} {
+		if !IsValidOutcome(outcome) {
+			t.Errorf("classified outcome %q rejected by filter", outcome)
+		}
+	}
+	for _, outcome := range []string{"", "unknown", "success", "error"} {
+		if IsValidOutcome(outcome) {
+			t.Errorf("unclassified outcome %q accepted by filter", outcome)
+		}
+	}
+
+	query, args := auditOutcomeSQL(9)
+	for range 20 {
+		repeatedQuery, repeatedArgs := auditOutcomeSQL(9)
+		if repeatedQuery != query || !reflect.DeepEqual(repeatedArgs, args) {
+			t.Fatal("outcome SQL generation is not stable")
+		}
+	}
+	for action, rule := range auditOutcomeRules {
+		for _, raw := range []string{action, rule.outcome, rule.metadataKey} {
+			if raw != "" && strings.Contains(query, raw) {
+				t.Errorf("outcome SQL contains unbound rule value %q", raw)
+			}
+		}
+		for value, outcome := range rule.metadataOutcomes {
+			for _, raw := range []string{value, outcome} {
+				if strings.Contains(query, raw) {
+					t.Errorf("outcome SQL contains unbound dynamic value %q", raw)
+				}
+			}
+		}
 	}
 }
 

@@ -565,7 +565,15 @@ func (s *PostgresStore) ReplaceDraftBindings(ctx context.Context, actor Principa
 	if _, err = tx.Exec(ctx, `UPDATE lesson_drafts SET lock_version=lock_version+1,updated_at=now() WHERE lesson_id=$1`, lessonID); err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,metadata,request_id,ip) VALUES($1,'file.policy_changed','lesson',$2,'{}'::jsonb,$3,$4)`, actor.User.ID, lessonID.String(), actor.RequestID, actor.IP); err != nil {
+	if err = audit.NewPostgresWriter(tx).Write(ctx, audit.Event{
+		ActorUserID: actor.User.ID,
+		Action:      "file.policy_changed",
+		TargetType:  "lesson",
+		TargetID:    lessonID.String(),
+		Metadata:    map[string]any{},
+		RequestID:   actor.RequestID,
+		IP:          actor.IP,
+	}); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {

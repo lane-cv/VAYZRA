@@ -63,7 +63,7 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM file_processing_jobs WHERE file_version_id=$1 AND kind='process_file' AND state='queued' AND attempts=0`, completed.FileVersionID).Scan(&jobsCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='file.uploaded' AND target_type='file_version' AND target_id=$1 AND request_id='postgres-upload-request' AND metadata='{}'::jsonb`, completed.FileVersionID.String()).Scan(&auditCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='file.uploaded' AND target_type='file_version' AND target_id=$1 AND request_id='postgres-upload-request' AND metadata=jsonb_build_object('outcome','succeeded')`, completed.FileVersionID.String()).Scan(&auditCount); err != nil {
 		t.Fatal(err)
 	}
 	if filesCount != 1 || versionsCount != 1 || jobsCount != 1 || auditCount != 1 {

@@ -24,6 +24,7 @@ type operationsHTTPStub struct {
 	putErr   error
 	auditErr error
 	puts     int
+	lastPut  Settings
 }
 
 type operationsAuditReader struct {
@@ -42,6 +43,7 @@ func (s *operationsHTTPStub) GetSettings(context.Context, Principal) (Settings, 
 
 func (s *operationsHTTPStub) UpdateSettings(_ context.Context, _ Principal, settings Settings) (Settings, error) {
 	s.puts++
+	s.lastPut = settings
 	if s.putErr != nil {
 		return Settings{}, s.putErr
 	}
@@ -163,6 +165,65 @@ func TestOperationsHTTPSettingsAreTypedStrictAndConflictSafe(t *testing.T) {
 	assertOperationsErrorEnvelope(t, conflict, "settings_conflict")
 }
 
+func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
+	valid := validOperationsSettingsJSON()
+	withoutUpdatedAt := strings.Replace(
+		valid, `,"updatedAt":"2026-07-28T01:00:00Z"`, "", 1,
+	)
+	invalidUTF8 := strings.Replace(valid, "HappyLearn", "Happy\xffLearn", 1)
+	tooLarge := valid + strings.Repeat(" ", 65<<10)
+
+	for _, tc := range []struct {
+		name         string
+		body         string
+		contentTypes []string
+		wantStatus   int
+		wantCode     string
+	}{
+		{"valid content type", valid, []string{"application/json"}, http.StatusOK, ""},
+		{"valid utf8 charset", valid, []string{"application/json; charset=UTF-8"}, http.StatusOK, ""},
+		{"updatedAt omitted", withoutUpdatedAt, []string{"application/json"}, http.StatusOK, ""},
+		{"missing content type", valid, nil, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"duplicate content type", valid, []string{"application/json", "application/json"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"wrong content type", valid, []string{"text/plain"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"wrong charset", valid, []string{"application/json; charset=utf-16"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"extra media parameter", valid, []string{"application/json; charset=utf-8; profile=settings"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"duplicate version", strings.Replace(valid, `"version":1`, `"version":1,"version":2`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"duplicate setting", strings.Replace(valid, `"siteName":"HappyLearn"`, `"siteName":"HappyLearn","siteName":"Other"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"duplicate updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"2026-07-28T01:00:00Z","updatedAt":"2026-07-29T01:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"null updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":null`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"zero updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"0001-01-01T00:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"invalid updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"not-a-time"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"invalid utf8", invalidUTF8, []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"too large", tooLarge, []string{"application/json"}, http.StatusRequestEntityTooLarge, "request_too_large"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &operationsHTTPStub{}
+			handler := NewAdminHandler(stub, nil).Routes()
+			request := operationsHTTPRequest(http.MethodPut, "/settings", tc.body, auth.RoleAdmin)
+			request.Header.Del("Content-Type")
+			for _, value := range tc.contentTypes {
+				request.Header.Add("Content-Type", value)
+			}
+			result := httptest.NewRecorder()
+			handler.ServeHTTP(result, request)
+			if result.Code != tc.wantStatus {
+				t.Fatalf("status=%d want=%d puts=%d body=%s", result.Code, tc.wantStatus, stub.puts, result.Body.String())
+			}
+			if tc.wantStatus == http.StatusOK {
+				if stub.puts != 1 || !stub.lastPut.UpdatedAt.IsZero() {
+					t.Fatalf("puts=%d lastPut=%#v", stub.puts, stub.lastPut)
+				}
+				return
+			}
+			if stub.puts != 0 {
+				t.Fatalf("invalid request reached service: puts=%d", stub.puts)
+			}
+			assertOperationsErrorEnvelope(t, result, tc.wantCode)
+		})
+	}
+}
+
 func TestOperationsHTTPAuditIsAdminOnlyStrictAndRedacted(t *testing.T) {
 	actorID := uuid.MustParse("60000000-0000-4000-8000-000000000003")
 	stub := &operationsHTTPStub{page: audit.AuditPage{
@@ -238,11 +299,14 @@ func TestOperationsHTTPAuditIsAdminOnlyStrictAndRedacted(t *testing.T) {
 		"/audit?",
 		"/audit?unknown=value",
 		"/audit?action=",
+		"/audit?outcome=unknown",
 		"/audit?limit=01",
 		"/audit?beforeId=0",
 		"/audit?actorId=00000000-0000-0000-0000-000000000000",
 		"/audit?actorId=60000000000040008000000000000003",
 		"/audit?actorId=60000000-0000-4000-8000-000000000003&actorId=60000000-0000-4000-8000-000000000003",
+		"/audit?from=0001-01-01T00%3A00%3A00Z",
+		"/audit?to=0001-01-01T00%3A00%3A00Z",
 		"/audit?from=2026-07-29T00%3A00%3A00Z&to=2026-07-28T00%3A00%3A00Z",
 	} {
 		t.Run(invalid, func(t *testing.T) {
@@ -387,6 +451,10 @@ func operationsHTTPRequest(method, target, body string, role auth.Role) *http.Re
 		ID:   uuid.MustParse("60000000-0000-4000-8000-000000000010"),
 		Role: role, Status: auth.StatusActive,
 	}))
+}
+
+func validOperationsSettingsJSON() string {
+	return `{"version":1,"siteName":"HappyLearn","siteAnnouncement":"","softDeleteRetentionDays":30,"auditRetentionDays":365,"operationalSampleRetentionDays":7,"backupHour":3,"backupMinute":0,"backupTimezone":"Asia/Shanghai","diskWarningPercent":75,"diskCriticalPercent":90,"aiErrorWarningPercent":10,"aiErrorCriticalPercent":25,"processingQueueWarning":20,"processingQueueCritical":100,"updatedAt":"2026-07-28T01:00:00Z"}`
 }
 
 func assertOperationsErrorEnvelope(t *testing.T, response *httptest.ResponseRecorder, code string) {

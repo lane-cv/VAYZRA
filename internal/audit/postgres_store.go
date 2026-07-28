@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -74,21 +75,25 @@ func (s *PostgresWriter) ListFiltered(ctx context.Context, filter AuditFilter) (
 	if filter.BeforeID != 0 {
 		cursor = filter.BeforeID
 	}
-	rows, err := s.db.Query(ctx, `
+	outcomeExpression, outcomeArgs := auditOutcomeSQL(9)
+	query := `
 SELECT id,actor_user_id,action,target_type,target_id,metadata,request_id,ip,occurred_at
 FROM audit_logs
 WHERE ($1::text='' OR action=$1)
   AND ($2::text='' OR target_type=$2)
-  AND ($3::text='' OR metadata->>'outcome'=$3)
+  AND ($3::text='' OR (` + outcomeExpression + `)=$3)
   AND ($4::uuid IS NULL OR actor_user_id=$4)
   AND ($5::timestamptz IS NULL OR occurred_at >= $5)
   AND ($6::timestamptz IS NULL OR occurred_at <= $6)
   AND ($7::bigint IS NULL OR id < $7)
 ORDER BY id DESC
-LIMIT $8`,
+LIMIT $8`
+	args := []any{
 		filter.Action, filter.TargetType, filter.Outcome, actorID,
-		from, to, cursor, filter.Limit+1,
-	)
+		from, to, cursor, filter.Limit + 1,
+	}
+	args = append(args, outcomeArgs...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return AuditPage{}, fmt.Errorf("list audit events: %w", err)
 	}
@@ -128,7 +133,8 @@ func validateAuditFilter(filter AuditFilter) error {
 		filter.BeforeID < 0 ||
 		(filter.Action != "" && !identifier.MatchString(filter.Action)) ||
 		(filter.TargetType != "" && !identifier.MatchString(filter.TargetType)) ||
-		(filter.Outcome != "" && !identifier.MatchString(filter.Outcome)) ||
+		(filter.Outcome != "" &&
+			(!identifier.MatchString(filter.Outcome) || !IsValidOutcome(filter.Outcome))) ||
 		(!filter.From.IsZero() && !filter.To.IsZero() && filter.From.After(filter.To)) {
 		return ErrInvalidFilter
 	}
@@ -192,7 +198,16 @@ func validateAndMarshal(event Event) ([]byte, error) {
 			return nil, ErrInvalidEvent
 		}
 	}
-	return json.Marshal(event.Metadata)
+	outcome, ok := classifyAuditOutcome(event.Action, event.Metadata)
+	if !ok {
+		return nil, ErrInvalidEvent
+	}
+	storedMetadata := make(map[string]any, len(event.Metadata)+1)
+	for key, value := range event.Metadata {
+		storedMetadata[key] = value
+	}
+	storedMetadata["outcome"] = outcome
+	return json.Marshal(storedMetadata)
 }
 
 func systemActorAllowed(event Event) bool {
@@ -238,6 +253,148 @@ var allowedTargetTypes = map[string]string{
 	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
 	"ai.file_access_rejected":     "ai_file_request",
 	"operations.settings_updated": "system_settings", "operations.settings_rejected": "system_settings", "operations.lease_taken_over": "operational_mode",
+}
+
+type auditOutcomeRule struct {
+	outcome          string
+	metadataKey      string
+	metadataOutcomes map[string]string
+}
+
+var auditOutcomeRules = map[string]auditOutcomeRule{
+	"student.created":        {outcome: "succeeded"},
+	"student.disabled":       {outcome: "succeeded"},
+	"student.enabled":        {outcome: "succeeded"},
+	"student.password_reset": {outcome: "succeeded"},
+
+	"catalog.created":   {outcome: "succeeded"},
+	"catalog.renamed":   {outcome: "succeeded"},
+	"catalog.reordered": {outcome: "succeeded"},
+	"catalog.archived":  {outcome: "succeeded"},
+	"catalog.restored":  {outcome: "succeeded"},
+
+	"lesson.draft_saved": {outcome: "succeeded"},
+	"lesson.published":   {outcome: "succeeded"},
+	"lesson.withdrawn":   {outcome: "succeeded"},
+	"lesson.archived":    {outcome: "succeeded"},
+
+	"file.uploaded":                              {outcome: "succeeded"},
+	"file.policy_changed":                        {outcome: "succeeded"},
+	"file.processing_retried":                    {outcome: "succeeded"},
+	"file.replaced":                              {outcome: "succeeded"},
+	"file.draft_rolled_back":                     {outcome: "succeeded"},
+	"file.delete_requested":                      {outcome: "succeeded"},
+	"file.cleanup_scheduled":                     {outcome: "succeeded"},
+	"file.cleanup_completed":                     {outcome: "succeeded"},
+	"file.processing_artifact_cleanup_scheduled": {outcome: "succeeded"},
+	"file.processing_artifact_cleanup_completed": {outcome: "succeeded"},
+
+	"qa.thread_created":            {outcome: "succeeded"},
+	"qa.student_followed_up":       {outcome: "succeeded"},
+	"qa.admin_replied":             {outcome: "succeeded"},
+	"qa.status_changed":            {outcome: "succeeded"},
+	"qa.teacher_note_added":        {outcome: "succeeded"},
+	"ai.provider_created":          {outcome: "succeeded"},
+	"ai.provider_updated":          {outcome: "succeeded"},
+	"ai.provider_activated":        {outcome: "succeeded"},
+	"ai.model_put":                 {outcome: "succeeded"},
+	"ai.prompt_put":                {outcome: "succeeded"},
+	"ai.limits_global_put":         {outcome: "succeeded"},
+	"ai.limits_student_put":        {outcome: "succeeded"},
+	"ai.file_access_rejected":      {outcome: "rejected"},
+	"operations.settings_updated":  {outcome: "succeeded"},
+	"operations.settings_rejected": {outcome: "rejected"},
+	"operations.lease_taken_over":  {outcome: "succeeded"},
+	"ai.provider_tested": {
+		metadataKey: "ok",
+		metadataOutcomes: map[string]string{
+			"true": "succeeded", "false": "failed",
+		},
+	},
+}
+
+func classifyAuditOutcome(action string, metadata map[string]any) (string, bool) {
+	rule, ok := auditOutcomeRules[action]
+	if !ok {
+		return "", false
+	}
+	if rule.outcome != "" {
+		return rule.outcome, true
+	}
+	value, ok := metadata[rule.metadataKey].(string)
+	if !ok {
+		return "", false
+	}
+	outcome, ok := rule.metadataOutcomes[value]
+	return outcome, ok
+}
+
+func IsValidOutcome(outcome string) bool {
+	if outcome == "" {
+		return false
+	}
+	for _, rule := range auditOutcomeRules {
+		if rule.outcome == outcome {
+			return true
+		}
+		for _, classified := range rule.metadataOutcomes {
+			if classified == outcome {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func auditOutcomeSQL(firstParameter int) (string, []any) {
+	staticActions := make(map[string][]string)
+	dynamicActions := make([]string, 0)
+	for action, rule := range auditOutcomeRules {
+		if rule.outcome != "" {
+			staticActions[rule.outcome] = append(staticActions[rule.outcome], action)
+			continue
+		}
+		dynamicActions = append(dynamicActions, action)
+	}
+	sort.Strings(dynamicActions)
+	outcomes := make([]string, 0, len(staticActions))
+	for outcome := range staticActions {
+		outcomes = append(outcomes, outcome)
+		sort.Strings(staticActions[outcome])
+	}
+	sort.Strings(outcomes)
+
+	parameter := firstParameter
+	args := make([]any, 0)
+	clauses := make([]string, 0, len(dynamicActions)+len(outcomes))
+	bind := func(value any) string {
+		placeholder := "$" + strconv.Itoa(parameter)
+		parameter++
+		args = append(args, value)
+		return placeholder
+	}
+	for _, action := range dynamicActions {
+		rule := auditOutcomeRules[action]
+		values := make([]string, 0, len(rule.metadataOutcomes))
+		for value := range rule.metadataOutcomes {
+			values = append(values, value)
+		}
+		sort.Strings(values)
+		for _, value := range values {
+			clauses = append(clauses,
+				"WHEN action="+bind(action)+"::text"+
+					" AND metadata ->> ("+bind(rule.metadataKey)+"::text)="+bind(value)+"::text"+
+					" THEN "+bind(rule.metadataOutcomes[value])+"::text",
+			)
+		}
+	}
+	for _, outcome := range outcomes {
+		clauses = append(clauses,
+			"WHEN action = ANY("+bind(staticActions[outcome])+"::text[])"+
+				" THEN "+bind(outcome)+"::text",
+		)
+	}
+	return "CASE " + strings.Join(clauses, " ") + " END", args
 }
 
 func validOperationsEvent(event Event) bool {

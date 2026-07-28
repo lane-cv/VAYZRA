@@ -365,6 +365,18 @@ func TestTeachingFileConsumersFailClosedForQAAttachmentPurpose(t *testing.T) {
 	if _, err := store.ReplaceDraftBindings(ctx, actor, lessonID, 1, []securefiles.DraftBindingInput{teachingBinding}); err != nil {
 		t.Fatalf("bind teaching: %v", err)
 	}
+	var policyOutcome string
+	if err := pool.QueryRow(ctx, `
+SELECT metadata->>'outcome' FROM audit_logs
+WHERE action='file.policy_changed' AND target_type='lesson'
+  AND target_id=$1 AND actor_user_id=$2 AND request_id=$3 AND ip=$4`,
+		lessonID.String(), actor.User.ID, actor.RequestID, actor.IP,
+	).Scan(&policyOutcome); err != nil {
+		t.Fatal(err)
+	}
+	if policyOutcome != "succeeded" {
+		t.Fatalf("file policy outcome=%q", policyOutcome)
+	}
 	if err := store.ReplaceFile(ctx, actor, teachingFile, qaVersion, time.Now().Add(30*24*time.Hour)); !errors.Is(err, securefiles.ErrNotFound) {
 		t.Fatalf("replace from QA err=%v", err)
 	}

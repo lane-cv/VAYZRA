@@ -1,17 +1,21 @@
 package operations
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -178,34 +182,51 @@ func settingsView(settings Settings) settingsDTO {
 }
 
 type settingsRequest struct {
-	Version                        *int64     `json:"version"`
-	SiteName                       *string    `json:"siteName"`
-	SiteAnnouncement               *string    `json:"siteAnnouncement"`
-	SoftDeleteRetentionDays        *int       `json:"softDeleteRetentionDays"`
-	AuditRetentionDays             *int       `json:"auditRetentionDays"`
-	OperationalSampleRetentionDays *int       `json:"operationalSampleRetentionDays"`
-	BackupHour                     *int       `json:"backupHour"`
-	BackupMinute                   *int       `json:"backupMinute"`
-	BackupTimezone                 *string    `json:"backupTimezone"`
-	DiskWarningPercent             *int       `json:"diskWarningPercent"`
-	DiskCriticalPercent            *int       `json:"diskCriticalPercent"`
-	AIErrorWarningPercent          *int       `json:"aiErrorWarningPercent"`
-	AIErrorCriticalPercent         *int       `json:"aiErrorCriticalPercent"`
-	ProcessingQueueWarning         *int       `json:"processingQueueWarning"`
-	ProcessingQueueCritical        *int       `json:"processingQueueCritical"`
-	UpdatedAt                      *time.Time `json:"updatedAt"`
+	Version                        *int64          `json:"version"`
+	SiteName                       *string         `json:"siteName"`
+	SiteAnnouncement               *string         `json:"siteAnnouncement"`
+	SoftDeleteRetentionDays        *int            `json:"softDeleteRetentionDays"`
+	AuditRetentionDays             *int            `json:"auditRetentionDays"`
+	OperationalSampleRetentionDays *int            `json:"operationalSampleRetentionDays"`
+	BackupHour                     *int            `json:"backupHour"`
+	BackupMinute                   *int            `json:"backupMinute"`
+	BackupTimezone                 *string         `json:"backupTimezone"`
+	DiskWarningPercent             *int            `json:"diskWarningPercent"`
+	DiskCriticalPercent            *int            `json:"diskCriticalPercent"`
+	AIErrorWarningPercent          *int            `json:"aiErrorWarningPercent"`
+	AIErrorCriticalPercent         *int            `json:"aiErrorCriticalPercent"`
+	ProcessingQueueWarning         *int            `json:"processingQueueWarning"`
+	ProcessingQueueCritical        *int            `json:"processingQueueCritical"`
+	UpdatedAt                      json.RawMessage `json:"updatedAt"`
 }
 
 func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
+	if !settingsJSONContentType(w, r) {
+		return Settings{}, false
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpx.Error(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "请求体过大")
+		} else {
+			operationsInvalid(w, r, "settings_invalid")
+		}
+		return Settings{}, false
+	}
+	if !utf8.Valid(raw) || uniqueJSONObject(raw) != nil {
+		operationsInvalid(w, r, "settings_invalid")
+		return Settings{}, false
+	}
 	var input settingsRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
+	if err = decoder.Decode(&input); err != nil {
 		operationsInvalid(w, r, "settings_invalid")
 		return Settings{}, false
 	}
 	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+	if err = decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		operationsInvalid(w, r, "settings_invalid")
 		return Settings{}, false
 	}
@@ -218,6 +239,15 @@ func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
 		input.ProcessingQueueWarning == nil || input.ProcessingQueueCritical == nil {
 		operationsInvalid(w, r, "settings_invalid")
 		return Settings{}, false
+	}
+	if len(input.UpdatedAt) != 0 {
+		var updatedAt time.Time
+		if bytes.Equal(bytes.TrimSpace(input.UpdatedAt), []byte("null")) ||
+			json.Unmarshal(input.UpdatedAt, &updatedAt) != nil ||
+			updatedAt.IsZero() {
+			operationsInvalid(w, r, "settings_invalid")
+			return Settings{}, false
+		}
 	}
 	return Settings{
 		Version:                        *input.Version,
@@ -238,6 +268,68 @@ func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
 	}, true
 }
 
+func settingsJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	values := r.Header.Values("Content-Type")
+	if len(values) != 1 {
+		httpx.Error(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type", "仅支持 application/json")
+		return false
+	}
+	mediaType, parameters, err := mime.ParseMediaType(values[0])
+	if err != nil || mediaType != "application/json" ||
+		len(parameters) > 1 ||
+		(len(parameters) == 1 && !strings.EqualFold(parameters["charset"], "utf-8")) {
+		httpx.Error(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type", "仅支持 application/json")
+		return false
+	}
+	return true
+}
+
+func uniqueJSONObject(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	open, ok := token.(json.Delim)
+	if !ok || open != '{' {
+		return errors.New("settings body must be an object")
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("settings member name must be a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return errors.New("duplicate settings member")
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err = decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return err
+	}
+	close, ok := token.(json.Delim)
+	if !ok || close != '}' {
+		return errors.New("settings body must end with an object")
+	}
+	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("settings body has trailing data")
+		}
+		return err
+	}
+	return nil
+}
+
 var auditQueryValue = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 
 func auditFilterFromRequest(w http.ResponseWriter, r *http.Request) (audit.AuditFilter, bool) {
@@ -252,6 +344,10 @@ func auditFilterFromRequest(w http.ResponseWriter, r *http.Request) (audit.Audit
 			return audit.AuditFilter{}, false
 		}
 	}
+	if outcome := query.Get("outcome"); outcome != "" && !audit.IsValidOutcome(outcome) {
+		operationsInvalid(w, r, "invalid_request")
+		return audit.AuditFilter{}, false
+	}
 	filter := audit.AuditFilter{
 		Action: query.Get("action"), TargetType: query.Get("targetType"),
 		Outcome: query.Get("outcome"), Limit: 50,
@@ -265,14 +361,14 @@ func auditFilterFromRequest(w http.ResponseWriter, r *http.Request) (audit.Audit
 	}
 	if raw := query.Get("from"); raw != "" {
 		filter.From, err = time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
+		if err != nil || filter.From.IsZero() {
 			operationsInvalid(w, r, "invalid_request")
 			return audit.AuditFilter{}, false
 		}
 	}
 	if raw := query.Get("to"); raw != "" {
 		filter.To, err = time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
+		if err != nil || filter.To.IsZero() {
 			operationsInvalid(w, r, "invalid_request")
 			return audit.AuditFilter{}, false
 		}

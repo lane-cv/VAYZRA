@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
@@ -409,7 +410,8 @@ func TestPostgresSettingsDefaultsConflictAuditAndRollback(t *testing.T) {
 SELECT count(*) FROM audit_logs
 WHERE action='operations.settings_updated' AND target_type='system_settings'
   AND target_id='global' AND actor_user_id=$1 AND request_id=$2 AND ip=$3
-  AND metadata='{}'::jsonb`, admin.User.ID, admin.RequestID, admin.IP).Scan(&audits); err != nil {
+  AND metadata=jsonb_build_object('outcome','succeeded')`,
+		admin.User.ID, admin.RequestID, admin.IP).Scan(&audits); err != nil {
 		t.Fatal(err)
 	}
 	if audits != 1 {
@@ -488,13 +490,31 @@ HAVING count(*) > 0`,
 				t.Fatalf("rejection audits for request %q=%d", caseAdmin.RequestID, count)
 			}
 			if !bytes.Contains(metadata, []byte(`"category": "high_risk"`)) ||
-				!bytes.Contains(metadata, []byte(`"reason": "`+tc.reason+`"`)) {
+				!bytes.Contains(metadata, []byte(`"reason": "`+tc.reason+`"`)) ||
+				!bytes.Contains(metadata, []byte(`"outcome": "rejected"`)) {
 				t.Fatalf("unexpected rejection metadata=%s", metadata)
 			}
 			if bytes.Contains(metadata, []byte(settings.SiteAnnouncement)) ||
 				bytes.Contains(metadata, []byte(settings.SiteName)) ||
 				bytes.Contains(metadata, []byte("365")) {
 				t.Fatalf("settings values leaked in rejection metadata=%s", metadata)
+			}
+			page, listErr := audit.NewPostgresWriter(pool).ListFiltered(ctx, audit.AuditFilter{
+				Action: "operations.settings_rejected", TargetType: "system_settings",
+				Outcome: "rejected", ActorID: caseAdmin.User.ID, Limit: 100,
+			})
+			if listErr != nil {
+				t.Fatal(listErr)
+			}
+			found := false
+			for _, item := range page.Items {
+				if item.RequestID == caseAdmin.RequestID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("real operations rejection %q missing from rejected outcome page", caseAdmin.RequestID)
 			}
 		})
 	}
@@ -690,7 +710,7 @@ WHERE action='operations.lease_taken_over' AND target_type='operational_mode'
   AND ip='127.0.0.1'::inet`).Scan(&actor, &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if actor != nil || metadata != "{}" {
+	if actor != nil || metadata != `{"outcome": "succeeded"}` {
 		t.Fatalf("unsafe takeover audit actor=%v metadata=%s", actor, metadata)
 	}
 }
@@ -2310,7 +2330,8 @@ func assertRedactedSettingsRejectionAudit(
 SELECT count(*),
        bool_or(metadata <> jsonb_build_object(
            'category','high_risk',
-           'reason',$4::text
+           'reason',$4::text,
+           'outcome','rejected'
        ))
 FROM audit_logs
 WHERE action='operations.settings_rejected'
