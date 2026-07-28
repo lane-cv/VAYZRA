@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -349,10 +350,13 @@ type auditRecordDTO struct {
 func auditRecordView(record audit.Record) auditRecordDTO {
 	metadata := make(map[string]any)
 	for key, value := range record.Metadata {
-		if _, ok := publicAuditMetadata[key]; !ok || !publicAuditScalar(value) {
+		if _, ok := publicAuditMetadata[key]; !ok {
 			continue
 		}
-		metadata[key] = value
+		normalized, ok := publicAuditMetadataValue(key, value)
+		if ok {
+			metadata[key] = normalized
+		}
 	}
 	actorID := ""
 	if record.ActorUserID != uuid.Nil {
@@ -376,13 +380,103 @@ func publicAuditTargetID(raw string) string {
 	return raw
 }
 
-func publicAuditScalar(value any) bool {
-	switch value.(type) {
-	case string, bool, float64, json.Number:
-		return true
+var publicAuditStatuses = map[string]struct{}{
+	"active": {}, "disabled": {},
+	"normal": {}, "draining": {}, "backup": {}, "release": {},
+	"queued": {}, "snapshotting": {}, "encrypting": {}, "verifying": {},
+	"syncing": {}, "succeeded": {}, "degraded": {}, "failed": {},
+	"restoring": {}, "checking": {},
+	"open": {}, "acknowledged": {}, "resolved": {},
+}
+
+var publicAuditReasons = map[string]struct{}{
+	"retention": {}, "backup_schedule": {}, "threshold": {},
+	"malformed_id": {}, "unexpected_query": {},
+	"invalid_actor": {}, "invalid_ip": {},
+}
+
+var publicAuditFilePurposes = map[string]struct{}{
+	"teaching": {}, "qa_attachment": {}, "ai_attachment": {},
+}
+
+const (
+	maxPublicAuditCount   = uint64(1_000_000_000)
+	maxSafeJSONInteger    = float64(9_007_199_254_740_991)
+	maxPublicAuditVersion = uint64(math.MaxInt64)
+)
+
+func publicAuditMetadataValue(key string, value any) (any, bool) {
+	switch key {
+	case "status":
+		return publicAuditEnum(value, publicAuditStatuses)
+	case "reason":
+		return publicAuditEnum(value, publicAuditReasons)
+	case "version":
+		return publicAuditInteger(value, 1, maxPublicAuditVersion)
+	case "count":
+		return publicAuditInteger(value, 0, maxPublicAuditCount)
+	case "provider_id", "model_id":
+		raw, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		id, err := uuid.Parse(raw)
+		if err != nil || id == uuid.Nil || id.String() != raw {
+			return nil, false
+		}
+		return raw, true
+	case "file_purpose":
+		return publicAuditEnum(value, publicAuditFilePurposes)
 	default:
-		return false
+		return nil, false
 	}
+}
+
+func publicAuditEnum(value any, allowed map[string]struct{}) (any, bool) {
+	raw, ok := value.(string)
+	if !ok {
+		return nil, false
+	}
+	if _, ok := allowed[raw]; !ok {
+		return nil, false
+	}
+	return raw, true
+}
+
+func publicAuditInteger(value any, minimum, maximum uint64) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		parsed, ok := canonicalPublicAuditInteger(typed, minimum, maximum)
+		if !ok {
+			return nil, false
+		}
+		return strconv.FormatUint(parsed, 10), true
+	case json.Number:
+		parsed, ok := canonicalPublicAuditInteger(string(typed), minimum, maximum)
+		if !ok {
+			return nil, false
+		}
+		return json.Number(strconv.FormatUint(parsed, 10)), true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) ||
+			typed < float64(minimum) || typed > float64(maximum) ||
+			(typed == 0 && math.Signbit(typed)) ||
+			typed > maxSafeJSONInteger || math.Trunc(typed) != typed {
+			return nil, false
+		}
+		return typed, true
+	default:
+		return nil, false
+	}
+}
+
+func canonicalPublicAuditInteger(raw string, minimum, maximum uint64) (uint64, bool) {
+	parsed, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || parsed < minimum || parsed > maximum ||
+		strconv.FormatUint(parsed, 10) != raw {
+		return 0, false
+	}
+	return parsed, true
 }
 
 func operationsInvalid(w http.ResponseWriter, r *http.Request, code string) {

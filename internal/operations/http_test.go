@@ -2,7 +2,9 @@ package operations
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -172,9 +174,9 @@ func TestOperationsHTTPAuditIsAdminOnlyStrictAndRedacted(t *testing.T) {
 				TargetType:  "system_settings",
 				TargetID:    "private-target.pdf",
 				Metadata: map[string]any{
-					"status": "rejected", "reason": "retention", "version": "2",
+					"status": "succeeded", "reason": "retention", "version": "2",
 					"count": "1", "provider_id": uuid.NewString(),
-					"model_id": uuid.NewString(), "file_purpose": "ai_question",
+					"model_id": uuid.NewString(), "file_purpose": "ai_attachment",
 					"ip": "192.0.2.1", "request_payload": "private",
 					"credential": "secret", "object_key": "private/key",
 					"filename": "private.pdf", "prompt": "private prompt",
@@ -208,7 +210,7 @@ func TestOperationsHTTPAuditIsAdminOnlyStrictAndRedacted(t *testing.T) {
 		`"id":42`, `"actorId":"` + actorID.String() + `"`,
 		`"action":"operations.settings_rejected"`,
 		`"targetType":"system_settings"`,
-		`"status":"rejected"`, `"reason":"retention"`, `"version":"2"`,
+		`"status":"succeeded"`, `"reason":"retention"`, `"version":"2"`,
 		`"count":"1"`, `"provider_id":`, `"model_id":`, `"file_purpose":`,
 		`"occurredAt":"2026-07-28T03:00:00Z"`, `"nextBeforeId":41`,
 	} {
@@ -250,6 +252,107 @@ func TestOperationsHTTPAuditIsAdminOnlyStrictAndRedacted(t *testing.T) {
 				t.Fatalf("status=%d body=%s", invalidResult.Code, invalidResult.Body.String())
 			}
 			assertOperationsErrorEnvelope(t, invalidResult, "invalid_request")
+		})
+	}
+}
+
+func TestPublicAuditMetadataRejectsSecretsHiddenUnderEveryAllowedKey(t *testing.T) {
+	hidden := "private prompt credential private.pdf bucket/private/object"
+	metadata := map[string]any{}
+	for key := range publicAuditMetadata {
+		metadata[key] = hidden
+	}
+	view := auditRecordView(audit.Record{Event: audit.Event{Metadata: metadata}})
+	if len(view.Metadata) != 0 {
+		t.Fatalf("unsafe metadata survived: %#v", view.Metadata)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(encoded)
+	for key := range publicAuditMetadata {
+		if strings.Contains(body, `"`+key+`"`) {
+			t.Fatalf("unsafe key %q survived in %s", key, body)
+		}
+	}
+	for _, secret := range []string{"prompt", "credential", "private.pdf", "bucket/private/object"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("unsafe value %q survived in %s", secret, body)
+		}
+	}
+}
+
+func TestPublicAuditMetadataAllowsOnlyCanonicalPerKeyValues(t *testing.T) {
+	providerID := uuid.MustParse("70000000-0000-4000-8000-000000000001")
+	modelID := uuid.MustParse("7a000000-0000-4000-8000-000000000002")
+	legal := map[string]any{
+		"status": "succeeded", "reason": "retention", "version": "2",
+		"count": float64(0), "provider_id": providerID.String(),
+		"model_id": modelID.String(), "file_purpose": "ai_attachment",
+	}
+	view := auditRecordView(audit.Record{Event: audit.Event{Metadata: legal}})
+	if len(view.Metadata) != len(publicAuditMetadata) {
+		t.Fatalf("legal metadata dropped: %#v", view.Metadata)
+	}
+	for key, want := range legal {
+		if got := view.Metadata[key]; got != want {
+			t.Fatalf("%s=%#v want=%#v", key, got, want)
+		}
+	}
+	for _, tc := range []struct {
+		key   string
+		value any
+	}{
+		{"version", float64(2)},
+		{"version", json.Number("2")},
+		{"count", "0"},
+		{"count", json.Number("0")},
+	} {
+		t.Run("valid_"+tc.key, func(t *testing.T) {
+			got := auditRecordView(audit.Record{Event: audit.Event{
+				Metadata: map[string]any{tc.key: tc.value},
+			}})
+			if value, ok := got.Metadata[tc.key]; !ok || value != tc.value {
+				t.Fatalf("canonical %s=%#v dropped or changed: %#v", tc.key, tc.value, got.Metadata)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		key   string
+		value any
+	}{
+		{"status", "unknown"},
+		{"reason", "unknown"},
+		{"version", "0"},
+		{"version", "01"},
+		{"version", "-1"},
+		{"version", "1.5"},
+		{"version", float64(0)},
+		{"version", float64(1.5)},
+		{"version", math.NaN()},
+		{"version", float64(9007199254740992)},
+		{"count", "-1"},
+		{"count", "01"},
+		{"count", "1.5"},
+		{"count", float64(-1)},
+		{"count", math.Copysign(0, -1)},
+		{"count", float64(1.5)},
+		{"count", math.NaN()},
+		{"count", float64(1_000_000_001)},
+		{"provider_id", uuid.Nil.String()},
+		{"provider_id", "70000000000040008000000000000001"},
+		{"model_id", strings.ToUpper(modelID.String())},
+		{"file_purpose", "bucket/private.pdf"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			got := auditRecordView(audit.Record{Event: audit.Event{
+				Metadata: map[string]any{tc.key: tc.value},
+			}})
+			if _, ok := got.Metadata[tc.key]; ok {
+				t.Fatalf("unsafe %s=%#v survived", tc.key, tc.value)
+			}
 		})
 	}
 }
