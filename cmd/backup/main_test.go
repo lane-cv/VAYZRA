@@ -351,8 +351,7 @@ func (executor *workflowExecutorFixture) RemoteConfigured() (bool, error) {
 
 func (executor *workflowExecutorFixture) Sync(
 	context.Context,
-	string,
-	[]string,
+	backup.SyncInput,
 ) (string, error) {
 	return executor.syncResult, executor.syncErr
 }

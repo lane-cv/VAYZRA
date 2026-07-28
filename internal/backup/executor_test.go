@@ -522,33 +522,103 @@ func mustJSON(t *testing.T, value any) string {
 	return string(encoded)
 }
 
-func TestExecutorSyncUsesOwnerOnlySourceFilesAndKeepsRepositoriesOutOfArguments(t *testing.T) {
+func TestExecutorSyncVerifiesDistinctAuthenticatedRemoteSnapshot(t *testing.T) {
+	manifest := validManifest()
+	manifest.BatchID = commandRunIDForExecutor
+	manifestBytes, err := MarshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestBytes)
+	destinationID := strings.Repeat("3", sha256.Size*2)
+	accessKey := "remote-access-key-secret"
+	secretKey := "remote-secret-key-secret"
 	runner := &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
 		joined := strings.Join(command.Args, "\x00")
 		for _, forbidden := range []string{
 			"/private/local/repository",
-			"/private/remote/repository",
+			"s3:https://objects.example.test/backups/happylearn",
 			"local-password-secret",
 			"remote-password-secret",
+			accessKey,
+			secretKey,
 		} {
 			if strings.Contains(joined, forbidden) {
 				t.Fatalf("sync argv leaked %q", forbidden)
 			}
 		}
-		if len(command.Args) < 2 ||
-			command.Args[0] != "--no-cache" ||
-			command.Args[1] != "copy" {
+		if len(command.Args) < 2 || command.Args[0] != "--no-cache" {
 			t.Fatalf("args=%q", command.Args)
 		}
-		return CommandResult{ExitCode: 0}, nil
+		hasAccessKey := slices.Contains(command.Env, "AWS_ACCESS_KEY_ID="+accessKey)
+		hasSecretKey := slices.Contains(command.Env, "AWS_SECRET_ACCESS_KEY="+secretKey)
+		for _, environment := range command.Env {
+			if strings.Contains(strings.ToLower(environment), "insecure") ||
+				strings.HasPrefix(environment, "RESTIC_INSECURE_TLS=") {
+				t.Fatalf("TLS bypass in child environment: %q", command.Env)
+			}
+		}
+		switch command.Args[1] {
+		case "copy":
+			if !hasAccessKey || !hasSecretKey {
+				t.Fatalf("copy missing S3 credentials: %q", command.Env)
+			}
+			return CommandResult{ExitCode: 0}, nil
+		case "snapshots":
+			if !hasAccessKey || !hasSecretKey {
+				t.Fatalf("snapshot lookup missing S3 credentials: %q", command.Env)
+			}
+			if !slices.Equal(command.Args, []string{
+				"--no-cache",
+				"snapshots",
+				"--json",
+				"--tag",
+				"happylearn-batch:" + commandRunIDForExecutor,
+				"--tag",
+				"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+			}) {
+				t.Fatalf("snapshot lookup args=%q", command.Args)
+			}
+			return CommandResult{
+				ExitCode: 0,
+				Stdout: []byte(fmt.Sprintf(
+					`[{"id":%q,"short_id":"33333333","original":%q,"tags":%s}]`,
+					destinationID,
+					executorRecoverySnapshotID,
+					mustJSON(t, []string{
+						"happylearn-batch:" + commandRunIDForExecutor,
+						"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+					}),
+				)),
+			}, nil
+		case "check":
+			return CommandResult{ExitCode: 0}, nil
+		case "stats":
+			return CommandResult{
+				ExitCode: 0,
+				Stdout: []byte(
+					`{"total_size":558,"total_uncompressed_size":1837,"compression_ratio":3.292114695340502,"compression_progress":100,"compression_space_saving":69.62438758845944,"total_blob_count":3,"snapshots_count":1}`,
+				),
+			}, nil
+		case "dump":
+			return CommandResult{
+				ExitCode: 0,
+				Stdout:   append([]byte(nil), manifestBytes...),
+			}, nil
+		default:
+			t.Fatalf("unexpected remote command: %q", command.Args)
+			return CommandResult{}, nil
+		}
 	}}
 	executor, workRoot := executorFixture(t, runner)
 	executor.config.Secrets = mapSecrets{
 		SecretDatabasePassword: "database-password-secret",
 		SecretLocalRepository:  "/private/local/repository",
 		SecretLocalPassword:    "local-password-secret",
-		SecretRemoteRepository: "/private/remote/repository",
+		SecretRemoteRepository: "s3:https://objects.example.test/backups/happylearn",
 		SecretRemotePassword:   "remote-password-secret",
+		SecretRemoteAccessKey:  accessKey,
+		SecretRemoteSecretKey:  secretKey,
 	}
 	configured, err := executor.RemoteConfigured()
 	if err != nil || !configured {
@@ -556,14 +626,20 @@ func TestExecutorSyncUsesOwnerOnlySourceFilesAndKeepsRepositoriesOutOfArguments(
 	}
 	remoteSnapshotID, err := executor.Sync(
 		context.Background(),
-		commandRunIDForExecutor,
-		[]string{"1111111111111111", "2222222222222222"},
+		SyncInput{
+			RunID:            commandRunIDForExecutor,
+			SourceSnapshotID: executorRecoverySnapshotID,
+			ManifestSHA256:   manifestHash,
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remoteSnapshotID != "2222222222222222" {
+	if remoteSnapshotID != destinationID {
 		t.Fatalf("remoteSnapshotID=%q", remoteSnapshotID)
+	}
+	if len(runner.calls()) != 5 {
+		t.Fatalf("remote commands=%+v", runner.calls())
 	}
 	entries, err := os.ReadDir(workRoot)
 	if err != nil {
@@ -574,18 +650,101 @@ func TestExecutorSyncUsesOwnerOnlySourceFilesAndKeepsRepositoriesOutOfArguments(
 	}
 }
 
+func TestDecodeResticCopiedSnapshotRequiresUniqueFullDestinationBinding(t *testing.T) {
+	manifestHash := sha256.Sum256([]byte("manifest"))
+	destinationID := strings.Repeat("3", sha256.Size*2)
+	valid := fmt.Sprintf(
+		`[{"time":"2026-07-28T01:02:03Z","tree":%q,"paths":["/work/recovery"],"hostname":"backup","username":"happylearn-backup","uid":10003,"tags":%s,"program_version":"restic 0.19.1","summary":{},"id":%q,"short_id":"33333333","original":%q}]`,
+		strings.Repeat("4", sha256.Size*2),
+		mustJSON(t, []string{
+			"happylearn-batch:" + commandRunIDForExecutor,
+			"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+		}),
+		destinationID,
+		executorRecoverySnapshotID,
+	)
+	got, err := decodeResticCopiedSnapshot(
+		[]byte(valid),
+		executorRecoverySnapshotID,
+		commandRunIDForExecutor,
+		manifestHash,
+	)
+	if err != nil || got != destinationID {
+		t.Fatalf("destination=%q err=%v", got, err)
+	}
+	for name, encoded := range map[string]string{
+		"empty":            `[]`,
+		"multiple":         strings.TrimSuffix(valid, "]") + "," + strings.TrimPrefix(valid, "["),
+		"source-reused":    strings.Replace(valid, destinationID, executorRecoverySnapshotID, 1),
+		"short-id":         strings.Replace(valid, destinationID, "3333333333333333", 1),
+		"wrong-original":   strings.Replace(valid, executorRecoverySnapshotID, executorOtherSnapshotID, 1),
+		"missing-original": strings.Replace(valid, `,"original":"`+executorRecoverySnapshotID+`"`, "", 1),
+		"wrong-run-tag":    strings.Replace(valid, commandRunIDForExecutor, "30000000-0000-4000-8000-000000000003", 1),
+		"extra-tag":        strings.Replace(valid, `"tags":[`, `"tags":["extra",`, 1),
+		"unknown-field":    strings.Replace(valid, `,"short_id"`, `,"future":1,"short_id"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := decodeResticCopiedSnapshot(
+				[]byte(encoded),
+				executorRecoverySnapshotID,
+				commandRunIDForExecutor,
+				manifestHash,
+			); err == nil || got != "" {
+				t.Fatalf("destination=%q err=%v encoded=%s", got, err, encoded)
+			}
+		})
+	}
+}
+
 const commandRunIDForExecutor = "10000000-0000-4000-8000-000000000001"
 
 func TestExecutorRejectsPartialRemoteConfiguration(t *testing.T) {
 	executor, _ := executorFixture(t, &recordingRunner{})
-	executor.config.Secrets = mapSecrets{
-		SecretDatabasePassword: "database-password-secret",
-		SecretLocalRepository:  "/private/local/repository",
-		SecretLocalPassword:    "local-password-secret",
-		SecretRemoteRepository: "/private/remote/repository",
+	remoteTuple := mapSecrets{
+		SecretRemoteRepository: "s3:https://objects.example.test/backups",
+		SecretRemotePassword:   "remote-password-secret",
+		SecretRemoteAccessKey:  "remote-access-key-secret",
+		SecretRemoteSecretKey:  "remote-secret-key-secret",
 	}
-	if configured, err := executor.RemoteConfigured(); configured || !errors.Is(err, ErrRemoteSync) {
-		t.Fatalf("configured=%v err=%v", configured, err)
+	for missing := range remoteTuple {
+		t.Run("missing-"+string(missing), func(t *testing.T) {
+			secrets := mapSecrets{}
+			for name, value := range remoteTuple {
+				if name != missing {
+					secrets[name] = value
+				}
+			}
+			executor.config.Secrets = secrets
+			if configured, err := executor.RemoteConfigured(); configured ||
+				!errors.Is(err, ErrRemoteSync) {
+				t.Fatalf("configured=%v err=%v", configured, err)
+			}
+		})
+	}
+	executor.config.Secrets = mapSecrets{}
+	if configured, err := executor.RemoteConfigured(); configured || err != nil {
+		t.Fatalf("empty configured=%v err=%v", configured, err)
+	}
+	for _, repository := range []string{
+		"s3:http://objects.example.test/backups",
+		"s3:https://user:password@objects.example.test/backups",
+		"s3:https://objects.example.test",
+		"s3:https://objects.example.test/backups?insecure=true",
+		"s3:https://objects.example.test/backups#insecure-tls",
+		"https://objects.example.test/backups",
+	} {
+		t.Run(repository, func(t *testing.T) {
+			secrets := mapSecrets{}
+			for name, value := range remoteTuple {
+				secrets[name] = value
+			}
+			secrets[SecretRemoteRepository] = repository
+			executor.config.Secrets = secrets
+			if configured, err := executor.RemoteConfigured(); configured ||
+				!errors.Is(err, ErrRemoteSync) {
+				t.Fatalf("configured=%v err=%v", configured, err)
+			}
+		})
 	}
 }
 
@@ -730,6 +889,15 @@ func TestFileSecretsRequireOwnerOnlyRegularNonSymlinkFiles(t *testing.T) {
 	secrets := fileSecretsAt(root)
 	if got, err := secrets.Read(SecretDatabasePassword); err != nil || got != "value" {
 		t.Fatalf("got=%q err=%v", got, err)
+	}
+	for _, name := range []SecretName{
+		SecretRemoteAccessKey,
+		SecretRemoteSecretKey,
+	} {
+		write(string(name), 0o400)
+		if got, err := secrets.Read(name); err != nil || got != "value" {
+			t.Fatalf("name=%q got=%q err=%v", name, got, err)
+		}
 	}
 	if err := os.Remove(valid); err != nil {
 		t.Fatal(err)

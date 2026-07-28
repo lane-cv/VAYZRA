@@ -156,7 +156,7 @@ type backupWorkflowExecutor interface {
 	Snapshot(context.Context, backup.SnapshotInput) (backup.SnapshotResult, error)
 	Verify(context.Context, backup.VerifyInput) (backup.VerifyResult, error)
 	RemoteConfigured() (bool, error)
-	Sync(context.Context, string, []string) (string, error)
+	Sync(context.Context, backup.SyncInput) (string, error)
 }
 
 type workflowStates interface {
@@ -393,8 +393,11 @@ func (application *commandApplication) Sync(
 	}
 	remoteSnapshotID, syncErr := application.executor.Sync(
 		ctx,
-		runID.String(),
-		[]string{state.Evidence.LocalSnapshotID},
+		backup.SyncInput{
+			RunID:            runID.String(),
+			SourceSnapshotID: state.Evidence.LocalSnapshotID,
+			ManifestSHA256:   manifestHash(state.Evidence.ManifestSHA256),
+		},
 	)
 	if syncErr != nil {
 		if errors.Is(syncErr, backup.ErrCancelled) {
@@ -495,6 +498,12 @@ func (application *commandApplication) addArtifacts(
 
 func artifactTimestamp(now time.Time) time.Time {
 	return now.UTC().Truncate(time.Microsecond)
+}
+
+func manifestHash(value []byte) [sha256.Size]byte {
+	var result [sha256.Size]byte
+	copy(result[:], value)
+	return result
 }
 
 func (application *commandApplication) Finish(

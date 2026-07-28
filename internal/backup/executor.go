@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,6 +221,8 @@ const (
 	SecretLocalPassword    SecretName = "local_password"
 	SecretRemoteRepository SecretName = "remote_repository"
 	SecretRemotePassword   SecretName = "remote_password"
+	SecretRemoteAccessKey  SecretName = "remote_access_key_id"
+	SecretRemoteSecretKey  SecretName = "remote_secret_access_key"
 )
 
 type SecretSource interface {
@@ -282,7 +285,8 @@ func (secrets FileSecrets) Read(name SecretName) (string, error) {
 func validSecretName(name SecretName) bool {
 	switch name {
 	case SecretDatabasePassword, SecretLocalRepository, SecretLocalPassword,
-		SecretRemoteRepository, SecretRemotePassword:
+		SecretRemoteRepository, SecretRemotePassword,
+		SecretRemoteAccessKey, SecretRemoteSecretKey:
 		return true
 	default:
 		return false
@@ -372,6 +376,12 @@ type VerifyInput struct {
 
 type VerifyResult struct {
 	Manifest Manifest
+}
+
+type SyncInput struct {
+	RunID            string
+	SourceSnapshotID string
+	ManifestSHA256   [sha256.Size]byte
 }
 
 func (executor Executor) Snapshot(
@@ -684,40 +694,84 @@ func (executor Executor) Verify(
 }
 
 func (executor Executor) RemoteConfigured() (bool, error) {
-	repository, repositoryErr := executor.config.Secrets.Read(SecretRemoteRepository)
-	password, passwordErr := executor.config.Secrets.Read(SecretRemotePassword)
-	if errors.Is(repositoryErr, ErrSecretUnavailable) &&
-		errors.Is(passwordErr, ErrSecretUnavailable) {
-		return false, nil
+	_, configured, err := executor.remoteConfiguration()
+	return configured, err
+}
+
+type remoteConfiguration struct {
+	repository string
+	password   string
+	accessKey  string
+	secretKey  string
+}
+
+func (executor Executor) remoteConfiguration() (remoteConfiguration, bool, error) {
+	values := make(map[SecretName]string, 4)
+	missing := 0
+	for _, name := range []SecretName{
+		SecretRemoteRepository,
+		SecretRemotePassword,
+		SecretRemoteAccessKey,
+		SecretRemoteSecretKey,
+	} {
+		value, err := executor.config.Secrets.Read(name)
+		if errors.Is(err, ErrSecretUnavailable) {
+			missing++
+			continue
+		}
+		if err != nil || value == "" {
+			return remoteConfiguration{}, false, ErrRemoteSync
+		}
+		values[name] = value
 	}
-	if repositoryErr != nil ||
-		passwordErr != nil ||
-		repository == "" ||
-		password == "" {
-		return false, ErrRemoteSync
+	if missing == 4 {
+		return remoteConfiguration{}, false, nil
 	}
-	return true, nil
+	if missing != 0 || !validRemoteRepository(values[SecretRemoteRepository]) {
+		return remoteConfiguration{}, false, ErrRemoteSync
+	}
+	return remoteConfiguration{
+		repository: values[SecretRemoteRepository],
+		password:   values[SecretRemotePassword],
+		accessKey:  values[SecretRemoteAccessKey],
+		secretKey:  values[SecretRemoteSecretKey],
+	}, true, nil
+}
+
+func validRemoteRepository(repository string) bool {
+	const prefix = "s3:"
+	if !strings.HasPrefix(repository, prefix) ||
+		strings.TrimSpace(repository) != repository ||
+		strings.ContainsAny(repository, "\x00\r\n") {
+		return false
+	}
+	location, err := url.Parse(strings.TrimPrefix(repository, prefix))
+	if err != nil ||
+		location.Scheme != "https" ||
+		location.Host == "" ||
+		location.User != nil ||
+		location.RawQuery != "" ||
+		location.Fragment != "" ||
+		location.Opaque != "" {
+		return false
+	}
+	bucketPath := strings.Trim(location.EscapedPath(), "/")
+	return bucketPath != "" &&
+		!strings.Contains(bucketPath, `\`) &&
+		!strings.Contains(strings.ToLower(bucketPath), "insecure-tls")
 }
 
 func (executor Executor) Sync(
 	ctx context.Context,
-	runID string,
-	snapshotIDs []string,
+	input SyncInput,
 ) (remoteSnapshotID string, resultErr error) {
-	if !canonicalRunID(runID) || len(snapshotIDs) < 1 || len(snapshotIDs) > 2 {
+	if !canonicalRunID(input.RunID) ||
+		!resticSnapshotID.MatchString(input.SourceSnapshotID) ||
+		len(input.SourceSnapshotID) != sha256.Size*2 ||
+		input.ManifestSHA256 == [sha256.Size]byte{} {
 		return "", ErrRemoteSync
 	}
-	seen := make(map[string]struct{}, len(snapshotIDs))
-	for _, snapshotID := range snapshotIDs {
-		if !resticSnapshotID.MatchString(snapshotID) {
-			return "", ErrRemoteSync
-		}
-		if _, duplicate := seen[snapshotID]; duplicate {
-			return "", ErrRemoteSync
-		}
-		seen[snapshotID] = struct{}{}
-	}
-	configured, err := executor.RemoteConfigured()
+	remote, configured, err := executor.remoteConfiguration()
 	if err != nil || !configured {
 		return "", ErrRemoteSync
 	}
@@ -726,14 +780,6 @@ func (executor Executor) Sync(
 		return "", ErrRemoteSync
 	}
 	localPassword, err := executor.config.Secrets.Read(SecretLocalPassword)
-	if err != nil {
-		return "", ErrRemoteSync
-	}
-	remoteRepository, err := executor.config.Secrets.Read(SecretRemoteRepository)
-	if err != nil {
-		return "", ErrRemoteSync
-	}
-	remotePassword, err := executor.config.Secrets.Read(SecretRemotePassword)
 	if err != nil {
 		return "", ErrRemoteSync
 	}
@@ -760,23 +806,25 @@ func (executor Executor) Sync(
 		writeOwnerOnlyFile(localPasswordFile, []byte(localPassword)) != nil {
 		return "", ErrRemoteSync
 	}
-	args := []string{
-		"--no-cache",
-		"copy",
-		"--from-repository-file",
-		localRepositoryFile,
-		"--from-password-file",
-		localPasswordFile,
+	remoteEnv := []string{
+		"LC_ALL=C",
+		"RESTIC_REPOSITORY=" + remote.repository,
+		"RESTIC_PASSWORD=" + remote.password,
+		"AWS_ACCESS_KEY_ID=" + remote.accessKey,
+		"AWS_SECRET_ACCESS_KEY=" + remote.secretKey,
 	}
-	args = append(args, snapshotIDs...)
-	result, err := executor.config.Runner.Run(ctx, Command{
+	copyResult, err := executor.config.Runner.Run(ctx, Command{
 		Executable: resticExecutable,
-		Args:       args,
-		Env: []string{
-			"LC_ALL=C",
-			"RESTIC_REPOSITORY=" + remoteRepository,
-			"RESTIC_PASSWORD=" + remotePassword,
+		Args: []string{
+			"--no-cache",
+			"copy",
+			"--from-repository-file",
+			localRepositoryFile,
+			"--from-password-file",
+			localPasswordFile,
+			input.SourceSnapshotID,
 		},
+		Env:         remoteEnv,
 		Dir:         workDirectory,
 		Stdin:       ClosedStdin,
 		StdoutLimit: CommandOutputLimit,
@@ -785,10 +833,143 @@ func (executor Executor) Sync(
 	if err != nil {
 		return "", mapExecutorRunError(ctx, err, ErrRemoteSync)
 	}
-	if result.ExitCode != 0 {
+	if copyResult.ExitCode != 0 {
 		return "", ErrRemoteSync
 	}
-	return snapshotIDs[len(snapshotIDs)-1], nil
+	batchTag := "happylearn-batch:" + input.RunID
+	manifestTag := "happylearn-manifest-sha256:" +
+		hex.EncodeToString(input.ManifestSHA256[:])
+	lookupResult, err := executor.runRemoteRestic(
+		ctx,
+		remoteEnv,
+		workDirectory,
+		CommandOutputLimit,
+		"snapshots",
+		"--json",
+		"--tag",
+		batchTag,
+		"--tag",
+		manifestTag,
+	)
+	if err != nil {
+		return "", err
+	}
+	destinationID, err := decodeResticCopiedSnapshot(
+		lookupResult,
+		input.SourceSnapshotID,
+		input.RunID,
+		input.ManifestSHA256,
+	)
+	if err != nil {
+		return "", ErrRemoteSync
+	}
+	for _, verification := range []struct {
+		limit int
+		args  []string
+	}{
+		{CommandOutputLimit, []string{"check", "--read-data"}},
+		{CommandOutputLimit, []string{"stats", "--json", "--mode=raw-data", destinationID}},
+		{ManifestMaxBytes, []string{"dump", destinationID, "manifest.json"}},
+	} {
+		result, runErr := executor.runRemoteRestic(
+			ctx,
+			remoteEnv,
+			workDirectory,
+			verification.limit,
+			verification.args...,
+		)
+		if runErr != nil {
+			return "", runErr
+		}
+		switch verification.args[0] {
+		case "stats":
+			if decodeResticStats(result) != nil {
+				return "", ErrRemoteSync
+			}
+		case "dump":
+			manifest, decodeErr := DecodeManifest(bytes.NewReader(result))
+			actualHash := sha256.Sum256(result)
+			if decodeErr != nil ||
+				manifest.BatchID != input.RunID ||
+				!bytes.Equal(actualHash[:], input.ManifestSHA256[:]) {
+				return "", ErrRemoteSync
+			}
+		}
+	}
+	return destinationID, nil
+}
+
+func (executor Executor) runRemoteRestic(
+	ctx context.Context,
+	env []string,
+	workDirectory string,
+	stdoutLimit int,
+	args ...string,
+) ([]byte, error) {
+	result, err := executor.config.Runner.Run(ctx, Command{
+		Executable:  resticExecutable,
+		Args:        append([]string{"--no-cache"}, args...),
+		Env:         append([]string(nil), env...),
+		Dir:         workDirectory,
+		Stdin:       ClosedStdin,
+		StdoutLimit: stdoutLimit,
+		StderrLimit: CommandOutputLimit,
+	})
+	if err != nil {
+		return nil, mapExecutorRunError(ctx, err, ErrRemoteSync)
+	}
+	if result.ExitCode != 0 {
+		return nil, ErrRemoteSync
+	}
+	return append([]byte(nil), result.Stdout...), nil
+}
+
+func decodeResticCopiedSnapshot(
+	encoded []byte,
+	sourceSnapshotID string,
+	runID string,
+	manifestHash [sha256.Size]byte,
+) (string, error) {
+	var snapshots []resticSnapshotBinding
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if len(encoded) == 0 ||
+		len(encoded) > CommandOutputLimit ||
+		decoder.Decode(&snapshots) != nil ||
+		requireJSONEOF(decoder) != nil ||
+		len(snapshots) != 1 {
+		return "", ErrRemoteSync
+	}
+	snapshot := snapshots[0]
+	if len(snapshot.ID) != sha256.Size*2 ||
+		!resticSnapshotID.MatchString(snapshot.ID) ||
+		snapshot.ID == sourceSnapshotID ||
+		snapshot.Original != sourceSnapshotID ||
+		!exactSnapshotTags(snapshot.Tags, runID, manifestHash) {
+		return "", ErrRemoteSync
+	}
+	return snapshot.ID, nil
+}
+
+func exactSnapshotTags(
+	tags []string,
+	runID string,
+	manifestHash [sha256.Size]byte,
+) bool {
+	if len(tags) != 2 {
+		return false
+	}
+	expected := map[string]struct{}{
+		"happylearn-batch:" + runID:                                         {},
+		"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]): {},
+	}
+	for _, tag := range tags {
+		if _, ok := expected[tag]; !ok {
+			return false
+		}
+		delete(expected, tag)
+	}
+	return len(expected) == 0
 }
 
 type resticSummary struct {
