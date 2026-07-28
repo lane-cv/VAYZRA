@@ -113,7 +113,7 @@ type applicationDependencies struct {
 	newAIFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error)
 	newFileBindings        func(*pgxpool.Pool) files.BindingHTTPService
 	newFileCenter          func(*pgxpool.Pool) files.FileCenterHTTPService
-	startUploadCleanup     func(files.ExpiredUploadCleaner, operations.ClaimGate) func()
+	startUploadCleanup     func(files.ExpiredUploadCleaner, operations.WriteGate) func()
 	newStudentTeaching     func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions           func(*pgxpool.Pool) qanda.HTTPServices
 	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)

@@ -24,13 +24,13 @@ type cleanupRunner struct {
 	interval time.Duration
 	timeout  time.Duration
 	limit    int
-	gate     operations.ClaimGate
+	gate     operations.WriteGate
 	log      func(string)
 }
 
 func newCleanupRunner(
 	cleaner ExpiredUploadCleaner,
-	gate operations.ClaimGate,
+	gate operations.WriteGate,
 	logCategory func(string),
 	interval, timeout time.Duration,
 	limit int,
@@ -57,17 +57,23 @@ func (r *cleanupRunner) Run(ctx context.Context) {
 func (r *cleanupRunner) runOnce(ctx context.Context) {
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	if r.gate != nil {
-		allowed, err := r.gate.ClaimsAllowed(runCtx)
-		if err != nil {
-			r.logCategory("operational_gate_failed")
-			return
-		}
-		if !allowed {
-			return
-		}
+	if r.gate == nil {
+		r.logCategory("operational_gate_failed")
+		return
 	}
-	_ = r.cleaner.CleanupExpired(runCtx, r.limit)
+	release, err := r.gate.AcquireShared(runCtx)
+	if err != nil || release == nil {
+		if release != nil {
+			release()
+		}
+		r.logCategory("operational_gate_failed")
+		return
+	}
+	defer release()
+	_ = r.cleaner.CleanupExpired(
+		withCleanupAdmission(runCtx),
+		r.limit,
+	)
 }
 
 func (r *cleanupRunner) logCategory(category string) {
@@ -78,7 +84,7 @@ func (r *cleanupRunner) logCategory(category string) {
 	log.Printf("upload_cleanup category=%s", category)
 }
 
-func StartCleanupRunner(cleaner ExpiredUploadCleaner, gate operations.ClaimGate) func() {
+func StartCleanupRunner(cleaner ExpiredUploadCleaner, gate operations.WriteGate) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

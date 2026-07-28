@@ -24,7 +24,7 @@ func TestBuildApplicationStartsAndStopsUploadCleanupRunner(t *testing.T) {
 		newUploads: func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error) {
 			return cleaner, nil
 		},
-		startUploadCleanup: func(got files.ExpiredUploadCleaner, _ operations.ClaimGate) func() {
+		startUploadCleanup: func(got files.ExpiredUploadCleaner, _ operations.WriteGate) func() {
 			if got != cleaner {
 				t.Fatal("wrong cleaner")
 			}
@@ -75,7 +75,7 @@ func TestBuildApplicationRejectsNilUploadCleanupStopAndClosesResources(t *testin
 			requireOperations: true,
 			startUploadCleanup: func(
 				files.ExpiredUploadCleaner,
-				operations.ClaimGate,
+				operations.WriteGate,
 			) func() {
 				return nil
 			},

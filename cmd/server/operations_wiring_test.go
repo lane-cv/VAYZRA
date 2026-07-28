@@ -55,7 +55,8 @@ func TestProductionApplicationSharesOneOperationalGateAndClosesItBeforePool(t *t
 	var events []string
 	gate := &serverOperationsRuntime{events: &events}
 	cleaner := &serverUploadCleaner{}
-	var cleanupGate, outboxGate, aiGate operations.ClaimGate
+	var cleanupGate operations.WriteGate
+	var outboxGate, aiGate operations.ClaimGate
 	handler, closeResources, err := buildApplication(context.Background(), config.Config{
 		PublicOrigin: "https://learn.example.com",
 	}, applicationDependencies{
@@ -66,7 +67,7 @@ func TestProductionApplicationSharesOneOperationalGateAndClosesItBeforePool(t *t
 			return cleaner, nil
 		},
 		newOperations: func(*pgxpool.Pool) operationsRuntime { return gate },
-		startUploadCleanup: func(got files.ExpiredUploadCleaner, claimGate operations.ClaimGate) func() {
+		startUploadCleanup: func(got files.ExpiredUploadCleaner, claimGate operations.WriteGate) func() {
 			if got != cleaner {
 				t.Fatal("wrong cleanup service")
 			}

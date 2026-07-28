@@ -238,11 +238,13 @@ func (s *PostgresStore) ClaimCleanup(ctx context.Context, cutoff time.Time, limi
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := operations.AdmitClaim(ctx, tx); err != nil {
-		if errors.Is(err, operations.ErrLeaseHeld) {
-			return []UploadSession{}, nil
+	if !hasCleanupAdmission(ctx) {
+		if err := operations.AdmitClaim(ctx, tx); err != nil {
+			if errors.Is(err, operations.ErrLeaseHeld) {
+				return []UploadSession{}, nil
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 	rows, err := tx.Query(ctx, sessionSelect+` WHERE expires_at <= $1 AND state IN ('open','expired','cancelled','completing') AND NOT EXISTS (SELECT 1 FROM file_versions WHERE file_versions.object_key=upload_sessions.object_key) ORDER BY expires_at,id FOR UPDATE SKIP LOCKED LIMIT $2`, cutoff, limit)
 	if err != nil {
