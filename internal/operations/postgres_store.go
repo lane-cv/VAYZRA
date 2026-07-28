@@ -462,6 +462,47 @@ func (s *PostgresStore) authoritativeLeaseState(
 	return fresh, state, nil
 }
 
+func leaseConnectionInterrupted(conn *pgxpool.Conn, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if conn.Conn().IsClosed() {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Severity == "FATAL"
+}
+
+func (s *PostgresStore) recoverLeaseSessionLocked(
+	ctx context.Context,
+	tokenHash [32]byte,
+	session *leaseSession,
+	lease Lease,
+	originalErr error,
+) error {
+	recoveredConn, state, recoverErr := s.authoritativeLeaseState(ctx, session.conn)
+	if recoveredConn == nil {
+		s.removeSessionLocked(tokenHash, session)
+		return originalErr
+	}
+	session.conn = recoveredConn
+	if recoverErr != nil {
+		s.releaseSessionLocked(tokenHash, session)
+		return originalErr
+	}
+	if !state.ownedBy(lease.OwnerID, tokenHash) ||
+		state.expiresAt == nil ||
+		state.remaining <= 0 {
+		s.releaseSessionLocked(tokenHash, session)
+		return ErrStaleLease
+	}
+	s.scheduleLeaseExpiryLocked(tokenHash, session, state.remaining)
+	return nil
+}
+
 func queryLeaseDBState(
 	ctx context.Context,
 	conn *pgxpool.Conn,
@@ -538,83 +579,42 @@ func (s *PostgresStore) mutateLease(ctx context.Context, lease Lease, mode strin
 	}
 	dbCtx, cancel := context.WithTimeout(lifecycleCtx, 3*time.Second)
 	defer cancel()
-	tx, err := session.conn.Begin(dbCtx)
-	if err != nil {
-		return Lease{}, err
-	}
-	rollback := func() {
-		_ = tx.Rollback(dbCtx)
-	}
-	defer rollback()
-	var currentMode string
-	var ownerID *uuid.UUID
-	var storedHash []byte
-	var storedExpiry *time.Time
-	if err := tx.QueryRow(dbCtx, `
-SELECT mode,owner_id,lease_token_hash,lease_expires_at
-FROM operational_modes WHERE singleton_id=true FOR UPDATE`).
-		Scan(&currentMode, &ownerID, &storedHash, &storedExpiry); err != nil {
-		rollback()
-		if errors.Is(err, pgx.ErrNoRows) {
-			s.releaseSessionLocked(tokenHash, session)
-			return Lease{}, ErrStaleLease
+	var updated Lease
+	var commitErr error
+	for attempt := 0; ; attempt++ {
+		var attemptErr error
+		var interrupted bool
+		updated, commitErr, interrupted, attemptErr = s.mutateLeaseTransaction(
+			dbCtx,
+			tokenHash,
+			session,
+			lease,
+			mode,
+			expiresAt,
+			transition,
+		)
+		if attemptErr == nil {
+			break
 		}
-		return Lease{}, mapLeaseError(err)
-	}
-	var databaseNow time.Time
-	if err := tx.QueryRow(dbCtx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
-		return Lease{}, mapLeaseError(err)
-	}
-	if ownerID == nil || *ownerID != lease.OwnerID ||
-		!bytes.Equal(storedHash, tokenHash[:]) {
-		rollback()
-		s.releaseSessionLocked(tokenHash, session)
-		return Lease{}, ErrStaleLease
-	}
-	if storedExpiry == nil || !storedExpiry.After(databaseNow) {
-		rollback()
-		s.releaseSessionLocked(tokenHash, session)
-		return Lease{}, ErrStaleLease
-	}
-	if !expiresAt.After(databaseNow) {
-		return Lease{}, ErrInvalid
-	}
-	updated := Lease{
-		Mode: currentMode, OwnerID: lease.OwnerID,
-		Token: append([]byte(nil), lease.Token...),
-	}
-	var updateErr error
-	if transition {
-		updated.Mode = mode
-		updateErr = tx.QueryRow(dbCtx, `
-UPDATE operational_modes
-SET mode=$1,lease_expires_at=$2,updated_at=now(),version=version+1
-WHERE singleton_id=true AND owner_id=$3 AND lease_token_hash=$4
-RETURNING lease_expires_at,version`,
-			mode, expiresAt, lease.OwnerID, tokenHash[:],
-		).Scan(&updated.ExpiresAt, &updated.Version)
-	} else {
-		updateErr = tx.QueryRow(dbCtx, `
-UPDATE operational_modes
-SET lease_expires_at=$1,updated_at=now(),version=version+1
-WHERE singleton_id=true AND owner_id=$2 AND lease_token_hash=$3
-RETURNING mode,lease_expires_at,version`,
-			expiresAt, lease.OwnerID, tokenHash[:],
-		).Scan(&updated.Mode, &updated.ExpiresAt, &updated.Version)
-	}
-	if updateErr != nil {
-		rollback()
-		if errors.Is(updateErr, pgx.ErrNoRows) {
-			s.releaseSessionLocked(tokenHash, session)
-			return Lease{}, ErrStaleLease
+		if lifecycleCtx.Err() != nil {
+			return Lease{}, s.mapLifecycleError(attemptErr)
 		}
-		return Lease{}, mapLeaseError(updateErr)
+		if attempt > 0 || !interrupted {
+			if interrupted {
+				s.releaseSessionLocked(tokenHash, session)
+			}
+			return Lease{}, s.mapLifecycleError(attemptErr)
+		}
+		if err := s.recoverLeaseSessionLocked(
+			dbCtx,
+			tokenHash,
+			session,
+			lease,
+			attemptErr,
+		); err != nil {
+			return Lease{}, s.mapLifecycleError(err)
+		}
 	}
-	operation := "renew"
-	if transition {
-		operation = "transition"
-	}
-	commitErr := s.commitLeaseTx(dbCtx, operation, tx, session.conn)
 	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer reconcileCancel()
 	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, session.conn)
@@ -654,14 +654,108 @@ RETURNING mode,lease_expires_at,version`,
 	return updated, nil
 }
 
-func (s *PostgresStore) clearLeaseAndReleaseLocked(ctx context.Context, tokenHash [32]byte, session *leaseSession, lease Lease) (bool, error) {
+func (s *PostgresStore) mutateLeaseTransaction(
+	ctx context.Context,
+	tokenHash [32]byte,
+	session *leaseSession,
+	lease Lease,
+	mode string,
+	expiresAt time.Time,
+	transition bool,
+) (Lease, error, bool, error) {
 	tx, err := session.conn.Begin(ctx)
 	if err != nil {
-		return false, err
+		return Lease{}, nil, leaseConnectionInterrupted(session.conn, err), mapLeaseError(err)
+	}
+	rollback := func() {
+		_ = tx.Rollback(ctx)
+	}
+	defer rollback()
+	var currentMode string
+	var ownerID *uuid.UUID
+	var storedHash []byte
+	var storedExpiry *time.Time
+	if err := tx.QueryRow(ctx, `
+SELECT mode,owner_id,lease_token_hash,lease_expires_at
+FROM operational_modes WHERE singleton_id=true FOR UPDATE`).
+		Scan(&currentMode, &ownerID, &storedHash, &storedExpiry); err != nil {
+		rollback()
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.releaseSessionLocked(tokenHash, session)
+			return Lease{}, nil, false, ErrStaleLease
+		}
+		return Lease{}, nil, leaseConnectionInterrupted(session.conn, err), mapLeaseError(err)
+	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return Lease{}, nil, leaseConnectionInterrupted(session.conn, err), mapLeaseError(err)
+	}
+	if ownerID == nil || *ownerID != lease.OwnerID ||
+		!bytes.Equal(storedHash, tokenHash[:]) {
+		rollback()
+		s.releaseSessionLocked(tokenHash, session)
+		return Lease{}, nil, false, ErrStaleLease
+	}
+	if storedExpiry == nil || !storedExpiry.After(databaseNow) {
+		rollback()
+		s.releaseSessionLocked(tokenHash, session)
+		return Lease{}, nil, false, ErrStaleLease
+	}
+	if !expiresAt.After(databaseNow) {
+		return Lease{}, nil, false, ErrInvalid
+	}
+	updated := Lease{
+		Mode: currentMode, OwnerID: lease.OwnerID,
+		Token: append([]byte(nil), lease.Token...),
+	}
+	var updateErr error
+	if transition {
+		updated.Mode = mode
+		updateErr = tx.QueryRow(ctx, `
+UPDATE operational_modes
+SET mode=$1,lease_expires_at=$2,updated_at=now(),version=version+1
+WHERE singleton_id=true AND owner_id=$3 AND lease_token_hash=$4
+RETURNING lease_expires_at,version`,
+			mode, expiresAt, lease.OwnerID, tokenHash[:],
+		).Scan(&updated.ExpiresAt, &updated.Version)
+	} else {
+		updateErr = tx.QueryRow(ctx, `
+UPDATE operational_modes
+SET lease_expires_at=$1,updated_at=now(),version=version+1
+WHERE singleton_id=true AND owner_id=$2 AND lease_token_hash=$3
+RETURNING mode,lease_expires_at,version`,
+			expiresAt, lease.OwnerID, tokenHash[:],
+		).Scan(&updated.Mode, &updated.ExpiresAt, &updated.Version)
+	}
+	if updateErr != nil {
+		rollback()
+		if errors.Is(updateErr, pgx.ErrNoRows) {
+			s.releaseSessionLocked(tokenHash, session)
+			return Lease{}, nil, false, ErrStaleLease
+		}
+		return Lease{}, nil, leaseConnectionInterrupted(session.conn, updateErr), mapLeaseError(updateErr)
+	}
+	operation := "renew"
+	if transition {
+		operation = "transition"
+	}
+	commitErr := s.commitLeaseTx(ctx, operation, tx, session.conn)
+	return updated, commitErr, false, nil
+}
+
+func (s *PostgresStore) clearLeaseAndReleaseLocked(
+	ctx context.Context,
+	tokenHash [32]byte,
+	session *leaseSession,
+	lease Lease,
+) (bool, bool, error) {
+	tx, err := session.conn.Begin(ctx)
+	if err != nil {
+		return false, leaseConnectionInterrupted(session.conn, err), err
 	}
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout='2s'`); err != nil {
-		return false, err
+		return false, leaseConnectionInterrupted(session.conn, err), err
 	}
 	var ownerID *uuid.UUID
 	var storedHash []byte
@@ -672,15 +766,15 @@ FROM operational_modes WHERE singleton_id=true FOR UPDATE`).
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
 			s.releaseSessionLocked(tokenHash, session)
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, leaseConnectionInterrupted(session.conn, err), err
 	}
 	if ownerID == nil || *ownerID != lease.OwnerID ||
 		!bytes.Equal(storedHash, tokenHash[:]) {
 		_ = tx.Rollback(ctx)
 		s.releaseSessionLocked(tokenHash, session)
-		return false, nil
+		return false, false, nil
 	}
 	tag, err := tx.Exec(ctx, `
 UPDATE operational_modes
@@ -689,12 +783,12 @@ SET mode='normal',owner_id=NULL,lease_token_hash=NULL,lease_expires_at=NULL,
 WHERE singleton_id=true AND owner_id=$1 AND lease_token_hash=$2`,
 		lease.OwnerID, tokenHash[:])
 	if err != nil {
-		return false, err
+		return false, leaseConnectionInterrupted(session.conn, err), err
 	}
 	if tag.RowsAffected() != 1 {
-		return false, ErrStaleLease
+		return false, false, ErrStaleLease
 	}
-	return true, s.commitLeaseTx(ctx, "release", tx, session.conn)
+	return true, false, s.commitLeaseTx(ctx, "release", tx, session.conn)
 }
 
 func (s *PostgresStore) ReleaseLease(ctx context.Context, lease Lease) error {
@@ -719,7 +813,38 @@ func (s *PostgresStore) ReleaseLease(ctx context.Context, lease Lease) error {
 	}
 	cleanupCtx, cancel := context.WithTimeout(lifecycleCtx, 3*time.Second)
 	defer cancel()
-	matched, commitErr := s.clearLeaseAndReleaseLocked(cleanupCtx, tokenHash, session, lease)
+	var matched bool
+	var commitErr error
+	for attempt := 0; ; attempt++ {
+		var interrupted bool
+		matched, interrupted, commitErr = s.clearLeaseAndReleaseLocked(
+			cleanupCtx,
+			tokenHash,
+			session,
+			lease,
+		)
+		if matched || commitErr == nil {
+			break
+		}
+		if lifecycleCtx.Err() != nil {
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		if attempt > 0 || !interrupted {
+			if interrupted {
+				s.releaseSessionLocked(tokenHash, session)
+			}
+			return s.mapLifecycleError(mapLeaseError(commitErr))
+		}
+		if err := s.recoverLeaseSessionLocked(
+			cleanupCtx,
+			tokenHash,
+			session,
+			lease,
+			mapLeaseError(commitErr),
+		); err != nil {
+			return s.mapLifecycleError(err)
+		}
+	}
 	if !matched {
 		if commitErr != nil {
 			return s.mapLifecycleError(mapLeaseError(commitErr))
@@ -868,8 +993,11 @@ func (s *PostgresStore) Close(ctx context.Context) error {
 			session.mu.Unlock()
 			continue
 		}
-		if err := normalizeOwnedLease(ctx, session.conn, session.ownerID, entry.tokenHash); err != nil &&
-			firstErr == nil {
+		if err := s.normalizeLeaseSessionLocked(
+			ctx,
+			entry.tokenHash,
+			session,
+		); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		session.released = true
@@ -893,6 +1021,31 @@ func (s *PostgresStore) Close(ctx context.Context) error {
 		session.mu.Unlock()
 	}
 	return firstErr
+}
+
+func (s *PostgresStore) normalizeLeaseSessionLocked(
+	ctx context.Context,
+	tokenHash [32]byte,
+	session *leaseSession,
+) error {
+	err := normalizeOwnedLease(ctx, session.conn, session.ownerID, tokenHash)
+	if err == nil || !leaseConnectionInterrupted(session.conn, err) {
+		return err
+	}
+	recoveredConn, state, recoverErr := s.authoritativeLeaseState(ctx, session.conn)
+	if recoveredConn == nil {
+		return recoverErr
+	}
+	session.conn = recoveredConn
+	if recoverErr != nil {
+		return recoverErr
+	}
+	if !state.ownedBy(session.ownerID, tokenHash) ||
+		state.expiresAt == nil ||
+		state.remaining <= 0 {
+		return nil
+	}
+	return normalizeOwnedLease(ctx, session.conn, session.ownerID, tokenHash)
 }
 
 func (s *PostgresStore) registerLeaseSession(
