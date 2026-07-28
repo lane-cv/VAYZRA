@@ -19,6 +19,8 @@ import NotificationCenterView from '../features/notifications/NotificationCenter
 import AIQuestionDetailView from '../features/ai/AIQuestionDetailView.vue'
 import AdminAIConfigView from '../features/ai/AdminAIConfigView.vue'
 import AdminAIUsageView from '../features/ai/AdminAIUsageView.vue'
+import SystemSettingsView from '../features/operations/SystemSettingsView.vue'
+import AuditView from '../features/operations/AuditView.vue'
 import { useSessionStore } from '../stores/session'
 import type { Role } from '../api/client'
 
@@ -28,7 +30,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/login' },
   { path: '/login', name: 'login', component: LoginView },
   { path: '/change-password', name: 'change-password', component: ChangePasswordView, meta: { requiresAuth: true, allowDuringPasswordChange: true } },
-  { path: '/admin', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['admin'] }, children: [{ path: '', name: 'admin-home', component: AdminHomeView }, { path: 'students', name: 'admin-students', component: StudentListView }, { path: 'teaching', name: 'admin-teaching', component: TeachingManagerView }, { path: 'teaching/lessons/:lessonId', name: 'admin-lesson-editor', component: LessonEditorView, props: true }, { path: 'files', name: 'admin-files', component: FileCenterView }, { path: 'ai', name: 'admin-ai', component: AdminAIConfigView }, { path: 'ai-usage', name: 'admin-ai-usage', component: AdminAIUsageView }, {path:'questions',component:TeacherQuestionWorkspaceView,children:[{path:'',name:'admin-questions',component:TeacherQuestionPlaceholder},{path:':questionId',name:'admin-question-detail',component:TeacherQuestionDetailView,props:true}]}] },
+  { path: '/admin', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['admin'] }, children: [{ path: '', name: 'admin-home', component: AdminHomeView }, { path: 'students', name: 'admin-students', component: StudentListView }, { path: 'teaching', name: 'admin-teaching', component: TeachingManagerView }, { path: 'teaching/lessons/:lessonId', name: 'admin-lesson-editor', component: LessonEditorView, props: true }, { path: 'files', name: 'admin-files', component: FileCenterView }, { path: 'ai', name: 'admin-ai', component: AdminAIConfigView }, { path: 'ai-usage', name: 'admin-ai-usage', component: AdminAIUsageView }, { path: 'settings', name: 'admin-settings', component: SystemSettingsView }, { path: 'audit', name: 'admin-audit', component: AuditView }, {path:'questions',component:TeacherQuestionWorkspaceView,children:[{path:'',name:'admin-questions',component:TeacherQuestionPlaceholder},{path:':questionId',name:'admin-question-detail',component:TeacherQuestionDetailView,props:true}]}] },
   { path: '/student', component: ConsoleLayout, meta: { requiresAuth: true, roles: ['student'] }, children: [
     { path: '', name: 'student-home', component: StudentHomeView },
     { path: 'learning', name: 'student-learning', component: LearningView },
