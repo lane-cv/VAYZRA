@@ -176,6 +176,8 @@ type workflowState struct {
 	DatabaseDumpBytes  int64                   `json:"databaseDumpBytes"`
 	ReferencedBytes    int64                   `json:"referencedBytes"`
 	ManifestBytes      int64                   `json:"manifestBytes"`
+	LocalVerifiedAt    time.Time               `json:"localVerifiedAt"`
+	RemoteVerifiedAt   time.Time               `json:"remoteVerifiedAt"`
 	RemoteConfigured   bool                    `json:"remoteConfigured"`
 	RemoteSucceeded    bool                    `json:"remoteSucceeded"`
 	ErrorCategory      string                  `json:"errorCategory"`
@@ -341,10 +343,17 @@ func (application *commandApplication) Verify(
 	}
 	state.DatabaseDumpBytes =
 		*state.Evidence.LogicalBytes - state.ReferencedBytes
+	if state.LocalVerifiedAt.IsZero() {
+		state.LocalVerifiedAt = artifactTimestamp(application.now())
+		if application.states.Save(state) != nil {
+			return errWorkflowState
+		}
+	}
 	if application.addArtifacts(
 		ctx,
 		state,
 		backup.RepositoryLocal,
+		state.LocalVerifiedAt,
 		state.Evidence.LocalExpiresAt,
 	) != nil {
 		return errWorkflowUnavailable
@@ -395,15 +404,34 @@ func (application *commandApplication) Sync(
 		state.ErrorCategory = "remote_unavailable"
 		return application.states.Save(state)
 	}
+	if state.Evidence.RemoteSnapshotID != "" &&
+		state.Evidence.RemoteSnapshotID != remoteSnapshotID {
+		return errWorkflowUnavailable
+	}
 	state.RemoteSucceeded = true
 	state.Evidence.RemoteSnapshotID = remoteSnapshotID
-	remoteExpiry := application.now().UTC().Add(30 * 24 * time.Hour)
-	state.Evidence.RemoteExpiresAt = &remoteExpiry
+	if state.RemoteVerifiedAt.IsZero() {
+		if state.Evidence.RemoteExpiresAt == nil {
+			state.RemoteVerifiedAt = artifactTimestamp(application.now())
+			remoteExpiry := state.RemoteVerifiedAt.Add(30 * 24 * time.Hour)
+			state.Evidence.RemoteExpiresAt = &remoteExpiry
+		} else {
+			state.RemoteVerifiedAt = artifactTimestamp(
+				state.Evidence.RemoteExpiresAt.Add(-30 * 24 * time.Hour),
+			)
+		}
+	}
+	if state.Evidence.RemoteExpiresAt == nil ||
+		state.Evidence.RemoteExpiresAt.IsZero() ||
+		application.states.Save(state) != nil {
+		return errWorkflowState
+	}
 	if application.addArtifacts(
 		ctx,
 		state,
 		backup.RepositoryRemote,
-		remoteExpiry,
+		state.RemoteVerifiedAt,
+		*state.Evidence.RemoteExpiresAt,
 	) != nil {
 		return errWorkflowUnavailable
 	}
@@ -414,8 +442,12 @@ func (application *commandApplication) addArtifacts(
 	ctx context.Context,
 	state workflowState,
 	repository backup.Repository,
+	verifiedAt time.Time,
 	expiresAt time.Time,
 ) error {
+	if verifiedAt.IsZero() || expiresAt.IsZero() {
+		return errWorkflowState
+	}
 	databaseDumpSHA256, err := hex.DecodeString(state.DatabaseDumpSHA256)
 	if err != nil || len(databaseDumpSHA256) != sha256.Size {
 		return errWorkflowState
@@ -428,7 +460,6 @@ func (application *commandApplication) addArtifacts(
 	if repository == backup.RepositoryRemote {
 		recoverySnapshotID = state.Evidence.RemoteSnapshotID
 	}
-	verifiedAt := application.now().UTC()
 	for _, artifact := range []backup.Artifact{
 		{
 			Kind:       backup.ArtifactDatabaseDump,
@@ -460,6 +491,10 @@ func (application *commandApplication) addArtifacts(
 		}
 	}
 	return nil
+}
+
+func artifactTimestamp(now time.Time) time.Time {
+	return now.UTC().Truncate(time.Microsecond)
 }
 
 func (application *commandApplication) Finish(
@@ -560,6 +595,15 @@ func (application *commandApplication) resume(
 	}
 	state, err := application.states.Load(runID)
 	if err != nil || !validWorkflowState(state) || state.RunID != runID {
+		durable, lookupErr := application.service.WorkflowRun(ctx, runID)
+		if lookupErr == nil &&
+			durable.ID == runID &&
+			terminalWorkflowState(durable.State) {
+			return workflowState{
+				RunID: runID,
+				State: durable.State,
+			}, true, nil
+		}
 		return workflowState{}, false, errWorkflowState
 	}
 	renewed, err := application.service.Renew(
@@ -616,7 +660,23 @@ func (application *commandApplication) resume(
 		return workflowState{}, false, errWorkflowUnavailable
 	}
 	if hasEvidence &&
-		!equalWorkflowEvidence(state.Evidence, evidence) {
+		evidence.RemoteSnapshotID == "" &&
+		evidence.RemoteExpiresAt == nil {
+		localHasRemoteID := state.Evidence.RemoteSnapshotID != ""
+		localHasRemoteExpiry := state.Evidence.RemoteExpiresAt != nil
+		if localHasRemoteID != localHasRemoteExpiry {
+			return workflowState{}, false, errWorkflowUnavailable
+		}
+		if localHasRemoteID {
+			if state.Evidence.RemoteExpiresAt.IsZero() {
+				return workflowState{}, false, errWorkflowUnavailable
+			}
+			evidence.RemoteSnapshotID = state.Evidence.RemoteSnapshotID
+			remoteExpiry := state.Evidence.RemoteExpiresAt.UTC()
+			evidence.RemoteExpiresAt = &remoteExpiry
+		}
+	}
+	if hasEvidence && !equalWorkflowEvidence(state.Evidence, evidence) {
 		state.Evidence = evidence
 		changed = true
 	}
@@ -667,8 +727,12 @@ func workflowEvidenceFromRun(
 	hasEvidence := run.DatabaseMigrationVersion != nil ||
 		run.EncryptionKeyID != "" ||
 		run.LocalSnapshotID != "" ||
+		run.RemoteSnapshotID != "" ||
 		len(run.ManifestSHA256) != 0 ||
-		run.LocalExpiresAt != nil
+		run.LogicalBytes != nil ||
+		run.StoredBytes != nil ||
+		run.LocalExpiresAt != nil ||
+		run.RemoteExpiresAt != nil
 	if !hasEvidence {
 		return backup.RecoveryEvidence{}, false, nil
 	}
@@ -679,6 +743,9 @@ func workflowEvidenceFromRun(
 		len(run.ManifestSHA256) != sha256.Size ||
 		run.LocalExpiresAt == nil ||
 		run.LocalExpiresAt.IsZero() {
+		return backup.RecoveryEvidence{}, false, errWorkflowState
+	}
+	if (run.RemoteSnapshotID == "") != (run.RemoteExpiresAt == nil) {
 		return backup.RecoveryEvidence{}, false, errWorkflowState
 	}
 	evidence := backup.RecoveryEvidence{

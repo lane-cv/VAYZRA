@@ -116,21 +116,24 @@ func TestRunCommandRejectsMalformedDuplicateAndUnexpectedInput(t *testing.T) {
 }
 
 type workflowServiceFixture struct {
-	runID         uuid.UUID
-	owner         uuid.UUID
-	generation    int64
-	state         backup.State
-	evidence      backup.RecoveryEvidence
-	leaseActive   bool
-	claimErr      error
-	renewErr      error
-	workflowErr   error
-	genericClaims int
-	targetClaims  []uuid.UUID
-	renewCalls    int
-	transitions   []backup.TransitionInput
-	completions   []backup.CompletionInput
-	artifacts     []backup.Artifact
+	runID                    uuid.UUID
+	owner                    uuid.UUID
+	generation               int64
+	state                    backup.State
+	evidence                 backup.RecoveryEvidence
+	leaseActive              bool
+	claimErr                 error
+	renewErr                 error
+	workflowErr              error
+	genericClaims            int
+	targetClaims             []uuid.UUID
+	workflowCalls            int
+	renewCalls               int
+	transitions              []backup.TransitionInput
+	transitionResponseLossAt int
+	completions              []backup.CompletionInput
+	artifacts                []backup.Artifact
+	strictArtifacts          bool
 }
 
 func (service *workflowServiceFixture) Claim(
@@ -183,6 +186,7 @@ func (service *workflowServiceFixture) WorkflowRun(
 	_ context.Context,
 	runID uuid.UUID,
 ) (backup.Run, error) {
+	service.workflowCalls++
 	if service.workflowErr != nil {
 		return backup.Run{}, service.workflowErr
 	}
@@ -258,6 +262,9 @@ func (service *workflowServiceFixture) Transition(
 		service.owner = uuid.Nil
 		service.leaseActive = false
 	}
+	if service.transitionResponseLossAt == len(service.transitions) {
+		return backup.Run{}, backup.ErrUnavailable
+	}
 	return backup.Run{
 		ID: input.RunID, State: input.To, OwnerID: input.OwnerID,
 		LeaseGeneration: input.LeaseGeneration,
@@ -290,6 +297,23 @@ func (service *workflowServiceFixture) AddArtifact(
 		artifact.OwnerID != service.owner ||
 		artifact.LeaseGeneration != service.generation {
 		return backup.ErrStaleOwner
+	}
+	if service.strictArtifacts {
+		for _, existing := range service.artifacts {
+			if existing.BackupRunID != artifact.BackupRunID ||
+				existing.Kind != artifact.Kind ||
+				existing.Repository != artifact.Repository {
+				continue
+			}
+			if existing.SnapshotID != artifact.SnapshotID ||
+				string(existing.SHA256) != string(artifact.SHA256) ||
+				existing.SizeBytes != artifact.SizeBytes ||
+				!existing.VerifiedAt.Equal(artifact.VerifiedAt) ||
+				!existing.ExpiresAt.Equal(artifact.ExpiresAt) {
+				return backup.ErrInvalid
+			}
+			return nil
+		}
 	}
 	service.artifacts = append(service.artifacts, artifact)
 	return nil
@@ -337,6 +361,7 @@ type memoryWorkflowStates struct {
 	state        *workflowState
 	saveCalls    int
 	failSaveAt   int
+	failSave     func(workflowState, int) bool
 	deleteCalls  int
 	failDeleteAt int
 }
@@ -350,7 +375,8 @@ func (states *memoryWorkflowStates) Load(uuid.UUID) (workflowState, error) {
 
 func (states *memoryWorkflowStates) Save(state workflowState) error {
 	states.saveCalls++
-	if states.failSaveAt == states.saveCalls {
+	if states.failSaveAt == states.saveCalls ||
+		(states.failSave != nil && states.failSave(state, states.saveCalls)) {
 		return errWorkflowState
 	}
 	cloned := state
@@ -881,6 +907,134 @@ func TestCommandApplicationRecoversVerifyAndSyncTransitionSaveFailures(t *testin
 	})
 }
 
+func TestCommandApplicationRetriesArtifactsWithStableTimesAfterCrash(t *testing.T) {
+	t.Run("local-transition-response-loss", func(t *testing.T) {
+		runID := uuid.MustParse(commandRunID)
+		owner := uuid.New()
+		startedAt := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+		result := commandSnapshotResult(t, startedAt)
+		evidence := commandEvidence(result, startedAt)
+		service := &workflowServiceFixture{
+			runID: runID, owner: owner, generation: 7,
+			state: backup.StateEncrypting, evidence: evidence, leaseActive: true,
+			transitionResponseLossAt: 1, strictArtifacts: true,
+		}
+		states := &memoryWorkflowStates{state: &workflowState{
+			RunID: runID, OwnerID: owner, LeaseGeneration: 7,
+			State: backup.StateEncrypting, Evidence: evidence,
+		}}
+		clockCalls := 0
+		application := commandApplication{
+			service:  service,
+			executor: &workflowExecutorFixture{snapshotResult: result},
+			states:   states, newOwner: uuid.New,
+			migrationVersion: func(context.Context) (int64, error) {
+				return 20, nil
+			},
+			now: func() time.Time {
+				at := startedAt.Add(time.Duration(clockCalls) * time.Hour)
+				clockCalls++
+				return at
+			},
+		}
+		if err := application.Verify(
+			context.Background(),
+			runID,
+		); !errors.Is(err, errWorkflowUnavailable) {
+			t.Fatalf("first verify err=%v", err)
+		}
+		if len(service.artifacts) != 3 ||
+			service.state != backup.StateVerifying {
+			t.Fatalf(
+				"artifacts=%+v durable=%s",
+				service.artifacts,
+				service.state,
+			)
+		}
+		if err := application.Verify(context.Background(), runID); err != nil {
+			t.Fatalf("retry verify: %v", err)
+		}
+		assertStableArtifactTimes(t, service.artifacts)
+	})
+
+	t.Run("remote-state-save-crash", func(t *testing.T) {
+		runID := uuid.MustParse(commandRunID)
+		owner := uuid.New()
+		startedAt := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+		result := commandSnapshotResult(t, startedAt)
+		evidence := commandEvidence(result, startedAt)
+		service := &workflowServiceFixture{
+			runID: runID, owner: owner, generation: 8,
+			state: backup.StateSyncing, evidence: evidence, leaseActive: true,
+			strictArtifacts: true,
+		}
+		crashed := false
+		states := &memoryWorkflowStates{
+			state: &workflowState{
+				RunID: runID, OwnerID: owner, LeaseGeneration: 8,
+				State: backup.StateSyncing, Evidence: evidence,
+				ObjectSnapshotID:   result.Manifest.ObjectSnapshotID,
+				DatabaseDumpSHA256: result.Manifest.DatabaseDumpSHA256,
+				DatabaseDumpBytes:  result.DatabaseDumpBytes,
+				ReferencedBytes:    result.Manifest.ReferencedBytes,
+				ManifestBytes:      int64(len(mustManifestBytes(t, result.Manifest))),
+				RemoteConfigured:   true,
+			},
+			failSave: func(workflowState, int) bool {
+				if !crashed && len(service.artifacts) == 3 {
+					crashed = true
+					return true
+				}
+				return false
+			},
+		}
+		clockCalls := 0
+		application := commandApplication{
+			service: service,
+			executor: &workflowExecutorFixture{
+				snapshotResult: result,
+				remote:         true,
+				syncResult:     commandRecoveryID,
+			},
+			states: states, newOwner: uuid.New,
+			migrationVersion: func(context.Context) (int64, error) {
+				return 20, nil
+			},
+			now: func() time.Time {
+				at := startedAt.Add(time.Duration(clockCalls) * time.Hour)
+				clockCalls++
+				return at
+			},
+		}
+		if err := application.Sync(
+			context.Background(),
+			runID,
+		); !errors.Is(err, errWorkflowState) {
+			t.Fatalf("first sync err=%v", err)
+		}
+		if len(service.artifacts) != 3 {
+			t.Fatalf("artifacts=%+v", service.artifacts)
+		}
+		if err := application.Sync(context.Background(), runID); err != nil {
+			t.Fatalf("retry sync: %v", err)
+		}
+		assertStableArtifactTimes(t, service.artifacts)
+	})
+}
+
+func assertStableArtifactTimes(t *testing.T, artifacts []backup.Artifact) {
+	t.Helper()
+	if len(artifacts) != 3 {
+		t.Fatalf("artifacts=%+v", artifacts)
+	}
+	for _, artifact := range artifacts[1:] {
+		if !artifact.VerifiedAt.Equal(artifacts[0].VerifiedAt) ||
+			!artifact.ExpiresAt.Equal(artifacts[0].ExpiresAt) {
+			t.Fatalf("artifact times are not stable: %+v", artifacts)
+		}
+	}
+}
+
 func TestCommandApplicationRecoversTerminalDeleteFailures(t *testing.T) {
 	for _, command := range []string{"finish", "fail"} {
 		t.Run(command, func(t *testing.T) {
@@ -940,6 +1094,108 @@ func TestCommandApplicationRecoversTerminalDeleteFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCommandApplicationRetriesMatchingTerminalAfterStateWasDeleted(t *testing.T) {
+	for _, command := range []string{"finish", "fail"} {
+		t.Run(command, func(t *testing.T) {
+			runID := uuid.MustParse(commandRunID)
+			owner := uuid.New()
+			now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+			result := commandSnapshotResult(t, now)
+			evidence := commandEvidence(result, now)
+			service := &workflowServiceFixture{
+				runID: runID, owner: owner, generation: 9,
+				state: backup.StateVerifying, evidence: evidence, leaseActive: true,
+			}
+			states := &memoryWorkflowStates{state: &workflowState{
+				RunID: runID, OwnerID: owner, LeaseGeneration: 9,
+				State: backup.StateVerifying, Evidence: evidence,
+			}}
+			application := commandApplication{
+				service:  service,
+				executor: &workflowExecutorFixture{snapshotResult: result},
+				states:   states, newOwner: uuid.New,
+				migrationVersion: func(context.Context) (int64, error) {
+					return 20, nil
+				},
+				now: func() time.Time { return now },
+			}
+			call := application.Finish
+			if command == "fail" {
+				call = func(ctx context.Context, runID uuid.UUID) error {
+					return application.Fail(ctx, runID, "integrity")
+				}
+			}
+			if err := call(context.Background(), runID); err != nil {
+				t.Fatalf("first %s: %v", command, err)
+			}
+			if states.state != nil {
+				t.Fatalf("state was not deleted: %+v", states.state)
+			}
+			if err := call(context.Background(), runID); err != nil {
+				t.Fatalf("retry %s: %v", command, err)
+			}
+			if service.workflowCalls != 1 {
+				t.Fatalf("workflow lookups=%d", service.workflowCalls)
+			}
+			if command == "finish" && len(service.completions) != 1 {
+				t.Fatalf("completions=%+v", service.completions)
+			}
+			if command == "fail" && len(service.transitions) != 1 {
+				t.Fatalf("transitions=%+v", service.transitions)
+			}
+		})
+	}
+}
+
+func TestCommandApplicationMissingStateFailsClosedForWrongOrNonterminalRun(t *testing.T) {
+	for _, state := range []backup.State{
+		backup.StateQueued,
+		backup.StateFailed,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			runID := uuid.MustParse(commandRunID)
+			service := &workflowServiceFixture{
+				runID: runID, state: state, generation: 2,
+			}
+			application := commandApplication{
+				service: service, executor: &workflowExecutorFixture{},
+				states: &memoryWorkflowStates{}, newOwner: uuid.New,
+				migrationVersion: func(context.Context) (int64, error) {
+					return 20, nil
+				},
+				now: time.Now,
+			}
+			if err := application.Finish(
+				context.Background(),
+				runID,
+			); !errors.Is(err, errWorkflowUnavailable) {
+				t.Fatalf("state=%s finish err=%v", state, err)
+			}
+		})
+	}
+	t.Run("fail-succeeded", func(t *testing.T) {
+		runID := uuid.MustParse(commandRunID)
+		service := &workflowServiceFixture{
+			runID: runID, state: backup.StateSucceeded, generation: 2,
+		}
+		application := commandApplication{
+			service: service, executor: &workflowExecutorFixture{},
+			states: &memoryWorkflowStates{}, newOwner: uuid.New,
+			migrationVersion: func(context.Context) (int64, error) {
+				return 20, nil
+			},
+			now: time.Now,
+		}
+		if err := application.Fail(
+			context.Background(),
+			runID,
+			"integrity",
+		); !errors.Is(err, errWorkflowUnavailable) {
+			t.Fatalf("fail err=%v", err)
+		}
+	})
 }
 
 func TestCommandApplicationLeaseTakeoverRefreshesFenceAndRejectsLiveOwner(t *testing.T) {
