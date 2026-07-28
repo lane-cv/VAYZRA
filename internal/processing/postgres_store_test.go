@@ -17,6 +17,74 @@ func TestPostgresStoreImplementsLeaseContract(t *testing.T) {
 	var _ Store = NewPostgresStore(nil)
 }
 
+func TestPostgresProcessingClaimCannotPassQueuedMaintenance(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actor := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO users(id,username,display_name,role,status,password_hash)
+VALUES($1,$2,'Processing admission','student','active','hash')`,
+		actor, "processing_admission_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	var fileID, versionID, jobID uuid.UUID
+	if err := pool.QueryRow(
+		ctx,
+		`INSERT INTO files(created_by) VALUES($1) RETURNING id`,
+		actor,
+	).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+INSERT INTO file_versions(
+ file_id,version,purpose,object_key,display_name,declared_mime,
+ size_bytes,sha256,processing_state,created_by
+) VALUES($1,1,'teaching',$2,'admission.pdf','application/pdf',1,$3,'pending_scan',$4)
+RETURNING id`,
+		fileID,
+		"test-processing/admission/"+uuid.NewString(),
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		actor,
+	).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+INSERT INTO file_processing_jobs(file_version_id,kind,available_at)
+VALUES($1,'process_file','-infinity') RETURNING id`, versionID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	finishMaintenance := integration.QueueOperationsExclusiveBehindShared(t, pool)
+	started := time.Now()
+	job, err := NewPostgresStore(pool).LeaseNext(
+		ctx,
+		"maintenance-race",
+		time.Now().UTC(),
+		DefaultLeaseDuration,
+	)
+	if !errors.Is(err, ErrNoJob) || job.ID != uuid.Nil ||
+		time.Since(started) > time.Second {
+		t.Fatalf("job=%+v err=%v elapsed=%s", job, err, time.Since(started))
+	}
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM file_processing_jobs WHERE id=$1`, jobID).
+		Scan(&state); err != nil || state != StateQueued {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	finishMaintenance()
+	job, err = NewPostgresStore(pool).LeaseNext(
+		ctx,
+		"after-maintenance",
+		time.Now().UTC(),
+		DefaultLeaseDuration,
+	)
+	if err != nil || job.ID != jobID {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+}
+
 func TestPostgresAITextCompletionRequiresAndPersistsPrivateArtifact(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

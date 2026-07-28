@@ -464,6 +464,44 @@ VALUES($1,$2,$2,'student','active','x')`, secondStudent, "runner-second-"+uuid.N
 	}
 }
 
+func TestPostgresRunnerClaimCannotPassQueuedMaintenance(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newRuntimeFixture(t, ctx, pool, 20)
+	_, run, err := NewPostgresRuntimeStore(pool).AdmitRun(ctx, fixture.admission())
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishMaintenance := integration.QueueOperationsExclusiveBehindShared(t, pool)
+	started := time.Now()
+	leased, err := NewPostgresRunnerStore(
+		pool,
+		runnerTestSecretBox{},
+		nil,
+	).LeaseNext(ctx, "maintenance-race", time.Now().UTC(), time.Minute)
+	if !errors.Is(err, ErrNoRunnableRun) || leased.Run.ID != uuid.Nil ||
+		time.Since(started) > time.Second {
+		t.Fatalf("leased=%+v err=%v elapsed=%s", leased, err, time.Since(started))
+	}
+	var status RunStatus
+	if err := pool.QueryRow(ctx, `SELECT status FROM ai_runs WHERE id=$1`, run.ID).
+		Scan(&status); err != nil || status != RunQueued {
+		t.Fatalf("status=%s err=%v", status, err)
+	}
+	finishMaintenance()
+	leased, err = NewPostgresRunnerStore(
+		pool,
+		runnerTestSecretBox{},
+		nil,
+	).LeaseNext(ctx, "after-maintenance", time.Now().UTC(), time.Minute)
+	if err != nil || leased.Run.ID != run.ID {
+		t.Fatalf("leased=%+v err=%v", leased, err)
+	}
+}
+
 func TestPostgresRunnerCompletionAtomicallyWritesAssistantUsageAndQuota(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

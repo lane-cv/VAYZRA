@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/operations"
 )
 
 var stableCategory = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
@@ -97,6 +98,12 @@ func (s *PostgresStore) LeaseNext(ctx context.Context, owner string, now time.Ti
 		return Job{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := operations.AdmitClaim(ctx, tx); err != nil {
+		if errors.Is(err, operations.ErrLeaseHeld) {
+			return Job{}, ErrNoJob
+		}
+		return Job{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 WITH exhausted_candidates AS (
   SELECT id FROM file_processing_jobs

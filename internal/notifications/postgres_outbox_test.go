@@ -49,6 +49,39 @@ func TestPostgresOutboxClaimIsExclusiveAndLeaseCanBeTakenOver(t *testing.T) {
 	}
 }
 
+func TestPostgresOutboxClaimCannotPassQueuedMaintenance(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM outbox_events WHERE published_at IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO outbox_events(id,kind,payload,dedupe_key)
+VALUES($1,'lesson.published','{}',$2)`, id, "maintenance:"+id.String()); err != nil {
+		t.Fatal(err)
+	}
+	finishMaintenance := integration.QueueOperationsExclusiveBehindShared(t, pool)
+	started := time.Now()
+	events, err := NewPostgresOutboxStore(pool).Claim(ctx, "maintenance-race")
+	if err != nil || len(events) != 0 || time.Since(started) > time.Second {
+		t.Fatalf("events=%v err=%v elapsed=%s", events, err, time.Since(started))
+	}
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT attempts FROM outbox_events WHERE id=$1`, id).
+		Scan(&attempts); err != nil || attempts != 0 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+	finishMaintenance()
+	events, err = NewPostgresOutboxStore(pool).Claim(ctx, "after-maintenance")
+	if err != nil || len(events) != 1 || events[0].ID != id {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+}
+
 func TestPostgresOutboxConcurrentClaimersHaveOneExclusiveOwner(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

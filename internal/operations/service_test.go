@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +20,164 @@ import (
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
+
+func TestPostgresUnsafeWriteGateFailsFastDuringActiveMaintenance(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlerCalls := atomic.Int32{}
+	handler := UnsafeWriteGate(store)(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			handlerCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
+	type response struct {
+		code int
+		body string
+	}
+	result := make(chan response, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(
+			recorder,
+			httptest.NewRequest(http.MethodPost, "/api/v1/student/progress", nil),
+		)
+		result <- response{code: recorder.Code, body: recorder.Body.String()}
+	}()
+	select {
+	case got := <-result:
+		if got.code != http.StatusServiceUnavailable ||
+			!strings.Contains(got.body, `"code":"maintenance_mode"`) ||
+			handlerCalls.Load() != 0 {
+			t.Fatalf(
+				"status=%d calls=%d body=%s",
+				got.code,
+				handlerCalls.Load(),
+				got.body,
+			)
+		}
+	case <-time.After(time.Second):
+		_ = store.ReleaseLease(ctx, lease)
+		<-result
+		t.Fatal("unsafe write did not fail fast during maintenance")
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/api/v1/student/progress", nil),
+	)
+	if recorder.Code != http.StatusNoContent || handlerCalls.Load() != 1 {
+		t.Fatalf("status=%d calls=%d", recorder.Code, handlerCalls.Load())
+	}
+}
+
+func TestPostgresSharedAdmissionTimeoutReturnsCleanConnectionToPool(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgresWithMaxConns(t, 3)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE operational_modes
+SET mode='normal',owner_id=NULL,lease_token_hash=NULL,lease_expires_at=NULL,
+    entered_at=NULL,updated_at=now(),version=version+1
+WHERE singleton_id=true`); err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reservedPID int
+	if err := reserved.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&reservedPID); err != nil {
+		reserved.Release()
+		t.Fatal(err)
+	}
+	store := NewPostgresStore(pool)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(time.Minute),
+	})
+	if err != nil {
+		reserved.Release()
+		t.Fatal(err)
+	}
+	reserved.Release()
+
+	requireSharedAdmissionRejectedQuickly(t, store)
+	reused, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reused.Release()
+	var reusedPID int
+	if err := reused.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&reusedPID); err != nil {
+		t.Fatal(err)
+	}
+	if reusedPID != reservedPID {
+		t.Fatalf("timed-out connection replaced: before=%d after=%d", reservedPID, reusedPID)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresClaimAdmissionRejectsDurableNonNormalMode(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	tokenHash := sha256.Sum256([]byte("durable-maintenance-mode"))
+	if _, err := pool.Exec(ctx, `
+UPDATE operational_modes
+SET mode='draining',owner_id=$1,lease_token_hash=$2,
+    lease_expires_at=clock_timestamp()+interval '1 minute',
+    entered_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1
+WHERE singleton_id=true`, uuid.New(), tokenHash[:]); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	started := time.Now()
+	if err := AdmitClaim(ctx, tx); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("admission error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("durable non-normal admission took %v", elapsed)
+	}
+}
+
+func TestPostgresClaimAdmissionRestoresLockTimeoutAfterAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := AdmitClaim(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	var lockTimeout string
+	if err := tx.QueryRow(ctx, `SHOW lock_timeout`).Scan(&lockTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if lockTimeout != "0" {
+		t.Fatalf("lock_timeout=%q", lockTimeout)
+	}
+}
 
 func TestValidateSettingsAcceptsDefaultsAndEveryBoundary(t *testing.T) {
 	defaults := validSettings()
@@ -471,14 +631,7 @@ func TestPostgresLeaseLifecycleAndAdvisoryGate(t *testing.T) {
 		t.Fatalf("transitioned=%#v", backup)
 	}
 
-	readCtx, readCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer readCancel()
-	if release, err := store.AcquireShared(readCtx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			release()
-		}
-		t.Fatalf("shared lock while lease held error=%v", err)
-	}
+	requireSharedAdmissionRejectedQuickly(t, store)
 	if err := store.ReleaseLease(ctx, backup); err != nil {
 		t.Fatal(err)
 	}
@@ -705,14 +858,7 @@ WHERE singleton_id=true`)
 		t.Fatalf("canceled mutation retained %d lease session entries", heldSessions)
 	}
 
-	probeCtx, probeCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer probeCancel()
-	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			release()
-		}
-		t.Fatalf("canceled mutation opened shared gate: %v", err)
-	}
+	requireSharedAdmissionRejectedQuickly(t, store)
 	mode, err := store.GetMode(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -751,14 +897,7 @@ func TestCanceledLeaseReleaseRetainsExclusiveSessionAndCanRetry(t *testing.T) {
 	if mode.Mode != "backup" || mode.OwnerID != lease.OwnerID {
 		t.Fatalf("canceled release changed non-normal mode: %#v", mode)
 	}
-	probeCtx, probeCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer probeCancel()
-	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			release()
-		}
-		t.Fatalf("canceled release opened shared gate: %v", err)
-	}
+	requireSharedAdmissionRejectedQuickly(t, store)
 	if err := store.ReleaseLease(ctx, lease); err != nil {
 		t.Fatal(err)
 	}
@@ -2036,6 +2175,21 @@ func postgresClock(t *testing.T, pool *pgxpool.Pool) time.Time {
 		t.Fatal(err)
 	}
 	return now.UTC()
+}
+
+func requireSharedAdmissionRejectedQuickly(t *testing.T, store *PostgresStore) {
+	t.Helper()
+	started := time.Now()
+	release, err := store.AcquireShared(context.Background())
+	if err == nil {
+		release()
+	}
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("shared maintenance admission error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("shared maintenance admission took %v", elapsed)
+	}
 }
 
 func waitForPostgresClock(t *testing.T, pool *pgxpool.Pool, target time.Time) {

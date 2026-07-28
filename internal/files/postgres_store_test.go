@@ -71,6 +71,56 @@ func TestPostgresUploadStorePersistsPartsAcrossRestartAndCompletesAtomically(t *
 	}
 }
 
+func TestPostgresUploadCleanupClaimCannotPassQueuedMaintenance(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	actor := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO users(id,username,display_name,role,status,password_hash)
+VALUES($1,$2,'Cleanup admission','student','active','hash')`,
+		actor, "cleanup_admission_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM upload_sessions WHERE id=$1`, actor)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, actor)
+	})
+	session := UploadSession{
+		ID: actor, ActorUserID: actor, Purpose: UploadPurposeTeaching,
+		ObjectKey:     "originals/" + uuid.NewString(),
+		MinIOUploadID: uuid.NewString(), DisplayName: "cleanup.pdf",
+		DeclaredMIME: "application/pdf", ExpectedSize: 1,
+		ExpectedSHA256: digestOf([]byte("x")), State: UploadOpen,
+		ExpiresAt: time.Now().UTC().Add(-2 * time.Hour),
+		CreatedAt: time.Now().UTC().Add(-3 * time.Hour),
+	}
+	store := NewPostgresStore(pool)
+	if err := store.CreateSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	finishMaintenance := integration.QueueOperationsExclusiveBehindShared(t, pool)
+	started := time.Now()
+	claimed, err := store.ClaimCleanup(ctx, time.Now().UTC(), 100)
+	if err != nil || len(claimed) != 0 || time.Since(started) > time.Second {
+		t.Fatalf("claimed=%v err=%v elapsed=%s", claimed, err, time.Since(started))
+	}
+	finishMaintenance()
+	claimed, err = store.ClaimCleanup(ctx, time.Now().UTC(), 100)
+	found := false
+	for _, candidate := range claimed {
+		if candidate.ID == session.ID {
+			found = true
+			break
+		}
+	}
+	if err != nil || !found {
+		t.Fatalf("claimed=%v err=%v", claimed, err)
+	}
+}
+
 func TestPostgresQAAccessAuthorizationIsDerivedFromBoundThread(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)

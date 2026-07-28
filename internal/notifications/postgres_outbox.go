@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/operations"
 )
 
 type PostgresOutboxStore struct {
@@ -24,9 +25,20 @@ func (s *PostgresOutboxStore) Claim(ctx context.Context, owner string) ([]Outbox
 	if s == nil || s.pool == nil || strings.TrimSpace(owner) == "" || len(owner) > 160 {
 		return nil, ErrInvalidInput
 	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.Background())
+	if err := operations.AdmitClaim(ctx, tx); err != nil {
+		if errors.Is(err, operations.ErrLeaseHeld) {
+			return []OutboxEvent{}, nil
+		}
+		return nil, err
+	}
 	// A process may die after taking its final allowed lease. Once that lease
 	// expires, make the terminal state explicit instead of stranding the row.
-	if _, err := s.pool.Exec(ctx, `WITH terminal AS (
+	if _, err := tx.Exec(ctx, `WITH terminal AS (
  SELECT id FROM outbox_events
  WHERE published_at IS NULL AND attempts>=$1 AND (lease_until IS NULL OR lease_until<=clock_timestamp())
  ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT $2
@@ -34,7 +46,7 @@ func (s *PostgresOutboxStore) Claim(ctx context.Context, owner string) ([]Outbox
  FROM terminal WHERE e.id=terminal.id`, OutboxMaxAttempts, OutboxBatchLimit); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `WITH ready AS (
+	rows, err := tx.Query(ctx, `WITH ready AS (
  SELECT id FROM outbox_events
  WHERE published_at IS NULL AND next_attempt_at<=clock_timestamp()
    AND attempts<$2 AND (lease_until IS NULL OR lease_until<=clock_timestamp())
@@ -55,7 +67,14 @@ RETURNING e.id,e.kind,e.payload,e.attempts,e.lease_owner,e.lease_until`, owner, 
 		event.LeaseUntil = event.LeaseUntil.UTC()
 		events = append(events, event)
 	}
-	return events, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 func (s *PostgresOutboxStore) DeliverLessonPublication(ctx context.Context, event OutboxEvent, owner string) error {

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/operations"
 )
 
 type PostgresRunnerStore struct {
@@ -35,6 +36,12 @@ func (s *PostgresRunnerStore) LeaseNext(ctx context.Context, owner string, now t
 		return leased, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := operations.AdmitClaim(ctx, tx); err != nil {
+		if errors.Is(err, operations.ErrLeaseHeld) {
+			return LeasedRun{}, ErrNoRunnableRun
+		}
+		return LeasedRun{}, err
+	}
 	if failed, failErr := failQueuedRunWithRotatedKey(ctx, tx, now); failErr != nil {
 		return LeasedRun{}, failErr
 	} else if failed {

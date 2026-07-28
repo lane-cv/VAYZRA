@@ -246,13 +246,37 @@ func (s *PostgresStore) AcquireShared(ctx context.Context) (func(), error) {
 	if err != nil {
 		return nil, s.mapLifecycleError(err)
 	}
-	if _, err := conn.Exec(waitCtx, `SELECT pg_advisory_lock_shared($1)`, operationsAdvisoryKey); err != nil {
-		closeHijackedConnection(conn)
+	tx, err := conn.Begin(waitCtx)
+	if err != nil {
+		conn.Release()
+		return nil, s.mapLifecycleError(err)
+	}
+	rollback := func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}
+	if _, err := tx.Exec(waitCtx, admissionLockTimeoutSQL); err != nil {
+		rollback()
+		conn.Release()
+		return nil, s.mapLifecycleError(err)
+	}
+	if _, err := tx.Exec(
+		waitCtx,
+		`SELECT pg_advisory_lock_shared($1)`,
+		operationsAdvisoryKey,
+	); err != nil {
+		rollback()
+		conn.Release()
+		if admissionLockTimedOut(err) {
+			return nil, ErrLeaseHeld
+		}
 		return nil, s.mapLifecycleError(err)
 	}
 	var mode string
-	if err := conn.QueryRow(waitCtx, `
+	if err := tx.QueryRow(waitCtx, `
 SELECT mode FROM operational_modes WHERE singleton_id=true`).Scan(&mode); err != nil {
+		rollback()
 		releaseSharedConnection(conn)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrConflict
@@ -260,8 +284,13 @@ SELECT mode FROM operational_modes WHERE singleton_id=true`).Scan(&mode); err !=
 		return nil, s.mapLifecycleError(err)
 	}
 	if mode != "normal" {
+		rollback()
 		releaseSharedConnection(conn)
 		return nil, ErrLeaseHeld
+	}
+	if err := tx.Commit(waitCtx); err != nil {
+		closeHijackedConnection(conn)
+		return nil, s.mapLifecycleError(err)
 	}
 	shared := &sharedSession{conn: conn}
 	s.mu.Lock()
