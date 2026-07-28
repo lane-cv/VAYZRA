@@ -153,7 +153,7 @@ type backupWorkflowService interface {
 
 type backupWorkflowExecutor interface {
 	Snapshot(context.Context, backup.SnapshotInput) (backup.SnapshotResult, error)
-	Verify(context.Context, string, string) error
+	Verify(context.Context, backup.VerifyInput) (backup.VerifyResult, error)
 	RemoteConfigured() (bool, error)
 	Sync(context.Context, string, []string) (string, error)
 }
@@ -245,7 +245,9 @@ func (application *commandApplication) Snapshot(
 		return errWorkflowUnavailable
 	}
 	manifestBytes, manifestErr := backup.MarshalManifest(result.Manifest)
+	manifestHash := sha256.Sum256(manifestBytes)
 	if manifestErr != nil ||
+		!bytes.Equal(manifestHash[:], result.ManifestSHA256[:]) ||
 		result.Manifest.BatchID != runID.String() ||
 		result.Manifest.DatabaseMigrationVersion != migrationVersion ||
 		result.EncryptionKeyID == "" ||
@@ -284,15 +286,31 @@ func (application *commandApplication) Verify(
 	if err != nil || state.State != backup.StateEncrypting {
 		return errWorkflowUnavailable
 	}
-	for _, snapshotID := range []string{
-		state.ObjectSnapshotID,
-		state.Evidence.LocalSnapshotID,
-	} {
-		if snapshotID == "" ||
-			application.executor.Verify(ctx, runID.String(), snapshotID) != nil {
-			return errWorkflowUnavailable
-		}
+	if len(state.Evidence.ManifestSHA256) != sha256.Size ||
+		state.Evidence.LocalSnapshotID == "" {
+		return errWorkflowUnavailable
 	}
+	var manifestHash [sha256.Size]byte
+	copy(manifestHash[:], state.Evidence.ManifestSHA256)
+	verified, err := application.executor.Verify(ctx, backup.VerifyInput{
+		RunID:          runID.String(),
+		SnapshotID:     state.Evidence.LocalSnapshotID,
+		ManifestSHA256: manifestHash,
+	})
+	if err != nil {
+		return errWorkflowUnavailable
+	}
+	manifestBytes, err := backup.MarshalManifest(verified.Manifest)
+	if err != nil ||
+		verified.Manifest.BatchID != runID.String() ||
+		verified.Manifest.DatabaseMigrationVersion !=
+			state.Evidence.DatabaseMigrationVersion {
+		return errWorkflowUnavailable
+	}
+	state.ObjectSnapshotID = verified.Manifest.ObjectSnapshotID
+	state.DatabaseDumpSHA256 = verified.Manifest.DatabaseDumpSHA256
+	state.ReferencedBytes = verified.Manifest.ReferencedBytes
+	state.ManifestBytes = int64(len(manifestBytes))
 	if application.addArtifacts(
 		ctx,
 		state,
@@ -329,7 +347,7 @@ func (application *commandApplication) Sync(
 	remoteSnapshotID, syncErr := application.executor.Sync(
 		ctx,
 		runID.String(),
-		[]string{state.ObjectSnapshotID, state.Evidence.LocalSnapshotID},
+		[]string{state.Evidence.LocalSnapshotID},
 	)
 	if syncErr != nil {
 		if errors.Is(syncErr, backup.ErrCancelled) {
@@ -364,28 +382,31 @@ func (application *commandApplication) addArtifacts(
 	if err != nil || len(databaseDumpSHA256) != sha256.Size {
 		return errWorkflowState
 	}
-	objectSnapshotSHA256 := sha256.Sum256([]byte(state.ObjectSnapshotID))
-	manifestSnapshotID := state.Evidence.LocalSnapshotID
+	objectSnapshotSHA256, err := hex.DecodeString(state.ObjectSnapshotID)
+	if err != nil || len(objectSnapshotSHA256) != sha256.Size {
+		return errWorkflowState
+	}
+	recoverySnapshotID := state.Evidence.LocalSnapshotID
 	if repository == backup.RepositoryRemote {
-		manifestSnapshotID = state.Evidence.RemoteSnapshotID
+		recoverySnapshotID = state.Evidence.RemoteSnapshotID
 	}
 	verifiedAt := application.now().UTC()
 	for _, artifact := range []backup.Artifact{
 		{
 			Kind:       backup.ArtifactDatabaseDump,
-			SnapshotID: state.ObjectSnapshotID,
+			SnapshotID: recoverySnapshotID,
 			SHA256:     databaseDumpSHA256,
 			SizeBytes:  state.DatabaseDumpBytes,
 		},
 		{
 			Kind:       backup.ArtifactObjectSnapshot,
-			SnapshotID: state.ObjectSnapshotID,
-			SHA256:     objectSnapshotSHA256[:],
+			SnapshotID: recoverySnapshotID,
+			SHA256:     objectSnapshotSHA256,
 			SizeBytes:  state.ReferencedBytes,
 		},
 		{
 			Kind:       backup.ArtifactManifest,
-			SnapshotID: manifestSnapshotID,
+			SnapshotID: recoverySnapshotID,
 			SHA256:     append([]byte(nil), state.Evidence.ManifestSHA256...),
 			SizeBytes:  state.ManifestBytes,
 		},

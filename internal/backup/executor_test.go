@@ -4,6 +4,9 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +18,11 @@ import (
 	"syscall"
 	"testing"
 	"time"
+)
+
+const (
+	executorRecoverySnapshotID = "1111111111111111111111111111111111111111111111111111111111111111"
+	executorOtherSnapshotID    = "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
 type recordingRunner struct {
@@ -100,14 +108,10 @@ func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing
 			}
 			return CommandResult{ExitCode: 0}, nil
 		case "restic":
-			snapshot := "1111111111111111"
-			if index > 1 {
-				snapshot = "2222222222222222"
-			}
 			return CommandResult{
 				Stdout: []byte(fmt.Sprintf(
 					`{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":0,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":1,"data_added":128,"data_added_packed":96,"total_files_processed":1,"total_bytes_processed":22,"total_duration":0.1,"snapshot_id":%q}`,
-					snapshot,
+					executorRecoverySnapshotID,
 				)),
 				ExitCode: 0,
 			}, nil
@@ -154,11 +158,13 @@ func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing
 		}
 		t.Fatalf("err=%v executables=%v", err, executables)
 	}
-	if result.LocalSnapshotID != "2222222222222222" ||
-		result.Manifest.ObjectSnapshotID != "1111111111111111" ||
+	if result.LocalSnapshotID != executorRecoverySnapshotID ||
+		len(result.Manifest.ObjectSnapshotID) != sha256.Size*2 ||
+		result.Manifest.ObjectSnapshotID == executorRecoverySnapshotID ||
 		result.ManifestSHA256 == [32]byte{} {
 		t.Fatalf("result=%+v", result)
 	}
+	var resticBackups []Command
 	for _, command := range runner.calls() {
 		if command.Stdin != ClosedStdin {
 			t.Errorf("stdin=%q for %s", command.Stdin, command.Executable)
@@ -177,6 +183,25 @@ func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing
 		}
 		if command.StdoutLimit < 1 || command.StderrLimit != CommandOutputLimit {
 			t.Errorf("unbounded command=%+v", command)
+		}
+		if filepath.Base(command.Executable) == "restic" {
+			resticBackups = append(resticBackups, command)
+		}
+	}
+	if len(resticBackups) != 1 {
+		t.Fatalf("restic backups=%d want=1", len(resticBackups))
+	}
+	manifestHashTag := "happylearn-manifest-sha256:" +
+		hex.EncodeToString(result.ManifestSHA256[:])
+	for _, required := range []string{
+		"happylearn-batch:" + commandRunIDForExecutor,
+		manifestHashTag,
+		"database.dump",
+		"manifest.json",
+		"recovery-bundle.age",
+	} {
+		if !slices.Contains(resticBackups[0].Args, required) {
+			t.Errorf("single recovery snapshot missing arg %q: %q", required, resticBackups[0].Args)
 		}
 	}
 	entries, err := os.ReadDir(workRoot)
@@ -266,14 +291,168 @@ func TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError(t *testing.T) {
 		}, nil
 	}}
 	executor, _ := executorFixture(t, runner)
-	err := executor.Verify(
+	_, err := executor.Verify(
 		context.Background(),
-		"10000000-0000-4000-8000-000000000001",
-		"1111111111111111",
+		VerifyInput{
+			RunID:      commandRunIDForExecutor,
+			SnapshotID: executorRecoverySnapshotID,
+		},
 	)
 	if !errors.Is(err, ErrIntegrity) || err.Error() != ErrIntegrity.Error() {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+func TestExecutorVerifyBindsExactSnapshotBatchTagAndManifestHash(t *testing.T) {
+	manifest := validManifest()
+	manifest.BatchID = commandRunIDForExecutor
+	manifestBytes, err := MarshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestBytes)
+	runner := verifyRunner(t, executorRecoverySnapshotID, []string{
+		"happylearn-batch:" + commandRunIDForExecutor,
+		"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+	}, manifestBytes)
+	executor, _ := executorFixture(t, runner)
+
+	verified, err := executor.Verify(context.Background(), VerifyInput{
+		RunID:          commandRunIDForExecutor,
+		SnapshotID:     executorRecoverySnapshotID,
+		ManifestSHA256: manifestHash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Manifest != manifest {
+		t.Fatalf("manifest=%+v", verified.Manifest)
+	}
+}
+
+func TestExecutorVerifyRejectsWrongRunSnapshotTagHashAndManifest(t *testing.T) {
+	manifest := validManifest()
+	manifest.BatchID = commandRunIDForExecutor
+	manifestBytes, err := MarshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestBytes)
+	otherRunID := "30000000-0000-4000-8000-000000000003"
+	cases := []struct {
+		name       string
+		snapshotID string
+		tags       []string
+		manifest   []byte
+		expected   [sha256.Size]byte
+	}{
+		{
+			name: "wrong exact snapshot", snapshotID: executorOtherSnapshotID,
+			tags: []string{
+				"happylearn-batch:" + commandRunIDForExecutor,
+				"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+			},
+			manifest: manifestBytes, expected: manifestHash,
+		},
+		{
+			name: "wrong run tag", snapshotID: executorRecoverySnapshotID,
+			tags: []string{
+				"happylearn-batch:" + otherRunID,
+				"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+			},
+			manifest: manifestBytes, expected: manifestHash,
+		},
+		{
+			name: "wrong manifest hash tag", snapshotID: executorRecoverySnapshotID,
+			tags: []string{
+				"happylearn-batch:" + commandRunIDForExecutor,
+				"happylearn-manifest-sha256:" + strings.Repeat("f", sha256.Size*2),
+			},
+			manifest: manifestBytes, expected: manifestHash,
+		},
+		{
+			name: "tampered manifest bytes", snapshotID: executorRecoverySnapshotID,
+			tags: []string{
+				"happylearn-batch:" + commandRunIDForExecutor,
+				"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+			},
+			manifest: append(append([]byte(nil), manifestBytes...), '\n'),
+			expected: manifestHash,
+		},
+		{
+			name: "mismatched expected manifest", snapshotID: executorRecoverySnapshotID,
+			tags: []string{
+				"happylearn-batch:" + commandRunIDForExecutor,
+				"happylearn-manifest-sha256:" + strings.Repeat("e", sha256.Size*2),
+			},
+			manifest: manifestBytes,
+			expected: [sha256.Size]byte{1},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := verifyRunner(t, tc.snapshotID, tc.tags, tc.manifest)
+			executor, _ := executorFixture(t, runner)
+			_, err := executor.Verify(context.Background(), VerifyInput{
+				RunID:          commandRunIDForExecutor,
+				SnapshotID:     executorRecoverySnapshotID,
+				ManifestSHA256: tc.expected,
+			})
+			if !errors.Is(err, ErrIntegrity) || err.Error() != ErrIntegrity.Error() {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func verifyRunner(
+	t *testing.T,
+	snapshotID string,
+	tags []string,
+	manifest []byte,
+) *recordingRunner {
+	t.Helper()
+	return &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
+		switch {
+		case slices.Equal(command.Args, []string{"check", "--read-data"}):
+			return CommandResult{ExitCode: 0}, nil
+		case len(command.Args) == 3 &&
+			command.Args[0] == "snapshots" &&
+			command.Args[1] == "--json":
+			return CommandResult{
+				ExitCode: 0,
+				Stdout: []byte(fmt.Sprintf(
+					`[{"id":%q,"tags":%s}]`,
+					snapshotID,
+					mustJSON(t, tags),
+				)),
+			}, nil
+		case len(command.Args) == 4 &&
+			command.Args[0] == "stats" &&
+			command.Args[1] == "--json":
+			return CommandResult{
+				ExitCode: 0,
+				Stdout:   []byte(`{"total_size":1,"total_file_count":4,"snapshots_count":1}`),
+			}, nil
+		case len(command.Args) == 3 &&
+			command.Args[0] == "dump" &&
+			command.Args[1] == executorRecoverySnapshotID &&
+			command.Args[2] == "manifest.json":
+			return CommandResult{ExitCode: 0, Stdout: append([]byte(nil), manifest...)}, nil
+		default:
+			t.Fatalf("unexpected verify command: %q", command.Args)
+			return CommandResult{}, nil
+		}
+	}}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func TestExecutorSyncUsesOwnerOnlySourceFilesAndKeepsRepositoriesOutOfArguments(t *testing.T) {

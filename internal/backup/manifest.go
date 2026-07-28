@@ -69,6 +69,10 @@ func DecodeManifest(reader io.Reader) (Manifest, error) {
 	if validateManifest(manifest) != nil {
 		return Manifest{}, ErrInvalidManifest
 	}
+	canonical, err := MarshalManifest(manifest)
+	if err != nil || !bytes.Equal(encoded, canonical) {
+		return Manifest{}, ErrInvalidManifest
+	}
 	return manifest, nil
 }
 
@@ -121,7 +125,7 @@ func validateManifest(manifest Manifest) error {
 		offset != 0 ||
 		manifest.DatabaseMigrationVersion < 1 ||
 		!lowerSHA256.MatchString(manifest.DatabaseDumpSHA256) ||
-		!resticSnapshotID.MatchString(manifest.ObjectSnapshotID) ||
+		!lowerSHA256.MatchString(manifest.ObjectSnapshotID) ||
 		manifest.ObjectCount < 0 ||
 		manifest.ReferencedBytes < 0 {
 		return ErrInvalidManifest

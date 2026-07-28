@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -10,7 +11,11 @@ import (
 	"happylearn.local/app/internal/backup"
 )
 
-const commandRunID = "10000000-0000-4000-8000-000000000001"
+const (
+	commandRunID            = "10000000-0000-4000-8000-000000000001"
+	commandObjectSnapshotID = "1111111111111111111111111111111111111111111111111111111111111111"
+	commandRecoveryID       = "2222222222222222222222222222222222222222222222222222222222222222"
+)
 
 type recordingActions struct {
 	calls      []string
@@ -196,7 +201,7 @@ func (service *workflowServiceFixture) AddArtifact(
 
 type workflowExecutorFixture struct {
 	snapshotResult backup.SnapshotResult
-	verified       []string
+	verified       []backup.VerifyInput
 	remote         bool
 	remoteErr      error
 	syncResult     string
@@ -212,11 +217,10 @@ func (executor *workflowExecutorFixture) Snapshot(
 
 func (executor *workflowExecutorFixture) Verify(
 	_ context.Context,
-	_ string,
-	snapshotID string,
-) error {
-	executor.verified = append(executor.verified, snapshotID)
-	return nil
+	input backup.VerifyInput,
+) (backup.VerifyResult, error) {
+	executor.verified = append(executor.verified, input)
+	return backup.VerifyResult{Manifest: executor.snapshotResult.Manifest}, nil
 }
 
 func (executor *workflowExecutorFixture) RemoteConfigured() (bool, error) {
@@ -263,18 +267,23 @@ func TestCommandApplicationFencesEveryMutationWithClaimedOwnerAndGeneration(t *t
 		CreatedAt:                now,
 		DatabaseMigrationVersion: 20,
 		DatabaseDumpSHA256:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		ObjectSnapshotID:         "1111111111111111",
+		ObjectSnapshotID:         commandObjectSnapshotID,
 		ObjectCount:              1,
 		ReferencedBytes:          11,
 	}
+	manifestBytes, err := backup.MarshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestBytes)
 	service := &workflowServiceFixture{
 		runID: runID, generation: 9, state: backup.StateQueued,
 	}
 	executor := &workflowExecutorFixture{snapshotResult: backup.SnapshotResult{
 		Manifest:          manifest,
-		ManifestSHA256:    [32]byte{1},
+		ManifestSHA256:    manifestHash,
 		EncryptionKeyID:   "key-2026-07",
-		LocalSnapshotID:   "2222222222222222",
+		LocalSnapshotID:   commandRecoveryID,
 		DatabaseDumpBytes: 22,
 		LogicalBytes:      33,
 		StoredBytes:       22,
@@ -326,12 +335,13 @@ func TestCommandApplicationFencesEveryMutationWithClaimedOwnerAndGeneration(t *t
 		service.completions[0].OwnerID != owner ||
 		service.completions[0].LeaseGeneration != 9 ||
 		service.completions[0].Evidence.EncryptionKeyID != "key-2026-07" ||
-		service.completions[0].Evidence.LocalSnapshotID != "2222222222222222" {
+		service.completions[0].Evidence.LocalSnapshotID != commandRecoveryID {
 		t.Fatalf("completions=%+v", service.completions)
 	}
-	if len(executor.verified) != 2 ||
-		executor.verified[0] != "1111111111111111" ||
-		executor.verified[1] != "2222222222222222" {
+	if len(executor.verified) != 1 ||
+		executor.verified[0].RunID != commandRunID ||
+		executor.verified[0].SnapshotID != commandRecoveryID ||
+		executor.verified[0].ManifestSHA256 != manifestHash {
 		t.Fatalf("verified=%v", executor.verified)
 	}
 	if len(service.artifacts) != 3 ||
@@ -390,14 +400,14 @@ func TestCommandApplicationRemoteFailureCompletesDegradedWithSameFence(t *testin
 	evidence := backup.RecoveryEvidence{
 		DatabaseMigrationVersion: 20,
 		EncryptionKeyID:          "key-2026-07",
-		LocalSnapshotID:          "2222222222222222",
+		LocalSnapshotID:          commandRecoveryID,
 		ManifestSHA256:           make([]byte, 32),
 		LocalExpiresAt:           now.Add(7 * 24 * time.Hour),
 	}
 	states := &memoryWorkflowStates{state: &workflowState{
 		RunID: runID, OwnerID: owner, LeaseGeneration: 4,
 		State: backup.StateVerifying, Evidence: evidence,
-		ObjectSnapshotID: "1111111111111111",
+		ObjectSnapshotID: commandObjectSnapshotID,
 	}}
 	application := &commandApplication{
 		service: service, executor: executor, states: states,
@@ -442,11 +452,11 @@ func TestCommandApplicationDoesNotConvertCancellationToRemoteDegradation(t *test
 		Evidence: backup.RecoveryEvidence{
 			DatabaseMigrationVersion: 20,
 			EncryptionKeyID:          "key-2026-07",
-			LocalSnapshotID:          "2222222222222222",
+			LocalSnapshotID:          commandRecoveryID,
 			ManifestSHA256:           make([]byte, 32),
 			LocalExpiresAt:           time.Now().UTC().Add(7 * 24 * time.Hour),
 		},
-		ObjectSnapshotID: "1111111111111111",
+		ObjectSnapshotID: commandObjectSnapshotID,
 	}}
 	application := &commandApplication{
 		service: service,
@@ -483,11 +493,11 @@ func TestCommandApplicationRecordsVerifiedRemoteArtifactsAfterSuccessfulSync(t *
 		Evidence: backup.RecoveryEvidence{
 			DatabaseMigrationVersion: 20,
 			EncryptionKeyID:          "key-2026-07",
-			LocalSnapshotID:          "2222222222222222",
+			LocalSnapshotID:          commandRecoveryID,
 			ManifestSHA256:           make([]byte, 32),
 			LocalExpiresAt:           now.Add(7 * 24 * time.Hour),
 		},
-		ObjectSnapshotID:   "1111111111111111",
+		ObjectSnapshotID:   commandObjectSnapshotID,
 		DatabaseDumpSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		DatabaseDumpBytes:  22,
 		ReferencedBytes:    11,
@@ -496,7 +506,7 @@ func TestCommandApplicationRecordsVerifiedRemoteArtifactsAfterSuccessfulSync(t *
 	application := &commandApplication{
 		service: service,
 		executor: &workflowExecutorFixture{
-			remote: true, syncResult: "2222222222222222",
+			remote: true, syncResult: commandRecoveryID,
 		},
 		states: states, newOwner: uuid.New,
 		migrationVersion: func(context.Context) (int64, error) {

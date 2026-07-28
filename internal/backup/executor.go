@@ -363,6 +363,16 @@ type SnapshotResult struct {
 	StoredBytes       int64
 }
 
+type VerifyInput struct {
+	RunID          string
+	SnapshotID     string
+	ManifestSHA256 [sha256.Size]byte
+}
+
+type VerifyResult struct {
+	Manifest Manifest
+}
+
 func (executor Executor) Snapshot(
 	ctx context.Context,
 	input SnapshotInput,
@@ -403,10 +413,6 @@ func (executor Executor) Snapshot(
 		}
 	}()
 
-	objectCount, referencedBytes, err := countObjectFiles(executor.config.ObjectRoot)
-	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
-	}
 	dumpPath := filepath.Join(workDirectory, "database.dump")
 	pgResult, err := executor.config.Runner.Run(ctx, Command{
 		Executable: pgDumpExecutable,
@@ -444,16 +450,10 @@ func (executor Executor) Snapshot(
 		return SnapshotResult{}, ErrDatabaseDump
 	}
 
-	objectSummary, err := executor.resticBackup(
-		ctx,
-		workDirectory,
-		repository,
-		repositoryPassword,
-		input.RunID,
-		[]string{dumpPath, executor.config.ObjectRoot},
-	)
+	objectCount, referencedBytes, objectIdentity, err :=
+		summarizeObjectFiles(executor.config.ObjectRoot)
 	if err != nil {
-		return SnapshotResult{}, err
+		return SnapshotResult{}, ErrSnapshot
 	}
 	manifest := Manifest{
 		SchemaVersion:            1,
@@ -461,7 +461,7 @@ func (executor Executor) Snapshot(
 		CreatedAt:                executor.config.Now().UTC(),
 		DatabaseMigrationVersion: input.DatabaseMigrationVersion,
 		DatabaseDumpSHA256:       hex.EncodeToString(dumpHash[:]),
-		ObjectSnapshotID:         objectSummary.SnapshotID,
+		ObjectSnapshotID:         hex.EncodeToString(objectIdentity[:]),
 		ObjectCount:              objectCount,
 		ReferencedBytes:          referencedBytes,
 	}
@@ -513,13 +513,21 @@ func (executor Executor) Snapshot(
 	if ageResult.ExitCode != 0 {
 		return SnapshotResult{}, ErrSnapshot
 	}
-	bundleSummary, err := executor.resticBackup(
+	snapshotSummary, err := executor.resticBackup(
 		ctx,
 		workDirectory,
 		repository,
 		repositoryPassword,
-		input.RunID,
-		[]string{bundlePath},
+		[]string{
+			"happylearn-batch:" + input.RunID,
+			"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
+		},
+		[]string{
+			filepath.Base(dumpPath),
+			filepath.Base(manifestPath),
+			filepath.Base(bundlePath),
+			executor.config.ObjectRoot,
+		},
 	)
 	if err != nil {
 		return SnapshotResult{}, err
@@ -532,10 +540,10 @@ func (executor Executor) Snapshot(
 		Manifest:          manifest,
 		ManifestSHA256:    manifestHash,
 		EncryptionKeyID:   executor.config.EncryptionKeyID,
-		LocalSnapshotID:   bundleSummary.SnapshotID,
+		LocalSnapshotID:   snapshotSummary.SnapshotID,
 		DatabaseDumpBytes: dumpBytes,
 		LogicalBytes:      logicalBytes,
-		StoredBytes:       objectSummary.DataAddedPacked + bundleSummary.DataAddedPacked,
+		StoredBytes:       snapshotSummary.DataAddedPacked,
 	}, nil
 }
 
@@ -551,15 +559,19 @@ func (executor Executor) resticBackup(
 	workDirectory string,
 	repository string,
 	password string,
-	runID string,
+	tags []string,
 	paths []string,
 ) (resticSummary, error) {
 	args := []string{
 		"backup",
 		"--json",
 		"--quiet",
-		"--tag",
-		"happylearn-batch:" + runID,
+	}
+	for _, tag := range tags {
+		if tag == "" || strings.TrimSpace(tag) != tag {
+			return resticSummary{}, ErrSnapshot
+		}
+		args = append(args, "--tag", tag)
 	}
 	args = append(args, paths...)
 	result, err := executor.config.Runner.Run(ctx, Command{
@@ -590,24 +602,32 @@ func (executor Executor) resticBackup(
 
 func (executor Executor) Verify(
 	ctx context.Context,
-	runID string,
-	snapshotID string,
-) error {
-	if !canonicalRunID(runID) || !resticSnapshotID.MatchString(snapshotID) {
-		return ErrIntegrity
+	input VerifyInput,
+) (VerifyResult, error) {
+	if !canonicalRunID(input.RunID) ||
+		!resticSnapshotID.MatchString(input.SnapshotID) ||
+		len(input.SnapshotID) != sha256.Size*2 {
+		return VerifyResult{}, ErrIntegrity
 	}
 	repository, err := executor.config.Secrets.Read(SecretLocalRepository)
 	if err != nil {
-		return ErrIntegrity
+		return VerifyResult{}, ErrIntegrity
 	}
 	password, err := executor.config.Secrets.Read(SecretLocalPassword)
 	if err != nil {
-		return ErrIntegrity
+		return VerifyResult{}, ErrIntegrity
 	}
+	var manifestBytes []byte
 	for _, args := range [][]string{
 		{"check", "--read-data"},
-		{"stats", "--json", "--mode=raw-data", snapshotID},
+		{"snapshots", "--json", input.SnapshotID},
+		{"stats", "--json", "--mode=raw-data", input.SnapshotID},
+		{"dump", input.SnapshotID, "manifest.json"},
 	} {
+		stdoutLimit := CommandOutputLimit
+		if args[0] == "dump" {
+			stdoutLimit = ManifestMaxBytes
+		}
 		result, runErr := executor.config.Runner.Run(ctx, Command{
 			Executable: resticExecutable,
 			Args:       args,
@@ -617,23 +637,46 @@ func (executor Executor) Verify(
 				"RESTIC_PASSWORD=" + password,
 			},
 			Stdin:       ClosedStdin,
-			StdoutLimit: CommandOutputLimit,
+			StdoutLimit: stdoutLimit,
 			StderrLimit: CommandOutputLimit,
 		})
 		if runErr != nil {
 			if ctx.Err() != nil {
-				return ErrCancelled
+				return VerifyResult{}, ErrCancelled
 			}
-			return ErrIntegrity
+			return VerifyResult{}, ErrIntegrity
 		}
 		if result.ExitCode != 0 {
-			return ErrIntegrity
+			return VerifyResult{}, ErrIntegrity
 		}
-		if args[0] == "stats" && decodeResticStats(result.Stdout) != nil {
-			return ErrIntegrity
+		switch args[0] {
+		case "snapshots":
+			if decodeResticSnapshotBinding(
+				result.Stdout,
+				input.SnapshotID,
+				input.RunID,
+				input.ManifestSHA256,
+			) != nil {
+				return VerifyResult{}, ErrIntegrity
+			}
+		case "stats":
+			if decodeResticStats(result.Stdout) != nil {
+				return VerifyResult{}, ErrIntegrity
+			}
+		case "dump":
+			manifestBytes = append([]byte(nil), result.Stdout...)
 		}
 	}
-	return nil
+	manifest, err := DecodeManifest(bytes.NewReader(manifestBytes))
+	if err != nil {
+		return VerifyResult{}, ErrIntegrity
+	}
+	actualHash := sha256.Sum256(manifestBytes)
+	if manifest.BatchID != input.RunID ||
+		!bytes.Equal(actualHash[:], input.ManifestSHA256[:]) {
+		return VerifyResult{}, ErrIntegrity
+	}
+	return VerifyResult{Manifest: manifest}, nil
 }
 
 func (executor Executor) RemoteConfigured() (bool, error) {
@@ -796,6 +839,59 @@ type resticStats struct {
 	SnapshotsCount int64 `json:"snapshots_count"`
 }
 
+type resticSnapshotBinding struct {
+	Time           time.Time       `json:"time"`
+	Parent         string          `json:"parent"`
+	Tree           string          `json:"tree"`
+	Paths          []string        `json:"paths"`
+	Hostname       string          `json:"hostname"`
+	Username       string          `json:"username"`
+	UID            uint32          `json:"uid"`
+	GID            uint32          `json:"gid"`
+	Excludes       []string        `json:"excludes"`
+	Tags           []string        `json:"tags"`
+	ProgramVersion string          `json:"program_version"`
+	Summary        json.RawMessage `json:"summary"`
+	ID             string          `json:"id"`
+	ShortID        string          `json:"short_id"`
+	Original       string          `json:"original"`
+}
+
+func decodeResticSnapshotBinding(
+	encoded []byte,
+	snapshotID string,
+	runID string,
+	manifestHash [sha256.Size]byte,
+) error {
+	if len(encoded) == 0 || len(encoded) > CommandOutputLimit {
+		return ErrIntegrity
+	}
+	var snapshots []resticSnapshotBinding
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshots); err != nil ||
+		requireJSONEOF(decoder) != nil ||
+		len(snapshots) != 1 ||
+		snapshots[0].ID != snapshotID ||
+		len(snapshots[0].Tags) != 2 {
+		return ErrIntegrity
+	}
+	expectedTags := map[string]struct{}{
+		"happylearn-batch:" + runID:                                         {},
+		"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]): {},
+	}
+	for _, tag := range snapshots[0].Tags {
+		if _, ok := expectedTags[tag]; !ok {
+			return ErrIntegrity
+		}
+		delete(expectedTags, tag)
+	}
+	if len(expectedTags) != 0 {
+		return ErrIntegrity
+	}
+	return nil
+}
+
 func decodeResticStats(encoded []byte) error {
 	if len(encoded) == 0 || len(encoded) > CommandOutputLimit {
 		return ErrIntegrity
@@ -857,9 +953,13 @@ func cleanupWorkDirectory(root string, workDirectory string) error {
 	return os.RemoveAll(workDirectory)
 }
 
-func countObjectFiles(root string) (int64, int64, error) {
+func summarizeObjectFiles(
+	root string,
+) (int64, int64, [sha256.Size]byte, error) {
 	var count int64
 	var bytesCount int64
+	setHash := sha256.New()
+	_, _ = setHash.Write([]byte("happylearn-object-set-v1\x00"))
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return ErrSnapshot
@@ -870,21 +970,50 @@ func countObjectFiles(root string) (int64, int64, error) {
 		if entry.IsDir() {
 			return nil
 		}
-		info, err := entry.Info()
+		info, err := os.Lstat(path)
 		if err != nil || !info.Mode().IsRegular() || info.Size() < 0 {
 			return ErrSnapshot
 		}
 		if count == int64(^uint64(0)>>1) || bytesCount > int64(^uint64(0)>>1)-info.Size() {
 			return ErrCapacity
 		}
+		relativePath, err := filepath.Rel(root, path)
+		if err != nil ||
+			relativePath == "." ||
+			filepath.IsAbs(relativePath) ||
+			strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+			return ErrSnapshot
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return ErrSnapshot
+		}
+		openedInfo, statErr := file.Stat()
+		if statErr != nil || !os.SameFile(info, openedInfo) {
+			_ = file.Close()
+			return ErrSnapshot
+		}
+		fileHash := sha256.New()
+		written, copyErr := io.Copy(fileHash, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil || written != info.Size() {
+			return ErrSnapshot
+		}
+		_, _ = setHash.Write([]byte(filepath.ToSlash(relativePath)))
+		_, _ = setHash.Write([]byte{0})
+		_, _ = setHash.Write([]byte(strconv.FormatInt(info.Size(), 10)))
+		_, _ = setHash.Write([]byte{0})
+		_, _ = setHash.Write(fileHash.Sum(nil))
 		count++
 		bytesCount += info.Size()
 		return nil
 	})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, [sha256.Size]byte{}, err
 	}
-	return count, bytesCount, nil
+	var identity [sha256.Size]byte
+	copy(identity[:], setHash.Sum(nil))
+	return count, bytesCount, identity, nil
 }
 
 func hashBoundedRegularFile(path string, limit int64) ([sha256.Size]byte, int64, error) {

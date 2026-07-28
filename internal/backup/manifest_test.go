@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const canonicalManifestJSON = `{"schemaVersion":1,"batchId":"10000000-0000-4000-8000-000000000001","createdAt":"2026-07-28T01:02:03.000000004Z","databaseMigrationVersion":20,"databaseDumpSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","objectSnapshotId":"8f7e6d5c4b3a2100","objectCount":12,"referencedBytes":3456}`
+const canonicalManifestJSON = `{"schemaVersion":1,"batchId":"10000000-0000-4000-8000-000000000001","createdAt":"2026-07-28T01:02:03.000000004Z","databaseMigrationVersion":20,"databaseDumpSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","objectSnapshotId":"8f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a2100","objectCount":12,"referencedBytes":3456}`
 
 func validManifest() Manifest {
 	return Manifest{
@@ -17,7 +17,7 @@ func validManifest() Manifest {
 		CreatedAt:                time.Date(2026, 7, 28, 1, 2, 3, 4, time.UTC),
 		DatabaseMigrationVersion: 20,
 		DatabaseDumpSHA256:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		ObjectSnapshotID:         "8f7e6d5c4b3a2100",
+		ObjectSnapshotID:         "8f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a2100",
 		ObjectCount:              12,
 		ReferencedBytes:          3456,
 	}
@@ -84,6 +84,7 @@ func TestManifestRejectsInvalidSemanticFields(t *testing.T) {
 			v.DatabaseDumpSHA256 = strings.ToUpper(v.DatabaseDumpSHA256)
 		}},
 		{name: "empty snapshot", mutate: func(v *Manifest) { v.ObjectSnapshotID = "" }},
+		{name: "short snapshot identity", mutate: func(v *Manifest) { v.ObjectSnapshotID = "8f7e6d5c4b3a2100" }},
 		{name: "nonhex snapshot", mutate: func(v *Manifest) { v.ObjectSnapshotID = "snapshot-id" }},
 		{name: "uppercase snapshot", mutate: func(v *Manifest) { v.ObjectSnapshotID = "ABCDEF0123456789" }},
 		{name: "snapshot path", mutate: func(v *Manifest) { v.ObjectSnapshotID = "../../repository" }},
@@ -110,5 +111,37 @@ func TestManifestDecoderRejectsNonUTCWireTimestamp(t *testing.T) {
 	)
 	if _, err := DecodeManifest(strings.NewReader(input)); !errors.Is(err, ErrInvalidManifest) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestManifestDecoderRequiresAllEightFieldsIncludingValidZeroValues(t *testing.T) {
+	withZeroValues := strings.NewReplacer(
+		`"objectCount":12`,
+		`"objectCount":0`,
+		`"referencedBytes":3456`,
+		`"referencedBytes":0`,
+	).Replace(canonicalManifestJSON)
+	for _, field := range []string{
+		`,"objectCount":0`,
+		`,"referencedBytes":0`,
+	} {
+		input := strings.Replace(withZeroValues, field, "", 1)
+		if _, err := DecodeManifest(strings.NewReader(input)); !errors.Is(err, ErrInvalidManifest) {
+			t.Errorf("missing field %q accepted: err=%v", field, err)
+		}
+	}
+}
+
+func TestManifestDecoderRequiresCanonicalFieldOrderAndWhitespace(t *testing.T) {
+	reordered := `{"batchId":"10000000-0000-4000-8000-000000000001","schemaVersion":1,"createdAt":"2026-07-28T01:02:03.000000004Z","databaseMigrationVersion":20,"databaseDumpSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","objectSnapshotId":"8f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a21008f7e6d5c4b3a2100","objectCount":12,"referencedBytes":3456}`
+	for _, input := range []string{
+		reordered,
+		" " + canonicalManifestJSON,
+		canonicalManifestJSON + "\n",
+		strings.Replace(canonicalManifestJSON, `,"batchId"`, `, "batchId"`, 1),
+	} {
+		if _, err := DecodeManifest(strings.NewReader(input)); !errors.Is(err, ErrInvalidManifest) {
+			t.Errorf("noncanonical manifest accepted: %q", input)
+		}
 	}
 }
