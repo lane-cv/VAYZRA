@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -42,6 +43,61 @@ func TestBuildApplicationStartsAndStopsUploadCleanupRunner(t *testing.T) {
 	closeResources()
 	if !stopped {
 		t.Fatal("cleanup runner not stopped")
+	}
+}
+
+func TestBuildApplicationRejectsNilUploadCleanupStopAndClosesResources(t *testing.T) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) {
+				return nil, nil
+			},
+			migrate: func(context.Context, *pgxpool.Pool) error {
+				return nil
+			},
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+				return serverFakeAuth{}, nil
+			},
+			newUploads: func(
+				context.Context,
+				*pgxpool.Pool,
+				config.Config,
+			) (files.UploadHTTPService, error) {
+				return &serverUploadCleaner{}, nil
+			},
+			newOperations: func(*pgxpool.Pool) operationsRuntime {
+				return gate
+			},
+			requireOperations: true,
+			startUploadCleanup: func(
+				files.ExpiredUploadCleaner,
+				operations.ClaimGate,
+			) func() {
+				return nil
+			},
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) {
+				events = append(events, "pool_close")
+			},
+		},
+	)
+	if handler != nil || closeResources != nil || err == nil ||
+		err.Error() != "initialize upload cleanup" {
+		t.Fatalf(
+			"handler=%v cleanup_present=%t err=%v",
+			handler,
+			closeResources != nil,
+			err,
+		)
+	}
+	if got := strings.Join(events, ","); got != "operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
 	}
 }
 

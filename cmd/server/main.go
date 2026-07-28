@@ -56,6 +56,7 @@ func main() {
 type serverLifecycle interface {
 	ListenAndServe() error
 	Shutdown(context.Context) error
+	Close() error
 }
 
 func runServerLifecycle(
@@ -63,23 +64,27 @@ func runServerLifecycle(
 	server serverLifecycle,
 	closeResources func(),
 ) error {
-	defer closeResources()
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.ListenAndServe() }()
 
+	var result error
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return errors.New("server start")
+			result = errors.New("server start")
 		}
 	case <-signals.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return errors.New("server shutdown")
-		}
 	}
-	return nil
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		if closeErr := server.Close(); closeErr != nil {
+			return errors.New("server force close")
+		}
+		return errors.New("server shutdown")
+	}
+	closeResources()
+	return result
 }
 
 func newServer(address string, handler http.Handler) *http.Server {
@@ -369,6 +374,10 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	}
 	if cleaner, ok := uploadService.(files.ExpiredUploadCleaner); ok && deps.startUploadCleanup != nil {
 		stopCleanup := deps.startUploadCleanup(cleaner, operationalGate)
+		if stopCleanup == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize upload cleanup")
+		}
 		closeOtherResources := closeResources
 		closeResources = func() {
 			stopCleanup()

@@ -84,6 +84,57 @@ func TestOperationalGateBypassesOnlySafeMethodsAndExactLogoutPath(t *testing.T) 
 	}
 }
 
+func TestMissingOperationalGateFailsClosedOnlyForUnsafeWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantCalled bool
+	}{
+		{
+			name: "safe method", method: http.MethodGet,
+			path:       "/api/v1/student/catalog",
+			wantStatus: http.StatusNoContent, wantCalled: true,
+		},
+		{
+			name: "logout", method: http.MethodPost,
+			path:       logoutPath,
+			wantStatus: http.StatusNoContent, wantCalled: true,
+		},
+		{
+			name: "unsafe write", method: http.MethodPost,
+			path:       "/api/v1/student/progress",
+			wantStatus: http.StatusServiceUnavailable, wantCalled: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			handler := UnsafeWriteGate(nil)(http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					called = true
+					w.WriteHeader(http.StatusNoContent)
+				},
+			))
+			result := httptest.NewRecorder()
+			handler.ServeHTTP(
+				result,
+				httptest.NewRequest(tc.method, tc.path, nil),
+			)
+			if result.Code != tc.wantStatus || called != tc.wantCalled {
+				t.Fatalf(
+					"status=%d called=%t want_status=%d want_called=%t body=%s",
+					result.Code,
+					called,
+					tc.wantStatus,
+					tc.wantCalled,
+					result.Body.String(),
+				)
+			}
+		})
+	}
+}
+
 func TestOperationalGateDenialReturnsStableMaintenanceResponse(t *testing.T) {
 	for _, gateErr := range []error{ErrLeaseHeld, errors.New("secret gate detail")} {
 		gate := &recordingWriteGate{err: gateErr}

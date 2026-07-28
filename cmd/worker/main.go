@@ -59,16 +59,26 @@ func run() error {
 	if err != nil {
 		return errors.New("worker database")
 	}
-	defer pool.Close()
+	cleanupDatabase := true
+	var operationalGate *operations.PostgresStore
+	defer func() {
+		if !cleanupDatabase {
+			return
+		}
+		if operationalGate != nil {
+			closeCtx, closeCancel := context.WithTimeout(
+				context.Background(),
+				3*time.Second,
+			)
+			_ = operationalGate.Close(closeCtx)
+			closeCancel()
+		}
+		pool.Close()
+	}()
 	if err := database.Migrate(ctx, pool); err != nil {
 		return errors.New("worker migration")
 	}
-	operationalGate := operations.NewPostgresStore(pool)
-	defer func() {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = operationalGate.Close(closeCtx)
-		closeCancel()
-	}()
+	operationalGate = operations.NewPostgresStore(pool)
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development"})
 	if err != nil {
 		return errors.New("worker object storage")
@@ -103,7 +113,7 @@ func run() error {
 
 	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return coordinateWorkerRuntime(
+	safeToClean, lifecycleErr := coordinateWorkerRuntime(
 		signalCtx,
 		cancel,
 		health,
@@ -111,10 +121,13 @@ func run() error {
 		healthDone,
 		workerShutdownLimit,
 	)
+	cleanupDatabase = safeToClean
+	return lifecycleErr
 }
 
 type workerHealthLifecycle interface {
 	Shutdown(context.Context) error
+	Close() error
 }
 
 func coordinateWorkerRuntime(
@@ -124,7 +137,7 @@ func coordinateWorkerRuntime(
 	workerDone <-chan error,
 	healthDone <-chan error,
 	shutdownTimeout time.Duration,
-) error {
+) (bool, error) {
 	workerExited := false
 	var result error
 	select {
@@ -146,24 +159,27 @@ func coordinateWorkerRuntime(
 		shutdownTimeout,
 	)
 	defer shutdownCancel()
-	if err := health.Shutdown(shutdownCtx); err != nil && result == nil {
+	workerStopped := workerExited
+	if !workerExited {
+		select {
+		case err := <-workerDone:
+			workerStopped = true
+			if err != nil && result == nil {
+				result = errors.New("worker shutdown")
+			}
+		case <-shutdownCtx.Done():
+			result = errors.New("worker shutdown timeout")
+		}
+	}
+	healthStopped := true
+	if err := health.Shutdown(shutdownCtx); err != nil {
+		healthStopped = false
 		result = errors.New("worker health shutdown")
-	}
-	if workerExited {
-		return result
-	}
-	select {
-	case err := <-workerDone:
-		if err != nil && result == nil {
-			result = errors.New("worker shutdown")
+		if closeErr := health.Close(); closeErr != nil {
+			result = errors.New("worker health force close")
 		}
-		return result
-	case <-shutdownCtx.Done():
-		if result != nil {
-			return result
-		}
-		return errors.New("worker shutdown timeout")
 	}
+	return workerStopped && healthStopped, result
 }
 
 type processorFactory func() (processing.Processor, error)

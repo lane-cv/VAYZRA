@@ -11,8 +11,18 @@ const logoutPath = "/api/v1/auth/logout"
 func UnsafeWriteGate(gate WriteGate) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if gate == nil || safeMethod(r.Method) || r.URL.Path == logoutPath {
+			if safeMethod(r.Method) || r.URL.Path == logoutPath {
 				next.ServeHTTP(w, r)
+				return
+			}
+			if gate == nil {
+				httpx.Error(
+					w,
+					r,
+					http.StatusServiceUnavailable,
+					"maintenance_mode",
+					"系统维护中，请稍后重试",
+				)
 				return
 			}
 			release, err := gate.AcquireShared(r.Context())
