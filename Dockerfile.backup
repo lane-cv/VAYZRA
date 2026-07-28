@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && /usr/lib/postgresql/18/bin/pg_restore --version \
       | grep -Eq '^pg_restore \(PostgreSQL\) 18\.4 '
 RUN useradd --uid 10003 --gid 0 --no-create-home \
-      --shell /usr/sbin/nologin backup \
+      --shell /usr/sbin/nologin happylearn-backup \
     && install -d -o 10003 -g 0 -m 0555 /app \
     && install -d -o 10003 -g 0 -m 0700 /work /state
 COPY --from=tools --chown=10003:0 /out/restic /usr/local/bin/restic

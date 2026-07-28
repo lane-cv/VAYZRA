@@ -100,6 +100,31 @@ func TestBackupImageVersionAssertionsMatchRealExecutableOutput(t *testing.T) {
 	}
 }
 
+func TestBackupImageUsesProjectSpecificNonShellRuntimeAccount(t *testing.T) {
+	dockerfile := filepath.Join("..", "..", "Dockerfile.backup")
+	contents, err := os.ReadFile(dockerfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := strings.Join(
+		strings.Fields(strings.ReplaceAll(string(contents), "\\\n", " ")),
+		" ",
+	)
+	for _, required := range []string{
+		"useradd --uid 10003 --gid 0 --no-create-home --shell /usr/sbin/nologin happylearn-backup",
+		"install -d -o 10003 -g 0 -m 0555 /app",
+		"install -d -o 10003 -g 0 -m 0700 /work /state",
+		"USER 10003:0",
+	} {
+		if !strings.Contains(normalized, required) {
+			t.Errorf("Dockerfile.backup missing runtime account contract %q", required)
+		}
+	}
+	if strings.Contains(normalized, "--shell /usr/sbin/nologin backup") {
+		t.Error("Dockerfile.backup uses reserved base-image account name backup")
+	}
+}
+
 func dockerVersionPattern(t *testing.T, dockerfile string, command string) string {
 	t.Helper()
 	commandOffset := strings.Index(dockerfile, command)
