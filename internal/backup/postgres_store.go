@@ -128,6 +128,28 @@ func (s *PostgresStore) Claim(
 	owner uuid.UUID,
 	lease time.Duration,
 ) (Run, error) {
+	return s.claim(ctx, uuid.Nil, owner, lease, "claim")
+}
+
+func (s *PostgresStore) ClaimRunByID(
+	ctx context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	lease time.Duration,
+) (Run, error) {
+	if runID == uuid.Nil {
+		return Run{}, ErrInvalid
+	}
+	return s.claim(ctx, runID, owner, lease, "claim_by_id")
+}
+
+func (s *PostgresStore) claim(
+	ctx context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	lease time.Duration,
+	operation string,
+) (Run, error) {
 	if s == nil || s.pool == nil || owner == uuid.Nil ||
 		lease < time.Second || lease > 24*time.Hour {
 		return Run{}, ErrInvalid
@@ -149,16 +171,33 @@ func (s *PostgresStore) Claim(
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, backupClaimAdvisoryKey); err != nil {
 		return Run{}, ErrUnavailable
 	}
-	current, err := scanRun(tx.QueryRow(ctx, runSelect+`
-WHERE state NOT IN ('succeeded','degraded','failed')
-ORDER BY (owner_id IS NULL),requested_at,id
-FOR UPDATE
-LIMIT 1`))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Run{}, ErrNoClaimableRun
+	var current Run
+	if runID == uuid.Nil {
+		current, err = scanRun(tx.QueryRow(ctx, runSelect+`
+	WHERE state NOT IN ('succeeded','degraded','failed')
+	ORDER BY (owner_id IS NULL),requested_at,id
+	FOR UPDATE
+	LIMIT 1`))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Run{}, ErrNoClaimableRun
+		}
+	} else {
+		current, err = scanRun(tx.QueryRow(
+			ctx,
+			runSelect+`WHERE id=$1 FOR UPDATE`,
+			runID,
+		))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Run{}, ErrNotFound
+		}
 	}
 	if err != nil {
 		return Run{}, ErrUnavailable
+	}
+	if current.State == StateSucceeded ||
+		current.State == StateDegraded ||
+		current.State == StateFailed {
+		return Run{}, ErrNoClaimableRun
 	}
 	var databaseNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
@@ -181,7 +220,7 @@ RETURNING `+runColumns,
 	if err != nil {
 		return Run{}, mapPostgresWriteError(err)
 	}
-	commitErr := s.commit(ctx, "claim", tx, conn)
+	commitErr := s.commit(ctx, operation, tx, conn)
 	if commitErr == nil {
 		return run, nil
 	}
@@ -207,10 +246,10 @@ func (s *PostgresStore) reconcileClaim(owner uuid.UUID, intended Run) (Run, erro
 			continue
 		}
 		durable, err = scanRun(conn.QueryRow(ctx, runSelect+`
-WHERE owner_id=$1
-  AND lease_expires_at > clock_timestamp()
-ORDER BY lease_generation DESC,id
-LIMIT 1`, owner))
+	WHERE id=$1
+	  AND owner_id=$2
+	  AND lease_expires_at > clock_timestamp()
+	LIMIT 1`, intended.ID, owner))
 		conn.Release()
 		if err == nil {
 			break

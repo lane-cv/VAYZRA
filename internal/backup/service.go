@@ -84,6 +84,23 @@ func (s *Service) Claim(ctx context.Context, owner uuid.UUID, lease time.Duratio
 	return normalizeRun(run), nil
 }
 
+func (s *Service) ClaimRunByID(
+	ctx context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	lease time.Duration,
+) (Run, error) {
+	if s == nil || s.store == nil || runID == uuid.Nil || owner == uuid.Nil ||
+		lease < time.Second || lease > 24*time.Hour {
+		return Run{}, ErrInvalid
+	}
+	run, err := s.store.ClaimRunByID(ctx, runID, owner, lease)
+	if err != nil {
+		return Run{}, mapStoreError(err)
+	}
+	return normalizeRun(run), nil
+}
+
 func (s *Service) Renew(
 	ctx context.Context,
 	runID uuid.UUID,

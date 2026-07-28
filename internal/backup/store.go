@@ -11,6 +11,7 @@ import (
 type Store interface {
 	Create(context.Context, CreateInput) (Run, error)
 	Claim(context.Context, uuid.UUID, time.Duration) (Run, error)
+	ClaimRunByID(context.Context, uuid.UUID, uuid.UUID, time.Duration) (Run, error)
 	Renew(context.Context, uuid.UUID, uuid.UUID, int64, time.Duration) (Run, error)
 	Transition(context.Context, TransitionInput) (Run, error)
 	AddArtifact(context.Context, Artifact) error

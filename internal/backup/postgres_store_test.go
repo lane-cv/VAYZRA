@@ -145,6 +145,134 @@ func TestPostgresStoreAllowsOnlyOneActiveClaim(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreClaimRunByIDNeverMutatesAnUnrelatedRun(t *testing.T) {
+	pool := backupPool(t)
+	store := NewPostgresStore(pool)
+	ctx := context.Background()
+	firstID := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	targetID := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	for index, runID := range []uuid.UUID{firstID, targetID} {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO backup_runs(
+  id,idempotency_key,trigger_kind,state,requested_at
+) VALUES($1,$2,'scheduled','queued',$3)`,
+			runID,
+			fmt.Sprintf("target-claim-%d", index),
+			time.Date(2026, 7, 28, 1, index, 0, 0, time.UTC),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner := uuid.New()
+	claimed, err := store.ClaimRunByID(ctx, targetID, owner, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ID != targetID ||
+		claimed.OwnerID != owner ||
+		claimed.LeaseGeneration != 1 {
+		t.Fatalf("claimed=%+v", claimed)
+	}
+	var firstOwner *uuid.UUID
+	var firstLease *time.Time
+	var firstGeneration int64
+	if err := pool.QueryRow(ctx, `
+SELECT owner_id,lease_expires_at,lease_generation
+FROM backup_runs
+WHERE id=$1`, firstID).Scan(
+		&firstOwner,
+		&firstLease,
+		&firstGeneration,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if firstOwner != nil || firstLease != nil || firstGeneration != 0 {
+		t.Fatalf(
+			"unrelated run mutated: owner=%v lease=%v generation=%d",
+			firstOwner,
+			firstLease,
+			firstGeneration,
+		)
+	}
+	if _, err := store.ClaimRunByID(
+		ctx,
+		uuid.New(),
+		uuid.New(),
+		time.Minute,
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing target err=%v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+SELECT owner_id,lease_expires_at,lease_generation
+FROM backup_runs
+WHERE id=$1`, firstID).Scan(
+		&firstOwner,
+		&firstLease,
+		&firstGeneration,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if firstOwner != nil || firstLease != nil || firstGeneration != 0 {
+		t.Fatalf(
+			"missing target claimed unrelated run: owner=%v lease=%v generation=%d",
+			firstOwner,
+			firstLease,
+			firstGeneration,
+		)
+	}
+}
+
+func TestPostgresStoreClaimRunByIDTakesOverOnlyAfterLeaseExpiry(t *testing.T) {
+	pool := backupPool(t)
+	store := NewPostgresStore(pool)
+	ctx := context.Background()
+	run, err := store.Create(ctx, CreateInput{
+		ID: uuid.New(), Trigger: TriggerScheduled,
+		IdempotencyKey: "target-takeover-1",
+		RequestedAt:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldOwner, newOwner := uuid.New(), uuid.New()
+	oldClaim, err := store.ClaimRunByID(ctx, run.ID, oldOwner, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRunByID(
+		ctx,
+		run.ID,
+		newOwner,
+		time.Hour,
+	); !errors.Is(err, ErrActiveClaim) {
+		t.Fatalf("live takeover err=%v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE backup_runs
+SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := store.ClaimRunByID(ctx, run.ID, newOwner, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taken.ID != run.ID ||
+		taken.OwnerID != newOwner ||
+		taken.LeaseGeneration != oldClaim.LeaseGeneration+1 {
+		t.Fatalf("taken=%+v old=%+v", taken, oldClaim)
+	}
+	if _, err := store.Renew(
+		ctx,
+		run.ID,
+		oldOwner,
+		oldClaim.LeaseGeneration,
+		time.Minute,
+	); !errors.Is(err, ErrStaleOwner) {
+		t.Fatalf("stale owner renewed after takeover: %v", err)
+	}
+}
+
 func TestPostgresStoreClaimSchedulesLeaseAfterLockWait(t *testing.T) {
 	pool := backupPool(t)
 	store := NewPostgresStore(pool)
@@ -401,6 +529,39 @@ func TestPostgresStoreReconcilesCommittedClaimAfterResponseLoss(t *testing.T) {
 	claimed, err := store.Claim(ctx, owner, time.Minute)
 	if err != nil {
 		t.Fatalf("claim after committed response loss: %v", err)
+	}
+	if terminatedPID == 0 ||
+		claimed.ID != run.ID ||
+		claimed.OwnerID != owner ||
+		claimed.LeaseGeneration != 1 ||
+		claimed.LeaseExpiresAt == nil ||
+		!claimed.LeaseExpiresAt.After(postgresBackupClock(t, pool)) {
+		t.Fatalf("claimed=%+v terminated_pid=%d", claimed, terminatedPID)
+	}
+}
+
+func TestPostgresStoreReconcilesCommittedTargetClaimAfterResponseLoss(t *testing.T) {
+	pool := backupPool(t)
+	store := NewPostgresStore(pool)
+	ctx := context.Background()
+	run, err := store.Create(ctx, CreateInput{
+		ID: uuid.New(), Trigger: TriggerScheduled,
+		IdempotencyKey: "target-claim-reconcile-1",
+		RequestedAt:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := uuid.New()
+	var terminatedPID int
+	store.afterCommit = terminatingBackupCommitHook(
+		pool,
+		"claim_by_id",
+		&terminatedPID,
+	)
+	claimed, err := store.ClaimRunByID(ctx, run.ID, owner, time.Minute)
+	if err != nil {
+		t.Fatalf("target claim after committed response loss: %v", err)
 	}
 	if terminatedPID == 0 ||
 		claimed.ID != run.ID ||

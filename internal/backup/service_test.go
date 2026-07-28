@@ -19,6 +19,9 @@ type serviceStore struct {
 	claims        []claimCall
 	claimResult   Run
 	claimErr      error
+	targetClaims  []targetClaimCall
+	targetResult  Run
+	targetErr     error
 	renewCalls    []renewCall
 	renewResult   Run
 	renewErr      error
@@ -35,6 +38,12 @@ type serviceStore struct {
 }
 
 type claimCall struct {
+	owner uuid.UUID
+	lease time.Duration
+}
+
+type targetClaimCall struct {
+	runID uuid.UUID
 	owner uuid.UUID
 	lease time.Duration
 }
@@ -60,6 +69,18 @@ func (s *serviceStore) Create(_ context.Context, input CreateInput) (Run, error)
 func (s *serviceStore) Claim(_ context.Context, owner uuid.UUID, lease time.Duration) (Run, error) {
 	s.claims = append(s.claims, claimCall{owner: owner, lease: lease})
 	return s.claimResult, s.claimErr
+}
+
+func (s *serviceStore) ClaimRunByID(
+	_ context.Context,
+	runID uuid.UUID,
+	owner uuid.UUID,
+	lease time.Duration,
+) (Run, error) {
+	s.targetClaims = append(s.targetClaims, targetClaimCall{
+		runID: runID, owner: owner, lease: lease,
+	})
+	return s.targetResult, s.targetErr
 }
 
 func (s *serviceStore) Renew(
@@ -228,6 +249,33 @@ func TestBackupServiceRenewsCurrentLeaseGeneration(t *testing.T) {
 			runID: runID, owner: owner, generation: 7, lease: 2 * time.Minute,
 		}) {
 		t.Fatalf("renewed=%+v calls=%+v", renewed, store.renewCalls)
+	}
+}
+
+func TestBackupServiceClaimsOnlyTheExactRunID(t *testing.T) {
+	runID, owner := uuid.New(), uuid.New()
+	store := &serviceStore{targetResult: Run{
+		ID: runID, OwnerID: owner, LeaseGeneration: 3,
+		LeaseExpiresAt: timePointer(time.Now().UTC().Add(time.Minute)),
+	}}
+	service := NewService(store, time.Now)
+	claimed, err := service.ClaimRunByID(
+		context.Background(),
+		runID,
+		owner,
+		2*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ID != runID ||
+		claimed.OwnerID != owner ||
+		claimed.LeaseGeneration != 3 ||
+		len(store.targetClaims) != 1 ||
+		store.targetClaims[0] != (targetClaimCall{
+			runID: runID, owner: owner, lease: 2 * time.Minute,
+		}) {
+		t.Fatalf("claimed=%+v calls=%+v", claimed, store.targetClaims)
 	}
 }
 
