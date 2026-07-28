@@ -298,7 +298,7 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, request LeaseRequest) 
 	lockAttempted := false
 	keepConnection := false
 	defer func() {
-		if !keepConnection {
+		if !keepConnection && conn != nil {
 			if lockAttempted {
 				closeHijackedConnection(conn)
 			} else {
@@ -372,11 +372,10 @@ RETURNING lease_expires_at,version`,
 	commitErr := s.commitLeaseTx(dbCtx, "acquire", tx, conn)
 	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer reconcileCancel()
-	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, conn)
+	ownedConn := conn
+	conn = nil
+	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, ownedConn)
 	conn = reconciledConn
-	if conn == nil {
-		keepConnection = true
-	}
 	if reconcileErr != nil {
 		if commitErr != nil {
 			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
@@ -483,12 +482,11 @@ func (s *PostgresStore) recoverLeaseSessionLocked(
 	lease Lease,
 	originalErr error,
 ) error {
-	recoveredConn, state, recoverErr := s.authoritativeLeaseState(ctx, session.conn)
-	if recoveredConn == nil {
+	state, recoverErr := s.authoritativeLeaseSessionStateLocked(ctx, session)
+	if session.conn == nil {
 		s.removeSessionLocked(tokenHash, session)
 		return originalErr
 	}
-	session.conn = recoveredConn
 	if recoverErr != nil {
 		s.releaseSessionLocked(tokenHash, session)
 		return originalErr
@@ -501,6 +499,17 @@ func (s *PostgresStore) recoverLeaseSessionLocked(
 	}
 	s.scheduleLeaseExpiryLocked(tokenHash, session, state.remaining)
 	return nil
+}
+
+func (s *PostgresStore) authoritativeLeaseSessionStateLocked(
+	ctx context.Context,
+	session *leaseSession,
+) (leaseDBState, error) {
+	ownedConn := session.conn
+	session.conn = nil
+	recoveredConn, state, err := s.authoritativeLeaseState(ctx, ownedConn)
+	session.conn = recoveredConn
+	return state, err
 }
 
 func queryLeaseDBState(
@@ -617,15 +626,14 @@ func (s *PostgresStore) mutateLease(ctx context.Context, lease Lease, mode strin
 	}
 	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer reconcileCancel()
-	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, session.conn)
-	if reconciledConn == nil {
+	state, reconcileErr := s.authoritativeLeaseSessionStateLocked(reconcileCtx, session)
+	if session.conn == nil {
 		s.removeSessionLocked(tokenHash, session)
 		if commitErr != nil {
 			return Lease{}, s.mapLifecycleError(mapLeaseError(commitErr))
 		}
 		return Lease{}, mapLeaseError(reconcileErr)
 	}
-	session.conn = reconciledConn
 	if reconcileErr != nil {
 		s.releaseSessionLocked(tokenHash, session)
 		if commitErr != nil {
@@ -853,15 +861,14 @@ func (s *PostgresStore) ReleaseLease(ctx context.Context, lease Lease) error {
 	}
 	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer reconcileCancel()
-	reconciledConn, state, reconcileErr := s.authoritativeLeaseState(reconcileCtx, session.conn)
-	if reconciledConn == nil {
+	state, reconcileErr := s.authoritativeLeaseSessionStateLocked(reconcileCtx, session)
+	if session.conn == nil {
 		s.removeSessionLocked(tokenHash, session)
 		if commitErr != nil {
 			return s.mapLifecycleError(mapLeaseError(commitErr))
 		}
 		return mapLeaseError(reconcileErr)
 	}
-	session.conn = reconciledConn
 	if reconcileErr != nil {
 		s.releaseSessionLocked(tokenHash, session)
 		if commitErr != nil {
@@ -1006,7 +1013,11 @@ func (s *PostgresStore) Close(ctx context.Context) error {
 			session.timer = nil
 		}
 		if err := lockMutexContext(ctx, &s.mu); err != nil {
-			closeHijackedConnectionWithContext(ctx, session.conn)
+			ownedConn := session.conn
+			session.conn = nil
+			if ownedConn != nil {
+				closeHijackedConnectionWithContext(ctx, ownedConn)
+			}
 			session.mu.Unlock()
 			if firstErr != nil {
 				return errors.Join(firstErr, err)
@@ -1017,7 +1028,11 @@ func (s *PostgresStore) Close(ctx context.Context) error {
 			delete(s.sessions, entry.tokenHash)
 		}
 		s.mu.Unlock()
-		closeHijackedConnectionWithContext(ctx, session.conn)
+		ownedConn := session.conn
+		session.conn = nil
+		if ownedConn != nil {
+			closeHijackedConnectionWithContext(ctx, ownedConn)
+		}
 		session.mu.Unlock()
 	}
 	return firstErr
@@ -1032,11 +1047,10 @@ func (s *PostgresStore) normalizeLeaseSessionLocked(
 	if err == nil || !leaseConnectionInterrupted(session.conn, err) {
 		return err
 	}
-	recoveredConn, state, recoverErr := s.authoritativeLeaseState(ctx, session.conn)
-	if recoveredConn == nil {
+	state, recoverErr := s.authoritativeLeaseSessionStateLocked(ctx, session)
+	if session.conn == nil {
 		return recoverErr
 	}
-	session.conn = recoveredConn
 	if recoverErr != nil {
 		return recoverErr
 	}
@@ -1142,8 +1156,12 @@ func (s *PostgresStore) releaseSessionLocked(tokenHash [32]byte, session *leaseS
 	if session.released {
 		return
 	}
+	ownedConn := session.conn
+	session.conn = nil
 	s.removeSessionLocked(tokenHash, session)
-	releaseExclusiveConnection(session.conn)
+	if ownedConn != nil {
+		releaseExclusiveConnection(ownedConn)
+	}
 }
 
 func (s *PostgresStore) removeSessionLocked(tokenHash [32]byte, session *leaseSession) {

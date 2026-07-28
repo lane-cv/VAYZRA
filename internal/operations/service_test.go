@@ -7,10 +7,12 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/database"
@@ -1587,6 +1589,79 @@ WHERE singleton_id=true FOR UPDATE`); err != nil {
 			}
 			assertExclusiveAdvisoryAvailable(t, pool)
 		})
+	}
+}
+
+func TestPostgresStoreCloseHandlesFailedRecoveryAfterDedicatedBackendDies(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	var failFreshConnect atomic.Bool
+	forcedRecoveryErr := errors.New("forced fresh authoritative recovery failure")
+	storeConfig, err := pgxpool.ParseConfig(pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeConfig.MaxConns = 1
+	storeConfig.BeforeConnect = func(context.Context, *pgx.ConnConfig) error {
+		if failFreshConnect.Load() {
+			return forcedRecoveryErr
+		}
+		return nil
+	}
+	storePool, err := pgxpool.NewWithConfig(ctx, storeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storePool.Close)
+	store := NewPostgresStore(storePool)
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode:      "draining",
+		OwnerID:   uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256(lease.Token)
+	store.mu.Lock()
+	session := store.sessions[tokenHash]
+	store.mu.Unlock()
+	if session == nil {
+		t.Fatal("missing acquired lease session")
+	}
+
+	failFreshConnect.Store(true)
+	terminateLeaseSessionBackend(t, pool, store, lease)
+	closeCtx, cancelClose := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelClose()
+	if err := store.Close(closeCtx); !errors.Is(err, forcedRecoveryErr) {
+		t.Fatalf("close recovery error=%v, want %v", err, forcedRecoveryErr)
+	}
+
+	store.mu.Lock()
+	retained := len(store.sessions)
+	store.mu.Unlock()
+	if retained != 0 {
+		t.Fatalf("close retained %d lease sessions", retained)
+	}
+	session.mu.Lock()
+	released := session.released
+	timer := session.timer
+	conn := session.conn
+	session.mu.Unlock()
+	if !released || timer != nil || conn != nil {
+		t.Fatalf("cleaned session released=%t timer=%v conn=%p", released, timer, conn)
+	}
+
+	poolClosed := make(chan struct{})
+	go func() {
+		storePool.Close()
+		close(poolClosed)
+	}()
+	select {
+	case <-poolClosed:
+	case <-time.After(time.Second):
+		t.Fatal("store pool close blocked after failed lease recovery")
 	}
 }
 
