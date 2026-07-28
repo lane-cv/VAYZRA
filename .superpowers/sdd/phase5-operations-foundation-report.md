@@ -34,100 +34,130 @@ this verification report.
   production build.
 - `git diff --check` — PASS before this report was created.
 
-### Reproducible Go gate environment
+### Actual sanitized invocation
 
-The host login shell did not expose a `go` executable, so both passing Go gates
-used the following pinned local images:
-
-- `golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651`
-- `postgres:18.4@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a`
-
-The variables below are operator-local placeholders. The operator must set
-them in the local shell; absolute host paths and the generated PostgreSQL
-password are not repository data and must never be committed:
+This subsection records the commands that were actually run. Only the absolute
+worktree path and the URL-safe test password have been replaced with
+`$PHASE5_SOURCE` and `$PHASE5_PG_PASSWORD`; every Docker option, image tag,
+container/volume name, port, package, and Go flag remains as executed. The
+operator-local values are not repository data and must not be committed:
 
 ```sh
-export PHASE5_SOURCE='<absolute path to the phase5-phase6 worktree>'
-export PHASE5_GO_MOD_CACHE='<absolute path to a writable Go module cache>'
-export PHASE5_GO_BUILD_CACHE='<absolute path to a writable Go build cache>'
-export PHASE5_PG_CONTAINER='phase5-foundation-gate-pg'
-export PHASE5_GO_IMAGE='golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651'
-export PHASE5_PG_IMAGE='postgres:18.4@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a'
-read -r -s PHASE5_PG_PASSWORD
-export PHASE5_PG_PASSWORD
+export PHASE5_SOURCE='<redacted absolute phase5-phase6 worktree path>'
+export PHASE5_PG_PASSWORD='<redacted URL-safe test password>'
 export PHASE5_TEST_DATABASE_URL="postgres://happylearn:${PHASE5_PG_PASSWORD}@host.docker.internal:54330/happylearn?sslmode=disable"
 ```
 
-A fresh PostgreSQL 18.4 container was initialized with a loopback-only host
-port, explicit database/user, and a bounded health check:
+Before starting the containers, read-only `docker image inspect` checks
+verified that the tags used by the actual CLI resolved to:
+
+- `golang:1.26.5-bookworm` →
+  `sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651`;
+- `postgres:18.4` →
+  `sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a`.
+
+The fresh database was started by the following actual command. It used `-d`,
+did not use `--rm`, stored PostgreSQL data in a 512 MiB tmpfs, and published
+only loopback port 54330:
 
 ```sh
-docker run --detach --rm \
-  --name "$PHASE5_PG_CONTAINER" \
-  --publish 127.0.0.1:54330:5432 \
-  --env POSTGRES_USER=happylearn \
-  --env POSTGRES_PASSWORD="$PHASE5_PG_PASSWORD" \
-  --env POSTGRES_DB=happylearn \
+docker run -d \
+  --name vayzra-phase5-gate-postgres-019fa57b \
+  --tmpfs /var/lib/postgresql:rw,size=512m \
+  -e POSTGRES_USER=happylearn \
+  -e POSTGRES_PASSWORD="$PHASE5_PG_PASSWORD" \
+  -e POSTGRES_DB=happylearn \
+  -p 127.0.0.1:54330:5432 \
   --health-cmd 'pg_isready -U happylearn -d happylearn' \
-  --health-interval 1s \
+  --health-interval 2s \
   --health-timeout 5s \
-  --health-retries 30 \
-  "$PHASE5_PG_IMAGE"
-
-PHASE5_PG_HEALTH=''
-for PHASE5_PG_ATTEMPT in $(seq 1 60); do
-  PHASE5_PG_HEALTH="$(docker inspect \
-    --format '{{.State.Health.Status}}' "$PHASE5_PG_CONTAINER")"
-  [ "$PHASE5_PG_HEALTH" = healthy ] && break
-  [ "$PHASE5_PG_HEALTH" = unhealthy ] && break
-  sleep 1
-done
-test "$PHASE5_PG_HEALTH" = healthy
-unset PHASE5_PG_ATTEMPT PHASE5_PG_HEALTH
+  --health-retries 20 \
+  postgres:18.4
 ```
 
-The source was mounted read-only. Only the operator-local Go module and build
-caches were writable. The successful non-race gate used this complete command:
+After startup, the actual health verification was one read:
+
+```sh
+docker inspect --format '{{.State.Health.Status}}' \
+  vayzra-phase5-gate-postgres-019fa57b
+# healthy
+```
+
+The passing normal gate used the Go tag, read-only source bind, and the two
+named cache volumes shown below:
 
 ```sh
 docker run --rm \
-  --mount "type=bind,source=$PHASE5_SOURCE,target=/src,readonly" \
-  --mount "type=bind,source=$PHASE5_GO_MOD_CACHE,target=/go/pkg/mod" \
-  --mount "type=bind,source=$PHASE5_GO_BUILD_CACHE,target=/root/.cache/go-build" \
-  --workdir /src \
-  --env GOENV=off \
-  --env GOFLAGS= \
-  --env HAPPYLEARN_TEST_DATABASE_URL="$PHASE5_TEST_DATABASE_URL" \
-  "$PHASE5_GO_IMAGE" \
+  -v $PHASE5_SOURCE:/src:ro \
+  -v vayzra-phase5-go-mod:/go/pkg/mod \
+  -v vayzra-phase5-go-build:/root/.cache/go-build \
+  -w /src \
+  -e GOENV=off \
+  -e GOFLAGS= \
+  -e HAPPYLEARN_TEST_DATABASE_URL="$PHASE5_TEST_DATABASE_URL" \
+  golang:1.26.5-bookworm \
   go test -p 1 \
     ./internal/operations ./internal/audit ./internal/app \
     ./internal/notifications ./internal/aiqa ./internal/processing \
     ./cmd/server ./cmd/worker -count=1
 ```
 
-The successful race gate used the same pinned images, fresh database, mounts,
-and environment:
+The passing race gate used the same database, read-only source, named caches,
+and sanitized URL:
 
 ```sh
 docker run --rm \
-  --mount "type=bind,source=$PHASE5_SOURCE,target=/src,readonly" \
-  --mount "type=bind,source=$PHASE5_GO_MOD_CACHE,target=/go/pkg/mod" \
-  --mount "type=bind,source=$PHASE5_GO_BUILD_CACHE,target=/root/.cache/go-build" \
-  --workdir /src \
-  --env GOENV=off \
-  --env GOFLAGS= \
-  --env HAPPYLEARN_TEST_DATABASE_URL="$PHASE5_TEST_DATABASE_URL" \
-  "$PHASE5_GO_IMAGE" \
+  -v $PHASE5_SOURCE:/src:ro \
+  -v vayzra-phase5-go-mod:/go/pkg/mod \
+  -v vayzra-phase5-go-build:/root/.cache/go-build \
+  -w /src \
+  -e GOENV=off \
+  -e GOFLAGS= \
+  -e HAPPYLEARN_TEST_DATABASE_URL="$PHASE5_TEST_DATABASE_URL" \
+  golang:1.26.5-bookworm \
   go test -race -p 1 \
     ./internal/operations ./internal/audit ./internal/app \
     ./internal/notifications ./internal/aiqa ./internal/processing \
     ./cmd/server ./cmd/worker -count=1
 ```
 
-The disposable database can be removed after both gates:
+### Equivalent digest-pinned reproduction
+
+This recipe was not the executed CLI above; it is an equivalent
+digest-pinned reproduction. It deliberately generates a URL-safe hexadecimal
+password before composing the database URL:
 
 ```sh
-docker stop "$PHASE5_PG_CONTAINER"
+export PHASE5_SOURCE='<absolute path to the phase5-phase6 worktree>'
+export PHASE5_PG_PASSWORD="$(openssl rand -hex 24)"
+export PHASE5_TEST_DATABASE_URL="postgres://happylearn:${PHASE5_PG_PASSWORD}@host.docker.internal:54330/happylearn?sslmode=disable"
+export PHASE5_GO_IMAGE='golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651'
+export PHASE5_PG_IMAGE='postgres:18.4@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a'
+```
+
+Use the actual commands above with only the final `postgres:18.4` token
+replaced by `"$PHASE5_PG_IMAGE"` and each final
+`golang:1.26.5-bookworm` token replaced by `"$PHASE5_GO_IMAGE"`. All other
+arguments remain identical.
+
+### Pending exact cleanup
+
+Cleanup has not yet been executed. A read-only status check during this review
+confirmed:
+
+- `vayzra-phase5-gate-postgres-019fa57b` is running and healthy;
+- failed-attempt container `vayzra-phase5-gate-019fa57b` still exists in
+  `Created` state;
+- named volumes `vayzra-phase5-go-mod` and `vayzra-phase5-go-build` still
+  exist.
+
+After both report reviews approve the evidence, remove only those exact
+artifacts:
+
+```sh
+docker rm -f vayzra-phase5-gate-postgres-019fa57b
+docker rm -f vayzra-phase5-gate-019fa57b
+docker volume rm vayzra-phase5-go-mod vayzra-phase5-go-build
 unset PHASE5_PG_PASSWORD PHASE5_TEST_DATABASE_URL
 ```
 
@@ -210,7 +240,7 @@ database on `host.docker.internal:54330` are counted as passing Go gates.
 
 ## Report amendment verification
 
-- Markdown fenced-code structure — PASS; all 10 fence lines are balanced.
+- Markdown fenced-code structure — PASS; all 14 fence lines are balanced.
 - Markdown trailing-whitespace scan — PASS; no matches.
 - Secret/operator-path scan — PASS; no committed credential, private-key
   marker, cloud access-key pattern, operator-specific absolute path, or
