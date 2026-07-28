@@ -872,11 +872,15 @@ func cloneEvidence(value backup.RecoveryEvidence) backup.RecoveryEvidence {
 }
 
 type fileWorkflowStates struct {
-	root string
+	root          string
+	syncDirectory func(string) error
 }
 
 func newFileWorkflowStates() fileWorkflowStates {
-	return fileWorkflowStates{root: defaultStateRoot}
+	return fileWorkflowStates{
+		root:          defaultStateRoot,
+		syncDirectory: syncWorkflowStateDirectory,
+	}
 }
 
 func (states fileWorkflowStates) Load(runID uuid.UUID) (workflowState, error) {
@@ -960,6 +964,9 @@ func (states fileWorkflowStates) Save(state workflowState) error {
 		_ = os.Remove(tempPath)
 		return errWorkflowState
 	}
+	if states.syncRoot() != nil {
+		return errWorkflowState
+	}
 	return nil
 }
 
@@ -968,6 +975,43 @@ func (states fileWorkflowStates) Delete(runID uuid.UUID) error {
 		return errWorkflowState
 	}
 	if err := os.Remove(states.path(runID)); err != nil {
+		return errWorkflowState
+	}
+	if states.syncRoot() != nil {
+		return errWorkflowState
+	}
+	return nil
+}
+
+func (states fileWorkflowStates) syncRoot() error {
+	syncDirectory := states.syncDirectory
+	if syncDirectory == nil {
+		syncDirectory = syncWorkflowStateDirectory
+	}
+	return syncDirectory(states.root)
+}
+
+func syncWorkflowStateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil ||
+		!info.IsDir() ||
+		info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o077 != 0 ||
+		!stateOwnedByCurrentUser(info) {
+		return errWorkflowState
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return errWorkflowState
+	}
+	openedInfo, statErr := directory.Stat()
+	if statErr != nil || !os.SameFile(info, openedInfo) {
+		_ = directory.Close()
+		return errWorkflowState
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil || closeErr != nil {
 		return errWorkflowState
 	}
 	return nil

@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1420,6 +1422,86 @@ func TestCommandApplicationLeaseTakeoverRefreshesFenceAndRejectsLiveOwner(t *tes
 
 func oldOwnerPlaceholder() uuid.UUID {
 	return uuid.MustParse("90000000-0000-4000-8000-000000000009")
+}
+
+func TestWorkflowStateMutationsFsyncStateDirectoryAfterMetadataChange(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	saveStart := strings.Index(text, "func (states fileWorkflowStates) Save")
+	deleteStart := strings.Index(text, "func (states fileWorkflowStates) Delete")
+	pathStart := strings.Index(text, "func (states fileWorkflowStates) path")
+	if saveStart < 0 || deleteStart <= saveStart || pathStart <= deleteStart {
+		t.Fatal("workflow state method boundaries missing")
+	}
+	saveBody := text[saveStart:deleteStart]
+	deleteBody := text[deleteStart:pathStart]
+	assertOrderedCall := func(body, mutation, syncCall string) {
+		t.Helper()
+		mutationAt := strings.Index(body, mutation)
+		syncAt := strings.Index(body, syncCall)
+		if mutationAt < 0 || syncAt <= mutationAt {
+			t.Fatalf(
+				"%s must occur after %s:\n%s",
+				syncCall,
+				mutation,
+				body,
+			)
+		}
+	}
+	assertOrderedCall(saveBody, "os.Rename(", "states.syncRoot(")
+	assertOrderedCall(deleteBody, "os.Remove(", "states.syncRoot(")
+}
+
+func TestWorkflowStateMutationsPropagateDirectorySyncFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runID := uuid.MustParse(commandRunID)
+	state := workflowState{
+		RunID: runID, OwnerID: uuid.New(), LeaseGeneration: 1,
+		State: backup.StateDraining,
+	}
+	statePath := filepath.Join(root, runID.String()+".json")
+	syncCalls := 0
+	states := fileWorkflowStates{
+		root: root,
+		syncDirectory: func(path string) error {
+			syncCalls++
+			if path != root {
+				t.Fatalf("sync path=%q", path)
+			}
+			if _, err := os.Stat(statePath); err != nil {
+				t.Fatalf("rename did not precede directory sync: %v", err)
+			}
+			return errors.New("injected directory sync failure")
+		},
+	}
+	if err := states.Save(state); !errors.Is(err, errWorkflowState) {
+		t.Fatalf("save err=%v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("save sync calls=%d", syncCalls)
+	}
+	states.syncDirectory = func(path string) error {
+		syncCalls++
+		if path != root {
+			t.Fatalf("sync path=%q", path)
+		}
+		if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("delete did not precede directory sync: %v", err)
+		}
+		return errors.New("injected directory sync failure")
+	}
+	if err := states.Delete(runID); !errors.Is(err, errWorkflowState) {
+		t.Fatalf("delete err=%v", err)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("total sync calls=%d", syncCalls)
+	}
 }
 
 func commandSnapshotResult(t *testing.T, now time.Time) backup.SnapshotResult {
