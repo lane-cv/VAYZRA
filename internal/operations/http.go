@@ -200,6 +200,18 @@ type settingsRequest struct {
 	UpdatedAt                      json.RawMessage `json:"updatedAt"`
 }
 
+var settingsJSONFields = map[string]struct{}{
+	"version": {}, "siteName": {}, "siteAnnouncement": {},
+	"softDeleteRetentionDays": {}, "auditRetentionDays": {},
+	"operationalSampleRetentionDays": {},
+	"backupHour":                     {}, "backupMinute": {},
+	"backupTimezone":     {},
+	"diskWarningPercent": {}, "diskCriticalPercent": {},
+	"aiErrorWarningPercent": {}, "aiErrorCriticalPercent": {},
+	"processingQueueWarning": {}, "processingQueueCritical": {},
+	"updatedAt": {},
+}
+
 func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
 	if !settingsJSONContentType(w, r) {
 		return Settings{}, false
@@ -303,6 +315,9 @@ func uniqueJSONObject(raw []byte) error {
 		key, ok := token.(string)
 		if !ok {
 			return errors.New("settings member name must be a string")
+		}
+		if _, allowed := settingsJSONFields[key]; !allowed {
+			return errors.New("unknown settings member")
 		}
 		if _, duplicate := seen[key]; duplicate {
 			return errors.New("duplicate settings member")

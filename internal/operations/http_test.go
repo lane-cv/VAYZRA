@@ -180,7 +180,7 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 		wantStatus   int
 		wantCode     string
 	}{
-		{"valid content type", valid, []string{"application/json"}, http.StatusOK, ""},
+		{"all exact contract fields", valid, []string{"application/json"}, http.StatusOK, ""},
 		{"valid utf8 charset", valid, []string{"application/json; charset=UTF-8"}, http.StatusOK, ""},
 		{"updatedAt omitted", withoutUpdatedAt, []string{"application/json"}, http.StatusOK, ""},
 		{"missing content type", valid, nil, http.StatusUnsupportedMediaType, "unsupported_media_type"},
@@ -190,6 +190,10 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 		{"extra media parameter", valid, []string{"application/json; charset=utf-8; profile=settings"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
 		{"duplicate version", strings.Replace(valid, `"version":1`, `"version":1,"version":2`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"duplicate setting", strings.Replace(valid, `"siteName":"HappyLearn"`, `"siteName":"HappyLearn","siteName":"Other"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"version case alias", strings.Replace(valid, `"version":1`, `"version":1,"Version":2`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"siteName case alias", strings.Replace(valid, `"siteName":"HappyLearn"`, `"siteName":"HappyLearn","SiteName":"Other"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"only Version alias", strings.Replace(valid, `"version":1`, `"Version":1`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"only SiteName alias", strings.Replace(valid, `"siteName":"HappyLearn"`, `"SiteName":"HappyLearn"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"duplicate updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"2026-07-28T01:00:00Z","updatedAt":"2026-07-29T01:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"null updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":null`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"zero updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"0001-01-01T00:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
