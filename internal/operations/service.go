@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
@@ -29,7 +30,9 @@ func (s *service) UpdateSettings(ctx context.Context, principal Principal, setti
 	}
 	if err := ValidateSettings(settings); err != nil {
 		if reason := highRiskSettingsReason(settings); reason != "" {
-			if auditErr := s.store.AuditSettingsRejection(ctx, principal, reason); auditErr != nil {
+			auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			defer cancelAudit()
+			if auditErr := s.store.AuditSettingsRejection(auditCtx, principal, reason); auditErr != nil {
 				return Settings{}, auditErr
 			}
 		}

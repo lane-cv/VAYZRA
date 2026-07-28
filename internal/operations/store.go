@@ -46,8 +46,13 @@ type SettingsRejectionAuditor interface {
 	AuditSettingsRejection(context.Context, Principal, string) error
 }
 
+type SettingsStore interface {
+	GetSettings(context.Context) (Settings, error)
+	UpdateSettings(context.Context, Principal, Settings) (Settings, error)
+}
+
 type ServiceStore interface {
-	Store
+	SettingsStore
 	SettingsRejectionAuditor
 }
 
@@ -65,4 +70,9 @@ type LeaseManager interface {
 	RenewLease(context.Context, Lease, time.Time) (Lease, error)
 	TransitionLease(context.Context, Lease, string, time.Time) (Lease, error)
 	ReleaseLease(context.Context, Lease) error
+}
+
+// LeaseSessionCloser must be closed before its backing PostgreSQL pool.
+type LeaseSessionCloser interface {
+	Close(context.Context) error
 }

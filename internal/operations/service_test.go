@@ -296,21 +296,27 @@ func TestPostgresHighRiskSettingsRejectionAuditIsRedacted(t *testing.T) {
 		"queue threshold":       {func(s *Settings) { s.ProcessingQueueCritical = s.ProcessingQueueWarning }, "threshold"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			caseAdmin := admin
+			caseAdmin.RequestID = "settings-reject-" + uuid.NewString()
 			settings := validSettings()
 			settings.SiteAnnouncement = "submitted-marker-must-not-leak"
 			tc.mutate(&settings)
-			if _, err := service.UpdateSettings(ctx, admin, settings); !errors.Is(err, ErrInvalid) {
+			if _, err := service.UpdateSettings(ctx, caseAdmin, settings); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("rejection error=%v", err)
 			}
+			var count int
 			var metadata []byte
 			if err := pool.QueryRow(ctx, `
-SELECT metadata FROM audit_logs
+SELECT count(*),min(metadata::text)::bytea FROM audit_logs
 WHERE action='operations.settings_rejected'
   AND target_type='system_settings' AND target_id='global'
   AND actor_user_id=$1 AND request_id=$2 AND ip=$3
-ORDER BY id DESC LIMIT 1`,
-				admin.User.ID, admin.RequestID, admin.IP).Scan(&metadata); err != nil {
+HAVING count(*) > 0`,
+				caseAdmin.User.ID, caseAdmin.RequestID, caseAdmin.IP).Scan(&count, &metadata); err != nil {
 				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("rejection audits for request %q=%d", caseAdmin.RequestID, count)
 			}
 			if !bytes.Contains(metadata, []byte(`"category": "high_risk"`)) ||
 				!bytes.Contains(metadata, []byte(`"reason": "`+tc.reason+`"`)) {
@@ -332,6 +338,62 @@ ORDER BY id DESC LIMIT 1`,
 	}
 }
 
+func TestHighRiskSettingsRejectionAuditSurvivesPreCanceledContext(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	admin := seedOperationsAdmin(t, ctx, pool)
+	admin.RequestID = "settings-reject-precanceled"
+	service := NewService(NewPostgresStore(pool))
+	settings := validSettings()
+	settings.AuditRetentionDays = 0
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	if _, err := service.UpdateSettings(canceledCtx, admin, settings); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("pre-canceled rejection error=%v", err)
+	}
+	assertRedactedSettingsRejectionAudit(t, pool, admin, "retention", 1)
+}
+
+func TestHighRiskSettingsRejectionAuditSurvivesCancellationWhileBlocked(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	admin := seedOperationsAdmin(t, ctx, pool)
+	admin.RequestID = "settings-reject-blocked"
+	service := NewService(NewPostgresStore(pool))
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, `LOCK TABLE audit_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := validSettings()
+	settings.BackupTimezone = "UTC"
+	rejectionCtx, cancelRejection := context.WithCancel(ctx)
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.UpdateSettings(rejectionCtx, admin, settings)
+		result <- err
+	}()
+	waitForBlockedPostgresQuery(t, pool, "INSERT INTO audit_logs")
+	cancelRejection()
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("blocked rejection error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked rejection did not return after table lock released")
+	}
+	assertRedactedSettingsRejectionAudit(t, pool, admin, "backup_schedule", 1)
+}
+
 func TestPostgresLeaseLifecycleAndAdvisoryGate(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
@@ -343,16 +405,29 @@ func TestPostgresLeaseLifecycleAndAdvisoryGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blockedCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	if _, err := store.AcquireLease(blockedCtx, LeaseRequest{Mode: "draining", OwnerID: owner, ExpiresAt: expires}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("exclusive acquisition while shared held error=%v", err)
+	type acquireResult struct {
+		lease Lease
+		err   error
 	}
+	acquired := make(chan acquireResult, 1)
+	go func() {
+		lease, err := store.AcquireLease(ctx, LeaseRequest{
+			Mode: "draining", OwnerID: owner, ExpiresAt: expires,
+		})
+		acquired <- acquireResult{lease: lease, err: err}
+	}()
+	waitForBlockedPostgresQuery(t, pool, "SELECT pg_advisory_lock")
 	sharedRelease()
 
-	lease, err := store.AcquireLease(ctx, LeaseRequest{Mode: "draining", OwnerID: owner, ExpiresAt: expires})
-	if err != nil {
-		t.Fatal(err)
+	var lease Lease
+	select {
+	case result := <-acquired:
+		if result.err != nil {
+			t.Fatalf("exclusive acquisition after shared release: %v", result.err)
+		}
+		lease = result.lease
+	case <-time.After(2 * time.Second):
+		t.Fatal("exclusive acquisition did not drain and pass the shared gate")
 	}
 	if lease.Mode != "draining" || lease.OwnerID != owner || len(lease.Token) != 32 ||
 		lease.Version != 2 || !lease.ExpiresAt.After(time.Now().UTC()) {
@@ -723,7 +798,7 @@ func TestExpiredLeaseOwnerCannotRenewAndTakeoverCanAcquire(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
 	oldStore := NewPostgresStore(pool)
-	expiresAt := time.Now().UTC().Add(150 * time.Millisecond)
+	expiresAt := postgresClock(t, pool).Add(700 * time.Millisecond)
 	oldLease, err := oldStore.AcquireLease(ctx, LeaseRequest{
 		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: expiresAt,
 	})
@@ -731,9 +806,8 @@ func TestExpiredLeaseOwnerCannotRenewAndTakeoverCanAcquire(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = oldStore.ReleaseLease(context.Background(), oldLease) })
-	timer := time.NewTimer(time.Until(expiresAt) + 50*time.Millisecond)
-	defer timer.Stop()
-	<-timer.C
+	waitForPostgresClock(t, pool, expiresAt)
+	waitForLeaseSessionRelease(t, oldStore, sha256.Sum256(oldLease.Token))
 
 	sharedCtx, sharedCancel := context.WithTimeout(ctx, time.Second)
 	defer sharedCancel()
@@ -763,12 +837,421 @@ func TestExpiredLeaseOwnerCannotRenewAndTakeoverCanAcquire(t *testing.T) {
 	}
 }
 
-func TestRenewedLeaseIgnoresAlreadyWaitingExpiryCallback(t *testing.T) {
+func TestLeaseMutationAfterRowWaitUsesPostLockDatabaseTime(t *testing.T) {
+	for name, mutate := range map[string]func(context.Context, *PostgresStore, Lease, time.Time) (Lease, error){
+		"renew": func(ctx context.Context, store *PostgresStore, lease Lease, expiresAt time.Time) (Lease, error) {
+			return store.RenewLease(ctx, lease, expiresAt)
+		},
+		"transition": func(ctx context.Context, store *PostgresStore, lease Lease, expiresAt time.Time) (Lease, error) {
+			return store.TransitionLease(ctx, lease, "backup", expiresAt)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := migratedOperationsStore(t)
+			store := NewPostgresStore(pool)
+			oldExpiry := postgresClock(t, pool).Add(700 * time.Millisecond)
+			lease, err := store.AcquireLease(ctx, LeaseRequest{
+				Mode: "draining", OwnerID: uuid.New(), ExpiresAt: oldExpiry,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), lease) })
+
+			blocker, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(ctx)
+			if _, err := blocker.Exec(ctx, `
+SELECT singleton_id FROM operational_modes
+WHERE singleton_id=true FOR UPDATE`); err != nil {
+				t.Fatal(err)
+			}
+
+			type mutationResult struct {
+				lease Lease
+				err   error
+			}
+			result := make(chan mutationResult, 1)
+			newExpiry := oldExpiry.Add(5 * time.Minute)
+			go func() {
+				updated, err := mutate(ctx, store, lease, newExpiry)
+				result <- mutationResult{lease: updated, err: err}
+			}()
+			waitForBlockedPostgresQuery(t, pool, "SELECT mode,owner_id,lease_token_hash")
+			waitForPostgresClock(t, pool, oldExpiry.Add(20*time.Millisecond))
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case got := <-result:
+				if !errors.Is(got.err, ErrStaleLease) {
+					t.Fatalf("mutation after expiry returned lease=%#v err=%v", got.lease, got.err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("mutation did not return after row blocker committed")
+			}
+
+			newStore := NewPostgresStore(pool)
+			takeoverCtx, cancelTakeover := context.WithTimeout(ctx, 2*time.Second)
+			defer cancelTakeover()
+			takeover, err := newStore.AcquireLease(takeoverCtx, LeaseRequest{
+				Mode:      "release",
+				OwnerID:   uuid.New(),
+				ExpiresAt: postgresClock(t, pool).Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("bounded takeover after stale mutation: %v", err)
+			}
+			if err := newStore.ReleaseLease(ctx, takeover); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAcquireTakeoverAfterRowWaitUsesPostLockDatabaseTime(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	oldOwner := uuid.New()
+	oldHash := sha256.Sum256(bytes.Repeat([]byte{0x44}, 32))
+	var staleExpiry time.Time
+	if err := blocker.QueryRow(ctx, `
+UPDATE operational_modes
+SET mode='backup',owner_id=$1,lease_token_hash=$2,
+    lease_expires_at=clock_timestamp()+interval '700 milliseconds',
+    entered_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1
+WHERE singleton_id=true
+RETURNING lease_expires_at`, oldOwner, oldHash[:]).Scan(&staleExpiry); err != nil {
+		t.Fatal(err)
+	}
+
+	type acquireResult struct {
+		lease Lease
+		err   error
+	}
+	result := make(chan acquireResult, 1)
+	request := LeaseRequest{
+		Mode:      "release",
+		OwnerID:   uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(5 * time.Minute),
+	}
+	go func() {
+		lease, err := store.AcquireLease(ctx, request)
+		result <- acquireResult{lease: lease, err: err}
+	}()
+	waitForBlockedPostgresQuery(t, pool, "SELECT mode,owner_id,lease_token_hash")
+	waitForPostgresClock(t, pool, staleExpiry.Add(20*time.Millisecond))
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var acquired Lease
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("takeover after row wait: %v", got.err)
+		}
+		acquired = got.lease
+	case <-time.After(2 * time.Second):
+		t.Fatal("acquisition did not return after row blocker committed")
+	}
+	if acquired.OwnerID != request.OwnerID || acquired.Mode != request.Mode {
+		t.Fatalf("acquired lease=%#v request=%#v", acquired, request)
+	}
+	if err := store.ReleaseLease(ctx, acquired); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledAcquireAfterPreflightReturnsCommittedManagedLease(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, `
+SELECT singleton_id FROM operational_modes
+WHERE singleton_id=true FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	request := LeaseRequest{
+		Mode:      "draining",
+		OwnerID:   uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(5 * time.Minute),
+	}
+	acquireCtx, cancelAcquire := context.WithCancel(ctx)
+	type acquireResult struct {
+		lease Lease
+		err   error
+	}
+	result := make(chan acquireResult, 1)
+	go func() {
+		lease, err := store.AcquireLease(acquireCtx, request)
+		result <- acquireResult{lease: lease, err: err}
+	}()
+	waitForBlockedPostgresQuery(t, pool, "SELECT mode,owner_id,lease_token_hash")
+	cancelAcquire()
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var committed Lease
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("committed acquisition returned error: %v", got.err)
+		}
+		committed = got.lease
+	case <-time.After(2 * time.Second):
+		t.Fatal("acquisition did not return after row blocker committed")
+	}
+	if committed.OwnerID != request.OwnerID || committed.Mode != request.Mode ||
+		len(committed.Token) != sha256.Size {
+		t.Fatalf("committed lease=%#v", committed)
+	}
+	tokenHash := sha256.Sum256(committed.Token)
+	var durableOwner uuid.UUID
+	var durableHash []byte
+	if err := pool.QueryRow(ctx, `
+SELECT owner_id,lease_token_hash
+FROM operational_modes WHERE singleton_id=true`,
+	).Scan(&durableOwner, &durableHash); err != nil {
+		t.Fatal(err)
+	}
+	if durableOwner != committed.OwnerID || !bytes.Equal(durableHash, tokenHash[:]) {
+		t.Fatalf("durable owner=%s hash=%x, lease owner=%s hash=%x",
+			durableOwner, durableHash, committed.OwnerID, tokenHash)
+	}
+	store.mu.Lock()
+	session := store.sessions[tokenHash]
+	store.mu.Unlock()
+	if session == nil {
+		t.Fatal("committed acquisition was not registered as a managed session")
+	}
+	session.mu.Lock()
+	managed := !session.released && session.timer != nil
+	session.mu.Unlock()
+	if !managed {
+		t.Fatal("committed acquisition session was not active and timed")
+	}
+	if err := store.ReleaseLease(ctx, committed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcquireCommitReconciliationMismatchReacquiresAndReleasesExclusiveSession(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, operationsAdvisoryKey); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	var backendPID int
+	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+		closeHijackedConnection(conn)
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, backendPID); err != nil {
+		closeHijackedConnection(conn)
+		t.Fatal(err)
+	}
+
+	token := bytes.Repeat([]byte{0x72}, sha256.Size)
+	tokenHash := sha256.Sum256(token)
+	reconciledConn, _, matched, err := store.reconcileAcquiredLease(
+		ctx,
+		conn,
+		Lease{Mode: "draining", OwnerID: uuid.New(), Token: token},
+		tokenHash,
+	)
+	if err != nil {
+		t.Fatalf("reconcile mismatch: %v", err)
+	}
+	if matched {
+		releaseExclusiveConnection(reconciledConn)
+		t.Fatal("uncommitted token unexpectedly matched durable lease")
+	}
+	if reconciledConn == nil {
+		t.Fatal("reconciliation did not reacquire an exclusive session")
+	}
+	releaseExclusiveConnection(reconciledConn)
+
+	probe, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Release()
+	var acquired bool
+	if err := probe.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, operationsAdvisoryKey).
+		Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("negative reconciliation retained the exclusive advisory lock")
+	}
+	if _, err := probe.Exec(ctx, `SELECT pg_advisory_unlock($1)`, operationsAdvisoryKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresStoreCloseClearsActiveLeaseAndReleasesDedicatedConnection(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	var _ LeaseSessionCloser = store
+	baselineAcquired := pool.Stat().AcquiredConns()
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode:      "backup",
+		OwnerID:   uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.Stat().AcquiredConns(); got != baselineAcquired+1 {
+		t.Fatalf("acquired connections with active lease=%d, want %d", got, baselineAcquired+1)
+	}
+
+	closeCtx, cancelClose := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelClose()
+	if err := store.Close(closeCtx); err != nil {
+		t.Fatalf("close active store: %v", err)
+	}
+	if got := pool.Stat().AcquiredConns(); got != baselineAcquired {
+		t.Fatalf("acquired connections after close=%d, want %d", got, baselineAcquired)
+	}
+	mode, err := store.GetMode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode.Mode != "normal" || mode.OwnerID != uuid.Nil || !mode.ExpiresAt.IsZero() {
+		t.Fatalf("close left durable lease orphaned: %#v", mode)
+	}
+
+	probe, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Release()
+	var acquired bool
+	if err := probe.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, operationsAdvisoryKey).
+		Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("close retained the exclusive advisory lock")
+	}
+	if _, err := probe.Exec(ctx, `SELECT pg_advisory_unlock($1)`, operationsAdvisoryKey); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode:      "draining",
+		OwnerID:   uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(time.Minute),
+	}); !errors.Is(err, errStoreClosed) {
+		t.Fatalf("closed store acquisition error=%v", err)
+	}
+	_ = lease
+}
+
+func TestPostgresStoreCloseRacingBlockedAcquireLeavesNoCommittedOrphan(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, `
+SELECT singleton_id FROM operational_modes
+WHERE singleton_id=true FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	type acquireResult struct {
+		lease Lease
+		err   error
+	}
+	result := make(chan acquireResult, 1)
+	go func() {
+		lease, err := store.AcquireLease(ctx, LeaseRequest{
+			Mode:      "release",
+			OwnerID:   uuid.New(),
+			ExpiresAt: postgresClock(t, pool).Add(time.Hour),
+		})
+		result <- acquireResult{lease: lease, err: err}
+	}()
+	waitForBlockedPostgresQuery(t, pool, "SELECT mode,owner_id,lease_token_hash")
+
+	closeCtx, cancelClose := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelClose()
+	if err := store.Close(closeCtx); err != nil {
+		t.Fatalf("close racing acquire: %v", err)
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, errStoreClosed) {
+			t.Fatalf("racing acquisition returned lease=%#v err=%v", got.lease, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("racing acquisition did not return after row blocker committed")
+	}
+
+	mode, err := store.GetMode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode.Mode != "normal" || mode.OwnerID != uuid.Nil || !mode.ExpiresAt.IsZero() {
+		t.Fatalf("racing close left durable lease orphaned: %#v", mode)
+	}
+	probe, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Release()
+	var acquired bool
+	if err := probe.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, operationsAdvisoryKey).
+		Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("racing close left exclusive advisory lock held")
+	}
+	if _, err := probe.Exec(ctx, `SELECT pg_advisory_unlock($1)`, operationsAdvisoryKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeaseExpiryGenerationIgnoresStaleCallback(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedOperationsStore(t)
 	store := NewPostgresStore(pool)
 	lease, err := store.AcquireLease(ctx, LeaseRequest{
-		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: time.Now().UTC().Add(time.Minute),
+		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: postgresClock(t, pool).Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -783,159 +1266,135 @@ func TestRenewedLeaseIgnoresAlreadyWaitingExpiryCallback(t *testing.T) {
 	}
 
 	session.mu.Lock()
-	store.scheduleLeaseExpiryLocked(tokenHash, session, time.Now().UTC().Add(40*time.Millisecond))
-	newExpiry := time.Now().UTC().Add(300 * time.Millisecond)
-	type renewResult struct {
-		lease Lease
-		err   error
-	}
-	renewed := make(chan renewResult, 1)
-	go func() {
-		next, err := store.RenewLease(ctx, lease, newExpiry)
-		renewed <- renewResult{lease: next, err: err}
-	}()
-	time.Sleep(80 * time.Millisecond)
+	staleGeneration := session.expiryGeneration
+	store.scheduleLeaseExpiryLocked(tokenHash, session, time.Hour)
+	currentGeneration := session.expiryGeneration
 	session.mu.Unlock()
-
-	var result renewResult
-	select {
-	case result = <-renewed:
-	case <-time.After(time.Second):
-		t.Fatal("renewal did not complete")
+	if currentGeneration != staleGeneration+1 {
+		t.Fatalf("expiry generation=%d, want %d", currentGeneration, staleGeneration+1)
 	}
-	if result.err != nil {
-		t.Fatalf("renew lease: %v", result.err)
-	}
-	lease = result.lease
-	time.Sleep(30 * time.Millisecond)
+	store.expireLeaseSession(tokenHash, session, staleGeneration)
 	store.mu.Lock()
 	_, retained := store.sessions[tokenHash]
 	store.mu.Unlock()
 	if !retained {
-		t.Fatal("stale expiry callback released the rescheduled lease")
-	}
-	probeCtx, probeCancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer probeCancel()
-	if release, err := store.AcquireShared(probeCtx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			release()
-		}
-		t.Fatalf("stale expiry callback opened shared gate: %v", err)
+		t.Fatal("stale expiry generation released the current lease")
 	}
 
-	timer := time.NewTimer(time.Until(newExpiry) + 50*time.Millisecond)
-	defer timer.Stop()
-	<-timer.C
+	store.expireLeaseSession(tokenHash, session, currentGeneration)
 	store.mu.Lock()
 	_, retained = store.sessions[tokenHash]
 	store.mu.Unlock()
 	if retained {
-		t.Fatal("rescheduled lease remained after its new expiry")
+		t.Fatal("current expiry generation did not release its lease")
 	}
 }
 
-func TestCanceledRenewAfterCommitReschedulesExpiryBeforeReturning(t *testing.T) {
-	ctx := context.Background()
-	pool := migratedOperationsStore(t)
-	store := NewPostgresStore(pool)
-	oldExpiry := time.Now().UTC().Add(400 * time.Millisecond)
-	lease, err := store.AcquireLease(ctx, LeaseRequest{
-		Mode: "draining", OwnerID: uuid.New(), ExpiresAt: oldExpiry,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), lease) })
+func TestCanceledLeaseMutationReturnsCommittedLeaseAndReschedulesTimer(t *testing.T) {
+	for name, mutate := range map[string]func(context.Context, *PostgresStore, Lease, time.Time) (Lease, error){
+		"renew": func(ctx context.Context, store *PostgresStore, lease Lease, expiresAt time.Time) (Lease, error) {
+			return store.RenewLease(ctx, lease, expiresAt)
+		},
+		"transition": func(ctx context.Context, store *PostgresStore, lease Lease, expiresAt time.Time) (Lease, error) {
+			return store.TransitionLease(ctx, lease, "backup", expiresAt)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := migratedOperationsStore(t)
+			store := NewPostgresStore(pool)
+			lease, err := store.AcquireLease(ctx, LeaseRequest{
+				Mode:      "draining",
+				OwnerID:   uuid.New(),
+				ExpiresAt: postgresClock(t, pool).Add(5 * time.Minute),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.ReleaseLease(context.Background(), lease) })
+			tokenHash := sha256.Sum256(lease.Token)
+			store.mu.Lock()
+			session := store.sessions[tokenHash]
+			store.mu.Unlock()
+			if session == nil {
+				t.Fatal("missing acquired lease session")
+			}
+			session.mu.Lock()
+			startGeneration := session.expiryGeneration
+			session.mu.Unlock()
 
-	blocker, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer blocker.Rollback(ctx)
-	if _, err := blocker.Exec(ctx, `
+			blocker, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(ctx)
+			if _, err := blocker.Exec(ctx, `
 SELECT singleton_id FROM operational_modes
 WHERE singleton_id=true FOR UPDATE`); err != nil {
-		t.Fatal(err)
-	}
+				t.Fatal(err)
+			}
 
-	newExpiry := time.Now().UTC().Add(900 * time.Millisecond)
-	renewCtx, cancelRenew := context.WithCancel(ctx)
-	type renewResult struct {
-		lease Lease
-		err   error
-	}
-	renewed := make(chan renewResult, 1)
-	go func() {
-		next, err := store.RenewLease(renewCtx, lease, newExpiry)
-		renewed <- renewResult{lease: next, err: err}
-	}()
+			newExpiry := postgresClock(t, pool).Add(10 * time.Minute)
+			mutationCtx, cancelMutation := context.WithCancel(ctx)
+			type mutationResult struct {
+				lease Lease
+				err   error
+			}
+			result := make(chan mutationResult, 1)
+			go func() {
+				updated, err := mutate(mutationCtx, store, lease, newExpiry)
+				result <- mutationResult{lease: updated, err: err}
+			}()
+			waitForBlockedPostgresQuery(t, pool, "SELECT mode,owner_id,lease_token_hash")
+			cancelMutation()
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
 
-	waitDeadline := time.Now().Add(time.Second)
-	for {
-		var waiting bool
-		if err := pool.QueryRow(ctx, `
-SELECT EXISTS (
-	SELECT 1
-	FROM pg_stat_activity
-	WHERE datname=current_database()
-	  AND pid<>pg_backend_pid()
-	  AND state='active'
-	  AND wait_event_type='Lock'
-	  AND query LIKE '%SELECT mode,owner_id,lease_token_hash%'
-)`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting {
-			break
-		}
-		if time.Now().After(waitDeadline) {
-			t.Fatal("renewal did not block on the operational mode row")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	cancelRenew()
-	if err := blocker.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	var result renewResult
-	select {
-	case result = <-renewed:
-	case <-time.After(time.Second):
-		t.Fatal("renewal did not return after the row blocker committed")
-	}
-	if !errors.Is(result.err, context.Canceled) {
-		t.Fatalf("renewal error = %v, want context canceled", result.err)
-	}
-	var durableExpiry time.Time
-	if err := pool.QueryRow(ctx, `
-SELECT lease_expires_at FROM operational_modes WHERE singleton_id=true`,
-	).Scan(&durableExpiry); err != nil {
-		t.Fatal(err)
-	}
-	if delta := durableExpiry.Sub(newExpiry); delta < -time.Millisecond || delta > time.Millisecond {
-		t.Fatalf("durable expiry = %v, want %v", durableExpiry, newExpiry)
-	}
-
-	timer := time.NewTimer(time.Until(oldExpiry) + 75*time.Millisecond)
-	defer timer.Stop()
-	<-timer.C
-	tokenHash := sha256.Sum256(lease.Token)
-	store.mu.Lock()
-	_, retained := store.sessions[tokenHash]
-	store.mu.Unlock()
-	if !retained {
-		t.Fatal("committed renewal retained the old expiry timer")
-	}
-
-	timer.Reset(time.Until(newExpiry) + 75*time.Millisecond)
-	<-timer.C
-	store.mu.Lock()
-	_, retained = store.sessions[tokenHash]
-	store.mu.Unlock()
-	if retained {
-		t.Fatal("committed renewal remained registered after its new expiry")
+			var committed Lease
+			select {
+			case got := <-result:
+				if got.err != nil {
+					t.Fatalf("committed mutation returned error: %v", got.err)
+				}
+				committed = got.lease
+			case <-time.After(2 * time.Second):
+				t.Fatal("mutation did not return after row blocker committed")
+			}
+			wantMode := "draining"
+			if name == "transition" {
+				wantMode = "backup"
+			}
+			if committed.Mode != wantMode || committed.OwnerID != lease.OwnerID ||
+				committed.Version != lease.Version+1 {
+				t.Fatalf("committed lease=%#v", committed)
+			}
+			var durableMode string
+			var durableExpiry time.Time
+			if err := pool.QueryRow(ctx, `
+SELECT mode,lease_expires_at
+FROM operational_modes WHERE singleton_id=true`,
+			).Scan(&durableMode, &durableExpiry); err != nil {
+				t.Fatal(err)
+			}
+			if durableMode != wantMode ||
+				durableExpiry.Sub(newExpiry) < -time.Millisecond ||
+				durableExpiry.Sub(newExpiry) > time.Millisecond {
+				t.Fatalf("durable mode=%q expiry=%v, want mode=%q expiry=%v",
+					durableMode, durableExpiry, wantMode, newExpiry)
+			}
+			session.mu.Lock()
+			rescheduled := !session.released &&
+				session.timer != nil &&
+				session.expiryGeneration == startGeneration+1
+			session.mu.Unlock()
+			if !rescheduled {
+				t.Fatal("committed mutation did not reschedule its retained lease session")
+			}
+			if err := store.ReleaseLease(ctx, committed); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -989,6 +1448,118 @@ WHERE singleton_id=true`); err != nil {
 	return pool
 }
 
+func postgresClock(t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+	var now time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	return now.UTC()
+}
+
+func waitForPostgresClock(t *testing.T, pool *pgxpool.Pool, target time.Time) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if !postgresClock(t, pool).Before(target) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("database clock did not reach %v: %v", target, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForLeaseSessionRelease(t *testing.T, store *PostgresStore, tokenHash [32]byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		store.mu.Lock()
+		_, retained := store.sessions[tokenHash]
+		store.mu.Unlock()
+		if !retained {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("lease session was not released: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForBlockedPostgresQuery(t *testing.T, pool *pgxpool.Pool, queryFragment string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `
+SELECT EXISTS (
+	SELECT 1
+	FROM pg_stat_activity
+	WHERE datname=current_database()
+	  AND pid<>pg_backend_pid()
+	  AND state='active'
+	  AND wait_event_type='Lock'
+	  AND query LIKE '%' || $1 || '%'
+)`, queryFragment).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("query containing %q did not block: %v", queryFragment, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertRedactedSettingsRejectionAudit(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	principal Principal,
+	reason string,
+	wantCount int,
+) {
+	t.Helper()
+	var count int
+	var leaked bool
+	if err := pool.QueryRow(context.Background(), `
+SELECT count(*),
+       bool_or(metadata <> jsonb_build_object(
+           'category','high_risk',
+           'reason',$4::text
+       ))
+FROM audit_logs
+WHERE action='operations.settings_rejected'
+  AND target_type='system_settings'
+  AND target_id='global'
+  AND actor_user_id=$1
+  AND request_id=$2
+  AND ip=$3`,
+		principal.User.ID, principal.RequestID, principal.IP, reason,
+	).Scan(&count, &leaked); err != nil {
+		t.Fatal(err)
+	}
+	if count != wantCount || leaked {
+		t.Fatalf("redacted rejection audits count=%d leaked=%t, want count=%d",
+			count, leaked, wantCount)
+	}
+}
+
 func seedOperationsAdmin(t *testing.T, ctx context.Context, pool *pgxpool.Pool) Principal {
 	t.Helper()
 	id := uuid.New()
@@ -1022,14 +1593,3 @@ func (s *fakeStore) AuditSettingsRejection(_ context.Context, _ Principal, reaso
 	s.rejectionReason = reason
 	return s.rejectionErr
 }
-func (*fakeStore) GetMode(context.Context) (ModeSnapshot, error) { return ModeSnapshot{}, nil }
-func (*fakeStore) AcquireLease(context.Context, LeaseRequest) (Lease, error) {
-	return Lease{}, nil
-}
-func (*fakeStore) RenewLease(context.Context, Lease, time.Time) (Lease, error) {
-	return Lease{}, nil
-}
-func (*fakeStore) TransitionLease(context.Context, Lease, string, time.Time) (Lease, error) {
-	return Lease{}, nil
-}
-func (*fakeStore) ReleaseLease(context.Context, Lease) error { return nil }
