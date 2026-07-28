@@ -346,11 +346,16 @@ func validRepository(repository Repository) bool {
 
 func validSafeError(category, traceID string) bool {
 	if category != "" {
-		if _, ok := safeErrorCategories[category]; !ok {
+		if !ValidErrorCategory(category) {
 			return false
 		}
 	}
 	return traceID == "" || (len(traceID) <= 64 && safeOpaqueValue.MatchString(traceID))
+}
+
+func ValidErrorCategory(category string) bool {
+	_, ok := safeErrorCategories[category]
+	return ok
 }
 
 func cloneTime(value *time.Time) *time.Time {
