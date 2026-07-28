@@ -140,26 +140,32 @@ replaced by `"$PHASE5_PG_IMAGE"` and each final
 `golang:1.26.5-bookworm` token replaced by `"$PHASE5_GO_IMAGE"`. All other
 arguments remain identical.
 
-### Pending exact cleanup
+### Post-review cleanup
 
-Cleanup has not yet been executed. A read-only status check during this review
-confirmed:
+After both independent reviews reported Critical/Important/Minor `0/0/0`, the
+temporary resources created for this gate were removed. The container cleanup
+completed with exit 0 and printed both exact container names:
 
-- `vayzra-phase5-gate-postgres-019fa57b` is running and healthy;
-- failed-attempt container `vayzra-phase5-gate-019fa57b` still exists in
-  `Created` state;
-- named volumes `vayzra-phase5-go-mod` and `vayzra-phase5-go-build` still
-  exist.
-
-After both report reviews approve the evidence, remove only those exact
-artifacts:
-
-```sh
-docker rm -f vayzra-phase5-gate-postgres-019fa57b
-docker rm -f vayzra-phase5-gate-019fa57b
-docker volume rm vayzra-phase5-go-mod vayzra-phase5-go-build
-unset PHASE5_PG_PASSWORD PHASE5_TEST_DATABASE_URL
+```text
+$ docker rm -f vayzra-phase5-gate-019fa57b vayzra-phase5-gate-postgres-019fa57b
+vayzra-phase5-gate-019fa57b
+vayzra-phase5-gate-postgres-019fa57b
 ```
+
+The named Go module/build cache cleanup also completed with exit 0 and printed
+both exact volume names:
+
+```text
+$ docker volume rm vayzra-phase5-go-mod vayzra-phase5-go-build
+vayzra-phase5-go-mod
+vayzra-phase5-go-build
+```
+
+These were only this review's temporary in-memory PostgreSQL container, failed
+container, and Go caches. A post-cleanup read-only check returned no rows for
+the two Phase 5 container names or the two Phase 5 volume names. The existing
+`vayzra-phase3-baseline-postgres` container remained present and running
+(`Up 6 days`) and was not touched.
 
 ### Pre-success attempts not counted as passing gates
 
@@ -240,7 +246,7 @@ database on `host.docker.internal:54330` are counted as passing Go gates.
 
 ## Report amendment verification
 
-- Markdown fenced-code structure — PASS; all 14 fence lines are balanced.
+- Markdown fenced-code structure — PASS; all 16 fence lines are balanced.
 - Markdown trailing-whitespace scan — PASS; no matches.
 - Secret/operator-path scan — PASS; no committed credential, private-key
   marker, cloud access-key pattern, operator-specific absolute path, or
