@@ -454,16 +454,23 @@ func (executor Executor) Snapshot(
 		return SnapshotResult{}, ErrDatabaseDump
 	}
 	dumpHash, dumpBytes, err := hashBoundedRegularFile(
+		ctx,
 		dumpPath,
 		int64(executor.config.MaxPlaintextBytes),
 	)
 	if err != nil {
+		if errors.Is(err, ErrCancelled) {
+			return SnapshotResult{}, ErrCancelled
+		}
 		return SnapshotResult{}, ErrDatabaseDump
 	}
 
 	objectCount, referencedBytes, objectIdentity, err :=
-		summarizeObjectFiles(executor.config.ObjectRoot)
+		summarizeObjectFiles(ctx, executor.config.ObjectRoot)
 	if err != nil {
+		if errors.Is(err, ErrCancelled) {
+			return SnapshotResult{}, ErrCancelled
+		}
 		return SnapshotResult{}, ErrSnapshot
 	}
 	manifest := Manifest{
@@ -1168,13 +1175,20 @@ func cleanupWorkDirectory(root string, workDirectory string) error {
 }
 
 func summarizeObjectFiles(
+	ctx context.Context,
 	root string,
 ) (int64, int64, [sha256.Size]byte, error) {
+	if ctx == nil {
+		return 0, 0, [sha256.Size]byte{}, ErrCancelled
+	}
 	var count int64
 	var bytesCount int64
 	setHash := sha256.New()
 	_, _ = setHash.Write([]byte("happylearn-object-set-v1\x00"))
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if ctx.Err() != nil {
+			return ErrCancelled
+		}
 		if walkErr != nil {
 			return ErrSnapshot
 		}
@@ -1207,17 +1221,23 @@ func summarizeObjectFiles(
 			_ = file.Close()
 			return ErrSnapshot
 		}
-		fileHash := sha256.New()
-		written, copyErr := io.Copy(fileHash, file)
+		fileHash, written, copyErr := hashFileContents(
+			ctx,
+			file,
+			info.Size(),
+		)
 		closeErr := file.Close()
 		if copyErr != nil || closeErr != nil || written != info.Size() {
+			if errors.Is(copyErr, ErrCancelled) {
+				return ErrCancelled
+			}
 			return ErrSnapshot
 		}
 		_, _ = setHash.Write([]byte(filepath.ToSlash(relativePath)))
 		_, _ = setHash.Write([]byte{0})
 		_, _ = setHash.Write([]byte(strconv.FormatInt(info.Size(), 10)))
 		_, _ = setHash.Write([]byte{0})
-		_, _ = setHash.Write(fileHash.Sum(nil))
+		_, _ = setHash.Write(fileHash[:])
 		count++
 		bytesCount += info.Size()
 		return nil
@@ -1230,8 +1250,15 @@ func summarizeObjectFiles(
 	return count, bytesCount, identity, nil
 }
 
-func hashBoundedRegularFile(path string, limit int64) ([sha256.Size]byte, int64, error) {
+func hashBoundedRegularFile(
+	ctx context.Context,
+	path string,
+	limit int64,
+) ([sha256.Size]byte, int64, error) {
 	var empty [sha256.Size]byte
+	if ctx == nil || ctx.Err() != nil {
+		return empty, 0, ErrCancelled
+	}
 	info, err := os.Lstat(path)
 	if err != nil ||
 		!info.Mode().IsRegular() ||
@@ -1244,14 +1271,53 @@ func hashBoundedRegularFile(path string, limit int64) ([sha256.Size]byte, int64,
 	if err != nil {
 		return empty, 0, ErrDatabaseDump
 	}
-	defer file.Close()
-	hash := sha256.New()
-	written, err := io.Copy(hash, io.LimitReader(file, limit+1))
-	if err != nil || written != info.Size() || written > limit {
+	hash, written, readErr := hashFileContents(ctx, file, limit)
+	closeErr := file.Close()
+	if errors.Is(readErr, ErrCancelled) {
+		return empty, 0, ErrCancelled
+	}
+	if readErr != nil ||
+		closeErr != nil ||
+		written != info.Size() ||
+		written > limit {
 		return empty, 0, ErrCapacity
 	}
+	return hash, written, nil
+}
+
+func hashFileContents(
+	ctx context.Context,
+	file *os.File,
+	limit int64,
+) ([sha256.Size]byte, int64, error) {
+	var empty [sha256.Size]byte
+	if ctx == nil || file == nil || limit < 0 {
+		return empty, 0, ErrCapacity
+	}
+	hasher := sha256.New()
+	buffer := make([]byte, 64*1024)
+	var written int64
+	for {
+		if ctx.Err() != nil {
+			return empty, written, ErrCancelled
+		}
+		count, err := file.Read(buffer)
+		if count > 0 {
+			if written > limit-int64(count) {
+				return empty, written, ErrCapacity
+			}
+			_, _ = hasher.Write(buffer[:count])
+			written += int64(count)
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return empty, written, err
+		}
+	}
 	var result [sha256.Size]byte
-	copy(result[:], hash.Sum(nil))
+	copy(result[:], hasher.Sum(nil))
 	return result, written, nil
 }
 

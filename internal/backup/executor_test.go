@@ -3,6 +3,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -29,6 +30,38 @@ type recordingRunner struct {
 	mu       sync.Mutex
 	commands []Command
 	run      func(context.Context, Command, int) (CommandResult, error)
+}
+
+type cancelAfterChecksContext struct {
+	context.Context
+	checksUntilCancel int
+	done              chan struct{}
+	cancelled         bool
+}
+
+func newCancelAfterChecksContext(checks int) *cancelAfterChecksContext {
+	return &cancelAfterChecksContext{
+		Context:           context.Background(),
+		checksUntilCancel: checks,
+		done:              make(chan struct{}),
+	}
+}
+
+func (ctx *cancelAfterChecksContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *cancelAfterChecksContext) Err() error {
+	if ctx.cancelled {
+		return context.Canceled
+	}
+	ctx.checksUntilCancel--
+	if ctx.checksUntilCancel <= 0 {
+		ctx.cancelled = true
+		close(ctx.done)
+		return context.Canceled
+	}
+	return nil
 }
 
 func (r *recordingRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
@@ -276,6 +309,76 @@ func TestExecutorCleansPlaintextOnFailureAndCancellation(t *testing.T) {
 			}
 			if len(entries) != 0 {
 				t.Fatalf("temporary plaintext remains: %v", entries)
+			}
+		})
+	}
+}
+
+func TestExecutorCancelsDuringDumpAndObjectContentHashing(t *testing.T) {
+	for _, stage := range []string{"dump", "object"} {
+		t.Run(stage, func(t *testing.T) {
+			dump := bytes.Repeat([]byte("d"), 8*64*1024)
+			cancelAfter := 4
+			if stage == "object" {
+				dump = []byte("PGDMP")
+				cancelAfter = 7
+			}
+			runner := &recordingRunner{run: func(
+				_ context.Context,
+				command Command,
+				_ int,
+			) (CommandResult, error) {
+				switch filepath.Base(command.Executable) {
+				case "pg_dump":
+					if err := os.WriteFile(command.StdoutFile, dump, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					return CommandResult{ExitCode: 0}, nil
+				case "age":
+					if err := os.WriteFile(command.StdoutFile, []byte("encrypted"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					return CommandResult{ExitCode: 0}, nil
+				case "restic":
+					return CommandResult{
+						ExitCode: 0,
+						Stdout: []byte(fmt.Sprintf(
+							`{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":0,"dirs_new":0,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":1,"data_added":128,"data_added_packed":96,"total_files_processed":1,"total_bytes_processed":22,"total_duration":0.1,"snapshot_id":%q}`,
+							executorRecoverySnapshotID,
+						)),
+					}, nil
+				default:
+					t.Fatalf("unexpected executable %q", command.Executable)
+					return CommandResult{}, nil
+				}
+			}}
+			executor, workRoot := executorFixture(t, runner)
+			if stage == "object" {
+				if err := os.WriteFile(
+					filepath.Join(executor.config.ObjectRoot, "object.bin"),
+					bytes.Repeat([]byte("o"), 8*64*1024),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := newCancelAfterChecksContext(cancelAfter)
+			_, err := executor.Snapshot(ctx, SnapshotInput{
+				RunID:                    commandRunIDForExecutor,
+				DatabaseMigrationVersion: 20,
+			})
+			if !errors.Is(err, ErrCancelled) {
+				t.Fatalf("err=%v commands=%+v", err, runner.calls())
+			}
+			if len(runner.calls()) != 1 {
+				t.Fatalf("local cancellation ran child commands: %+v", runner.calls())
+			}
+			entries, readErr := os.ReadDir(workRoot)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("plaintext remains after cancellation: %v", entries)
 			}
 		})
 	}
