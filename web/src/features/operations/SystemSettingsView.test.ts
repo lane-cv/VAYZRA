@@ -133,6 +133,27 @@ describe('SystemSettingsView', () => {
     expect(cleanUnload.defaultPrevented).toBe(false)
   })
 
+  it('locks every editable group during a slow save and preserves the submitted state', async () => {
+    let resolveSave!: (value: OperationsSettings) => void
+    vi.mocked(saveSettings).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve }))
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const announcement = wrapper.get<HTMLInputElement>('[data-testid="site-announcement"]')
+    await announcement.setValue('等待保存的公告')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.findAll('fieldset')).toHaveLength(6)
+    expect(wrapper.findAll('fieldset').every((group) => group.attributes('disabled') !== undefined)).toBe(true)
+    expect(announcement.element.matches(':disabled')).toBe(true)
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ siteAnnouncement: '等待保存的公告' }))
+
+    resolveSave({ ...settings, version: 8, siteAnnouncement: '等待保存的公告' })
+    await flushPromises()
+    expect(wrapper.get<HTMLInputElement>('[data-testid="site-announcement"]').element.value).toBe('等待保存的公告')
+    expect(wrapper.findAll('fieldset').some((group) => group.attributes('disabled') !== undefined)).toBe(false)
+  })
+
   it('offers a conflict reload and shows the request ID without overwriting edits', async () => {
     vi.mocked(saveSettings).mockRejectedValueOnce(
       new APIError(409, 'settings_conflict', '设置已被其他管理员更新', 'req-settings-409'),
@@ -150,6 +171,34 @@ describe('SystemSettingsView', () => {
     await wrapper.get('[data-testid="reload-conflict"]').trigger('click')
     await flushPromises()
     expect(wrapper.get<HTMLInputElement>('[data-testid="site-name"]').element.value).toBe('服务端新名称')
+    expect(document.activeElement).toBe(wrapper.get('#operations-settings-title').element)
+  })
+
+  it('keeps conflict reload retryable after a failed reload, then focuses the successful result', async () => {
+    vi.mocked(saveSettings).mockRejectedValueOnce(
+      new APIError(409, 'settings_conflict', '设置已被其他管理员更新', 'req-conflict'),
+    )
+    vi.mocked(readSettings)
+      .mockResolvedValueOnce({ ...settings })
+      .mockRejectedValueOnce(new APIError(500, 'internal_error', '重新加载失败', 'req-reload-failed'))
+      .mockResolvedValueOnce({ ...settings, version: 8, siteName: '重试后的服务端名称' })
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    await wrapper.get('[data-testid="site-name"]').setValue('需要保留的本地编辑')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="reload-conflict"]').trigger('click')
+    await flushPromises()
+    const failedAlert = wrapper.get('[role="alert"]')
+    expect(failedAlert.text()).toContain('req-reload-failed')
+    expect(document.activeElement).toBe(failedAlert.element)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="site-name"]').element.value).toBe('需要保留的本地编辑')
+    expect(wrapper.get('[data-testid="reload-conflict"]').attributes('disabled')).toBeUndefined()
+
+    await wrapper.get('[data-testid="reload-conflict"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get<HTMLInputElement>('[data-testid="site-name"]').element.value).toBe('重试后的服务端名称')
     expect(document.activeElement).toBe(wrapper.get('#operations-settings-title').element)
   })
 

@@ -44,28 +44,35 @@ async function focusFeedback() {
   feedback.value?.focus()
 }
 
-async function loadSettings(focusAfter = false) {
+async function loadSettings(focusAfter = false, preserveConflict = false) {
   if (!isAdmin.value) return
+  const conflictReload = preserveConflict && conflict.value
   const requestGeneration = ++generation
   loadController?.abort()
   const controller = new AbortController()
   loadController = controller
   loading.value = true
-  error.value = ''
-  requestId.value = ''
+  if (!conflictReload) {
+    error.value = ''
+    requestId.value = ''
+    conflict.value = false
+  }
   validationError.value = ''
-  conflict.value = false
   savedMessage.value = ''
   try {
     const value = await readSettings(controller.signal)
     if (!alive || requestGeneration !== generation || controller.signal.aborted) return
     current.value = clone(value)
     draft.value = clone(value)
+    error.value = ''
+    requestId.value = ''
+    conflict.value = false
   } catch (reason) {
     if (!alive || requestGeneration !== generation || controller.signal.aborted) return
     const details = failure(reason, '系统设置加载失败，请稍后重试')
     error.value = details.message
     requestId.value = details.requestId
+    conflict.value = conflictReload
   } finally {
     if (alive && requestGeneration === generation) {
       loading.value = false
@@ -180,7 +187,7 @@ onBeforeUnmount(() => {
     </div>
 
     <form v-else-if="draft" novalidate @submit.prevent="submit">
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>站点信息</legend>
         <label for="site-name">站点名称
           <input id="site-name" v-model="draft.siteName" data-testid="site-name" maxlength="80" required>
@@ -190,7 +197,7 @@ onBeforeUnmount(() => {
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>数据保留</legend>
         <label for="soft-delete-retention">软删除保留天数
           <input id="soft-delete-retention" v-model.number="draft.softDeleteRetentionDays" data-testid="soft-delete-retention" type="number" min="30" max="365" step="1">
@@ -203,7 +210,7 @@ onBeforeUnmount(() => {
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>备份计划</legend>
         <label for="backup-hour">小时（0–23）
           <input id="backup-hour" v-model.number="draft.backupHour" type="number" min="0" max="23" step="1">
@@ -216,7 +223,7 @@ onBeforeUnmount(() => {
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>磁盘告警</legend>
         <label for="disk-warning">警告阈值（%）
           <input id="disk-warning" v-model.number="draft.diskWarningPercent" data-testid="disk-warning" type="number" min="1" max="99" step="1">
@@ -226,7 +233,7 @@ onBeforeUnmount(() => {
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>AI 错误率告警</legend>
         <label for="ai-warning">警告阈值（%）
           <input id="ai-warning" v-model.number="draft.aiErrorWarningPercent" type="number" min="1" max="99" step="1">
@@ -236,7 +243,7 @@ onBeforeUnmount(() => {
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset :disabled="saving || loading">
         <legend>处理队列告警</legend>
         <label for="queue-warning">警告队列长度
           <input id="queue-warning" v-model.number="draft.processingQueueWarning" type="number" min="1" step="1">
@@ -256,7 +263,7 @@ onBeforeUnmount(() => {
         aria-live="polite"
       >
         <p>{{ validationError || error || savedMessage }}<span v-if="requestId">（支持编号：{{ requestId }}）</span></p>
-        <button v-if="conflict" data-testid="reload-conflict" type="button" :disabled="loading" @click="loadSettings(true)">重新加载服务端设置</button>
+        <button v-if="conflict" data-testid="reload-conflict" type="button" :disabled="loading" @click="loadSettings(true, true)">重新加载服务端设置</button>
       </div>
 
       <footer class="form-actions">

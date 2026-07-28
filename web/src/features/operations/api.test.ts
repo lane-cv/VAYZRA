@@ -51,6 +51,38 @@ describe('operations API', () => {
     await expect(readSettings()).rejects.toMatchObject({ code: 'invalid_response' })
   })
 
+  it('rejects settings responses outside every server constraint', async () => {
+    const invalid: Array<[string, Partial<OperationsSettings>]> = [
+      ['zero version', { version: 0 }],
+      ['unsafe version', { version: Number.MAX_SAFE_INTEGER + 1 }],
+      ['empty site name', { siteName: '' }],
+      ['long site name', { siteName: '学'.repeat(81) }],
+      ['invalid Unicode site name', { siteName: '\ud800' }],
+      ['long announcement', { siteAnnouncement: '公'.repeat(1001) }],
+      ['soft-delete retention', { softDeleteRetentionDays: 29 }],
+      ['audit retention', { auditRetentionDays: 2556 }],
+      ['sample retention', { operationalSampleRetentionDays: 31 }],
+      ['backup hour', { backupHour: 24 }],
+      ['backup minute', { backupMinute: 60 }],
+      ['backup timezone', { backupTimezone: 'UTC' as 'Asia/Shanghai' }],
+      ['disk warning', { diskWarningPercent: 100 }],
+      ['disk threshold order', { diskWarningPercent: 90, diskCriticalPercent: 90 }],
+      ['disk critical ceiling', { diskCriticalPercent: 101 }],
+      ['AI warning', { aiErrorWarningPercent: 0 }],
+      ['AI threshold order', { aiErrorWarningPercent: 25, aiErrorCriticalPercent: 25 }],
+      ['AI critical ceiling', { aiErrorCriticalPercent: 101 }],
+      ['queue warning', { processingQueueWarning: 0 }],
+      ['queue threshold order', { processingQueueWarning: 50, processingQueueCritical: 50 }],
+      ['unsafe queue integer', { processingQueueCritical: Number.MAX_SAFE_INTEGER + 1 }],
+    ]
+    for (const [label, override] of invalid) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...settings, ...override },
+      })))
+      await expect(readSettings(), label).rejects.toMatchObject({ code: 'invalid_response' })
+    }
+  })
+
   it('rejects settings and audit records with invalid timestamps', async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -69,6 +101,62 @@ describe('operations API', () => {
 
     await expect(readSettings()).rejects.toMatchObject({ code: 'invalid_response' })
     await expect(listAudit({})).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
+  it('accepts only real RFC3339Nano timestamps with strict offsets and shapes', async () => {
+    const invalid = [
+      '2026-07-28',
+      '2026-02-30T01:02:03Z',
+      '2026-07-28 01:02:03Z',
+      '2026-07-28T01:02:03z',
+      '2026-07-28T01:02:03+24:00',
+      '2026-07-28T01:02:03+08',
+      '2026-07-28T01:02:60Z',
+      '2026-07-28T01:02:03.1234567890Z',
+    ]
+    for (const updatedAt of invalid) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...settings, updatedAt },
+      })))
+      await expect(readSettings()).rejects.toMatchObject({ code: 'invalid_response' })
+    }
+
+    for (const updatedAt of [
+      '2026-07-28T01:02:03.123456789Z',
+      '2026-07-28T01:02:03+08:00',
+      '2024-02-29T23:59:59.1-05:30',
+    ]) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...settings, updatedAt },
+      })))
+      await expect(readSettings()).resolves.toMatchObject({ updatedAt })
+    }
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{
+          id: 1,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          metadata: {},
+          occurredAt: '2025-02-29T01:02:03Z',
+        }],
+        meta: {},
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{
+          id: 1,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          metadata: {},
+          occurredAt: '2026-07-28T01:02:03.123456789+08:00',
+        }],
+        meta: {},
+      })))
+    await expect(listAudit({})).rejects.toMatchObject({ code: 'invalid_response' })
+    await expect(listAudit({})).resolves.toMatchObject({
+      items: [expect.objectContaining({ occurredAt: '2026-07-28T01:02:03.123456789+08:00' })],
+    })
   })
 
   it('saves the complete settings object including updatedAt with PUT', async () => {
@@ -104,6 +192,41 @@ describe('operations API', () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: [], meta: {} })))
     await listAudit({ action: '', actorId: '', from: '', limit: undefined })
     expect(vi.mocked(fetch).mock.calls[1][0]).toBe('/api/v1/admin/operations/audit')
+  })
+
+  it('fails closed on audit IDs and cursors outside the exact JavaScript integer range', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{
+          id: Number.MAX_SAFE_INTEGER + 1,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          metadata: {},
+          occurredAt: '2026-07-28T01:02:03Z',
+        }],
+        meta: {},
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [],
+        meta: { nextBeforeId: Number.MAX_SAFE_INTEGER + 1 },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{
+          id: Number.MAX_SAFE_INTEGER,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          metadata: {},
+          occurredAt: '2026-07-28T01:02:03Z',
+        }],
+        meta: { nextBeforeId: Number.MAX_SAFE_INTEGER },
+      })))
+
+    await expect(listAudit({})).rejects.toMatchObject({ code: 'invalid_response' })
+    await expect(listAudit({})).rejects.toMatchObject({ code: 'invalid_response' })
+    await expect(listAudit({})).resolves.toMatchObject({
+      items: [expect.objectContaining({ id: Number.MAX_SAFE_INTEGER })],
+      nextBeforeId: Number.MAX_SAFE_INTEGER,
+    })
   })
 
   it('projects audit responses onto safe fields and allowlisted metadata only', async () => {
@@ -173,6 +296,57 @@ describe('operations API', () => {
     const page = await listAudit({})
     expect(page.items[0]).toMatchObject({ actorId: '', targetId: '', metadata: {} })
     expect(JSON.stringify(page)).not.toContain(secret)
+  })
+
+  it('accepts canonical non-nil UUIDs of any version and redacts noncanonical IDs', async () => {
+    const actorV7 = '01890f3e-e7b2-7cc1-98f2-5e17f0b6c701'
+    const targetV7 = '01890f3e-e7b2-7cc2-08f2-5e17f0b6c702'
+    const providerV7 = '01890f3e-e7b2-7cc3-f8f2-5e17f0b6c703'
+    const modelV7 = '01890f3e-e7b2-7cc4-18f2-5e17f0b6c704'
+    const nilUUID = '00000000-0000-0000-0000-000000000000'
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [
+        {
+          id: 46,
+          actorId: actorV7,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          targetId: targetV7,
+          occurredAt: '2026-07-28T01:02:03Z',
+          metadata: { provider_id: providerV7, model_id: modelV7 },
+        },
+        {
+          id: 47,
+          actorId: nilUUID,
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          targetId: nilUUID,
+          occurredAt: '2026-07-28T01:02:03Z',
+          metadata: { provider_id: nilUUID, model_id: nilUUID },
+        },
+        {
+          id: 48,
+          actorId: actorV7.toUpperCase(),
+          action: 'operations.settings_updated',
+          targetType: 'system_settings',
+          targetId: targetV7.replace(/-/g, ''),
+          occurredAt: '2026-07-28T01:02:03Z',
+          metadata: { provider_id: providerV7.toUpperCase(), model_id: modelV7.replace(/-/g, '') },
+        },
+      ],
+      meta: {},
+    })))
+
+    const page = await listAudit({})
+    expect(page.items[0]).toMatchObject({
+      actorId: actorV7,
+      targetId: targetV7,
+      metadata: { provider_id: providerV7, model_id: modelV7 },
+    })
+    expect(page.items.slice(1)).toEqual([
+      expect.objectContaining({ actorId: '', targetId: '', metadata: {} }),
+      expect.objectContaining({ actorId: '', targetId: '', metadata: {} }),
+    ])
   })
 
   it('enforces server integer bounds without losing precision', async () => {
