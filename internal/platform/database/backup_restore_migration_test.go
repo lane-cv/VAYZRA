@@ -157,6 +157,7 @@ WITH expected(table_name,constraint_name) AS (
     ('restore_verifications','restore_verifications_report_sha256_check'),
     ('restore_verifications','restore_verifications_row_counts_check'),
     ('restore_verifications','restore_verifications_terminal_check'),
+    ('restore_verifications','restore_verifications_timing_check'),
     ('restore_verifications','restore_verifications_success_check')
 )
 SELECT count(*)
@@ -169,8 +170,8 @@ JOIN pg_constraint c
   AND c.contype='c'`).Scan(&matched); err != nil {
 		t.Fatal(err)
 	}
-	if matched != 23 {
-		t.Fatalf("matched named check constraints=%d want=23", matched)
+	if matched != 24 {
+		t.Fatalf("matched named check constraints=%d want=24", matched)
 	}
 }
 
@@ -587,88 +588,148 @@ func TestBackupRestoreMigrationRestoreEvidenceInvariants(t *testing.T) {
 	}{
 		{
 			"negative checked count",
-			`'queued',NULL,NULL,'{}'::jsonb,-1,0,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,-1,0,0,false,NULL,NULL`,
 			"restore_verifications_counts_check",
 		},
 		{
 			"negative missing count",
-			`'queued',NULL,NULL,'{}'::jsonb,0,-1,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,0,-1,0,false,NULL,NULL`,
 			"restore_verifications_counts_check",
 		},
 		{
 			"negative unexpected count",
-			`'queued',NULL,NULL,'{}'::jsonb,0,0,-1,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,0,0,-1,false,NULL,NULL`,
 			"restore_verifications_counts_check",
 		},
 		{
 			"negative rto",
-			`'queued',NULL,NULL,'{}'::jsonb,0,0,0,false,-1,NULL`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,0,0,0,false,-1,NULL`,
 			"restore_verifications_rto_seconds_check",
 		},
 		{
 			"zero restored migration",
-			`'queued',NULL,0,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,0,'{}'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_migration_version_check",
 		},
 		{
 			"short report hash",
-			`'queued',NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,decode(repeat('00',31),'hex')`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,decode(repeat('00',31),'hex')`,
 			"restore_verifications_report_sha256_check",
 		},
 		{
 			"long report hash",
-			`'queued',NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,decode(repeat('00',33),'hex')`,
+			`'queued',NULL,NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,decode(repeat('00',33),'hex')`,
 			"restore_verifications_report_sha256_check",
 		},
 		{
 			"row counts array",
-			`'queued',NULL,NULL,'[]'::jsonb,0,0,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'[]'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_row_counts_check",
 		},
 		{
 			"row counts scalar",
-			`'queued',NULL,NULL,'1'::jsonb,0,0,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'1'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_row_counts_check",
 		},
 		{
 			"row counts null",
-			`'queued',NULL,NULL,'null'::jsonb,0,0,0,false,NULL,NULL`,
+			`'queued',NULL,NULL,NULL,'null'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_row_counts_check",
 		},
 		{
 			"succeeded without finish time",
-			`'succeeded',NULL,1,'{}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
+			`'succeeded',now(),NULL,1,'{"users":1}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
 			"restore_verifications_terminal_check",
 		},
 		{
 			"failed without finish time",
-			`'failed',NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			`'failed',now(),NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_terminal_check",
 		},
 		{
 			"nonterminal with finish time",
-			`'checking',now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			`'checking',now(),now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
 			"restore_verifications_terminal_check",
 		},
 		{
 			"succeeded without session revocation",
-			`'succeeded',now(),1,'{}'::jsonb,0,0,0,false,0,decode(repeat('00',32),'hex')`,
+			`'succeeded',now(),now(),1,'{"users":1}'::jsonb,0,0,0,false,0,decode(repeat('00',32),'hex')`,
 			"restore_verifications_success_check",
 		},
 		{
 			"succeeded with missing object",
-			`'succeeded',now(),1,'{}'::jsonb,1,1,0,true,0,decode(repeat('00',32),'hex')`,
+			`'succeeded',now(),now(),1,'{"users":1}'::jsonb,1,1,0,true,0,decode(repeat('00',32),'hex')`,
 			"restore_verifications_success_check",
 		},
 		{
 			"succeeded without restored migration",
-			`'succeeded',now(),NULL,'{}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
+			`'succeeded',now(),now(),NULL,'{"users":1}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
 			"restore_verifications_success_check",
 		},
 		{
 			"succeeded without report hash",
-			`'succeeded',now(),1,'{}'::jsonb,0,0,0,true,0,NULL`,
+			`'succeeded',now(),now(),1,'{"users":1}'::jsonb,0,0,0,true,0,NULL`,
 			"restore_verifications_success_check",
+		},
+		{
+			"queued with start time",
+			`'queued',now(),NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"queued with finish time",
+			`'queued',NULL,now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_terminal_check",
+		},
+		{
+			"restoring without start time",
+			`'restoring',NULL,NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"restoring with finish time",
+			`'restoring',now(),now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_terminal_check",
+		},
+		{
+			"checking without start time",
+			`'checking',NULL,NULL,NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"checking with finish time",
+			`'checking',now(),now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_terminal_check",
+		},
+		{
+			"failed without start time",
+			`'failed',NULL,now(),NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"failed with reversed times",
+			`'failed',now(),now()-interval '1 second',NULL,'{}'::jsonb,0,0,0,false,NULL,NULL`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"succeeded without start time",
+			`'succeeded',NULL,now(),1,'{"users":1}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
+			"restore_verifications_timing_check",
+		},
+		{
+			"succeeded without rto",
+			`'succeeded',now(),now(),1,'{"users":1}'::jsonb,0,0,0,true,NULL,decode(repeat('00',32),'hex')`,
+			"restore_verifications_success_check",
+		},
+		{
+			"succeeded with empty row counts",
+			`'succeeded',now(),now(),1,'{}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
+			"restore_verifications_success_check",
+		},
+		{
+			"succeeded with reversed times",
+			`'succeeded',now(),now()-interval '1 second',1,'{"users":1}'::jsonb,0,0,0,true,0,decode(repeat('00',32),'hex')`,
+			"restore_verifications_timing_check",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -679,7 +740,7 @@ WITH run AS (
   VALUES($1,'manual') RETURNING id
 )
 INSERT INTO restore_verifications(
-  backup_run_id,state,finished_at,restored_migration_version,
+  backup_run_id,state,started_at,finished_at,restored_migration_version,
   database_row_counts,checked_object_count,missing_object_count,
   unexpected_object_count,session_revocation_verified,rto_seconds,report_sha256
 )
@@ -696,9 +757,11 @@ FROM run`, "restore-"+strings.ReplaceAll(tc.name, " ", "-"))
 WITH runs AS (
   INSERT INTO backup_runs(idempotency_key,trigger_kind)
   VALUES
+    ('restore-valid-queued','manual'),
+    ('restore-valid-restoring','manual'),
+    ('restore-valid-checking','manual'),
     ('restore-valid-succeeded','manual'),
-    ('restore-valid-failed','manual'),
-    ('restore-valid-checking','manual')
+    ('restore-valid-failed','manual')
   RETURNING id,idempotency_key
 )
 INSERT INTO restore_verifications(
@@ -709,12 +772,22 @@ INSERT INTO restore_verifications(
 SELECT
   id,
   CASE idempotency_key
+    WHEN 'restore-valid-queued' THEN 'queued'
+    WHEN 'restore-valid-restoring' THEN 'restoring'
+    WHEN 'restore-valid-checking' THEN 'checking'
     WHEN 'restore-valid-succeeded' THEN 'succeeded'
-    WHEN 'restore-valid-failed' THEN 'failed'
-    ELSE 'checking'
+    ELSE 'failed'
   END,
-  now(),
-  CASE WHEN idempotency_key='restore-valid-checking' THEN NULL ELSE now() END,
+  CASE WHEN idempotency_key='restore-valid-queued' THEN NULL ELSE now() END,
+  CASE
+    WHEN idempotency_key IN (
+      'restore-valid-queued',
+      'restore-valid-restoring',
+      'restore-valid-checking'
+    )
+    THEN NULL
+    ELSE now()
+  END,
   CASE WHEN idempotency_key='restore-valid-succeeded' THEN 1 ELSE NULL END,
   '{"users":1}'::jsonb,
   CASE WHEN idempotency_key='restore-valid-succeeded' THEN 1 ELSE 0 END,

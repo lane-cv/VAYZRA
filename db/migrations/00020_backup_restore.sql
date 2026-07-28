@@ -179,6 +179,26 @@ CREATE TABLE restore_verifications (
       AND finished_at IS NULL
     )
   ),
+  CONSTRAINT restore_verifications_timing_check CHECK (
+    (
+      state = 'queued'
+      AND started_at IS NULL
+      AND finished_at IS NULL
+    )
+    OR
+    (
+      state IN ('restoring', 'checking')
+      AND started_at IS NOT NULL
+      AND finished_at IS NULL
+    )
+    OR
+    (
+      state IN ('succeeded', 'failed')
+      AND started_at IS NOT NULL
+      AND finished_at IS NOT NULL
+      AND finished_at >= started_at
+    )
+  ),
   CONSTRAINT restore_verifications_success_check CHECK (
     state <> 'succeeded'
     OR
@@ -189,6 +209,8 @@ CREATE TABLE restore_verifications (
       AND restored_migration_version >= 1
       AND report_sha256 IS NOT NULL
       AND octet_length(report_sha256) = 32
+      AND rto_seconds IS NOT NULL
+      AND database_row_counts <> '{}'::jsonb
     )
   )
 );
