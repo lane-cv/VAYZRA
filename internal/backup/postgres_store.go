@@ -706,8 +706,8 @@ ORDER BY started_at DESC NULLS LAST,id DESC`, id)
 		); err != nil {
 			return RunDetail{}, ErrUnavailable
 		}
-		if err := json.Unmarshal(rowCounts, &verification.DatabaseRowCounts); err != nil ||
-			!validRestoreRowCounts(verification.DatabaseRowCounts) {
+		verification.DatabaseRowCounts, err = decodeRestoreRowCounts(rowCounts)
+		if err != nil {
 			return RunDetail{}, ErrUnavailable
 		}
 		verification.StartedAt = cloneTime(verification.StartedAt)
@@ -718,6 +718,26 @@ ORDER BY started_at DESC NULLS LAST,id DESC`, id)
 		return RunDetail{}, ErrUnavailable
 	}
 	return detail, nil
+}
+
+func decodeRestoreRowCounts(raw []byte) (map[string]int64, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return nil, ErrUnavailable
+	}
+	counts := make(map[string]int64, len(members))
+	for table, encoded := range members {
+		if _, ok := allowedRestoreRowCountTables[table]; !ok ||
+			bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+			return nil, ErrUnavailable
+		}
+		var count int64
+		if err := json.Unmarshal(encoded, &count); err != nil || count < 0 {
+			return nil, ErrUnavailable
+		}
+		counts[table] = count
+	}
+	return counts, nil
 }
 
 func (s *PostgresStore) RetentionCandidates(

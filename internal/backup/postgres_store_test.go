@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"testing"
@@ -827,7 +828,7 @@ INSERT INTO restore_verifications(
   session_revocation_verified,rto_seconds,report_sha256
 ) VALUES(
   gen_random_uuid(),$1,'succeeded',$2,$2,20,
-  '{"users":3}'::jsonb,5,0,0,true,90,
+  '{"users":0,"sessions":9223372036854775807}'::jsonb,5,0,0,true,90,
   decode(repeat('11',32),'hex')
 )`, runID, at); err != nil {
 		t.Fatal(err)
@@ -839,7 +840,8 @@ INSERT INTO restore_verifications(
 	if detail.Run.ID != runID || len(detail.Artifacts) != 1 ||
 		detail.Artifacts[0].SnapshotID != "opaque-snapshot" ||
 		len(detail.RestoreVerifications) != 1 ||
-		detail.RestoreVerifications[0].DatabaseRowCounts["users"] != 3 {
+		detail.RestoreVerifications[0].DatabaseRowCounts["users"] != 0 ||
+		detail.RestoreVerifications[0].DatabaseRowCounts["sessions"] != math.MaxInt64 {
 		t.Fatalf("detail=%+v", detail)
 	}
 	if _, err := store.Get(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
@@ -872,10 +874,14 @@ CHECK (happylearn_valid_restore_row_counts(database_row_counts))`); err != nil {
 		name, counts string
 	}{
 		{name: "null", counts: `null`},
+		{name: "null member", counts: `{"users":null}`},
 		{name: "unknown key", counts: `{"secret_table":1}`},
 		{name: "negative", counts: `{"users":-1}`},
 		{name: "fraction", counts: `{"users":1.5}`},
 		{name: "string", counts: `{"users":"1"}`},
+		{name: "boolean", counts: `{"users":true}`},
+		{name: "object", counts: `{"users":{}}`},
+		{name: "array", counts: `{"users":[]}`},
 		{name: "bigint overflow", counts: `{"users":9223372036854775808}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

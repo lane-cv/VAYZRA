@@ -629,6 +629,7 @@ func TestBackupRestoreMigrationRequiresAllowlistedIntegerRowCounts(t *testing.T)
 	for _, tc := range []struct {
 		name, counts string
 	}{
+		{name: "null member", counts: `{"users":null}`},
 		{name: "unknown key", counts: `{"secret_table":1}`},
 		{name: "negative", counts: `{"users":-1}`},
 		{name: "fraction", counts: `{"users":1.5}`},
