@@ -2,8 +2,11 @@ package files
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
+
+	"happylearn.local/app/internal/operations"
 )
 
 const (
@@ -21,10 +24,21 @@ type cleanupRunner struct {
 	interval time.Duration
 	timeout  time.Duration
 	limit    int
+	gate     operations.ClaimGate
+	log      func(string)
 }
 
-func newCleanupRunner(cleaner ExpiredUploadCleaner, interval, timeout time.Duration, limit int) *cleanupRunner {
-	return &cleanupRunner{cleaner: cleaner, interval: interval, timeout: timeout, limit: limit}
+func newCleanupRunner(
+	cleaner ExpiredUploadCleaner,
+	gate operations.ClaimGate,
+	logCategory func(string),
+	interval, timeout time.Duration,
+	limit int,
+) *cleanupRunner {
+	return &cleanupRunner{
+		cleaner: cleaner, gate: gate, log: logCategory,
+		interval: interval, timeout: timeout, limit: limit,
+	}
 }
 
 func (r *cleanupRunner) Run(ctx context.Context) {
@@ -35,18 +49,43 @@ func (r *cleanupRunner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runCtx, cancel := context.WithTimeout(ctx, r.timeout)
-			_ = r.cleaner.CleanupExpired(runCtx, r.limit)
-			cancel()
+			r.runOnce(ctx)
 		}
 	}
 }
 
-func StartCleanupRunner(cleaner ExpiredUploadCleaner) func() {
+func (r *cleanupRunner) runOnce(ctx context.Context) {
+	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	if r.gate != nil {
+		allowed, err := r.gate.ClaimsAllowed(runCtx)
+		if err != nil {
+			r.logCategory("operational_gate_failed")
+			return
+		}
+		if !allowed {
+			return
+		}
+	}
+	_ = r.cleaner.CleanupExpired(runCtx, r.limit)
+}
+
+func (r *cleanupRunner) logCategory(category string) {
+	if r.log != nil {
+		r.log(category)
+		return
+	}
+	log.Printf("upload_cleanup category=%s", category)
+}
+
+func StartCleanupRunner(cleaner ExpiredUploadCleaner, gate operations.ClaimGate) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		newCleanupRunner(cleaner, cleanupRunnerInterval, cleanupRunTimeout, cleanupBatchLimit).Run(ctx)
+		newCleanupRunner(
+			cleaner, gate, nil,
+			cleanupRunnerInterval, cleanupRunTimeout, cleanupBatchLimit,
+		).Run(ctx)
 		close(done)
 	}()
 	var once sync.Once

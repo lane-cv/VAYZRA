@@ -16,6 +16,7 @@ import (
 	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/qanda"
 )
@@ -441,7 +442,7 @@ func TestBuildApplicationStartsOutboxAfterServicesAndStopsBeforeDatabase(t *test
 			return serverFakeAuth{}, nil
 		},
 		ready: func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
-		startOutbox: func(*pgxpool.Pool) func() {
+		startOutbox: func(*pgxpool.Pool, operations.ClaimGate) func() {
 			order = append(order, "outbox-start")
 			return func() { order = append(order, "outbox-stop") }
 		},
@@ -463,7 +464,7 @@ func TestBuildApplicationDoesNotStartOutboxWhenServiceConstructionFails(t *testi
 		open:        func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
 		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
 		newAuth:     func(*pgxpool.Pool) (auth.HTTPService, error) { return nil, errors.New("private") },
-		startOutbox: func(*pgxpool.Pool) func() { started = true; return func() {} },
+		startOutbox: func(*pgxpool.Pool, operations.ClaimGate) func() { started = true; return func() {} },
 		close:       func(*pgxpool.Pool) {},
 	})
 	if err == nil || closeResources != nil || started {

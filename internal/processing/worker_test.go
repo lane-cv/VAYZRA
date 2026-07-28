@@ -3,6 +3,7 @@ package processing
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -113,6 +114,60 @@ func TestWorkerUsesPerKindDeadlineAndBoundedPolling(t *testing.T) {
 type processorFunc func(context.Context, Job) (Result, error)
 
 func (f processorFunc) Process(ctx context.Context, job Job) (Result, error) { return f(ctx, job) }
+
+type processingClaimGate struct {
+	allowed bool
+	err     error
+	calls   int
+}
+
+func (g *processingClaimGate) ClaimsAllowed(context.Context) (bool, error) {
+	g.calls++
+	return g.allowed, g.err
+}
+
+func TestOperationalGateBlocksNewProcessingClaimsAndAllowsClaimedJobToSettle(t *testing.T) {
+	job := Job{ID: uuid.New(), FileVersionID: uuid.New(), Kind: KindProcessFile, Attempts: 1}
+	for _, gate := range []*processingClaimGate{
+		{allowed: false},
+		{err: errors.New("secret database detail")},
+	} {
+		store := &sequenceStore{jobs: []Job{job}}
+		var categories []string
+		worked, err := (&Worker{
+			Store: store, Processor: processorFunc(func(context.Context, Job) (Result, error) {
+				t.Fatal("processor called while claims paused")
+				return Result{}, nil
+			}), Owner: "gated", ClaimGate: gate,
+			LogCategory: func(category string) { categories = append(categories, category) },
+		}).RunOne(context.Background())
+		if err != nil || worked || len(store.jobs) != 1 || gate.calls != 1 {
+			t.Fatalf("worked=%t err=%v jobs=%d gate_calls=%d", worked, err, len(store.jobs), gate.calls)
+		}
+		wantLog := ""
+		if gate.err != nil {
+			wantLog = "operational_gate_failed"
+		}
+		if strings.Join(categories, ",") != wantLog {
+			t.Fatalf("log=%q want=%q", strings.Join(categories, ","), wantLog)
+		}
+	}
+
+	gate := &processingClaimGate{allowed: true}
+	store := &sequenceStore{jobs: []Job{job}}
+	worker := &Worker{
+		Store: store,
+		Processor: processorFunc(func(context.Context, Job) (Result, error) {
+			gate.allowed = false
+			return Result{DetectedMIME: "application/pdf", ScanResult: "clean"}, nil
+		}),
+		Owner: "gated", ClaimGate: gate,
+	}
+	worked, err := worker.RunOne(context.Background())
+	if err != nil || !worked || store.completed != 1 || gate.calls != 1 {
+		t.Fatalf("worked=%t err=%v completed=%d gate_calls=%d", worked, err, store.completed, gate.calls)
+	}
+}
 
 type sequenceStore struct {
 	mu           sync.Mutex

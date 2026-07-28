@@ -6,6 +6,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"happylearn.local/app/internal/operations"
 )
 
 type Runner struct {
@@ -15,11 +17,22 @@ type Runner struct {
 	BatchTimeout    time.Duration
 	ShutdownTimeout time.Duration
 	LogCategory     func(string)
+	ClaimGate       operations.ClaimGate
 }
 
 func (r Runner) ProcessBatch(ctx context.Context) error {
 	if r.Store == nil || r.Owner == "" {
 		return ErrInvalidInput
+	}
+	if r.ClaimGate != nil {
+		allowed, err := r.ClaimGate.ClaimsAllowed(ctx)
+		if err != nil {
+			r.log("operational_gate_failed")
+			return nil
+		}
+		if !allowed {
+			return nil
+		}
 	}
 	events, err := r.Store.Claim(ctx, r.Owner)
 	if err != nil {

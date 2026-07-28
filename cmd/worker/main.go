@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
@@ -62,6 +63,12 @@ func run() error {
 	if err := database.Migrate(ctx, pool); err != nil {
 		return errors.New("worker migration")
 	}
+	operationalGate := operations.NewPostgresStore(pool)
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = operationalGate.Close(closeCtx)
+		closeCancel()
+	}()
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development"})
 	if err != nil {
 		return errors.New("worker object storage")
@@ -82,7 +89,7 @@ func run() error {
 		return errors.New("worker identity")
 	}
 	processingStore := processing.NewPostgresStore(pool)
-	worker, err := buildWorker(processingStore, owner, func() (processing.Processor, error) {
+	worker, err := buildWorker(processingStore, operationalGate, owner, func() (processing.Processor, error) {
 		return newProductionProcessor(processingStore, stores.Originals, stores.Previews, workDir)
 	})
 	if err != nil {
@@ -144,15 +151,22 @@ func newProductionProcessor(sources processing.SourceStore, originals, previews 
 	return &processing.Pipeline{Sources: sources, Originals: originals, Previews: previews, Artifacts: artifacts, Runner: processing.ExecRunner{}, WorkRoot: workDir, ClamDefinitionsDir: "/var/lib/clamav"}, nil
 }
 
-func buildWorker(store processing.Store, owner string, factory processorFactory) (*processing.Worker, error) {
-	if store == nil || owner == "" || factory == nil {
+func buildWorker(
+	store processing.Store,
+	gate operations.ClaimGate,
+	owner string,
+	factory processorFactory,
+) (*processing.Worker, error) {
+	if store == nil || gate == nil || owner == "" || factory == nil {
 		return nil, errors.New("invalid worker wiring")
 	}
 	processor, err := factory()
 	if err != nil || processor == nil {
 		return nil, errors.New("processing pipeline unavailable")
 	}
-	return &processing.Worker{Store: store, Processor: processor, Owner: owner}, nil
+	return &processing.Worker{
+		Store: store, Processor: processor, Owner: owner, ClaimGate: gate,
+	}, nil
 }
 
 func workerOwner() (string, error) {

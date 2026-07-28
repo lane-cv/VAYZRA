@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
+
+	"happylearn.local/app/internal/operations"
 )
 
 const (
@@ -27,6 +30,8 @@ type Worker struct {
 	HeartbeatInterval time.Duration
 	Deadlines         map[string]time.Duration
 	Wake              <-chan struct{}
+	ClaimGate         operations.ClaimGate
+	LogCategory       func(string)
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -56,6 +61,16 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) RunOne(ctx context.Context) (bool, error) {
 	if err := w.validate(); err != nil {
 		return false, err
+	}
+	if w.ClaimGate != nil {
+		allowed, gateErr := w.ClaimGate.ClaimsAllowed(ctx)
+		if gateErr != nil {
+			w.log("operational_gate_failed")
+			return false, nil
+		}
+		if !allowed {
+			return false, nil
+		}
 	}
 	now := w.now()
 	job, err := w.Store.LeaseNext(ctx, w.Owner, now, w.leaseDuration())
@@ -126,6 +141,14 @@ func (w *Worker) RunOne(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 	}
+}
+
+func (w *Worker) log(category string) {
+	if w.LogCategory != nil {
+		w.LogCategory(category)
+		return
+	}
+	log.Printf("processing_worker category=%s", category)
 }
 
 func classifyFailure(err error, attempts int, now time.Time) Failure {

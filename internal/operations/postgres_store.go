@@ -228,6 +228,14 @@ FROM operational_modes WHERE singleton_id=true`).
 	return mode, nil
 }
 
+func (s *PostgresStore) ClaimsAllowed(ctx context.Context) (bool, error) {
+	mode, err := s.GetMode(ctx)
+	if err != nil {
+		return false, err
+	}
+	return mode.Mode == "normal", nil
+}
+
 func (s *PostgresStore) AcquireShared(ctx context.Context) (func(), error) {
 	waitCtx, _, done, err := s.admit(ctx)
 	if err != nil {
@@ -1294,4 +1302,5 @@ func mapLeaseError(err error) error {
 var _ Store = (*PostgresStore)(nil)
 var _ SettingsRejectionAuditor = (*PostgresStore)(nil)
 var _ WriteGate = (*PostgresStore)(nil)
+var _ ClaimGate = (*PostgresStore)(nil)
 var _ LeaseSessionCloser = (*PostgresStore)(nil)

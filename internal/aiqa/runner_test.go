@@ -84,6 +84,80 @@ func (f runnerGatewayFunc) Stream(ctx context.Context, cfg RuntimeProviderConfig
 	return f(ctx, cfg, req, cb)
 }
 
+type aiClaimGate struct {
+	allowed bool
+	err     error
+	called  chan struct{}
+}
+
+func (g *aiClaimGate) ClaimsAllowed(context.Context) (bool, error) {
+	select {
+	case g.called <- struct{}{}:
+	default:
+	}
+	return g.allowed, g.err
+}
+
+func TestOperationalGateBlocksNewAIClaimsAndLogsOnlySafeCategory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gate *aiClaimGate
+		log  string
+	}{
+		{name: "maintenance", gate: &aiClaimGate{allowed: false, called: make(chan struct{}, 1)}},
+		{name: "gate error", gate: &aiClaimGate{err: errors.New("secret database detail"), called: make(chan struct{}, 1)}, log: "operational_gate_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &runnerMemoryStore{queued: []LeasedRun{{Run: Run{ID: uuid.New()}}}}
+			var categories []string
+			stop := StartRunner(Runner{
+				Store: store, Gateway: runnerGatewayFunc(func(context.Context, RuntimeProviderConfig, GatewayRequest, func(GatewayEvent) error) error {
+					t.Fatal("gateway called while claims paused")
+					return nil
+				}),
+				Owner: "gated", GlobalConcurrency: 1, PollInterval: time.Hour,
+				ClaimGate: tc.gate, LogCategory: func(category string) { categories = append(categories, category) },
+			})
+			select {
+			case <-tc.gate.called:
+			case <-time.After(time.Second):
+				t.Fatal("claim gate was not consulted")
+			}
+			stop()
+			if store.leased.Load() != 0 || strings.Join(categories, ",") != tc.log {
+				t.Fatalf("leased=%d log=%q", store.leased.Load(), strings.Join(categories, ","))
+			}
+		})
+	}
+}
+
+func TestOperationalGateDoesNotCancelAlreadyClaimedAIRun(t *testing.T) {
+	store := &runnerMemoryStore{}
+	gate := &aiClaimGate{allowed: false, called: make(chan struct{}, 1)}
+	runner := Runner{
+		Store: store,
+		Gateway: runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, callback func(GatewayEvent) error) error {
+			if err := callback(GatewayEvent{Kind: "delta", Delta: "settled"}); err != nil {
+				return err
+			}
+			return callback(GatewayEvent{Kind: "completed", FinishReason: "stop"})
+		}),
+		Owner: "already-claimed", ClaimGate: gate, LeaseDuration: time.Second,
+		FlushInterval: time.Hour, FlushBytes: 4096,
+	}
+	runner.execute(context.Background(), LeasedRun{Run: Run{ID: uuid.New()}, LeaseOwner: "already-claimed"})
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.completed) != 1 || store.completed[0].Answer != "settled" {
+		t.Fatalf("completed=%+v", store.completed)
+	}
+	select {
+	case <-gate.called:
+		t.Fatal("settlement re-checked claim gate")
+	default:
+	}
+}
+
 func TestRunnerCompletesWithMonotonicEventsAndUsage(t *testing.T) {
 	store := &runnerMemoryStore{queued: []LeasedRun{{Run: Run{ID: uuid.New()}}}}
 	gateway := runnerGatewayFunc(func(_ context.Context, _ RuntimeProviderConfig, _ GatewayRequest, cb func(GatewayEvent) error) error {

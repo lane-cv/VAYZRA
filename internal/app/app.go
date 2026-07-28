@@ -13,6 +13,7 @@ import (
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
@@ -43,6 +44,7 @@ type Dependencies struct {
 	StudentAIEvents     aiqa.StudentEventStore
 	StudentAISummaries  aiqa.SummaryService
 	Notifications       notifications.HTTPService
+	OperationsWriteGate operations.WriteGate
 	AIFileAccess        files.AIAccessHTTPService
 	PublicOrigin        string
 	CookieSecure        bool
@@ -80,6 +82,9 @@ func New(d Dependencies) http.Handler {
 			api.Use(httpx.NoStore)
 			api.Use(httpx.OriginGuard(d.PublicOrigin))
 			api.Use(httpx.CSRF)
+			if d.OperationsWriteGate != nil {
+				api.Use(operations.UnsafeWriteGate(d.OperationsWriteGate))
+			}
 			api.Get("/auth/challenge", authHTTP.Challenge)
 			api.Post("/auth/login", authHTTP.Login)
 			api.Group(func(private chi.Router) {

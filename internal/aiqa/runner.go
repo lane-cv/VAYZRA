@@ -3,12 +3,14 @@ package aiqa
 import (
 	"context"
 	"errors"
+	"log"
 	"math"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/operations"
 )
 
 var (
@@ -62,6 +64,8 @@ type Runner struct {
 	LeaseDuration     time.Duration
 	FlushInterval     time.Duration
 	FlushBytes        int
+	ClaimGate         operations.ClaimGate
+	LogCategory       func(string)
 }
 
 func StartRunner(r Runner) func() {
@@ -113,6 +117,18 @@ func (r Runner) worker(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
+		if r.ClaimGate != nil {
+			allowed, gateErr := r.ClaimGate.ClaimsAllowed(ctx)
+			switch {
+			case gateErr != nil:
+				r.log("operational_gate_failed")
+				timer.Reset(r.PollInterval)
+				continue
+			case !allowed:
+				timer.Reset(r.PollInterval)
+				continue
+			}
+		}
 		leased, err := r.Store.LeaseNext(ctx, r.Owner, time.Now().UTC(), r.LeaseDuration)
 		switch {
 		case err == nil:
@@ -126,6 +142,14 @@ func (r Runner) worker(ctx context.Context) {
 			timer.Reset(r.PollInterval)
 		}
 	}
+}
+
+func (r Runner) log(category string) {
+	if r.LogCategory != nil {
+		r.LogCategory(category)
+		return
+	}
+	log.Printf("ai_runner category=%s", category)
 }
 
 func (r Runner) reconciler(ctx context.Context) {

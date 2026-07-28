@@ -42,6 +42,10 @@ type WriteGate interface {
 	AcquireShared(context.Context) (release func(), err error)
 }
 
+type ClaimGate interface {
+	ClaimsAllowed(context.Context) (bool, error)
+}
+
 type SettingsRejectionAuditor interface {
 	AuditSettingsRejection(context.Context, Principal, string) error
 }

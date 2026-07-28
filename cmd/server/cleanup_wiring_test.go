@@ -9,6 +9,7 @@ import (
 
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 )
 
@@ -22,7 +23,7 @@ func TestBuildApplicationStartsAndStopsUploadCleanupRunner(t *testing.T) {
 		newUploads: func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error) {
 			return cleaner, nil
 		},
-		startUploadCleanup: func(got files.ExpiredUploadCleaner) func() {
+		startUploadCleanup: func(got files.ExpiredUploadCleaner, _ operations.ClaimGate) func() {
 			if got != cleaner {
 				t.Fatal("wrong cleaner")
 			}

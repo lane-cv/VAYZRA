@@ -1990,6 +1990,45 @@ WHERE singleton_id=true`); err != nil {
 	return pool
 }
 
+func TestPostgresOperationalGateReportsNormalMaintenanceAndReadErrors(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedOperationsStore(t)
+	store := NewPostgresStore(pool)
+
+	allowed, err := store.ClaimsAllowed(ctx)
+	if err != nil || !allowed {
+		t.Fatalf("normal allowed=%t err=%v", allowed, err)
+	}
+	lease, err := store.AcquireLease(ctx, LeaseRequest{
+		Mode: "draining", OwnerID: uuid.New(),
+		ExpiresAt: postgresClock(t, pool).Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = store.ClaimsAllowed(ctx)
+	if err != nil || allowed {
+		t.Fatalf("maintenance allowed=%t err=%v", allowed, err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+
+	closedPool, err := pgxpool.New(ctx, pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPool.Close()
+	closedStore := NewPostgresStore(closedPool)
+	allowed, err = closedStore.ClaimsAllowed(ctx)
+	if err == nil || allowed {
+		t.Fatalf("closed pool allowed=%t err=%v", allowed, err)
+	}
+	if err := closedStore.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func postgresClock(t *testing.T, pool *pgxpool.Pool) time.Time {
 	t.Helper()
 	var now time.Time

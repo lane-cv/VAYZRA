@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/internal/processing"
 )
@@ -83,7 +84,7 @@ func (*leaseCountingStore) Fail(context.Context, processing.Job, processing.Fail
 
 func TestDefaultProcessorWiringFailsBeforeAnyLease(t *testing.T) {
 	store := &leaseCountingStore{}
-	worker, err := buildWorker(store, "staged-worker", func() (processing.Processor, error) { return newProductionProcessor(nil, nil, nil, "") })
+	worker, err := buildWorker(store, &workerClaimGate{allowed: true}, "staged-worker", func() (processing.Processor, error) { return newProductionProcessor(nil, nil, nil, "") })
 	if err == nil || worker != nil || store.leases != 0 || strings.Contains(err.Error(), "clamscan") {
 		t.Fatalf("worker=%v err=%v leases=%d", worker, err, store.leases)
 	}
@@ -106,7 +107,7 @@ func TestProductionProcessorWiringReturnsPipelineForCompleteDependencies(t *test
 func TestBuildWorkerRunsOneInjectedProcessorLifecycle(t *testing.T) {
 	job := processing.Job{ID: uuid.New(), FileVersionID: uuid.New(), Kind: processing.KindProcessFile, Attempts: 1}
 	store := &leaseCountingStore{job: &job}
-	worker, err := buildWorker(store, "test-worker", func() (processing.Processor, error) {
+	worker, err := buildWorker(store, &workerClaimGate{allowed: true}, "test-worker", func() (processing.Processor, error) {
 		return processorStub{}, nil
 	})
 	if err != nil || worker == nil || worker.Owner != "test-worker" || store.leases != 0 {
@@ -117,6 +118,40 @@ func TestBuildWorkerRunsOneInjectedProcessorLifecycle(t *testing.T) {
 		t.Fatalf("worked=%t err=%v leases=%d completed=%d", worked, err, store.leases, store.completed)
 	}
 }
+
+type workerClaimGate struct {
+	allowed bool
+	calls   int
+}
+
+func (g *workerClaimGate) ClaimsAllowed(context.Context) (bool, error) {
+	g.calls++
+	return g.allowed, nil
+}
+
+func TestBuildWorkerRequiresOperationalGateBeforeAnyLease(t *testing.T) {
+	store := &leaseCountingStore{}
+	worker, err := buildWorker(store, nil, "staged-worker", func() (processing.Processor, error) {
+		return processorStub{}, nil
+	})
+	if err == nil || worker != nil || store.leases != 0 {
+		t.Fatalf("worker=%v err=%v leases=%d", worker, err, store.leases)
+	}
+
+	gate := &workerClaimGate{allowed: false}
+	worker, err = buildWorker(store, gate, "staged-worker", func() (processing.Processor, error) {
+		return processorStub{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worked, runErr := worker.RunOne(context.Background())
+	if runErr != nil || worked || store.leases != 0 || gate.calls != 1 {
+		t.Fatalf("worked=%t err=%v leases=%d gate_calls=%d", worked, runErr, store.leases, gate.calls)
+	}
+}
+
+var _ operations.ClaimGate = (*workerClaimGate)(nil)
 
 type processorStub struct{}
 

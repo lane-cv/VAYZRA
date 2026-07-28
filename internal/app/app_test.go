@@ -12,8 +12,45 @@ import (
 	"github.com/google/uuid"
 
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/teaching"
 )
+
+type appOperationalGate struct {
+	calls int
+	err   error
+}
+
+func (g *appOperationalGate) AcquireShared(context.Context) (func(), error) {
+	g.calls++
+	if g.err != nil {
+		return nil, g.err
+	}
+	return func() {}, nil
+}
+
+func TestApplicationOperationalGateWrapsAPIRoutes(t *testing.T) {
+	gate := &appOperationalGate{err: operations.ErrLeaseHeld}
+	h := New(Dependencies{
+		Auth: &appFakeAuth{}, OperationsWriteGate: gate,
+		PublicOrigin: "https://learn.example.com",
+	})
+
+	login := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
+	loginRequest.Header.Set("Origin", "https://learn.example.com")
+	h.ServeHTTP(login, loginRequest)
+	if login.Code != http.StatusServiceUnavailable || gate.calls != 1 ||
+		!strings.Contains(login.Body.String(), `"code":"maintenance_mode"`) {
+		t.Fatalf("status=%d calls=%d body=%s", login.Code, gate.calls, login.Body.String())
+	}
+
+	challenge := httptest.NewRecorder()
+	h.ServeHTTP(challenge, httptest.NewRequest(http.MethodGet, "/api/v1/auth/challenge", nil))
+	if gate.calls != 1 {
+		t.Fatalf("safe request acquired operational gate: calls=%d status=%d", gate.calls, challenge.Code)
+	}
+}
 
 func TestApplicationMountsStudentTeachingRoutes(t *testing.T) {
 	h := New(Dependencies{Auth: &appStudentAuth{}, StudentTeaching: &appStudentTeaching{}})

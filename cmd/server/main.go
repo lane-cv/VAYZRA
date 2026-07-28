@@ -21,6 +21,7 @@ import (
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
@@ -92,14 +93,16 @@ type applicationDependencies struct {
 	newAIFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error)
 	newFileBindings        func(*pgxpool.Pool) files.BindingHTTPService
 	newFileCenter          func(*pgxpool.Pool) files.FileCenterHTTPService
-	startUploadCleanup     func(files.ExpiredUploadCleaner) func()
+	startUploadCleanup     func(files.ExpiredUploadCleaner, operations.ClaimGate) func()
 	newStudentTeaching     func(*pgxpool.Pool) teaching.StudentHTTPService
 	newQuestions           func(*pgxpool.Pool) qanda.HTTPServices
 	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
 	newAIReads             func(*pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService)
 	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
-	startOutbox            func(*pgxpool.Pool) func()
-	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config) (func(), error)
+	startOutbox            func(*pgxpool.Pool, operations.ClaimGate) func()
+	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
+	newOperations          func(*pgxpool.Pool) operationsRuntime
+	requireOperations      bool
 	ready                  func(*pgxpool.Pool) func(context.Context) error
 	objectReady            func(context.Context, config.Config) (func(context.Context) error, error)
 	readinessTimeout       time.Duration
@@ -110,6 +113,12 @@ type applicationDependencies struct {
 	newSearchLimiter       func(*redis.Client, config.Config) redisx.SearchRateLimiter
 	newProviderTestLimiter func(*redis.Client, config.Config) redisx.ProviderTestRateLimiter
 	closeRedis             func(*redis.Client)
+}
+
+type operationsRuntime interface {
+	operations.WriteGate
+	operations.ClaimGate
+	operations.LeaseSessionCloser
 }
 
 func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
@@ -136,6 +145,10 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newNotifications:   newProductionNotificationService,
 		startOutbox:        newProductionOutboxRunner,
 		startAIRunner:      newProductionAIRunner,
+		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
+			return operations.NewPostgresStore(pool)
+		},
+		requireOperations: true,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -290,21 +303,37 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		}
 	}
 	ready := combineReadinessWithTimeout(databaseReady, objectReady, deps.readinessTimeout)
+	var operationalGate operationsRuntime
+	if deps.newOperations != nil {
+		operationalGate = deps.newOperations(pool)
+	}
+	if deps.requireOperations && operationalGate == nil {
+		closePool()
+		return nil, nil, errors.New("initialize operations gate")
+	}
 	var limiter redisx.Limiter
 	var captchas redisx.CaptchaService
 	var progressLimiter redisx.ProgressWriteLimiter
 	var searchLimiter redisx.SearchRateLimiter
 	var providerTestLimiter redisx.ProviderTestRateLimiter
 	closeResources := closePool
+	if operationalGate != nil {
+		closeResources = func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = operationalGate.Close(closeCtx)
+			cancel()
+			closePool()
+		}
+	}
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
 		if err != nil {
-			closePool()
+			closeResources()
 			return nil, nil, errors.New("initialize login throttling")
 		}
 		if deps.newThrottle == nil || deps.closeRedis == nil {
-			closePool()
 			_ = client.Close()
+			closeResources()
 			return nil, nil, errors.New("initialize login throttling")
 		}
 		limiter, captchas = deps.newThrottle(client, cfg)
@@ -317,13 +346,14 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		if deps.newProviderTestLimiter != nil {
 			providerTestLimiter = deps.newProviderTestLimiter(client, cfg)
 		}
+		closeOtherResources := closeResources
 		closeResources = func() {
 			deps.closeRedis(client)
-			closePool()
+			closeOtherResources()
 		}
 	}
 	if cleaner, ok := uploadService.(files.ExpiredUploadCleaner); ok && deps.startUploadCleanup != nil {
-		stopCleanup := deps.startUploadCleanup(cleaner)
+		stopCleanup := deps.startUploadCleanup(cleaner, operationalGate)
 		closeOtherResources := closeResources
 		closeResources = func() {
 			stopCleanup()
@@ -351,6 +381,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentAIEvents:     studentAIEvents,
 		StudentAISummaries:  studentAISummaries,
 		Notifications:       notificationService,
+		OperationsWriteGate: operationalGate,
 		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
 		CookieSecure:        cfg.CookieSecure,
@@ -363,7 +394,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StaticFiles:         os.DirFS("web/dist"),
 	})
 	if deps.startOutbox != nil {
-		stopOutbox := deps.startOutbox(pool)
+		stopOutbox := deps.startOutbox(pool, operationalGate)
 		if stopOutbox == nil {
 			closeResources()
 			return nil, nil, errors.New("initialize notification delivery")
@@ -375,7 +406,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		}
 	}
 	if deps.startAIRunner != nil {
-		stopAIRunner, startErr := deps.startAIRunner(ctx, pool, cfg)
+		stopAIRunner, startErr := deps.startAIRunner(ctx, pool, cfg, operationalGate)
 		if startErr != nil || stopAIRunner == nil {
 			closeResources()
 			return nil, nil, errors.New("initialize AI runner")
@@ -568,14 +599,20 @@ func newProductionNotificationService(pool *pgxpool.Pool) notifications.HTTPServ
 	return notifications.NewService(notifications.NewPostgresStore(pool))
 }
 
-func newProductionOutboxRunner(pool *pgxpool.Pool) func() {
+func newProductionOutboxRunner(pool *pgxpool.Pool, gate operations.ClaimGate) func() {
 	return notifications.StartOutboxRunner(notifications.Runner{
 		Store: notifications.NewPostgresOutboxStore(pool), Owner: uuid.NewString(),
 		PollInterval: time.Second, BatchTimeout: 10 * time.Second, ShutdownTimeout: 2 * time.Second,
+		ClaimGate: gate,
 	})
 }
 
-func newProductionAIRunner(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) (func(), error) {
+func newProductionAIRunner(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg config.Config,
+	gate operations.ClaimGate,
+) (func(), error) {
 	box, err := aiqa.NewAESGCMSecretBox(cfg.AIMasterKey, cfg.AIMasterKeyVersion, rand.Reader)
 	if err != nil {
 		return nil, err
@@ -595,6 +632,7 @@ func newProductionAIRunner(ctx context.Context, pool *pgxpool.Pool, cfg config.C
 		Owner: uuid.NewString(), GlobalConcurrency: cfg.AIGlobalConcurrency,
 		PollInterval: time.Second, LeaseDuration: 30 * time.Second,
 		FlushInterval: 250 * time.Millisecond, FlushBytes: 4 << 10,
+		ClaimGate: gate,
 	}), nil
 }
 
