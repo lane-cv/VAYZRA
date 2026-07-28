@@ -72,7 +72,8 @@ func TestBuildApplicationRejectsNilUploadCleanupStopAndClosesResources(t *testin
 			newOperations: func(*pgxpool.Pool) operationsRuntime {
 				return gate
 			},
-			requireOperations: true,
+			newAdminOperations: newServerAdminOperations,
+			requireOperations:  true,
 			startUploadCleanup: func(
 				files.ExpiredUploadCleaner,
 				operations.WriteGate,

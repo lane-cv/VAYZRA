@@ -2,19 +2,26 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 )
 
 type service struct {
-	store ServiceStore
+	store       ServiceStore
+	auditReader audit.FilteredReader
 }
 
-func NewService(store ServiceStore) HTTPService {
-	return &service{store: store}
+func NewService(store ServiceStore, readers ...audit.FilteredReader) HTTPService {
+	var reader audit.FilteredReader
+	if len(readers) > 0 {
+		reader = readers[0]
+	}
+	return &service{store: store, auditReader: reader}
 }
 
 func (s *service) GetSettings(ctx context.Context, principal Principal) (Settings, error) {
@@ -39,6 +46,16 @@ func (s *service) UpdateSettings(ctx context.Context, principal Principal, setti
 		return Settings{}, err
 	}
 	return s.store.UpdateSettings(ctx, principal, settings)
+}
+
+func (s *service) ListAudit(ctx context.Context, principal Principal, filter audit.AuditFilter) (audit.AuditPage, error) {
+	if err := authorizeSettings(principal); err != nil {
+		return audit.AuditPage{}, err
+	}
+	if s.auditReader == nil {
+		return audit.AuditPage{}, errors.New("operations audit reader unavailable")
+	}
+	return s.auditReader.ListFiltered(ctx, filter)
 }
 
 func highRiskSettingsReason(settings Settings) string {

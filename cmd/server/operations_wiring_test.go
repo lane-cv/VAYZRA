@@ -7,10 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/operations"
@@ -20,6 +22,32 @@ import (
 
 type serverOperationsRuntime struct {
 	events *[]string
+}
+
+type serverAdminOperationsService struct{}
+
+func newServerAdminOperations(*pgxpool.Pool, operationsRuntime) operations.HTTPService {
+	return &serverAdminOperationsService{}
+}
+
+func (*serverAdminOperationsService) GetSettings(context.Context, operations.Principal) (operations.Settings, error) {
+	return operations.Settings{
+		Version: 1, SiteName: "HappyLearn", SoftDeleteRetentionDays: 30,
+		AuditRetentionDays: 365, OperationalSampleRetentionDays: 7,
+		BackupHour: 3, BackupTimezone: "Asia/Shanghai",
+		DiskWarningPercent: 75, DiskCriticalPercent: 90,
+		AIErrorWarningPercent: 10, AIErrorCriticalPercent: 25,
+		ProcessingQueueWarning: 20, ProcessingQueueCritical: 100,
+		UpdatedAt: time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+func (*serverAdminOperationsService) UpdateSettings(_ context.Context, _ operations.Principal, settings operations.Settings) (operations.Settings, error) {
+	return settings, nil
+}
+
+func (*serverAdminOperationsService) ListAudit(context.Context, operations.Principal, audit.AuditFilter) (audit.AuditPage, error) {
+	return audit.AuditPage{Items: []audit.Record{}}, nil
 }
 
 func (g *serverOperationsRuntime) AcquireShared(context.Context) (func(), error) {
@@ -51,6 +79,89 @@ func TestProductionApplicationRequiresOperationalGate(t *testing.T) {
 	}
 }
 
+func TestProductionApplicationWiresAdminOperationsFromSharedRuntime(t *testing.T) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	var factoryGate operationsRuntime
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open:          func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+			migrate:       func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth:       func(*pgxpool.Pool) (auth.HTTPService, error) { return serverAdminAuth{}, nil },
+			newOperations: func(*pgxpool.Pool) operationsRuntime { return gate },
+			newAdminOperations: func(_ *pgxpool.Pool, runtime operationsRuntime) operations.HTTPService {
+				factoryGate = runtime
+				return &serverAdminOperationsService{}
+			},
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) { events = append(events, "pool_close") },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/operations/settings", nil)
+	request.AddCookie(&http.Cookie{Name: "hl_session", Value: "opaque-token"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || factoryGate != gate ||
+		!strings.Contains(response.Body.String(), `"siteName":"HappyLearn"`) {
+		t.Fatalf("status=%d same_gate=%t body=%s", response.Code, factoryGate == gate, response.Body.String())
+	}
+	closeResources()
+	if got := strings.Join(events, ","); got != "operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestAdminOperationsInitializationFailureClosesRuntimeBeforePool(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		factory func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
+	}{
+		{name: "missing factory"},
+		{
+			name: "nil service",
+			factory: func(*pgxpool.Pool, operationsRuntime) operations.HTTPService {
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			gate := &serverOperationsRuntime{events: &events}
+			handler, cleanup, err := buildApplication(
+				context.Background(),
+				config.Config{},
+				applicationDependencies{
+					open:               func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+					migrate:            func(context.Context, *pgxpool.Pool) error { return nil },
+					newAuth:            func(*pgxpool.Pool) (auth.HTTPService, error) { return serverFakeAuth{}, nil },
+					newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+					newAdminOperations: tc.factory,
+					requireOperations:  true,
+					ready: func(*pgxpool.Pool) func(context.Context) error {
+						return func(context.Context) error { return nil }
+					},
+					close: func(*pgxpool.Pool) { events = append(events, "pool_close") },
+				},
+			)
+			if handler != nil || cleanup != nil || err == nil ||
+				err.Error() != "initialize operations service" {
+				t.Fatalf("handler=%v cleanup_present=%t err=%v", handler, cleanup != nil, err)
+			}
+			if got := strings.Join(events, ","); got != "operations_close,pool_close" {
+				t.Fatalf("lifecycle=%s", got)
+			}
+		})
+	}
+}
+
 func TestProductionApplicationSharesOneOperationalGateAndClosesItBeforePool(t *testing.T) {
 	var events []string
 	gate := &serverOperationsRuntime{events: &events}
@@ -66,7 +177,8 @@ func TestProductionApplicationSharesOneOperationalGateAndClosesItBeforePool(t *t
 		newUploads: func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error) {
 			return cleaner, nil
 		},
-		newOperations: func(*pgxpool.Pool) operationsRuntime { return gate },
+		newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+		newAdminOperations: newServerAdminOperations,
 		startUploadCleanup: func(got files.ExpiredUploadCleaner, claimGate operations.WriteGate) func() {
 			if got != cleaner {
 				t.Fatal("wrong cleanup service")
@@ -140,14 +252,15 @@ func TestOperationalGateClosesOnRedisInitializationFailures(t *testing.T) {
 				context.Background(),
 				config.Config{},
 				applicationDependencies{
-					open:              func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
-					migrate:           func(context.Context, *pgxpool.Pool) error { return nil },
-					newAuth:           func(*pgxpool.Pool) (auth.HTTPService, error) { return serverFakeAuth{}, nil },
-					newOperations:     func(*pgxpool.Pool) operationsRuntime { return gate },
-					requireOperations: true,
-					ready:             func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
-					openRedis:         tc.openRedis,
-					close:             func(*pgxpool.Pool) { events = append(events, "pool_close") },
+					open:               func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+					migrate:            func(context.Context, *pgxpool.Pool) error { return nil },
+					newAuth:            func(*pgxpool.Pool) (auth.HTTPService, error) { return serverFakeAuth{}, nil },
+					newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+					newAdminOperations: newServerAdminOperations,
+					requireOperations:  true,
+					ready:              func(*pgxpool.Pool) func(context.Context) error { return func(context.Context) error { return nil } },
+					openRedis:          tc.openRedis,
+					close:              func(*pgxpool.Pool) { events = append(events, "pool_close") },
 				},
 			)
 			if handler != nil || closeResources != nil || err == nil ||

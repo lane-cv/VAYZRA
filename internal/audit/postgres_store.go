@@ -47,38 +47,92 @@ func (s *PostgresWriter) List(ctx context.Context, limit int, beforeID int64) ([
 	if limit > 100 {
 		limit = 100
 	}
-	var cursor any
-	if beforeID != 0 {
-		cursor = beforeID
+	if beforeID < 0 {
+		return []Record{}, nil
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, actor_user_id, action, target_type, target_id, metadata, request_id, ip, occurred_at FROM audit_logs WHERE ($2::bigint IS NULL OR id < $2) ORDER BY id DESC LIMIT $1`, limit, cursor)
+	page, err := s.ListFiltered(ctx, AuditFilter{BeforeID: beforeID, Limit: limit})
 	if err != nil {
-		return nil, fmt.Errorf("list audit events: %w", err)
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *PostgresWriter) ListFiltered(ctx context.Context, filter AuditFilter) (AuditPage, error) {
+	if err := validateAuditFilter(filter); err != nil {
+		return AuditPage{}, err
+	}
+	var actorID, from, to, cursor any
+	if filter.ActorID != uuid.Nil {
+		actorID = filter.ActorID
+	}
+	if !filter.From.IsZero() {
+		from = filter.From
+	}
+	if !filter.To.IsZero() {
+		to = filter.To
+	}
+	if filter.BeforeID != 0 {
+		cursor = filter.BeforeID
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT id,actor_user_id,action,target_type,target_id,metadata,request_id,ip,occurred_at
+FROM audit_logs
+WHERE ($1::text='' OR action=$1)
+  AND ($2::text='' OR target_type=$2)
+  AND ($3::text='' OR metadata->>'outcome'=$3)
+  AND ($4::uuid IS NULL OR actor_user_id=$4)
+  AND ($5::timestamptz IS NULL OR occurred_at >= $5)
+  AND ($6::timestamptz IS NULL OR occurred_at <= $6)
+  AND ($7::bigint IS NULL OR id < $7)
+ORDER BY id DESC
+LIMIT $8`,
+		filter.Action, filter.TargetType, filter.Outcome, actorID,
+		from, to, cursor, filter.Limit+1,
+	)
+	if err != nil {
+		return AuditPage{}, fmt.Errorf("list audit events: %w", err)
 	}
 	defer rows.Close()
-	result := make([]Record, 0, limit)
-	for rows.Next() {
+	result := make([]Record, 0, filter.Limit+1)
+	for rows.Next() && len(result) < filter.Limit+1 {
 		var record Record
 		var metadata []byte
 		var ip net.IP
 		var actorUserID *uuid.UUID
 		if err := rows.Scan(&record.ID, &actorUserID, &record.Action, &record.TargetType, &record.TargetID, &metadata, &record.RequestID, &ip, &record.OccurredAt); err != nil {
-			return nil, fmt.Errorf("scan audit event: %w", err)
+			return AuditPage{}, fmt.Errorf("scan audit event: %w", err)
 		}
 		if actorUserID != nil {
 			record.ActorUserID = *actorUserID
 		}
 		if err := json.Unmarshal(metadata, &record.Metadata); err != nil {
-			return nil, fmt.Errorf("decode audit metadata: %w", err)
+			return AuditPage{}, fmt.Errorf("decode audit metadata: %w", err)
 		}
 		record.IP = append(net.IP(nil), ip...)
 		record.OccurredAt = record.OccurredAt.UTC()
 		result = append(result, record)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate audit events: %w", err)
+		return AuditPage{}, fmt.Errorf("iterate audit events: %w", err)
 	}
-	return result, nil
+	page := AuditPage{Items: result}
+	if len(result) > filter.Limit {
+		page.Items = result[:filter.Limit]
+		page.NextBeforeID = page.Items[len(page.Items)-1].ID
+	}
+	return page, nil
+}
+
+func validateAuditFilter(filter AuditFilter) error {
+	if filter.Limit < 1 || filter.Limit > 100 ||
+		filter.BeforeID < 0 ||
+		(filter.Action != "" && !identifier.MatchString(filter.Action)) ||
+		(filter.TargetType != "" && !identifier.MatchString(filter.TargetType)) ||
+		(filter.Outcome != "" && !identifier.MatchString(filter.Outcome)) ||
+		(!filter.From.IsZero() && !filter.To.IsZero() && filter.From.After(filter.To)) {
+		return ErrInvalidFilter
+	}
+	return nil
 }
 
 func validateAndMarshal(event Event) ([]byte, error) {

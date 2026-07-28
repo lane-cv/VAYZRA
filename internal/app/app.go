@@ -45,6 +45,7 @@ type Dependencies struct {
 	StudentAISummaries  aiqa.SummaryService
 	Notifications       notifications.HTTPService
 	OperationsWriteGate operations.WriteGate
+	AdminOperations     operations.HTTPService
 	AIFileAccess        files.AIAccessHTTPService
 	PublicOrigin        string
 	CookieSecure        bool
@@ -133,6 +134,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.AdminAIUsage != nil {
 					private.Mount("/admin/ai/usage", aiqa.NewAdminUsageHandler(d.AdminAIUsage, d.TrustedProxyCIDRs).Routes())
+				}
+				if d.AdminOperations != nil {
+					private.Mount("/admin/operations", operations.NewAdminHandler(d.AdminOperations, d.TrustedProxyCIDRs).Routes())
 				}
 				if d.StudentAI != nil {
 					private.Mount("/student/ai", aiqa.NewStudentHandlerWithConfig(d.StudentAI, d.StudentAIEvents, aiqa.StudentHTTPConfig{

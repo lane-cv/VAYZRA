@@ -122,6 +122,7 @@ type applicationDependencies struct {
 	startOutbox            func(*pgxpool.Pool, operations.ClaimGate) func()
 	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
 	newOperations          func(*pgxpool.Pool) operationsRuntime
+	newAdminOperations     func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
 	requireOperations      bool
 	ready                  func(*pgxpool.Pool) func(context.Context) error
 	objectReady            func(context.Context, config.Config) (func(context.Context) error, error)
@@ -168,7 +169,8 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
 			return operations.NewPostgresStore(pool)
 		},
-		requireOperations: true,
+		newAdminOperations: newProductionAdminOperationsService,
+		requireOperations:  true,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -345,6 +347,18 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closePool()
 		}
 	}
+	var adminOperations operations.HTTPService
+	if deps.requireOperations && deps.newAdminOperations == nil {
+		closeResources()
+		return nil, nil, errors.New("initialize operations service")
+	}
+	if deps.newAdminOperations != nil {
+		adminOperations = deps.newAdminOperations(pool, operationalGate)
+		if adminOperations == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize operations service")
+		}
+	}
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
 		if err != nil {
@@ -406,6 +420,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 		StudentAISummaries:  studentAISummaries,
 		Notifications:       notificationService,
 		OperationsWriteGate: operationalGate,
+		AdminOperations:     adminOperations,
 		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
 		CookieSecure:        cfg.CookieSecure,
@@ -621,6 +636,17 @@ func newProductionQuestionServices(pool *pgxpool.Pool) qanda.HTTPServices {
 
 func newProductionNotificationService(pool *pgxpool.Pool) notifications.HTTPService {
 	return notifications.NewService(notifications.NewPostgresStore(pool))
+}
+
+func newProductionAdminOperationsService(
+	pool *pgxpool.Pool,
+	runtime operationsRuntime,
+) operations.HTTPService {
+	store, ok := runtime.(operations.ServiceStore)
+	if !ok {
+		return nil
+	}
+	return operations.NewService(store, audit.NewPostgresWriter(pool))
 }
 
 func newProductionOutboxRunner(pool *pgxpool.Pool, gate operations.ClaimGate) func() {

@@ -5,11 +5,88 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
 )
+
+func TestPostgresAuditFilteredReadsUseStableKeysetAndExactFilters(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE audit_logs, users CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	actorID := uuid.MustParse("60000000-0000-4000-8000-000000000001")
+	otherActorID := uuid.MustParse("60000000-0000-4000-8000-000000000002")
+	if _, err := pool.Exec(ctx, `
+INSERT INTO users(id,username,display_name,role,password_hash,must_change_password)
+VALUES
+  ($1,'audit_filter_admin','Audit Filter Admin','admin','hash',false),
+  ($2,'audit_filter_other','Audit Filter Other','student','hash',false)`,
+		actorID, otherActorID); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	for _, row := range []struct {
+		actor     uuid.UUID
+		action    string
+		target    string
+		targetID  string
+		metadata  string
+		occurred  time.Time
+		requestID string
+	}{
+		{actorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"retention","credential":"secret"}`, base, "audit-filter-0001"},
+		{actorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"threshold"}`, base.Add(time.Minute), "audit-filter-0002"},
+		{actorID, "operations.settings_updated", "system_settings", "global", `{"outcome":"succeeded","status":"updated"}`, base.Add(2 * time.Minute), "audit-filter-0003"},
+		{otherActorID, "operations.settings_rejected", "system_settings", "global", `{"outcome":"rejected","reason":"backup_schedule"}`, base.Add(3 * time.Minute), "audit-filter-0004"},
+	} {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,metadata,request_id,ip,occurred_at)
+VALUES($1,$2,$3,$4,$5::jsonb,$6,'192.0.2.80',$7)`,
+			row.actor, row.action, row.target, row.targetID, row.metadata, row.requestID, row.occurred); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewPostgresWriter(pool)
+	filter := AuditFilter{
+		Action: "operations.settings_rejected", TargetType: "system_settings",
+		Outcome: "rejected", ActorID: actorID,
+		From: base.Add(-time.Second), To: base.Add(2 * time.Minute),
+		Limit: 1,
+	}
+	first, err := store.ListFiltered(ctx, filter)
+	if err != nil || len(first.Items) != 1 || first.NextBeforeID == 0 ||
+		first.Items[0].RequestID != "audit-filter-0002" {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	filter.BeforeID = first.NextBeforeID
+	second, err := store.ListFiltered(ctx, filter)
+	if err != nil || len(second.Items) != 1 || second.NextBeforeID != 0 ||
+		second.Items[0].RequestID != "audit-filter-0001" {
+		t.Fatalf("second=%#v err=%v", second, err)
+	}
+	if _, err := store.ListFiltered(ctx, AuditFilter{
+		Action: "' OR TRUE --", Limit: 20,
+	}); !errors.Is(err, ErrInvalidFilter) {
+		t.Fatalf("unsafe filter error=%v", err)
+	}
+
+	compatibility, err := store.List(ctx, 1000, 0)
+	if err != nil || len(compatibility) != 4 {
+		t.Fatalf("compatibility records=%d err=%v", len(compatibility), err)
+	}
+	negativeCursor, err := store.List(ctx, 10, -1)
+	if err != nil || len(negativeCursor) != 0 {
+		t.Fatalf("negative compatibility records=%d err=%v", len(negativeCursor), err)
+	}
+}
 
 func TestPostgresWriterSanitizesAndAuditRowsAreImmutable(t *testing.T) {
 	pool := integration.StartPostgres(t)
