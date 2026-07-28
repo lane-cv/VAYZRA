@@ -247,7 +247,7 @@ func validCreateBody(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return false
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
+	if len(raw) == 0 {
 		return true
 	}
 	values := r.Header.Values("Content-Type")

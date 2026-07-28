@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -163,6 +164,91 @@ func TestBackupAdminCreateAcceptsExactEmptyJSONObjectUsedByWebClient(t *testing.
 	httpx.RequestID(handler).ServeHTTP(result, request)
 	if result.Code != http.StatusAccepted || service.createCalls != 1 {
 		t.Fatalf("status=%d calls=%d body=%s", result.Code, service.createCalls, result.Body.String())
+	}
+}
+
+func TestBackupAdminCreateAcceptsZeroLengthBodyThatIsNotNoBody(t *testing.T) {
+	service := &backupHTTPService{createRun: Run{
+		ID: uuid.New(), Trigger: TriggerManual, State: StateQueued,
+		RequestedAt: time.Now().UTC(),
+	}}
+	handler := NewAdminHandler(service, nil).Routes()
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request.Body = io.NopCloser(strings.NewReader(""))
+	request.Header.Set("Idempotency-Key", "manual:key-123")
+	request = request.WithContext(auth.ContextWithUser(request.Context(), activeAdmin()))
+	result := httptest.NewRecorder()
+	httpx.RequestID(handler).ServeHTTP(result, request)
+	if result.Code != http.StatusAccepted || service.createCalls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", result.Code, service.createCalls, result.Body.String())
+	}
+}
+
+func TestBackupAdminCreateRejectsEveryOtherNonEmptyBody(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		body         string
+		contentTypes []string
+		wantStatus   int
+		wantCode     string
+	}{
+		{
+			name: "whitespace without content type", body: " \n\t",
+			wantStatus: http.StatusUnsupportedMediaType, wantCode: "unsupported_media_type",
+		},
+		{
+			name: "whitespace JSON", body: " \n\t", contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "BOM", body: "\ufeff", contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "string", body: `"value"`, contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "null", body: `null`, contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "array", body: `[]`, contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "multiple values", body: `{} {}`, contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "trailing token", body: `{} true`, contentTypes: []string{"application/json"},
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_request",
+		},
+		{
+			name: "duplicate content type", body: `{}`,
+			contentTypes: []string{"application/json", "application/json"},
+			wantStatus:   http.StatusUnsupportedMediaType, wantCode: "unsupported_media_type",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &backupHTTPService{}
+			handler := NewAdminHandler(service, nil).Routes()
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			request.Header.Set("Idempotency-Key", "manual:key-123")
+			for _, value := range tc.contentTypes {
+				request.Header.Add("Content-Type", value)
+			}
+			request = request.WithContext(auth.ContextWithUser(request.Context(), activeAdmin()))
+			result := httptest.NewRecorder()
+			httpx.RequestID(handler).ServeHTTP(result, request)
+			if result.Code != tc.wantStatus ||
+				!strings.Contains(result.Body.String(), `"code":"`+tc.wantCode+`"`) {
+				t.Fatalf("status=%d body=%s", result.Code, result.Body.String())
+			}
+			if service.createCalls != 0 {
+				t.Fatalf("create calls=%d", service.createCalls)
+			}
+		})
 	}
 }
 
