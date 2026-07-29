@@ -46,9 +46,23 @@ const resolved: OperationalAlert = {
 
 const mounted: VueWrapper[] = []
 function deferred<T>() {
+  let reject!: (reason?: unknown) => void
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => { resolve = done })
-  return { promise, resolve }
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, reject, resolve }
+}
+
+function orderedAlert(position: number): OperationalAlert {
+  return {
+    ...warning,
+    id: `30000000-0000-4000-8000-${String(position).padStart(12, '0')}`,
+    dedupeKey: `ordered_alert_${position}`,
+    lastObservedAt: new Date(Date.parse(lastObservedAt) - position * 60_000).toISOString(),
+    summary: `Ordered alert ${position}`,
+  }
 }
 
 function mountView() {
@@ -153,6 +167,7 @@ describe('AlertsView', () => {
       .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
       .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
       .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
+      .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
       .mockResolvedValueOnce({ items: [third], next: null })
     const wrapper = mountView()
     await flushPromises()
@@ -168,6 +183,7 @@ describe('AlertsView', () => {
       { limit: 50 },
       { before: 'page-2', limit: 50 },
       { limit: 50 },
+      { before: 'page-2', limit: 50 },
       { before: 'page-3', limit: 50 },
     ])
     expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual([
@@ -189,6 +205,7 @@ describe('AlertsView', () => {
       .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
       .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
       .mockImplementationOnce(() => refreshing.promise)
+      .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
       .mockResolvedValueOnce({ items: [third], next: null })
     const wrapper = mountView()
     await flushPromises()
@@ -205,8 +222,120 @@ describe('AlertsView', () => {
     await flushPromises()
     await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
     await flushPromises()
-    expect(api.listAlerts).toHaveBeenCalledTimes(4)
-    expect(api.listAlerts.mock.calls[3]?.[0]).toEqual({ before: 'page-3', limit: 50 })
+    expect(api.listAlerts).toHaveBeenCalledTimes(5)
+    expect(api.listAlerts.mock.calls[4]?.[0]).toEqual({ before: 'page-3', limit: 50 })
+  })
+
+  it('atomically rebuilds every loaded page when a new alert shifts a full head page', async () => {
+    vi.useFakeTimers()
+    const originalHead = Array.from({ length: 50 }, (_, index) => orderedAlert(index + 1))
+    const originalTail = [orderedAlert(51)]
+    const refreshedHead = Array.from({ length: 50 }, (_, index) => orderedAlert(index))
+    const refreshedTail = [orderedAlert(50), orderedAlert(51)]
+    api.listAlerts
+      .mockResolvedValueOnce({ items: originalHead, next: 'initial-page-2' })
+      .mockResolvedValueOnce({ items: originalHead, next: 'initial-page-2' })
+      .mockResolvedValueOnce({ items: originalTail, next: null })
+      .mockResolvedValueOnce({ items: refreshedHead, next: 'refreshed-page-2' })
+      .mockResolvedValueOnce({ items: refreshedTail, next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alert-state-filter"]').setValue('open')
+    await wrapper.get('[data-testid="alert-filters"]').trigger('submit')
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(api.listAlerts.mock.calls.slice(3).map(([request]) => request)).toEqual([
+      { state: 'open', limit: 50 },
+      { state: 'open', before: 'refreshed-page-2', limit: 50 },
+    ])
+    expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual(
+      Array.from({ length: 52 }, (_, index) => orderedAlert(index).id),
+    )
+  })
+
+  it('uses server order when an alert from a loaded tail page moves into the refreshed head', async () => {
+    vi.useFakeTimers()
+    const tailWarning = { ...warning, lastObservedAt: '2026-07-30T07:30:00Z' }
+    const promotedWarning = { ...warning, lastObservedAt: '2026-07-30T09:00:00Z' }
+    const third = {
+      ...warning,
+      id: '10000000-0000-4000-8000-000000000003',
+      lastObservedAt: '2026-07-30T07:00:00Z',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: 'initial-tail' })
+      .mockResolvedValueOnce({ items: [tailWarning, third], next: null })
+      .mockResolvedValueOnce({ items: [promotedWarning, critical], next: 'refreshed-tail' })
+      .mockResolvedValueOnce({ items: [third], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual([
+      warning.id,
+      critical.id,
+      third.id,
+    ])
+    expect(wrapper.find(`[data-id="${warning.id}"] time[datetime="${promotedWarning.lastObservedAt}"]`).exists()).toBe(true)
+  })
+
+  it('removes a resolved alert from a loaded tail page under an open filter rebuild', async () => {
+    vi.useFakeTimers()
+    const head = orderedAlert(1)
+    const tail = orderedAlert(2)
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [head], next: 'initial-tail' })
+      .mockResolvedValueOnce({ items: [head], next: 'initial-tail' })
+      .mockResolvedValueOnce({ items: [tail], next: null })
+      .mockResolvedValueOnce({ items: [head], next: 'refreshed-tail' })
+      .mockResolvedValueOnce({ items: [], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alert-state-filter"]').setValue('open')
+    await wrapper.get('[data-testid="alert-filters"]').trigger('submit')
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(wrapper.find(`[data-id="${tail.id}"]`).exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual([
+      head.id,
+    ])
+  })
+
+  it('keeps the previous complete list when a later page of a live rebuild fails', async () => {
+    vi.useFakeTimers()
+    const head = orderedAlert(1)
+    const tail = orderedAlert(2)
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [head], next: 'initial-tail' })
+      .mockResolvedValueOnce({ items: [tail], next: null })
+      .mockResolvedValueOnce({ items: [orderedAlert(0)], next: 'refreshed-tail' })
+      .mockRejectedValueOnce(new APIError(503, 'internal_error', '刷新失败', 'req-refresh'))
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual([
+      head.id,
+      tail.id,
+    ])
   })
 
   it('requires confirmation before acknowledgement and updates the alert in place', async () => {
@@ -379,11 +508,64 @@ describe('AlertsView', () => {
     expect(wrapper.get(`[data-id="${critical.id}"]`).text()).toContain('已确认')
   })
 
+  it('does not start or apply a visibility refresh triggered after acknowledgement begins', async () => {
+    const mutation = deferred<OperationalAlert>()
+    const polling = deferred<AlertPage>()
+    const acknowledged: OperationalAlert = {
+      ...critical,
+      state: 'acknowledged',
+      acknowledgedBy: '20000000-0000-4000-8000-000000000001',
+      acknowledgedAt: '2026-07-30T08:01:00Z',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockImplementationOnce(() => polling.promise)
+    api.acknowledgeAlert.mockImplementationOnce(() => mutation.promise)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flushPromises()
+
+    expect(api.listAlerts).toHaveBeenCalledTimes(1)
+    mutation.resolve(acknowledged)
+    await flushPromises()
+    polling.resolve({ items: [critical], next: null })
+    await flushPromises()
+    expect(wrapper.get(`[data-id="${critical.id}"]`).text()).toContain('已确认')
+  })
+
+  it('invalidates a mutation-period visibility response after acknowledgement fails', async () => {
+    const mutation = deferred<OperationalAlert>()
+    const polling = deferred<AlertPage>()
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockImplementationOnce(() => polling.promise)
+    api.acknowledgeAlert.mockImplementationOnce(() => mutation.promise)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flushPromises()
+    mutation.reject(new APIError(500, 'internal_error', '确认失败', 'req-acknowledge'))
+    await flushPromises()
+    polling.resolve({ items: [resolved], next: null })
+    await flushPromises()
+
+    expect(api.listAlerts).toHaveBeenCalledTimes(1)
+    expect(wrapper.get(`[data-id="${critical.id}"]`).text()).toContain('未处理')
+    expect(wrapper.get('[data-testid="acknowledge-error"]').text()).toContain('req-acknowledge')
+  })
+
   it('shows a live resolution without removing other loaded alerts', async () => {
     vi.useFakeTimers()
     api.listAlerts
       .mockResolvedValueOnce({ items: [warning, critical], next: null })
-      .mockResolvedValueOnce({ items: [resolved], next: null })
+      .mockResolvedValueOnce({ items: [resolved, critical], next: null })
     const wrapper = mountView()
     await flushPromises()
 

@@ -43,8 +43,7 @@ const acknowledgementCancel = ref<HTMLButtonElement>()
 const acknowledgementFeedback = ref<HTMLElement>()
 let alive = true
 let generation = 0
-let loadedPastHead = false
-let headIDs = new Set<string>()
+let loadedPageCount = 1
 let replaceController: AbortController | undefined
 let appendController: AbortController | undefined
 let polling: ReturnType<typeof setInterval> | undefined
@@ -109,20 +108,6 @@ function appendItems(incoming: OperationalAlert[]) {
   }
 }
 
-function mergeLive(incoming: OperationalAlert[]) {
-  const received = uniqueAlerts(incoming)
-  const updates = new Map(received.map((item) => [item.id, item]))
-  const existing = new Set(items.value.map((item) => item.id))
-  const retained = items.value
-    .map((item) => updates.get(item.id) ?? item)
-    .filter(matchesActiveFilters)
-  const additions: OperationalAlert[] = []
-  for (const item of received) {
-    if (matchesActiveFilters(item) && !existing.has(item.id)) additions.push(item)
-  }
-  items.value = [...additions, ...retained]
-}
-
 async function focusResults() {
   await nextTick()
   resultsTitle.value?.focus()
@@ -149,9 +134,8 @@ async function replace(restoreFocus = false) {
     )
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     replaceItems(page.items)
-    headIDs = new Set(items.value.map((item) => item.id))
     nextCursor.value = page.next
-    loadedPastHead = false
+    loadedPageCount = 1
     loaded = true
   } catch (reason) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
@@ -176,34 +160,36 @@ async function refreshLive() {
     document.visibilityState !== 'visible'
     || loading.value
     || loadingMore.value
+    || acknowledging.value
     || replaceController !== undefined
   ) return
   const requestGeneration = generation
+  const pagesToLoad = loadedPageCount
+  const requestFilters = { ...activeFilters.value }
   const controller = new AbortController()
   replaceController = controller
   try {
-    const page = await listAlerts(
-      { ...activeFilters.value, limit: PAGE_SIZE },
-      controller.signal,
-    )
-    if (!alive || controller.signal.aborted || requestGeneration !== generation) return
-    const nextHeadIDs = new Set(
-      uniqueAlerts(page.items)
-        .filter(matchesActiveFilters)
-        .map((item) => item.id),
-    )
-    if (
-      activeFilters.value.state !== undefined
-      || activeFilters.value.severity !== undefined
-      || activeFilters.value.category !== undefined
-    ) {
-      items.value = items.value.filter(
-        (item) => !headIDs.has(item.id) || nextHeadIDs.has(item.id),
+    const refreshed: OperationalAlert[] = []
+    let cursor: string | null = null
+    let pagesLoaded = 0
+    for (let pageIndex = 0; pageIndex < pagesToLoad; pageIndex++) {
+      const page = await listAlerts(
+        {
+          ...requestFilters,
+          ...(cursor ? { before: cursor } : {}),
+          limit: PAGE_SIZE,
+        },
+        controller.signal,
       )
+      refreshed.push(...page.items)
+      cursor = page.next
+      pagesLoaded++
+      if (!cursor) break
     }
-    mergeLive(page.items)
-    headIDs = nextHeadIDs
-    if (!loadedPastHead) nextCursor.value = page.next
+    if (!alive || controller.signal.aborted || requestGeneration !== generation) return
+    replaceItems(refreshed)
+    nextCursor.value = cursor
+    loadedPageCount = pagesLoaded
   } catch {
     // Background refresh keeps the last explicit state and never hides loaded alerts.
   } finally {
@@ -213,7 +199,13 @@ async function refreshLive() {
 
 async function loadMore(restoreFocus = false) {
   const before = nextCursor.value
-  if (!before || loading.value || loadingMore.value || replaceController !== undefined) return
+  if (
+    !before
+    || loading.value
+    || loadingMore.value
+    || acknowledging.value
+    || replaceController !== undefined
+  ) return
   appendController?.abort()
   const controller = new AbortController()
   appendController = controller
@@ -229,7 +221,7 @@ async function loadMore(restoreFocus = false) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     appendItems(page.items)
     nextCursor.value = page.next
-    loadedPastHead = true
+    loadedPageCount++
   } catch (reason) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     const details = failure(reason, '更多告警加载失败，请稍后重试')
@@ -304,16 +296,21 @@ function closeAcknowledgement() {
 async function confirmAcknowledgement() {
   const selected = pendingAcknowledgement.value
   if (!selected || acknowledging.value) return
-  replaceController?.abort()
-  appendController?.abort()
-  replaceController = undefined
-  appendController = undefined
-  loading.value = false
-  loadingMore.value = false
-  const mutationGeneration = ++generation
+  const invalidateReads = () => {
+    replaceController?.abort()
+    appendController?.abort()
+    replaceController = undefined
+    appendController = undefined
+    loading.value = false
+    loadingMore.value = false
+    return ++generation
+  }
+  const mutationGeneration = invalidateReads()
   acknowledging.value = true
   acknowledgementError.value = ''
   acknowledgementRequestId.value = ''
+  let refreshAfterMutation = false
+  let focusMutationError = false
   try {
     const updated = await acknowledgeAlert(selected.id)
     if (!alive || mutationGeneration !== generation) return
@@ -322,7 +319,6 @@ async function confirmAcknowledgement() {
     if (index >= 0 && remainsVisible) items.value[index] = updated
     else if (index >= 0) {
       items.value.splice(index, 1)
-      headIDs.delete(updated.id)
     }
     await dismissAcknowledgement(remainsVisible ? 'alert' : 'results')
   } catch (reason) {
@@ -340,13 +336,19 @@ async function confirmAcknowledgement() {
       )
     ) {
       items.value = items.value.filter((item) => item.id !== selected.id)
-      headIDs.delete(selected.id)
-      await refreshLive()
+      refreshAfterMutation = true
     }
+    focusMutationError = true
+  } finally {
+    if (alive) {
+      acknowledging.value = false
+      invalidateReads()
+    }
+  }
+  if (refreshAfterMutation && alive) await refreshLive()
+  if (focusMutationError && alive) {
     await nextTick()
     acknowledgementFeedback.value?.focus()
-  } finally {
-    if (alive) acknowledging.value = false
   }
 }
 
@@ -480,7 +482,7 @@ onBeforeUnmount(() => {
         v-if="nextCursor && !error"
         data-testid="alerts-load-more"
         type="button"
-        :disabled="loadingMore || replaceController !== undefined"
+        :disabled="loadingMore || acknowledging || replaceController !== undefined"
         @click="loadMore()"
       >{{ loadingMore ? '加载中…' : '加载更多' }}</button>
     </section>
