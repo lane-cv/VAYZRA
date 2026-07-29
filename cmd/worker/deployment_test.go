@@ -20,7 +20,7 @@ func TestWorkerDeploymentIsBoundedAndNonRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"worker:", "read_only: true", "size=1024m", "cap_drop:", "no-new-privileges:true", "memory: 1792m", "cpus: 1.0", "internal: true"} {
+	for _, required := range []string{"worker:", "read_only: true", "size=1024m", "cap_drop:", "no-new-privileges:true", "memory: 1792m", "cpus: 0.6", "internal: true"} {
 		if !strings.Contains(string(compose), required) {
 			t.Errorf("compose missing %q", required)
 		}
