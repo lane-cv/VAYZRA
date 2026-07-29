@@ -48,6 +48,7 @@ watch(() => session.user?.id, (userId, previousUserId) => {
         <RouterLink v-if="isAdmin" to="/admin/ai" @click="closeDrawer()">AI 管理</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/ai-usage" @click="closeDrawer()">用量统计</RouterLink>
         <RouterLink v-if="isAdmin" to="/admin/settings" @click="closeDrawer()">系统设置</RouterLink>
+        <RouterLink v-if="isAdmin" to="/admin/backups" @click="closeDrawer()">备份记录</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student" @click="closeDrawer()">学习首页</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student/learning" @click="closeDrawer()">课程学习</RouterLink>
         <RouterLink v-if="!isAdmin" to="/student/questions" @click="closeDrawer()">答疑中心</RouterLink>

@@ -49,3 +49,79 @@ export type AuditFilters = {
 }
 
 export type AuditPage = { items: AuditRecord[]; nextBeforeId: number | null }
+
+export type BackupTrigger = 'scheduled' | 'manual' | 'pre_release'
+export type BackupState =
+  | 'queued'
+  | 'draining'
+  | 'snapshotting'
+  | 'encrypting'
+  | 'verifying'
+  | 'syncing'
+  | 'succeeded'
+  | 'degraded'
+  | 'failed'
+export type BackupArtifactKind =
+  | 'database_dump'
+  | 'object_snapshot'
+  | 'manifest'
+  | 'recovery_report'
+export type BackupRepository = 'local' | 'remote'
+export type RestoreVerificationState =
+  | 'queued'
+  | 'restoring'
+  | 'checking'
+  | 'succeeded'
+  | 'failed'
+
+export type BackupRun = {
+  id: string
+  trigger: BackupTrigger
+  state: BackupState
+  requestedAt: string
+  startedAt?: string | null
+  finishedAt?: string | null
+  logicalBytes?: number | null
+  storedBytes?: number | null
+  localExpiresAt?: string | null
+  remoteExpiresAt?: string | null
+  errorCategory?: string
+}
+
+export type BackupCursor = {
+  requestedAt: string
+  id: string
+}
+
+export type BackupPage = {
+  items: BackupRun[]
+  next: BackupCursor | null
+}
+
+export type BackupArtifact = {
+  kind: BackupArtifactKind
+  repository: BackupRepository
+  sizeBytes: number
+  verifiedAt: string
+  expiresAt: string
+}
+
+export type RestoreVerification = {
+  id: string
+  state: RestoreVerificationState
+  startedAt?: string | null
+  finishedAt?: string | null
+  restoredMigrationVersion?: number | null
+  databaseRowCounts: Record<string, number>
+  checkedObjectCount: number
+  missingObjectCount: number
+  unexpectedObjectCount: number
+  sessionRevocationVerified: boolean
+  rtoSeconds?: number | null
+  errorCategory?: string
+}
+
+export type BackupRunDetail = BackupRun & {
+  artifacts: BackupArtifact[]
+  restoreVerifications: RestoreVerification[]
+}

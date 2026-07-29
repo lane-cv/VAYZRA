@@ -4,7 +4,13 @@ import type {
   AuditMetadata,
   AuditPage,
   AuditRecord,
+  BackupArtifact,
+  BackupCursor,
+  BackupPage,
+  BackupRun,
+  BackupRunDetail,
   OperationsSettings,
+  RestoreVerification,
 } from './types'
 
 function invalidResponse(): APIError {
@@ -248,4 +254,299 @@ export async function listAudit(filters: AuditFilters, signal?: AbortSignal): Pr
     items: response.data.map(parseAuditRecord),
     nextBeforeId: nextBeforeId ?? null,
   }
+}
+
+const backupSummaryKeys = new Set([
+  'id',
+  'trigger',
+  'state',
+  'requestedAt',
+  'startedAt',
+  'finishedAt',
+  'logicalBytes',
+  'storedBytes',
+  'localExpiresAt',
+  'remoteExpiresAt',
+  'errorCategory',
+])
+const backupDetailKeys = new Set([
+  ...backupSummaryKeys,
+  'artifacts',
+  'restoreVerifications',
+])
+const artifactKeys = new Set([
+  'kind',
+  'repository',
+  'sizeBytes',
+  'verifiedAt',
+  'expiresAt',
+])
+const restoreVerificationKeys = new Set([
+  'id',
+  'state',
+  'startedAt',
+  'finishedAt',
+  'restoredMigrationVersion',
+  'databaseRowCounts',
+  'checkedObjectCount',
+  'missingObjectCount',
+  'unexpectedObjectCount',
+  'sessionRevocationVerified',
+  'rtoSeconds',
+  'errorCategory',
+])
+const backupTriggers = new Set(['scheduled', 'manual', 'pre_release'])
+const backupStates = new Set([
+  'queued',
+  'draining',
+  'snapshotting',
+  'encrypting',
+  'verifying',
+  'syncing',
+  'succeeded',
+  'degraded',
+  'failed',
+])
+const artifactKinds = new Set([
+  'database_dump',
+  'object_snapshot',
+  'manifest',
+  'recovery_report',
+])
+const repositories = new Set(['local', 'remote'])
+const restoreStates = new Set([
+  'queued',
+  'restoring',
+  'checking',
+  'succeeded',
+  'failed',
+])
+const restoreRowCountTables = new Set([
+  'users',
+  'sessions',
+  'subjects',
+  'grades',
+  'terms',
+  'chapters',
+  'lessons',
+  'lesson_revisions',
+  'files',
+  'file_versions',
+  'file_previews',
+  'qa_threads',
+  'qa_messages',
+  'ai_threads',
+  'ai_messages',
+  'ai_runs',
+])
+
+function exactKeys(source: Record<string, unknown>, allowed: Set<string>): void {
+  if (Object.keys(source).some((key) => !allowed.has(key))) throw invalidResponse()
+}
+
+function safeInteger(value: unknown, minimum = 0): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || Object.is(value, -0)
+    || value < minimum
+  ) throw invalidResponse()
+  return value
+}
+
+function safeOptionalInteger(value: unknown): number | null {
+  return value === null ? null : safeInteger(value)
+}
+
+function safeOptionalTimestamp(value: unknown): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || !validTimestamp(value)) throw invalidResponse()
+  return value
+}
+
+function safeEnum<T extends string>(value: unknown, values: Set<string>): T {
+  if (typeof value !== 'string' || !values.has(value)) throw invalidResponse()
+  return value as T
+}
+
+function safeErrorCategory(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(value)
+    || !wellFormedUnicode(value)
+  ) throw invalidResponse()
+  return value
+}
+
+function parseBackupRunWithKeys(
+  value: unknown,
+  allowedKeys: Set<string>,
+): BackupRun {
+  const source = record(value)
+  exactKeys(source, allowedKeys)
+  if (
+    typeof source.id !== 'string'
+    || !canonicalUUID(source.id)
+    || typeof source.requestedAt !== 'string'
+    || !validTimestamp(source.requestedAt)
+  ) throw invalidResponse()
+  const result: BackupRun = {
+    id: source.id,
+    trigger: safeEnum(source.trigger, backupTriggers),
+    state: safeEnum(source.state, backupStates),
+    requestedAt: source.requestedAt,
+  }
+  for (const field of ['startedAt', 'finishedAt', 'localExpiresAt', 'remoteExpiresAt'] as const) {
+    if (field in source) result[field] = safeOptionalTimestamp(source[field])
+  }
+  for (const field of ['logicalBytes', 'storedBytes'] as const) {
+    if (field in source) result[field] = safeOptionalInteger(source[field])
+  }
+  if ('errorCategory' in source) {
+    if (source.errorCategory === '') result.errorCategory = ''
+    else result.errorCategory = safeErrorCategory(source.errorCategory)
+  }
+  return result
+}
+
+function parseBackupRun(value: unknown): BackupRun {
+  return parseBackupRunWithKeys(value, backupSummaryKeys)
+}
+
+function parseBackupArtifact(value: unknown): BackupArtifact {
+  const source = record(value)
+  exactKeys(source, artifactKeys)
+  if (
+    typeof source.verifiedAt !== 'string'
+    || !validTimestamp(source.verifiedAt)
+    || typeof source.expiresAt !== 'string'
+    || !validTimestamp(source.expiresAt)
+  ) throw invalidResponse()
+  return {
+    kind: safeEnum(source.kind, artifactKinds),
+    repository: safeEnum(source.repository, repositories),
+    sizeBytes: safeInteger(source.sizeBytes),
+    verifiedAt: source.verifiedAt,
+    expiresAt: source.expiresAt,
+  }
+}
+
+function parseRestoreRowCounts(value: unknown): Record<string, number> {
+  const source = record(value)
+  const result: Record<string, number> = {}
+  for (const [table, count] of Object.entries(source)) {
+    if (!restoreRowCountTables.has(table)) throw invalidResponse()
+    result[table] = safeInteger(count)
+  }
+  return result
+}
+
+function parseRestoreVerification(value: unknown): RestoreVerification {
+  const source = record(value)
+  exactKeys(source, restoreVerificationKeys)
+  if (
+    typeof source.id !== 'string'
+    || !canonicalUUID(source.id)
+    || typeof source.sessionRevocationVerified !== 'boolean'
+  ) throw invalidResponse()
+  const result: RestoreVerification = {
+    id: source.id,
+    state: safeEnum(source.state, restoreStates),
+    databaseRowCounts: parseRestoreRowCounts(source.databaseRowCounts),
+    checkedObjectCount: safeInteger(source.checkedObjectCount),
+    missingObjectCount: safeInteger(source.missingObjectCount),
+    unexpectedObjectCount: safeInteger(source.unexpectedObjectCount),
+    sessionRevocationVerified: source.sessionRevocationVerified,
+  }
+  for (const field of ['startedAt', 'finishedAt'] as const) {
+    if (field in source) result[field] = safeOptionalTimestamp(source[field])
+  }
+  for (const field of ['restoredMigrationVersion', 'rtoSeconds'] as const) {
+    if (field in source) result[field] = safeOptionalInteger(source[field])
+  }
+  if ('errorCategory' in source) {
+    if (source.errorCategory === '') result.errorCategory = ''
+    else result.errorCategory = safeErrorCategory(source.errorCategory)
+  }
+  return result
+}
+
+function parseBackupDetail(value: unknown): BackupRunDetail {
+  const source = record(value)
+  const summary = parseBackupRunWithKeys(source, backupDetailKeys)
+  if (!Array.isArray(source.artifacts) || !Array.isArray(source.restoreVerifications)) {
+    throw invalidResponse()
+  }
+  return {
+    ...summary,
+    artifacts: source.artifacts.map(parseBackupArtifact),
+    restoreVerifications: source.restoreVerifications.map(parseRestoreVerification),
+  }
+}
+
+function validBackupCursor(cursor: BackupCursor): boolean {
+  return canonicalUUID(cursor.id) && validTimestamp(cursor.requestedAt)
+}
+
+export async function listBackups(
+  filter: { before?: BackupCursor | null; limit?: number },
+  signal?: AbortSignal,
+): Promise<BackupPage> {
+  const query = new URLSearchParams()
+  if (filter.before) {
+    if (!validBackupCursor(filter.before)) throw invalidResponse()
+    query.set('beforeRequestedAt', filter.before.requestedAt)
+    query.set('beforeId', filter.before.id)
+  }
+  if (filter.limit !== undefined) {
+    if (!Number.isInteger(filter.limit) || filter.limit < 1 || filter.limit > 100) {
+      throw invalidResponse()
+    }
+    query.set('limit', String(filter.limit))
+  }
+  const suffix = query.size ? `?${query.toString()}` : ''
+  const response = await requestWithMeta<unknown>(
+    `/admin/operations/backups${suffix}`,
+    { signal },
+  )
+  if (!Array.isArray(response.data)) throw invalidResponse()
+  const meta = response.meta ?? {}
+  exactKeys(meta, new Set(['nextBeforeRequestedAt', 'nextBeforeId']))
+  const rawAt = meta.nextBeforeRequestedAt
+  const rawID = meta.nextBeforeId
+  if ((rawAt === undefined) !== (rawID === undefined)) throw invalidResponse()
+  let next: BackupCursor | null = null
+  if (rawAt !== undefined && rawID !== undefined) {
+    if (
+      typeof rawAt !== 'string'
+      || !validTimestamp(rawAt)
+      || typeof rawID !== 'string'
+      || !canonicalUUID(rawID)
+    ) throw invalidResponse()
+    next = { requestedAt: rawAt, id: rawID }
+  }
+  return { items: response.data.map(parseBackupRun), next }
+}
+
+export async function readBackup(
+  id: string,
+  signal?: AbortSignal,
+): Promise<BackupRunDetail> {
+  if (!canonicalUUID(id)) throw invalidResponse()
+  return parseBackupDetail(await request<unknown>(
+    `/admin/operations/backups/${id}`,
+    { signal },
+  ))
+}
+
+export async function queueBackup(idempotencyKey: string): Promise<BackupRun> {
+  if (
+    !/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)
+    || !wellFormedUnicode(idempotencyKey)
+  ) throw invalidResponse()
+  return parseBackupRun(await request<unknown>('/admin/operations/backups', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    json: {},
+  }))
 }
