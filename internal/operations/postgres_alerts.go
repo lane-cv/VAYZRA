@@ -20,8 +20,11 @@ const (
 )
 
 type PostgresAlertStore struct {
-	pool       *pgxpool.Pool
-	collectors []AlertSampleCollector
+	pool           *pgxpool.Pool
+	collectors     []AlertSampleCollector
+	webhookEnabled bool
+	clock          func() time.Time
+	newUUID        func() uuid.UUID
 }
 
 var _ AlertStore = (*PostgresAlertStore)(nil)
@@ -33,12 +36,33 @@ func NewPostgresAlertStore(pool *pgxpool.Pool) *PostgresAlertStore {
 	)
 }
 
+func NewPostgresAlertStoreWithWebhookOutbox(
+	pool *pgxpool.Pool,
+	clock func() time.Time,
+	newUUID func() uuid.UUID,
+) (*PostgresAlertStore, error) {
+	if pool == nil || clock == nil || newUUID == nil {
+		return nil, ErrInvalid
+	}
+	store := newPostgresAlertStoreWithCollectors(
+		pool,
+		NewPostgresAlertCollectors(pool),
+	)
+	store.webhookEnabled = true
+	store.clock = clock
+	store.newUUID = newUUID
+	return store, nil
+}
+
 func newPostgresAlertStoreWithCollectors(
 	pool *pgxpool.Pool,
 	collectors []AlertSampleCollector,
 ) *PostgresAlertStore {
 	return &PostgresAlertStore{
-		pool: pool, collectors: append([]AlertSampleCollector(nil), collectors...),
+		pool:       pool,
+		collectors: append([]AlertSampleCollector(nil), collectors...),
+		clock:      time.Now,
+		newUUID:    uuid.New,
 	}
 }
 
@@ -186,6 +210,18 @@ RETURNING `+alertSelectColumns,
 	if err != nil {
 		return AlertTransition{}, err
 	}
+	transitionKind := kind
+	if !wasVisible && failures < 2 {
+		transitionKind = AlertTransitionNone
+	}
+	if err := store.enqueueWebhookTransition(
+		ctx,
+		tx,
+		transitionKind,
+		updated,
+	); err != nil {
+		return AlertTransition{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return AlertTransition{}, err
 	}
@@ -229,12 +265,15 @@ RETURNING ` + alertSelectColumns
 	if err != nil {
 		return AlertTransition{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return AlertTransition{}, err
-	}
 	kind := AlertTransitionUpdated
 	if resolve {
 		kind = AlertTransitionResolved
+	}
+	if err := store.enqueueWebhookTransition(ctx, tx, kind, updated); err != nil {
+		return AlertTransition{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AlertTransition{}, err
 	}
 	return AlertTransition{Kind: kind, Alert: &updated}, nil
 }
@@ -427,10 +466,12 @@ func (store *PostgresAlertStore) RecordAlertDelivery(
 	var storedID uuid.UUID
 	err = tx.QueryRow(ctx, `
 INSERT INTO alert_deliveries(
-  id,alert_id,attempt,destination,outcome,http_status_class,error_category,
-  started_at,finished_at
-) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-ON CONFLICT(alert_id,attempt,destination) DO NOTHING
+  id,alert_id,attempt,destination,delivery_state,outcome,
+  http_status_class,error_category,started_at,finished_at
+) VALUES($1,$2,$3,$4,$5,$5,$6,$7,$8,$9)
+ON CONFLICT(alert_id,attempt,destination)
+  WHERE event_id IS NULL
+DO NOTHING
 RETURNING id`,
 		delivery.ID,
 		delivery.AlertID,

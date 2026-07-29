@@ -157,31 +157,42 @@ func newServer(address string, handler http.Handler) *http.Server {
 }
 
 type applicationDependencies struct {
-	open                   func(context.Context, string) (*pgxpool.Pool, error)
-	migrate                func(context.Context, *pgxpool.Pool) error
-	newAuth                func(*pgxpool.Pool) (auth.HTTPService, error)
-	newStudents            func(*pgxpool.Pool) students.HTTPService
-	newTeaching            func(*pgxpool.Pool) teaching.AdminHTTPService
-	newUploads             func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newQAUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newAIUploads           func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
-	newStudentAI           func(context.Context, *pgxpool.Pool, config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error)
-	newFileAccess          func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
-	newQAFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
-	newAIFileAccess        func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error)
-	newFileBindings        func(*pgxpool.Pool) files.BindingHTTPService
-	newFileCenter          func(*pgxpool.Pool) files.FileCenterHTTPService
-	startUploadCleanup     func(files.ExpiredUploadCleaner, operations.WriteGate) func()
-	newStudentTeaching     func(*pgxpool.Pool) teaching.StudentHTTPService
-	newQuestions           func(*pgxpool.Pool) qanda.HTTPServices
-	newAdminAI             func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
-	newAIReads             func(*pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService)
-	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
-	startOutbox            func(*pgxpool.Pool, operations.ClaimGate) func()
-	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
-	startAlertRunner       func(*pgxpool.Pool) func()
-	newOperations          func(*pgxpool.Pool) operationsRuntime
-	newAdminOperations     func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
+	open                          func(context.Context, string) (*pgxpool.Pool, error)
+	migrate                       func(context.Context, *pgxpool.Pool) error
+	newAuth                       func(*pgxpool.Pool) (auth.HTTPService, error)
+	newStudents                   func(*pgxpool.Pool) students.HTTPService
+	newTeaching                   func(*pgxpool.Pool) teaching.AdminHTTPService
+	newUploads                    func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newQAUploads                  func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newAIUploads                  func(context.Context, *pgxpool.Pool, config.Config) (files.UploadHTTPService, error)
+	newStudentAI                  func(context.Context, *pgxpool.Pool, config.Config) (aiqa.StudentService, aiqa.StudentEventStore, error)
+	newFileAccess                 func(context.Context, *pgxpool.Pool, config.Config) (files.AccessHTTPService, error)
+	newQAFileAccess               func(context.Context, *pgxpool.Pool, config.Config) (files.QAAccessHTTPService, error)
+	newAIFileAccess               func(context.Context, *pgxpool.Pool, config.Config) (files.AIAccessHTTPService, error)
+	newFileBindings               func(*pgxpool.Pool) files.BindingHTTPService
+	newFileCenter                 func(*pgxpool.Pool) files.FileCenterHTTPService
+	startUploadCleanup            func(files.ExpiredUploadCleaner, operations.WriteGate) func()
+	newStudentTeaching            func(*pgxpool.Pool) teaching.StudentHTTPService
+	newQuestions                  func(*pgxpool.Pool) qanda.HTTPServices
+	newAdminAI                    func(context.Context, *pgxpool.Pool, config.Config) (aiqa.AdminConfigHTTPService, error)
+	newAIReads                    func(*pgxpool.Pool) (aiqa.SummaryService, aiqa.AdminUsageService)
+	newNotifications              func(*pgxpool.Pool) notifications.HTTPService
+	startOutbox                   func(*pgxpool.Pool, operations.ClaimGate) func()
+	startAIRunner                 func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
+	startAlertRunner              func(*pgxpool.Pool) func()
+	startAlertRunnerWithWebhook   func(*pgxpool.Pool, bool) func()
+	startWebhookRunner            func(*pgxpool.Pool, operations.WebhookTestSender) (func(), error)
+	newOperations                 func(*pgxpool.Pool) operationsRuntime
+	newAdminOperations            func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
+	newAdminOperationsWithWebhook func(
+		*pgxpool.Pool,
+		operationsRuntime,
+		operations.WebhookTestSender,
+	) operations.HTTPService
+	newWebhookSender func(
+		context.Context,
+		config.Config,
+	) (operations.WebhookTestSender, error)
 	newAdminBackups        func(*pgxpool.Pool) backup.HTTPService
 	requireOperations      bool
 	ready                  func(*pgxpool.Pool) func(context.Context) error
@@ -213,35 +224,37 @@ func buildProductionApplication(
 	cfg config.Config,
 ) (*applicationRuntime, func(), error) {
 	return buildApplicationRuntime(ctx, cfg, applicationDependencies{
-		open:               database.Open,
-		migrate:            database.Migrate,
-		newAuth:            newProductionAuthService,
-		newStudents:        newProductionStudentService,
-		newTeaching:        newProductionTeachingService,
-		newUploads:         newProductionUploadService,
-		newQAUploads:       newProductionQAUploadService,
-		newAIUploads:       newProductionAIUploadService,
-		newStudentAI:       newProductionStudentAIService,
-		newFileAccess:      newProductionFileAccessService,
-		newQAFileAccess:    newProductionQAFileAccessService,
-		newAIFileAccess:    newProductionAIFileAccessService,
-		newFileBindings:    newProductionFileBindingService,
-		newFileCenter:      newProductionFileCenterService,
-		startUploadCleanup: files.StartCleanupRunner,
-		newStudentTeaching: newProductionStudentTeachingService,
-		newQuestions:       newProductionQuestionServices,
-		newAdminAI:         newProductionAdminAIService,
-		newAIReads:         newProductionAIReadServices,
-		newNotifications:   newProductionNotificationService,
-		startOutbox:        newProductionOutboxRunner,
-		startAIRunner:      newProductionAIRunner,
-		startAlertRunner:   newProductionAlertRunner,
+		open:                        database.Open,
+		migrate:                     database.Migrate,
+		newAuth:                     newProductionAuthService,
+		newStudents:                 newProductionStudentService,
+		newTeaching:                 newProductionTeachingService,
+		newUploads:                  newProductionUploadService,
+		newQAUploads:                newProductionQAUploadService,
+		newAIUploads:                newProductionAIUploadService,
+		newStudentAI:                newProductionStudentAIService,
+		newFileAccess:               newProductionFileAccessService,
+		newQAFileAccess:             newProductionQAFileAccessService,
+		newAIFileAccess:             newProductionAIFileAccessService,
+		newFileBindings:             newProductionFileBindingService,
+		newFileCenter:               newProductionFileCenterService,
+		startUploadCleanup:          files.StartCleanupRunner,
+		newStudentTeaching:          newProductionStudentTeachingService,
+		newQuestions:                newProductionQuestionServices,
+		newAdminAI:                  newProductionAdminAIService,
+		newAIReads:                  newProductionAIReadServices,
+		newNotifications:            newProductionNotificationService,
+		startOutbox:                 newProductionOutboxRunner,
+		startAIRunner:               newProductionAIRunner,
+		startAlertRunnerWithWebhook: newProductionAlertRunnerWithWebhook,
+		startWebhookRunner:          newProductionWebhookRunner,
 		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
 			return operations.NewPostgresStore(pool)
 		},
-		newAdminOperations: newProductionAdminOperationsService,
-		newAdminBackups:    newProductionAdminBackupService,
-		requireOperations:  true,
+		newAdminOperationsWithWebhook: newProductionAdminOperationsServiceWithWebhook,
+		newWebhookSender:              newProductionWebhookSender,
+		newAdminBackups:               newProductionAdminBackupService,
+		requireOperations:             true,
 		ready: func(pool *pgxpool.Pool) func(context.Context) error {
 			return pool.Ping
 		},
@@ -432,12 +445,36 @@ func buildApplicationRuntime(
 			closePool()
 		}
 	}
+	var webhookSender operations.WebhookTestSender
+	if deps.newWebhookSender != nil {
+		webhookSender, err = deps.newWebhookSender(ctx, cfg)
+		if err != nil || webhookSender == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize alert webhook")
+		}
+	}
 	var adminOperations operations.HTTPService
-	if deps.requireOperations && deps.newAdminOperations == nil {
+	if deps.requireOperations &&
+		deps.newAdminOperations == nil &&
+		deps.newAdminOperationsWithWebhook == nil {
 		closeResources()
 		return nil, nil, errors.New("initialize operations service")
 	}
-	if deps.newAdminOperations != nil {
+	if deps.newAdminOperationsWithWebhook != nil {
+		if webhookSender == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize alert webhook")
+		}
+		adminOperations = deps.newAdminOperationsWithWebhook(
+			pool,
+			operationalGate,
+			webhookSender,
+		)
+		if adminOperations == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize operations service")
+		}
+	} else if deps.newAdminOperations != nil {
 		adminOperations = deps.newAdminOperations(pool, operationalGate)
 		if adminOperations == nil {
 			closeResources()
@@ -551,8 +588,36 @@ func buildApplicationRuntime(
 			closeOtherResources()
 		}
 	}
-	if deps.startAlertRunner != nil {
-		stopAlertRunner := deps.startAlertRunner(pool)
+	if deps.startWebhookRunner != nil {
+		if webhookSender == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize alert webhook")
+		}
+		stopWebhookRunner, startErr := deps.startWebhookRunner(
+			pool,
+			webhookSender,
+		)
+		if startErr != nil || stopWebhookRunner == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize alert webhook")
+		}
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopWebhookRunner()
+			closeOtherResources()
+		}
+	}
+	if deps.startAlertRunnerWithWebhook != nil ||
+		deps.startAlertRunner != nil {
+		var stopAlertRunner func()
+		if deps.startAlertRunnerWithWebhook != nil {
+			stopAlertRunner = deps.startAlertRunnerWithWebhook(
+				pool,
+				webhookSender != nil && webhookSender.Enabled(),
+			)
+		} else {
+			stopAlertRunner = deps.startAlertRunner(pool)
+		}
 		if stopAlertRunner == nil {
 			closeResources()
 			return nil, nil, errors.New("initialize alert evaluator")
@@ -771,7 +836,29 @@ func newProductionAdminOperationsService(
 	pool *pgxpool.Pool,
 	runtime operationsRuntime,
 ) operations.HTTPService {
+	webhook, err := operations.NewWebhookSender(
+		context.Background(),
+		operations.WebhookSenderConfig{},
+	)
+	if err != nil {
+		return nil
+	}
+	return newProductionAdminOperationsServiceWithWebhook(
+		pool,
+		runtime,
+		webhook,
+	)
+}
+
+func newProductionAdminOperationsServiceWithWebhook(
+	pool *pgxpool.Pool,
+	runtime operationsRuntime,
+	webhook operations.WebhookTestSender,
+) operations.HTTPService {
 	if pool == nil || runtime == nil {
+		return nil
+	}
+	if webhook == nil {
 		return nil
 	}
 	store, ok := runtime.(operations.ServiceStore)
@@ -800,11 +887,12 @@ func newProductionAdminOperationsService(
 	if err != nil {
 		return nil
 	}
-	service, err := operations.NewServiceWithDashboardAndAlerts(
+	service, err := operations.NewServiceWithDashboardAlertsAndWebhook(
 		store,
 		audit.NewPostgresWriter(pool),
 		dashboard,
 		operations.NewPostgresAlertStore(pool),
+		webhook,
 	)
 	if err != nil {
 		return nil
@@ -813,12 +901,66 @@ func newProductionAdminOperationsService(
 }
 
 func newProductionAlertRunner(pool *pgxpool.Pool) func() {
+	return newProductionAlertRunnerWithWebhook(pool, false)
+}
+
+func newProductionAlertRunnerWithWebhook(
+	pool *pgxpool.Pool,
+	webhookEnabled bool,
+) func() {
+	store := operations.NewPostgresAlertStore(pool)
+	if webhookEnabled {
+		var err error
+		store, err = operations.NewPostgresAlertStoreWithWebhookOutbox(
+			pool,
+			time.Now,
+			uuid.New,
+		)
+		if err != nil {
+			return nil
+		}
+	}
 	return operations.StartAlertRunner(operations.AlertRunner{
-		Store:             operations.NewPostgresAlertStore(pool),
+		Store:             store,
 		Clock:             time.Now,
 		PollInterval:      operations.DefaultAlertRunnerInterval,
 		EvaluationTimeout: 30 * time.Second,
 	})
+}
+
+func newProductionWebhookSender(
+	ctx context.Context,
+	cfg config.Config,
+) (operations.WebhookTestSender, error) {
+	return operations.NewWebhookSender(ctx, operations.WebhookSenderConfig{
+		URL:                     cfg.WebhookURL,
+		Authorization:           cfg.WebhookAuthorization,
+		DevelopmentAllowPrivate: cfg.Environment == "development",
+	})
+}
+
+func newProductionWebhookRunner(
+	pool *pgxpool.Pool,
+	sender operations.WebhookTestSender,
+) (func(), error) {
+	if pool == nil || sender == nil {
+		return nil, operations.ErrInvalid
+	}
+	if !sender.Enabled() {
+		return func() {}, nil
+	}
+	return operations.StartWebhookDeliveryRunner(
+		operations.WebhookDeliveryRunner{
+			Store:           operations.NewPostgresWebhookDeliveryStore(pool),
+			Sender:          sender,
+			Clock:           time.Now,
+			NewUUID:         uuid.New,
+			ClaimOwner:      "server:" + uuid.NewString(),
+			PollInterval:    operations.DefaultWebhookPollInterval,
+			LeaseDuration:   operations.DefaultWebhookLeaseDuration,
+			DeliveryTimeout: 15 * time.Second,
+		},
+	)
 }
 
 func newProductionInternalHandler(

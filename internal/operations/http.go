@@ -46,6 +46,7 @@ func (h *AdminHandler) Routes() http.Handler {
 	router.Get("/dashboard", h.dashboard)
 	router.Get("/alerts", h.listAlerts)
 	router.Post("/alerts/{id}/acknowledge", h.acknowledgeAlert)
+	router.Post("/webhook-test", h.testWebhook)
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
 	})
@@ -53,6 +54,78 @@ func (h *AdminHandler) Routes() http.Handler {
 		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不被允许")
 	})
 	return router
+}
+
+func (h *AdminHandler) testWebhook(w http.ResponseWriter, r *http.Request) {
+	if !noQuery(r) || !emptyRequestBody(w, r) {
+		operationsInvalid(w, r, "invalid_request")
+		return
+	}
+	principal, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	service, ok := h.service.(WebhookTestHTTPService)
+	if !ok {
+		httpx.Error(
+			w,
+			r,
+			http.StatusInternalServerError,
+			"internal_error",
+			"服务暂不可用",
+		)
+		return
+	}
+	if err := service.TestWebhook(r.Context(), principal); err != nil {
+		webhookTestOperationsError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data struct {
+			Status string `json:"status"`
+		} `json:"data"`
+	}{
+		Data: struct {
+			Status string `json:"status"`
+		}{Status: "delivered"},
+	})
+}
+
+func webhookTestOperationsError(
+	w http.ResponseWriter,
+	r *http.Request,
+	err error,
+) {
+	switch {
+	case errors.Is(err, ErrForbidden):
+		httpx.Error(w, r, http.StatusForbidden, "forbidden", "无权访问")
+	case errors.Is(err, ErrInvalid):
+		operationsInvalid(w, r, "invalid_request")
+	case errors.Is(err, ErrWebhookNotConfigured):
+		httpx.Error(
+			w,
+			r,
+			http.StatusConflict,
+			"webhook_not_configured",
+			"Webhook 尚未配置",
+		)
+	case errors.Is(err, ErrWebhookDeliveryFailed):
+		httpx.Error(
+			w,
+			r,
+			http.StatusBadGateway,
+			"webhook_delivery_failed",
+			"Webhook 投递失败",
+		)
+	default:
+		httpx.Error(
+			w,
+			r,
+			http.StatusInternalServerError,
+			"internal_error",
+			"服务暂不可用",
+		)
+	}
 }
 
 func (h *AdminHandler) listAlerts(w http.ResponseWriter, r *http.Request) {

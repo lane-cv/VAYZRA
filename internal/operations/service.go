@@ -16,6 +16,34 @@ type service struct {
 	auditReader audit.FilteredReader
 	dashboard   DashboardReader
 	alerts      AlertStore
+	webhook     WebhookTestSender
+}
+
+func NewServiceWithDashboardAlertsAndWebhook(
+	store ServiceStore,
+	auditReader audit.FilteredReader,
+	dashboard DashboardReader,
+	alerts AlertStore,
+	webhook WebhookTestSender,
+) (HTTPService, error) {
+	if webhook == nil {
+		return nil, ErrInvalid
+	}
+	base, err := NewServiceWithDashboardAndAlerts(
+		store,
+		auditReader,
+		dashboard,
+		alerts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	concrete, ok := base.(*service)
+	if !ok {
+		return nil, ErrInvalid
+	}
+	concrete.webhook = webhook
+	return concrete, nil
 }
 
 func NewServiceWithDashboardAndAlerts(
@@ -141,6 +169,40 @@ func (s *service) AcknowledgeAlert(
 		return Alert{}, ErrInvalid
 	}
 	return s.alerts.AcknowledgeAlert(ctx, principal, id)
+}
+
+func (s *service) TestWebhook(
+	ctx context.Context,
+	principal Principal,
+) error {
+	if err := authorizeSettings(principal); err != nil {
+		return err
+	}
+	if s.webhook == nil || !s.webhook.Enabled() {
+		return ErrWebhookNotConfigured
+	}
+	result := s.webhook.Send(ctx, syntheticWebhookTestPayload())
+	if !validWebhookDeliveryResult(result) || !result.Succeeded {
+		return ErrWebhookDeliveryFailed
+	}
+	return nil
+}
+
+func syntheticWebhookTestPayload() WebhookPayload {
+	observedAt := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	return WebhookPayload{
+		SchemaVersion:   WebhookSchemaVersion,
+		AlertID:         "00000000-0000-4000-8000-000000000001",
+		Category:        "processing",
+		Severity:        AlertSeverityWarning,
+		State:           AlertStateOpen,
+		Summary:         "Webhook connectivity test",
+		FirstObservedAt: observedAt,
+		LastObservedAt:  observedAt,
+		CurrentValue:    0,
+		Threshold:       0,
+		DashboardPath:   WebhookDashboardPath,
+	}
 }
 
 func highRiskSettingsReason(settings Settings) string {

@@ -14,8 +14,9 @@ import (
 )
 
 type appAdminOperations struct {
-	puts int
-	acks int
+	puts         int
+	acks         int
+	webhookTests int
 }
 
 func (*appAdminOperations) GetSettings(context.Context, operations.Principal) (operations.Settings, error) {
@@ -74,6 +75,14 @@ func (service *appAdminOperations) AcknowledgeAlert(
 		CurrentValue: 21, ThresholdValue: 20,
 		Summary: "Processing queue depth is high",
 	}, nil
+}
+
+func (service *appAdminOperations) TestWebhook(
+	context.Context,
+	operations.Principal,
+) error {
+	service.webhookTests++
+	return nil
 }
 
 func TestApplicationMountsAdminOperationsWithOriginAndCSRF(t *testing.T) {
@@ -191,6 +200,73 @@ func TestApplicationProtectsAlertAcknowledgementWithAdminOriginAndCSRF(t *testin
 			validResult.Code,
 			service.acks,
 			validResult.Body.String(),
+		)
+	}
+}
+
+func TestApplicationProtectsWebhookTestWithAdminOriginCSRFAndRequestID(
+	t *testing.T,
+) {
+	service := &appAdminOperations{}
+	handler := New(Dependencies{
+		Auth: &appAdminAuth{}, AdminOperations: service,
+		PublicOrigin: "https://learn.example.com",
+	})
+	const target = "/api/v1/admin/operations/webhook-test"
+	for name, configure := range map[string]func(*http.Request){
+		"cross origin": func(request *http.Request) {
+			request.Header.Set("Origin", "https://evil.example")
+			request.Header.Set("X-CSRF-Token", "csrf-token")
+			request.AddCookie(&http.Cookie{
+				Name: "hl_csrf", Value: "csrf-token",
+			})
+		},
+		"missing CSRF": func(request *http.Request) {
+			request.Header.Set("Origin", "https://learn.example.com")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, target, nil)
+			request.AddCookie(&http.Cookie{
+				Name: "hl_session", Value: "opaque-token",
+			})
+			configure(request)
+			result := httptest.NewRecorder()
+			handler.ServeHTTP(result, request)
+			if result.Code != http.StatusForbidden ||
+				service.webhookTests != 0 {
+				t.Fatalf(
+					"status=%d webhookTests=%d body=%s",
+					result.Code,
+					service.webhookTests,
+					result.Body.String(),
+				)
+			}
+		})
+	}
+	valid := httptest.NewRequest(http.MethodPost, target, nil)
+	valid.Header.Set("Origin", "https://learn.example.com")
+	valid.Header.Set("X-CSRF-Token", "csrf-token")
+	valid.Header.Set("X-Request-ID", "webhook-test-request")
+	valid.AddCookie(&http.Cookie{
+		Name: "hl_session", Value: "opaque-token",
+	})
+	valid.AddCookie(&http.Cookie{
+		Name: "hl_csrf", Value: "csrf-token",
+	})
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, valid)
+	if result.Code != http.StatusOK ||
+		service.webhookTests != 1 ||
+		result.Header().Get("Cache-Control") != "no-store, private" ||
+		result.Header().Get("X-Request-ID") != "webhook-test-request" ||
+		result.Body.String() != "{\"data\":{\"status\":\"delivered\"}}\n" {
+		t.Fatalf(
+			"status=%d webhookTests=%d headers=%v body=%s",
+			result.Code,
+			service.webhookTests,
+			result.Header(),
+			result.Body.String(),
 		)
 	}
 }

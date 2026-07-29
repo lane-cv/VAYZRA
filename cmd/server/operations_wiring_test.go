@@ -33,6 +33,23 @@ type serverAdminOperationsService struct{}
 
 type serverAdminBackupService struct{}
 
+type serverWebhookSender struct {
+	enabled bool
+}
+
+func (sender *serverWebhookSender) Enabled() bool {
+	return sender.enabled
+}
+
+func (*serverWebhookSender) Send(
+	context.Context,
+	operations.WebhookPayload,
+) operations.WebhookDeliveryResult {
+	return operations.WebhookDeliveryResult{
+		Succeeded: true, HTTPStatusClass: 2,
+	}
+}
+
 func (*serverAdminBackupService) RequestManual(
 	context.Context,
 	operations.Principal,
@@ -216,6 +233,20 @@ func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
 	if err != nil || len(alerts.Items) != 0 {
 		t.Fatalf("alerts=%+v err=%v", alerts, err)
 	}
+	webhookService, ok := service.(operations.WebhookTestHTTPService)
+	if !ok {
+		t.Fatalf("production operations service lacks webhook test API: %T", service)
+	}
+	err = webhookService.TestWebhook(readCtx, operations.Principal{
+		User: auth.User{
+			ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive,
+		},
+		RequestID: "server-webhook-wiring",
+		IP:        net.ParseIP("192.0.2.92"),
+	})
+	if !errors.Is(err, operations.ErrWebhookNotConfigured) {
+		t.Fatalf("disabled webhook test error=%v", err)
+	}
 
 	nilPoolRuntime := operations.NewPostgresStore(nil)
 	t.Cleanup(func() {
@@ -266,6 +297,184 @@ func TestProductionApplicationStopsAlertRunnerBeforeOperationsAndPool(t *testing
 	closeResources()
 	if got := strings.Join(events, ","); got != "alert_start,alert_stop,operations_close,pool_close" {
 		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestProductionApplicationStartsWebhookBeforeAlertAndStopsInReverse(
+	t *testing.T,
+) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	sender := &serverWebhookSender{enabled: true}
+	var adminSender, runnerSender operations.WebhookTestSender
+	var alertWebhookEnabled bool
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) {
+				return nil, nil
+			},
+			migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+				return serverAdminAuth{}, nil
+			},
+			newOperations: func(*pgxpool.Pool) operationsRuntime {
+				return gate
+			},
+			newWebhookSender: func(
+				context.Context,
+				config.Config,
+			) (operations.WebhookTestSender, error) {
+				return sender, nil
+			},
+			newAdminOperationsWithWebhook: func(
+				_ *pgxpool.Pool,
+				_ operationsRuntime,
+				got operations.WebhookTestSender,
+			) operations.HTTPService {
+				adminSender = got
+				return &serverAdminOperationsService{}
+			},
+			startWebhookRunner: func(
+				_ *pgxpool.Pool,
+				got operations.WebhookTestSender,
+			) (func(), error) {
+				runnerSender = got
+				events = append(events, "webhook_start")
+				return func() {
+					events = append(events, "webhook_stop")
+				}, nil
+			},
+			startAlertRunnerWithWebhook: func(
+				_ *pgxpool.Pool,
+				enabled bool,
+			) func() {
+				alertWebhookEnabled = enabled
+				events = append(events, "alert_start")
+				return func() {
+					events = append(events, "alert_stop")
+				}
+			},
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) {
+				events = append(events, "pool_close")
+			},
+		},
+	)
+	if err != nil || handler == nil || closeResources == nil {
+		t.Fatalf(
+			"handler=%v cleanup_present=%t err=%v",
+			handler,
+			closeResources != nil,
+			err,
+		)
+	}
+	if adminSender != sender || runnerSender != sender ||
+		!alertWebhookEnabled {
+		t.Fatalf(
+			"admin_same=%t runner_same=%t alert_enabled=%t",
+			adminSender == sender,
+			runnerSender == sender,
+			alertWebhookEnabled,
+		)
+	}
+	closeResources()
+	if got := strings.Join(events, ","); got !=
+		"webhook_start,alert_start,alert_stop,webhook_stop,operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestWebhookInitializationFailureClosesOperationsAndPool(t *testing.T) {
+	for name, configure := range map[string]func(*applicationDependencies){
+		"sender": func(deps *applicationDependencies) {
+			deps.newWebhookSender = func(
+				context.Context,
+				config.Config,
+			) (operations.WebhookTestSender, error) {
+				return nil, errors.New("private sender detail")
+			}
+		},
+		"runner": func(deps *applicationDependencies) {
+			deps.newWebhookSender = func(
+				context.Context,
+				config.Config,
+			) (operations.WebhookTestSender, error) {
+				return &serverWebhookSender{enabled: true}, nil
+			}
+			deps.startWebhookRunner = func(
+				*pgxpool.Pool,
+				operations.WebhookTestSender,
+			) (func(), error) {
+				return nil, errors.New("private runner detail")
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var events []string
+			gate := &serverOperationsRuntime{events: &events}
+			deps := applicationDependencies{
+				open: func(
+					context.Context,
+					string,
+				) (*pgxpool.Pool, error) {
+					return nil, nil
+				},
+				migrate: func(
+					context.Context,
+					*pgxpool.Pool,
+				) error {
+					return nil
+				},
+				newAuth: func(
+					*pgxpool.Pool,
+				) (auth.HTTPService, error) {
+					return serverAdminAuth{}, nil
+				},
+				newOperations: func(*pgxpool.Pool) operationsRuntime {
+					return gate
+				},
+				newAdminOperationsWithWebhook: func(
+					*pgxpool.Pool,
+					operationsRuntime,
+					operations.WebhookTestSender,
+				) operations.HTTPService {
+					return &serverAdminOperationsService{}
+				},
+				requireOperations: true,
+				ready: func(
+					*pgxpool.Pool,
+				) func(context.Context) error {
+					return func(context.Context) error { return nil }
+				},
+				close: func(*pgxpool.Pool) {
+					events = append(events, "pool_close")
+				},
+			}
+			configure(&deps)
+			handler, cleanup, err := buildApplication(
+				context.Background(),
+				config.Config{},
+				deps,
+			)
+			if handler != nil || cleanup != nil || err == nil ||
+				err.Error() != "initialize alert webhook" {
+				t.Fatalf(
+					"handler=%v cleanup_present=%t err=%v",
+					handler,
+					cleanup != nil,
+					err,
+				)
+			}
+			if got := strings.Join(events, ","); got !=
+				"operations_close,pool_close" {
+				t.Fatalf("lifecycle=%s", got)
+			}
+		})
 	}
 }
 

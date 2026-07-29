@@ -77,6 +77,15 @@ type AlertHTTPService interface {
 	AcknowledgeAlert(context.Context, Principal, uuid.UUID) (Alert, error)
 }
 
+type WebhookTestSender interface {
+	WebhookDeliverySender
+	Enabled() bool
+}
+
+type WebhookTestHTTPService interface {
+	TestWebhook(context.Context, Principal) error
+}
+
 type ModeReader interface {
 	GetMode(context.Context) (ModeSnapshot, error)
 }
