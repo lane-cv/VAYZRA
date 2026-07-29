@@ -234,7 +234,7 @@ func TestPostgresSampleDashboardReaderReadsFixedOrderedServiceHealth(t *testing.
 		t.Fatal(err)
 	}
 	values := []Sample{
-		serviceUpSample(ServiceApp, 1, now.Add(-6*time.Second)),
+		serviceUpSample(ServiceApp, 1, now.Add(-time.Minute)),
 		serviceUpSample(ServicePostgres, 1, now.Add(-5*time.Second)),
 		serviceLatencySample(ServicePostgres, 12, now.Add(-4*time.Second)),
 		serviceUpSample(ServiceRedis, 1, now.Add(-3*time.Second)),
@@ -252,8 +252,8 @@ func TestPostgresSampleDashboardReaderReadsFixedOrderedServiceHealth(t *testing.
 	}
 	want := []ServiceHealth{
 		{
-			Service: ServiceApp, State: DataStateDegraded,
-			ObservedAt: cloneDashboardTimePointer(now.Add(-6 * time.Second)),
+			Service: ServiceApp, State: DataStateHealthy,
+			ObservedAt: cloneDashboardTimePointer(now.Add(-time.Minute)),
 		},
 		{
 			Service: ServiceCaddy, State: DataStateEmpty,
@@ -328,17 +328,17 @@ func TestPostgresSampleDashboardReaderUsesExactServiceSourcesAndNeverInventsLate
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Service != ServiceApp || got[0].State != DataStateDegraded ||
+	if got[0].Service != ServiceApp || got[0].State != DataStateHealthy ||
 		got[0].LatencyMilliseconds != 0 ||
-		got[1].Service != ServiceCaddy || got[1].State != DataStateDegraded ||
+		got[1].Service != ServiceCaddy || got[1].State != DataStateHealthy ||
 		got[1].LatencyMilliseconds != 0 ||
 		got[2].Service != ServicePostgres || got[2].State != DataStateDegraded ||
-	got[2].LatencyMilliseconds != 0 ||
+		got[2].LatencyMilliseconds != 0 ||
 		got[3].Service != ServiceRedis || got[3].State != DataStateHealthy ||
 		got[3].LatencyMilliseconds != 1 ||
 		got[4].Service != ServiceObjectStore || got[4].State != DataStateHealthy ||
 		got[4].LatencyMilliseconds != 9 ||
-		got[5].Service != ServiceWorker || got[5].State != DataStateDegraded ||
+		got[5].Service != ServiceWorker || got[5].State != DataStateHealthy ||
 		got[5].LatencyMilliseconds != 0 {
 		t.Fatalf("source or latency mapping=%+v", got)
 	}

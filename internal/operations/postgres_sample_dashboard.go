@@ -331,7 +331,7 @@ ORDER BY requested.ordinal`)
 		if observedAt.Before(now.Add(-reader.freshFor)) {
 			state = DataStateStale
 		} else if values.up.Value == 1 &&
-			values.needsLatency && values.latencyPresent {
+			(!values.needsLatency || values.latencyPresent) {
 			state = DataStateHealthy
 		}
 		out = append(out, ServiceHealth{
