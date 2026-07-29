@@ -149,9 +149,9 @@ require_literal 'prepare_restore_repository_access'
 require_literal 'restore_backup_repository_access'
 require_literal 'compose run --rm --no-deps \'
 require_literal 'backup-storage-init'
-require_literal 'find -P /repository -xdev -type l -print -quit'
-require_literal 'find -P /repository -xdev ! -type d ! -type f -print -quit'
-require_literal 'find -P /repository -xdev -type f -links +1 -print -quit'
+require_literal 'repository_find_empty -type l -print -quit'
+require_literal 'repository_find_empty ! -type d ! -type f -print -quit'
+require_literal 'repository_find_empty -type f -links +1 -print -quit'
 require_literal 'find "$repository" -xdev -mindepth 1 -print -quit'
 require_literal 'result="$(find "$repository" -xdev "$@")" || return 1'
 require_literal 'result="$(find -P /repository -xdev "$@")" || return 1'
@@ -1115,6 +1115,159 @@ review_repository_handoff_daemon_error() (
       '^run |(container|image|network|volume) rm' "$calls"
 )
 
+review_repository_transition_find_error() (
+  local transition fail_at scenario_root stub_dir counter chown_calls
+  local docker_calls output compose_calls scan_status
+  local transition_status stat_output
+  local script production_script previous argument
+  local -a shell_args
+  PROJECT='happylearn-phase5-live-111111111111'
+  HOST_UID="$(id -u)"
+  HOST_GID="$(id -g)"
+
+  for transition in prepare restore; do
+    for fail_at in 1 2 3 4 5; do
+      scenario_root="$CONTRACT_ROOT/repository-$transition-find-$fail_at"
+      stub_dir="$scenario_root/stub-bin"
+      counter="$scenario_root/find-count"
+      chown_calls="$scenario_root/chown.calls"
+      docker_calls="$scenario_root/docker.calls"
+      output="$scenario_root/transition.output"
+      mkdir -m 0700 "$scenario_root" "$scenario_root/repository" "$stub_dir"
+      printf '0\n' >"$counter"
+      : >"$chown_calls"
+      : >"$docker_calls"
+      printf '%s\n' \
+        '#!/bin/sh' \
+        'count=0' \
+        'IFS= read -r count <"$FIND_STUB_COUNT"' \
+        'count=$((count + 1))' \
+        'printf "%s\n" "$count" >"$FIND_STUB_COUNT"' \
+        'if [ "$count" -eq "$FIND_STUB_FAIL_AT" ]; then' \
+        '  exit 70' \
+        'fi' \
+        'exit 0' \
+        >"$stub_dir/find"
+      printf '%s\n' \
+        '#!/bin/sh' \
+        'printf "%s\n" "$*" >>"$CHOWN_STUB_CALLS"' \
+        'exit 0' \
+        >"$stub_dir/chown"
+      printf '%s\n' \
+        '#!/bin/sh' \
+        'printf "%s\n" "$STAT_STUB_OUTPUT"' \
+        >"$stub_dir/stat"
+      chmod 0700 "$stub_dir/find" "$stub_dir/chown" "$stub_dir/stat"
+
+      FIXTURE_ROOT="$scenario_root"
+      HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$FIXTURE_ROOT/repository"
+      compose_calls=0
+      scan_status=0
+      transition_status=0
+      if [[ "$transition" == prepare ]]; then
+        stat_output="$HOST_UID:$HOST_GID:700"
+      else
+        stat_output='10003:0:700'
+      fi
+      docker() {
+        printf '%s\n' "$*" >>"$docker_calls"
+        [[ "$1 $2" == 'ps --quiet' ]]
+      }
+      portable_owner() {
+        printf '%s\n' "$HOST_UID"
+      }
+      portable_mode() {
+        printf '700\n'
+      }
+      compose() {
+        compose_calls=$((compose_calls + 1))
+        script=''
+        previous=''
+        shell_args=()
+        while (($#)); do
+          argument="$1"
+          shift
+          if [[ "$previous" == -ceu ]]; then
+            script="$argument"
+            shell_args=("$@")
+            break
+          fi
+          previous="$argument"
+        done
+        [[ -n "$script" ]] || return 0
+        production_script="$script"
+        script='
+find() {
+  /bin/sh "$FIND_STUB_SCRIPT" "$@"
+}
+chown() {
+  /bin/sh "$CHOWN_STUB_SCRIPT" "$@"
+}
+stat() {
+  /bin/sh "$STAT_STUB_SCRIPT" "$@"
+}
+'"$production_script"
+        scan_status=0
+        FIND_STUB_SCRIPT="$stub_dir/find" \
+          CHOWN_STUB_SCRIPT="$stub_dir/chown" \
+          STAT_STUB_SCRIPT="$stub_dir/stat" \
+          FIND_STUB_COUNT="$counter" \
+          FIND_STUB_FAIL_AT="$fail_at" \
+          CHOWN_STUB_CALLS="$chown_calls" \
+          STAT_STUB_OUTPUT="$stat_output" \
+          /bin/sh -ceu "$script" "${shell_args[@]}" ||
+          scan_status=$?
+        return "$scan_status"
+      }
+
+      if [[ "$transition" == prepare ]]; then
+        prepare_restore_repository_access ||
+          transition_status=$?
+      else
+        restore_backup_repository_access ||
+          transition_status=$?
+      fi >"$output" 2>&1
+      [[ "$scan_status" != 0 &&
+        "$compose_calls" == 1 &&
+        "$transition_status" != 0 &&
+        "$(<"$counter")" == "$fail_at" &&
+        ! -s "$output" ]] || {
+        printf 'repository transition fault mismatch: transition=%s failAt=%s scanStatus=%s transitionStatus=%s composeCalls=%s findCount=%s outputBytes=%s\n' \
+          "$transition" "$fail_at" "$scan_status" "$transition_status" \
+          "$compose_calls" "$(<"$counter")" \
+          "$(wc -c <"$output" | tr -d '[:space:]')" >&2
+        return 1
+      }
+      if [[ "$fail_at" -le 3 ]]; then
+        [[ ! -s "$chown_calls" ]] || {
+          printf 'repository transition fault reached chown early: transition=%s failAt=%s\n' \
+            "$transition" "$fail_at" >&2
+          return 1
+        }
+      else
+        [[ "$(wc -l <"$chown_calls" | tr -d '[:space:]')" == 1 ]] || {
+          printf 'repository transition fault chown count mismatch: transition=%s failAt=%s\n' \
+            "$transition" "$fail_at" >&2
+          return 1
+        }
+      fi
+      ! grep -Eq \
+        '(container|image|network|volume) (create|run|rm)|compose down' \
+        "$docker_calls" || {
+        printf 'repository transition fault mutated Docker resources: transition=%s failAt=%s\n' \
+          "$transition" "$fail_at" >&2
+        return 1
+      }
+      rm -rf "$scenario_root"
+      [[ ! -e "$scenario_root" && ! -L "$scenario_root" ]] || {
+        printf 'repository transition fault left local residue: transition=%s failAt=%s\n' \
+          "$transition" "$fail_at" >&2
+        return 1
+      }
+    done
+  done
+)
+
 review_repository_handoff_find_error() (
   local calls cleanup_root image_id repository counter
   local stub_dir fail_at
@@ -1391,6 +1544,7 @@ review_dynamic_fault_windows() (
   review_controller_socket_groups || return 1
   review_create_fixture_daemon_error || return 1
   review_repository_handoff_daemon_error || return 1
+  review_repository_transition_find_error || return 1
   review_repository_handoff_find_error || return 1
   review_absence_checks_fail_closed || return 1
   review_project_fallback_cleanup || return 1

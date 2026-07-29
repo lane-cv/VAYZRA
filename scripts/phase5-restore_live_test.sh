@@ -1010,6 +1010,7 @@ assert_repository_handoff_safe() {
 }
 
 prepare_restore_repository_access() {
+  local repository_owner repository_mode
   assert_repository_handoff_safe ||
     fail 'repository ownership handoff was not quiescent'
   compose run --rm --no-deps \
@@ -1022,18 +1023,29 @@ prepare_restore_repository_access() {
       case "$uid:$gid" in
         *[!0-9:]* | :* | *: | *:*:*) exit 1 ;;
       esac
-      test -z "$(find -P /repository -xdev -type l -print -quit)"
-      test -z "$(find -P /repository -xdev ! -type d ! -type f -print -quit)"
-      test -z "$(find -P /repository -xdev -type f -links +1 -print -quit)"
+      repository_find_empty() {
+        result="$(find -P /repository -xdev "$@")" || return 1
+        test -z "$result"
+      }
+      repository_find_empty -type l -print -quit
+      repository_find_empty ! -type d ! -type f -print -quit
+      repository_find_empty -type f -links +1 -print -quit
       chown -R -- "$uid:$gid" /repository
-      test "$(stat -c "%u:%g:%a" /repository)" = "$uid:$gid:700"
-      test -z "$(find -P /repository -xdev ! -user "$uid" -print -quit)"
-      test -z "$(find -P /repository -xdev ! -group "$gid" -print -quit)"
+      repository_stat="$(stat -c "%u:%g:%a" /repository)" || exit 1
+      test "$repository_stat" = "$uid:$gid:700"
+      repository_find_empty ! -user "$uid" -print -quit
+      repository_find_empty ! -group "$gid" -print -quit
     ' handoff "$HOST_UID" "$HOST_GID" \
-    >/dev/null
-  [[ "$(portable_owner "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY")" == \
-    "$HOST_UID" &&
-    "$(portable_mode "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY")" == 700 ]] ||
+    >/dev/null ||
+    return 1
+  repository_owner="$(
+    portable_owner "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY"
+  )" || return 1
+  repository_mode="$(
+    portable_mode "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY"
+  )" || return 1
+  [[ "$repository_owner" == "$HOST_UID" &&
+    "$repository_mode" == 700 ]] ||
     fail 'repository ownership handoff to restore operator failed'
 }
 
@@ -1045,16 +1057,23 @@ restore_backup_repository_access() {
     backup-storage-init \
     --foreground --kill-after=10s 300s \
     /bin/sh -ceu '
-      test -z "$(find -P /repository -xdev -type l -print -quit)"
-      test -z "$(find -P /repository -xdev ! -type d ! -type f -print -quit)"
-      test -z "$(find -P /repository -xdev -type f -links +1 -print -quit)"
+      repository_find_empty() {
+        result="$(find -P /repository -xdev "$@")" || return 1
+        test -z "$result"
+      }
+      repository_find_empty -type l -print -quit
+      repository_find_empty ! -type d ! -type f -print -quit
+      repository_find_empty -type f -links +1 -print -quit
       chown -R -- 10003:0 /repository
-      test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700"
-      test -z "$(find -P /repository -xdev ! -user 10003 -print -quit)"
-      test -z "$(find -P /repository -xdev ! -group 0 -print -quit)"
+      repository_stat="$(stat -c "%u:%g:%a" /repository)" || exit 1
+      test "$repository_stat" = "10003:0:700"
+      repository_find_empty ! -user 10003 -print -quit
+      repository_find_empty ! -group 0 -print -quit
     ' handback \
-    >/dev/null
-  compose run --rm --no-deps backup-storage-init >/dev/null
+    >/dev/null ||
+    return 1
+  compose run --rm --no-deps backup-storage-init >/dev/null ||
+    return 1
   compose run --rm --no-deps \
     --entrypoint /usr/bin/timeout \
     backup \
@@ -1063,7 +1082,8 @@ restore_backup_repository_access() {
     --repository-file /run/secrets/local_repository \
     --password-file /run/secrets/local_password \
     cat config \
-    >/dev/null
+    >/dev/null ||
+    return 1
 }
 
 controller_identity_matches() {
