@@ -3,6 +3,9 @@ package operations
 import (
 	"context"
 	"errors"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,6 +243,160 @@ ORDER BY attempt`, eventID)
 	}
 }
 
+func TestPostgresWebhookDeliveryCompletionRequiresLiveLease(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name          string
+		finishedAfter time.Duration
+		wantConflict  bool
+		wantStates    []string
+	}{
+		{
+			name: "before expiry", finishedAfter: 29 * time.Second,
+			wantStates: []string{"succeeded", "cancelled", "cancelled"},
+		},
+		{
+			name: "exact expiry", finishedAfter: 30 * time.Second,
+			wantConflict: true,
+			wantStates:   []string{"claimed", "pending", "pending"},
+		},
+		{
+			name: "after expiry", finishedAfter: 31 * time.Second,
+			wantConflict: true,
+			wantStates:   []string{"claimed", "pending", "pending"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := migratedAlertPool(t)
+			enqueuedAt := alertPostgresClock(t, pool)
+			eventID, _ := seedWebhookEvent(
+				t,
+				ctx,
+				pool,
+				enqueuedAt,
+				AlertTransitionOpened,
+			)
+			store := NewPostgresWebhookDeliveryStore(pool)
+			claimedAt := enqueuedAt.Add(time.Minute)
+			job, err := store.Claim(
+				ctx,
+				"lease-worker",
+				uuid.New(),
+				claimedAt,
+				30*time.Second,
+			)
+			if err != nil || job == nil {
+				t.Fatalf("job=%+v err=%v", job, err)
+			}
+			err = store.Complete(
+				ctx,
+				*job,
+				WebhookDeliveryResult{
+					Succeeded: true, HTTPStatusClass: 2,
+				},
+				claimedAt.Add(test.finishedAfter),
+			)
+			if test.wantConflict {
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("completion error=%v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := pool.Query(ctx, `
+SELECT delivery_state
+FROM alert_deliveries
+WHERE event_id=$1
+ORDER BY attempt`, eventID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var states []string
+			for rows.Next() {
+				var state string
+				if err := rows.Scan(&state); err != nil {
+					t.Fatal(err)
+				}
+				states = append(states, state)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if len(states) != len(test.wantStates) {
+				t.Fatalf("states=%v", states)
+			}
+			for index := range states {
+				if states[index] != test.wantStates[index] {
+					t.Fatalf(
+						"states=%v want=%v",
+						states,
+						test.wantStates,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgresLegacyDeliveryCoexistsWithEventAttempts(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	enqueuedAt := alertPostgresClock(t, pool)
+	eventID, alertID := seedWebhookEvent(
+		t,
+		ctx,
+		pool,
+		enqueuedAt,
+		AlertTransitionOpened,
+	)
+	store := NewPostgresAlertStore(pool)
+	delivery := AlertDelivery{
+		ID: uuid.New(), AlertID: alertID,
+		Attempt: 1, Destination: "webhook",
+		Outcome: "failed", ErrorCategory: "timeout",
+		StartedAt:  enqueuedAt,
+		FinishedAt: enqueuedAt.Add(time.Second),
+	}
+	if err := store.RecordAlertDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	replay := delivery
+	replay.ID = uuid.New()
+	if err := store.RecordAlertDelivery(ctx, replay); err != nil {
+		t.Fatalf("legacy replay error=%v", err)
+	}
+	conflict := replay
+	conflict.Outcome = "succeeded"
+	conflict.HTTPStatusClass = 2
+	conflict.ErrorCategory = ""
+	if err := store.RecordAlertDelivery(
+		ctx,
+		conflict,
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("legacy conflict error=%v", err)
+	}
+	var legacyRows, eventRows int
+	if err := pool.QueryRow(ctx, `
+SELECT
+  count(*) FILTER (WHERE event_id IS NULL),
+  count(*) FILTER (WHERE event_id=$2)
+FROM alert_deliveries
+WHERE alert_id=$1`,
+		alertID,
+		eventID,
+	).Scan(&legacyRows, &eventRows); err != nil {
+		t.Fatal(err)
+	}
+	if legacyRows != 1 || eventRows != 3 {
+		t.Fatalf(
+			"legacy rows=%d event rows=%d",
+			legacyRows,
+			eventRows,
+		)
+	}
+}
+
 func TestPostgresWebhookDeliveryClaimCompetesAcrossReplicas(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedAlertPool(t)
@@ -285,6 +442,109 @@ func TestPostgresWebhookDeliveryClaimCompetesAcrossReplicas(t *testing.T) {
 	}
 	if claimed != 1 {
 		t.Fatalf("claimed=%d want=1", claimed)
+	}
+}
+
+func TestPostgresWebhookDeliveryClaimPlanStaysBounded(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	now := alertPostgresClock(t, pool)
+	seedWebhookClaimPlanHistory(t, ctx, pool, now, 12_000)
+	seedWebhookEvent(t, ctx, pool, now, AlertTransitionOpened)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(
+		ctx,
+		"EXPLAIN (ANALYZE,BUFFERS,COSTS OFF) "+claimWebhookDeliverySQL,
+		now.Add(time.Minute),
+		"plan-worker",
+		uuid.New(),
+		now.Add(2*time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, line)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(lines, "\n")
+	if !strings.Contains(
+		plan,
+		"alert_deliveries_effective_due_claim_idx",
+	) {
+		t.Fatalf("effective due index missing from plan:\n%s", plan)
+	}
+	if strings.Contains(plan, "Seq Scan on alert_deliveries") {
+		t.Fatalf("delivery sequential scan in claim plan:\n%s", plan)
+	}
+	removedPattern := regexp.MustCompile(
+		`Rows Removed by Filter: ([0-9]+)`,
+	)
+	for _, match := range removedPattern.FindAllStringSubmatch(
+		plan,
+		-1,
+	) {
+		removed, err := strconv.Atoi(match[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed >= 1000 {
+			t.Fatalf(
+				"claim plan filtered %d rows:\n%s",
+				removed,
+				plan,
+			)
+		}
+	}
+}
+
+func TestPostgresWebhookDeliveryClaimsAcknowledgedCriticalUpgrade(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	enqueuedAt := alertPostgresClock(t, pool)
+	eventID, _ := seedWebhookEvent(
+		t,
+		ctx,
+		pool,
+		enqueuedAt,
+		AlertTransitionOpened,
+	)
+	if _, err := pool.Exec(ctx, `
+UPDATE alert_webhook_events
+SET transition_kind='upgraded',
+    severity='critical',
+    state='acknowledged'
+WHERE id=$1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := NewPostgresWebhookDeliveryStore(pool).Claim(
+		ctx,
+		"acknowledged-upgrade-worker",
+		uuid.New(),
+		enqueuedAt.Add(time.Minute),
+		time.Minute,
+	)
+	if err != nil ||
+		job == nil ||
+		job.Event.TransitionKind != AlertTransitionUpgraded ||
+		job.Event.Severity != AlertSeverityCritical ||
+		job.Event.State != AlertStateAcknowledged {
+		t.Fatalf("job=%+v err=%v", job, err)
 	}
 }
 
@@ -391,4 +651,59 @@ WHERE alert_id=$1 AND transition_kind=$2`,
 		t.Fatal(err)
 	}
 	return eventID, alertID
+}
+
+func seedWebhookClaimPlanHistory(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	now time.Time,
+	count int,
+) {
+	t.Helper()
+	var alertID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+INSERT INTO operational_alerts(
+  dedupe_key,category,severity,state,first_observed_at,last_observed_at,
+  current_value,threshold_value,summary,consecutive_failures,version
+) VALUES(
+  $1,'processing','warning','open',$2,$3,21,20,
+  'Processing queue depth is high',2,$4
+)
+RETURNING id`,
+		"webhook_plan_"+uuid.NewString(),
+		now.Add(-2*time.Hour),
+		now,
+		count+10,
+	).Scan(&alertID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+WITH events AS (
+  INSERT INTO alert_webhook_events(
+    id,alert_id,transition_kind,alert_version,category,severity,state,
+    summary,current_value,threshold_value,first_observed_at,last_observed_at,
+    enqueued_at
+  )
+  SELECT
+    gen_random_uuid(),$1,'opened',series,'processing','warning','open',
+    'Processing queue depth is high',21,20,$2,$3,$3
+  FROM generate_series(10,$4 + 9) AS series
+  RETURNING id,alert_id
+)
+INSERT INTO alert_deliveries(
+  id,alert_id,event_id,attempt,destination,delivery_state,scheduled_at,
+  claim_owner,claim_token,claim_expires_at,started_at
+)
+SELECT
+  gen_random_uuid(),alert_id,id,1,'webhook','claimed',$2,
+  'active-plan-worker',gen_random_uuid(),$3 + interval '1 hour',$2
+FROM events`,
+		alertID,
+		now.Add(-2*time.Hour),
+		now,
+		count,
+	); err != nil {
+		t.Fatal(err)
+	}
 }

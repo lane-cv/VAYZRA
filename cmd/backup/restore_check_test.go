@@ -438,7 +438,7 @@ func TestLatestEmbeddedMigrationVersionIsStrictAndCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if latest != 24 {
+	if latest != 25 {
 		t.Fatalf("latest migration=%d", latest)
 	}
 
@@ -492,25 +492,25 @@ func TestValidateRestoreMigrationVersionsAllowsOldBackupAtLatestSchema(
 	}{
 		{
 			name:            "current manifest",
-			manifestVersion: 24, restoredVersion: 24, embeddedLatest: 24,
+			manifestVersion: 25, restoredVersion: 25, embeddedLatest: 25,
 		},
 		{
 			name:            "old manifest migrated forward",
-			manifestVersion: 23, restoredVersion: 24, embeddedLatest: 24,
+			manifestVersion: 24, restoredVersion: 25, embeddedLatest: 25,
 		},
 		{
 			name:            "future manifest",
-			manifestVersion: 25, restoredVersion: 24, embeddedLatest: 24,
+			manifestVersion: 26, restoredVersion: 25, embeddedLatest: 25,
 			wantError: true,
 		},
 		{
 			name:            "old restored database",
-			manifestVersion: 23, restoredVersion: 23, embeddedLatest: 24,
+			manifestVersion: 24, restoredVersion: 24, embeddedLatest: 25,
 			wantError: true,
 		},
 		{
 			name:            "future restored database",
-			manifestVersion: 24, restoredVersion: 25, embeddedLatest: 24,
+			manifestVersion: 25, restoredVersion: 26, embeddedLatest: 25,
 			wantError: true,
 		},
 	} {

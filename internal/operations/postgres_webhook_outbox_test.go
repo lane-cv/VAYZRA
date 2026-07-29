@@ -319,6 +319,84 @@ SELECT count(*) FROM alert_webhook_events`).Scan(&events); err != nil {
 	}
 }
 
+func TestWebhookTransitionSnapshotSemantics(t *testing.T) {
+	now := time.Now().UTC()
+	base := Alert{
+		ID: uuid.New(), Version: 2,
+		Category: "processing", Severity: AlertSeverityCritical,
+		State: AlertStateOpen, Summary: "Processing queue depth is high",
+		CurrentValue: 101, ThresholdValue: 100,
+		FirstObservedAt: now.Add(-time.Minute), LastObservedAt: now,
+	}
+	for _, test := range []struct {
+		name  string
+		kind  AlertTransitionKind
+		alert Alert
+		valid bool
+	}{
+		{
+			name: "opened open", kind: AlertTransitionOpened,
+			alert: base, valid: true,
+		},
+		{
+			name: "opened resolved", kind: AlertTransitionOpened,
+			alert: func() Alert {
+				value := base
+				value.State = AlertStateResolved
+				return value
+			}(),
+		},
+		{
+			name: "upgraded acknowledged critical",
+			kind: AlertTransitionUpgraded,
+			alert: func() Alert {
+				value := base
+				value.State = AlertStateAcknowledged
+				return value
+			}(),
+			valid: true,
+		},
+		{
+			name: "upgraded warning", kind: AlertTransitionUpgraded,
+			alert: func() Alert {
+				value := base
+				value.Severity = AlertSeverityWarning
+				return value
+			}(),
+		},
+		{
+			name: "upgraded resolved", kind: AlertTransitionUpgraded,
+			alert: func() Alert {
+				value := base
+				value.State = AlertStateResolved
+				return value
+			}(),
+		},
+		{
+			name: "resolved resolved", kind: AlertTransitionResolved,
+			alert: func() Alert {
+				value := base
+				value.State = AlertStateResolved
+				return value
+			}(),
+			valid: true,
+		},
+		{
+			name: "resolved open", kind: AlertTransitionResolved,
+			alert: base,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validWebhookTransition(
+				test.kind,
+				test.alert,
+			); got != test.valid {
+				t.Fatalf("valid=%t want=%t", got, test.valid)
+			}
+		})
+	}
+}
+
 type deterministicUUIDSequence struct {
 	values []uuid.UUID
 	index  int

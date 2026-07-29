@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +88,76 @@ func TestWebhookSenderConfigurationIsFailClosedAndDisabledIsNoop(t *testing.T) {
 	}
 }
 
+func TestWebhookSenderConfigurationErrorsAreStable(t *testing.T) {
+	t.Parallel()
+	const marker = "private-marker"
+	for name, config := range map[string]WebhookSenderConfig{
+		"authorization without URL": {
+			Authorization: "Bearer " + marker,
+		},
+		"unsafe authorization": {
+			URL:           "https://alerts.example.test/hook",
+			Authorization: "Bearer " + marker + "\n",
+			Resolver: &webhookResolver{answers: [][]netip.Addr{
+				{netip.MustParseAddr("93.184.216.34")},
+			}},
+		},
+		"normalization": {
+			URL: "https://" + marker + ".example.test/hook",
+			Resolver: &webhookResolver{
+				err: errors.New(
+					marker + " resolver refused 10.0.0.1",
+				),
+			},
+		},
+		"metadata address": {
+			URL: "https://169.254.169.254/" + marker,
+		},
+		"timeout": {
+			URL: "https://alerts.example.test/" + marker,
+			Resolver: &webhookResolver{answers: [][]netip.Addr{
+				{netip.MustParseAddr("93.184.216.34")},
+			}},
+			Timeouts: safehttp.Timeouts{
+				Total: -time.Second,
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sender, err := NewWebhookSender(
+				context.Background(),
+				config,
+			)
+			if sender != nil || !errors.Is(err, ErrInvalid) {
+				t.Fatalf("sender=%+v error=%v", sender, err)
+			}
+			for _, forbidden := range []string{
+				marker,
+				"169.254.169.254",
+				"10.0.0.1",
+				"resolver",
+				"alerts.example.test",
+			} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf(
+						"configuration error leaked %q: %q",
+						forbidden,
+						err,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestWebhookSenderConfigCannotInjectTransport(t *testing.T) {
+	t.Parallel()
+	configType := reflect.TypeOf(WebhookSenderConfig{})
+	if field, exists := configType.FieldByName("Doer"); exists {
+		t.Fatalf("exported transport injection remains: %+v", field)
+	}
+}
+
 func TestWebhookSenderSendsBoundedExactRequestAndReturnsSafeClassification(t *testing.T) {
 	t.Parallel()
 	at := time.Date(2026, 7, 30, 13, 0, 0, 0, time.UTC)
@@ -98,14 +169,17 @@ func TestWebhookSenderSendsBoundedExactRequestAndReturnsSafeClassification(t *te
 			Header:     make(http.Header),
 		},
 	}
-	sender, err := NewWebhookSender(context.Background(), WebhookSenderConfig{
-		URL:           "https://alerts.example.test/hook",
-		Authorization: "Bearer webhook-secret",
-		Resolver: &webhookResolver{answers: [][]netip.Addr{
-			{netip.MustParseAddr("93.184.216.34")},
-		}},
-		Doer: doer,
-	})
+	sender, err := newWebhookSenderWithDoer(
+		context.Background(),
+		WebhookSenderConfig{
+			URL:           "https://alerts.example.test/hook",
+			Authorization: "Bearer webhook-secret",
+			Resolver: &webhookResolver{answers: [][]netip.Addr{
+				{netip.MustParseAddr("93.184.216.34")},
+			}},
+		},
+		doer,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +382,7 @@ func TestWebhookSenderRejectsRequestAboveEightKiBBeforeTransport(t *testing.T) {
 
 func TestWebhookSenderNeverReturnsTransportOrResponseDetails(t *testing.T) {
 	t.Parallel()
-	for name, doer := range map[string]WebhookHTTPDoer{
+	for name, doer := range map[string]webhookHTTPDoer{
 		"transport": &webhookDoerStub{
 			err: errors.New(
 				"Bearer private-secret alerts.example.test refused",
@@ -354,6 +428,7 @@ type webhookResolver struct {
 	mu      sync.Mutex
 	answers [][]netip.Addr
 	index   int
+	err     error
 }
 
 func (resolver *webhookResolver) LookupNetIP(
@@ -363,6 +438,9 @@ func (resolver *webhookResolver) LookupNetIP(
 ) ([]netip.Addr, error) {
 	resolver.mu.Lock()
 	defer resolver.mu.Unlock()
+	if resolver.err != nil {
+		return nil, resolver.err
+	}
 	index := resolver.index
 	if index >= len(resolver.answers) {
 		index = len(resolver.answers) - 1
@@ -413,16 +491,19 @@ func (doer *webhookDoerStub) Calls() int {
 
 func webhookSenderWithDoer(
 	t *testing.T,
-	doer WebhookHTTPDoer,
+	doer webhookHTTPDoer,
 ) *WebhookSender {
 	t.Helper()
-	sender, err := NewWebhookSender(context.Background(), WebhookSenderConfig{
-		URL: "https://alerts.example.test/hook",
-		Resolver: &webhookResolver{answers: [][]netip.Addr{
-			{netip.MustParseAddr("93.184.216.34")},
-		}},
-		Doer: doer,
-	})
+	sender, err := newWebhookSenderWithDoer(
+		context.Background(),
+		WebhookSenderConfig{
+			URL: "https://alerts.example.test/hook",
+			Resolver: &webhookResolver{answers: [][]netip.Addr{
+				{netip.MustParseAddr("93.184.216.34")},
+			}},
+		},
+		doer,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

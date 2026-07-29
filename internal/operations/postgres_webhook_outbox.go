@@ -137,13 +137,6 @@ DO NOTHING`,
 }
 
 func validWebhookTransition(kind AlertTransitionKind, alert Alert) bool {
-	switch kind {
-	case AlertTransitionOpened,
-		AlertTransitionUpgraded,
-		AlertTransitionResolved:
-	default:
-		return false
-	}
 	if alert.ID == uuid.Nil ||
 		alert.Version < 1 ||
 		!alertIdentifier.MatchString(alert.Category) ||
@@ -168,5 +161,16 @@ func validWebhookTransition(kind AlertTransitionKind, alert Alert) bool {
 	default:
 		return false
 	}
-	return true
+	switch kind {
+	case AlertTransitionOpened:
+		return alert.State == AlertStateOpen
+	case AlertTransitionUpgraded:
+		return alert.Severity == AlertSeverityCritical &&
+			(alert.State == AlertStateOpen ||
+				alert.State == AlertStateAcknowledged)
+	case AlertTransitionResolved:
+		return alert.State == AlertStateResolved
+	default:
+		return false
+	}
 }

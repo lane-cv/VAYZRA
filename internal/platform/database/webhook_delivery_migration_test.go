@@ -43,7 +43,7 @@ SELECT
    WHERE schemaname='public' AND indexname IN (
      'alert_deliveries_alert_attempt_key',
      'alert_deliveries_event_attempt_key',
-     'alert_deliveries_due_claim_idx'
+     'alert_deliveries_effective_due_claim_idx'
    ))`).
 		Scan(&eventTable, &eventUnique, &columns, &constraints, &indexes); err != nil {
 		t.Fatal(err)
@@ -69,9 +69,9 @@ SELECT
 		dueIndex    string
 	)
 	for name, target := range map[string]*string{
-		"alert_deliveries_alert_attempt_key": &legacyIndex,
-		"alert_deliveries_event_attempt_key": &eventIndex,
-		"alert_deliveries_due_claim_idx":     &dueIndex,
+		"alert_deliveries_alert_attempt_key":       &legacyIndex,
+		"alert_deliveries_event_attempt_key":       &eventIndex,
+		"alert_deliveries_effective_due_claim_idx": &dueIndex,
 	} {
 		if err := pool.QueryRow(ctx, `
 SELECT indexdef FROM pg_indexes
@@ -93,8 +93,13 @@ WHERE schemaname='public' AND indexname=$1`, name).Scan(target); err != nil {
 		) ||
 		!containsAll(
 			dueIndex,
-			"(scheduled_at, event_id, attempt)",
-			"WHERE (delivery_state = ANY",
+			"CASE",
+			"scheduled_at",
+			"claim_expires_at",
+			"event_id",
+			"attempt",
+			"WHERE ((event_id IS NOT NULL)",
+			"delivery_state = ANY",
 		) {
 		t.Fatalf(
 			"legacy=%q event=%q due=%q",

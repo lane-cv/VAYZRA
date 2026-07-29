@@ -496,6 +496,7 @@ SELECT id,alert_id,attempt,destination,outcome,http_status_class,
        error_category,started_at,finished_at
 FROM alert_deliveries
 WHERE alert_id=$1 AND attempt=$2 AND destination=$3
+  AND event_id IS NULL
 FOR UPDATE`,
 		delivery.AlertID,
 		delivery.Attempt,

@@ -14,66 +14,56 @@ type PostgresWebhookDeliveryStore struct {
 	pool *pgxpool.Pool
 }
 
-func NewPostgresWebhookDeliveryStore(
-	pool *pgxpool.Pool,
-) *PostgresWebhookDeliveryStore {
-	return &PostgresWebhookDeliveryStore{pool: pool}
-}
-
-func (store *PostgresWebhookDeliveryStore) Claim(
-	ctx context.Context,
-	owner string,
-	token uuid.UUID,
-	now time.Time,
-	leaseDuration time.Duration,
-) (*WebhookDeliveryJob, error) {
-	if store == nil || store.pool == nil || ctx == nil ||
-		!webhookClaimOwner.MatchString(owner) ||
-		token == uuid.Nil ||
-		!validSampleTime(now) ||
-		leaseDuration <= 0 ||
-		leaseDuration > maxWebhookLeaseDuration {
-		return nil, ErrInvalid
-	}
-	now = postgresAlertTime(now)
-	expiresAt := postgresAlertTime(now.Add(leaseDuration))
-	row := store.pool.QueryRow(ctx, `
+const claimWebhookDeliverySQL = `
 WITH candidate AS (
   SELECT delivery.id
   FROM alert_deliveries delivery
   WHERE delivery.event_id IS NOT NULL
+    AND delivery.delivery_state IN ('pending','claimed')
     AND (
-      (delivery.delivery_state='pending' AND delivery.scheduled_at <= $1)
-      OR (
-        delivery.delivery_state='claimed'
-        AND delivery.claim_expires_at <= $1
-      )
-    )
+      CASE
+        WHEN delivery.delivery_state='pending' THEN delivery.scheduled_at
+        WHEN delivery.delivery_state='claimed' THEN delivery.claim_expires_at
+      END
+    ) <= $1
     AND (
       delivery.attempt=1
-      OR EXISTS (
-        SELECT 1
+      OR COALESCE((
+        SELECT true
         FROM alert_deliveries previous
         WHERE previous.event_id=delivery.event_id
           AND previous.attempt=delivery.attempt-1
+          AND previous.destination=delivery.destination
           AND previous.delivery_state='failed'
-      )
+        LIMIT 1
+      ),false)
     )
-    AND NOT EXISTS (
-      SELECT 1
+    AND NOT COALESCE((
+      SELECT true
       FROM alert_deliveries active
       WHERE active.event_id=delivery.event_id
         AND active.id<>delivery.id
         AND active.delivery_state='claimed'
         AND active.claim_expires_at > $1
-    )
-    AND NOT EXISTS (
-      SELECT 1
+      LIMIT 1
+    ),false)
+    AND NOT COALESCE((
+      SELECT true
       FROM alert_deliveries succeeded
       WHERE succeeded.event_id=delivery.event_id
         AND succeeded.delivery_state='succeeded'
-    )
-  ORDER BY delivery.scheduled_at,delivery.event_id,delivery.attempt
+      LIMIT 1
+    ),false)
+  ORDER BY
+    (
+      CASE
+        WHEN delivery.delivery_state='pending' THEN delivery.scheduled_at
+        WHEN delivery.delivery_state='claimed' THEN delivery.claim_expires_at
+      END
+    ),
+    delivery.event_id,
+    delivery.attempt,
+    delivery.id
   FOR UPDATE OF delivery SKIP LOCKED
   LIMIT 1
 ),
@@ -101,7 +91,32 @@ SELECT
   event.current_value,event.threshold_value,
   event.first_observed_at,event.last_observed_at
 FROM claimed
-JOIN alert_webhook_events event ON event.id=claimed.event_id`,
+JOIN alert_webhook_events event ON event.id=claimed.event_id`
+
+func NewPostgresWebhookDeliveryStore(
+	pool *pgxpool.Pool,
+) *PostgresWebhookDeliveryStore {
+	return &PostgresWebhookDeliveryStore{pool: pool}
+}
+
+func (store *PostgresWebhookDeliveryStore) Claim(
+	ctx context.Context,
+	owner string,
+	token uuid.UUID,
+	now time.Time,
+	leaseDuration time.Duration,
+) (*WebhookDeliveryJob, error) {
+	if store == nil || store.pool == nil || ctx == nil ||
+		!webhookClaimOwner.MatchString(owner) ||
+		token == uuid.Nil ||
+		!validSampleTime(now) ||
+		leaseDuration <= 0 ||
+		leaseDuration > maxWebhookLeaseDuration {
+		return nil, ErrInvalid
+	}
+	now = postgresAlertTime(now)
+	expiresAt := postgresAlertTime(now.Add(leaseDuration))
+	row := store.pool.QueryRow(ctx, claimWebhookDeliverySQL,
 		now,
 		owner,
 		token,
@@ -215,7 +230,8 @@ WHERE id=$1
   AND alert_id=$3
   AND delivery_state='claimed'
   AND claim_owner=$4
-  AND claim_token=$5`,
+  AND claim_token=$5
+  AND claim_expires_at > $10`,
 		job.ID,
 		job.EventID,
 		job.AlertID,

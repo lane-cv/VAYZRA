@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -76,7 +75,7 @@ func BuildWebhookPayload(event WebhookEvent) (WebhookPayload, error) {
 	}, nil
 }
 
-type WebhookHTTPDoer interface {
+type webhookHTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
@@ -86,36 +85,43 @@ type WebhookSenderConfig struct {
 	DevelopmentAllowPrivate bool
 	Resolver                safehttp.Resolver
 	Timeouts                safehttp.Timeouts
-	Doer                    WebhookHTTPDoer
 }
 
 type WebhookSender struct {
 	enabled       bool
 	endpoint      *url.URL
 	authorization string
-	doer          WebhookHTTPDoer
+	doer          webhookHTTPDoer
 }
 
 func NewWebhookSender(
 	ctx context.Context,
 	config WebhookSenderConfig,
 ) (*WebhookSender, error) {
+	return newWebhookSenderWithDoer(ctx, config, nil)
+}
+
+func newWebhookSenderWithDoer(
+	ctx context.Context,
+	config WebhookSenderConfig,
+	doer webhookHTTPDoer,
+) (*WebhookSender, error) {
 	if ctx == nil {
 		return nil, ErrInvalid
 	}
 	if config.URL == "" {
 		if config.Authorization != "" {
-			return nil, fmt.Errorf("webhook authorization requires an endpoint")
+			return nil, ErrInvalid
 		}
 		return &WebhookSender{}, nil
 	}
 	if strings.TrimSpace(config.URL) != config.URL ||
 		!safeWebhookAuthorization(config.Authorization) {
-		return nil, fmt.Errorf("invalid webhook configuration")
+		return nil, ErrInvalid
 	}
 	timeouts, err := webhookTimeouts(config.Timeouts)
 	if err != nil {
-		return nil, err
+		return nil, ErrInvalid
 	}
 	policy := safehttp.Policy{
 		DevelopmentAllowPrivate: config.DevelopmentAllowPrivate,
@@ -123,9 +129,8 @@ func NewWebhookSender(
 	}
 	endpoint, err := policy.NormalizeBaseURL(ctx, config.URL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid webhook endpoint: %w", err)
+		return nil, ErrInvalid
 	}
-	doer := config.Doer
 	if doer == nil {
 		doer = safehttp.NewClient(policy, safehttp.ClientOptions{
 			Timeouts:         timeouts,
@@ -263,7 +268,7 @@ func webhookTimeouts(value safehttp.Timeouts) (safehttp.Timeouts, error) {
 	}
 	for index, duration := range durations {
 		if *duration < 0 || *duration > maxWebhookNetworkTimeout {
-			return safehttp.Timeouts{}, fmt.Errorf("invalid webhook timeout")
+			return safehttp.Timeouts{}, ErrInvalid
 		}
 		if *duration == 0 {
 			*duration = defaults[index]
