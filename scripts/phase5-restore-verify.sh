@@ -7,19 +7,28 @@ readonly USAGE='Usage: scripts/phase5-restore-verify.sh --backup-id <canonical-u
 readonly PROJECT_PREFIX='happylearn-phase5-restore-'
 readonly OWNER_LABEL='io.happylearn.phase5.restore-owner'
 readonly KIND_LABEL='io.happylearn.phase5.restore-kind'
+readonly BACKUP_LABEL='io.happylearn.phase5.restore-backup-id'
 readonly RTO_LIMIT_SECONDS=14400
 readonly AISTOR_IMAGE='quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120'
+readonly CONTAINER_CPUS='0.25'
+readonly CONTAINER_MEMORY='512m'
+readonly CONTAINER_MEMORY_SWAP='512m'
+readonly CONTAINER_PIDS_LIMIT='256'
 
 BACKUP_ID=''
 PROJECT=''
 OWNER_TOKEN=''
 WORK_DIRECTORY=''
+CONTROL_DIRECTORY=''
 RESTORE_DIRECTORY=''
 REPORT_FILE=''
 REPORT_TEMPORARY=''
+RESTORE_LOCK_FILE=''
+RESTORE_LOCK_FD_OPEN=false
 NETWORK_NAME=''
 POSTGRES_VOLUME=''
 AISTOR_VOLUME=''
+AISTOR_LICENSE_VOLUME=''
 POSTGRES_CONTAINER=''
 AISTOR_CONTAINER=''
 REDIS_CONTAINER=''
@@ -31,9 +40,13 @@ SIGNING_EPOCH=''
 CLEANING_UP=false
 START_SECONDS="$SECONDS"
 CONTAINER_RECORD=''
+CLEANUP_INTENT_LEDGER=''
 NETWORK_CREATED=false
 POSTGRES_VOLUME_CREATED=false
 AISTOR_VOLUME_CREATED=false
+AISTOR_LICENSE_VOLUME_CREATED=false
+HOST_UID=''
+HOST_GID=''
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -98,19 +111,45 @@ validate_arguments() {
 
 portable_mode() {
   local path="$1"
-  if stat -f '%Lp' "$path" >/dev/null 2>&1; then
+  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+    stat -c '%a' "$path"
+  elif stat -f '%Lp' "$path" >/dev/null 2>&1; then
     stat -f '%Lp' "$path"
   else
-    stat -c '%a' "$path"
+    return 1
   fi
 }
 
 portable_owner() {
   local path="$1"
-  if stat -f '%u' "$path" >/dev/null 2>&1; then
+  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+    stat -c '%u' "$path"
+  elif stat -f '%u' "$path" >/dev/null 2>&1; then
     stat -f '%u' "$path"
   else
-    stat -c '%u' "$path"
+    return 1
+  fi
+}
+
+portable_group() {
+  local path="$1"
+  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+    stat -c '%g' "$path"
+  elif stat -f '%g' "$path" >/dev/null 2>&1; then
+    stat -f '%g' "$path"
+  else
+    return 1
+  fi
+}
+
+portable_size() {
+  local path="$1"
+  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+    stat -c '%s' "$path"
+  elif stat -f '%z' "$path" >/dev/null 2>&1; then
+    stat -f '%z' "$path"
+  else
+    return 1
   fi
 }
 
@@ -128,11 +167,7 @@ owner_only_secret() {
     "$(portable_mode "$path")" == '400' &&
     "$(portable_owner "$path")" == "$(id -u)" ]] ||
     return 1
-  if stat -f '%z' "$path" >/dev/null 2>&1; then
-    size="$(stat -f '%z' "$path")"
-  else
-    size="$(stat -c '%s' "$path")"
-  fi
+  size="$(portable_size "$path")" || return 1
   [[ "$size" -ge 1 && "$size" -le 4096 ]]
 }
 
@@ -148,10 +183,12 @@ canonical_directory() {
 validate_paths() {
   local repository_directory="${HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY:-}"
   local secret_directory="${HAPPYLEARN_BACKUP_SECRET_DIRECTORY:-}"
+  local control_directory="${HAPPYLEARN_RESTORE_CONTROL_DIRECTORY:-}"
   local report_directory="${HAPPYLEARN_RESTORE_REPORT_DIRECTORY:-}"
   local license_file="${HAPPYLEARN_AISTOR_LICENSE_FILE:-}"
   [[ -n "$repository_directory" &&
     -n "$secret_directory" &&
+    -n "$control_directory" &&
     -n "$report_directory" &&
     -n "$license_file" ]] ||
     return 1
@@ -161,6 +198,9 @@ validate_paths() {
   HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$(
     canonical_directory "$secret_directory"
   )" || return 1
+  HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$(
+    canonical_directory "$control_directory"
+  )" || return 1
   HAPPYLEARN_RESTORE_REPORT_DIRECTORY="$(
     canonical_directory "$report_directory"
   )" || return 1
@@ -169,17 +209,46 @@ validate_paths() {
   HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file"
   safe_mount_source "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
+  safe_mount_source "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_AISTOR_LICENSE_FILE" || return 1
   owner_only_directory "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
+  owner_only_directory "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY" || return 1
+  [[ "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY" != \
+    "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY" ]] ||
+    return 1
   owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password" ||
     return 1
+  owner_only_secret "$HAPPYLEARN_AISTOR_LICENSE_FILE" || return 1
   REPORT_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/restore-${BACKUP_ID}.json"
   REPORT_TEMPORARY="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new"
+  RESTORE_LOCK_FILE="$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY/restore-${BACKUP_ID}.lock"
   [[ ! -e "$REPORT_FILE" && ! -L "$REPORT_FILE" &&
     ! -e "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" ]] ||
     return 1
+}
+
+acquire_restore_lock() {
+  [[ "$RESTORE_LOCK_FILE" == \
+    "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY/restore-${BACKUP_ID}.lock" &&
+    ! -L "$RESTORE_LOCK_FILE" ]] ||
+    return 1
+  if [[ ! -e "$RESTORE_LOCK_FILE" ]]; then
+    (umask 077 && : >"$RESTORE_LOCK_FILE") || return 1
+    chmod 0600 "$RESTORE_LOCK_FILE" || return 1
+  fi
+  [[ -f "$RESTORE_LOCK_FILE" && ! -L "$RESTORE_LOCK_FILE" &&
+    "$(portable_mode "$RESTORE_LOCK_FILE")" == 600 &&
+    "$(portable_owner "$RESTORE_LOCK_FILE")" == "$(id -u)" ]] ||
+    return 1
+  command -v flock >/dev/null 2>&1 || return 1
+  exec 10<>"$RESTORE_LOCK_FILE" || return 1
+  if ! flock --exclusive --nonblock 10; then
+    exec 10>&-
+    return 1
+  fi
+  RESTORE_LOCK_FD_OPEN=true
 }
 
 random_token() {
@@ -191,6 +260,9 @@ random_token() {
 }
 
 initialize_identity() {
+  HOST_UID="$(id -u)" || return 1
+  HOST_GID="$(id -g)" || return 1
+  [[ "$HOST_UID" =~ ^[0-9]+$ && "$HOST_GID" =~ ^[0-9]+$ ]] || return 1
   OWNER_TOKEN="$(random_token)" || return 1
   PROJECT="${PROJECT_PREFIX}${OWNER_TOKEN:0:12}"
   valid_project "$PROJECT" || return 1
@@ -201,6 +273,7 @@ initialize_identity() {
   NETWORK_NAME="$PROJECT-network"
   POSTGRES_VOLUME="$PROJECT-postgres"
   AISTOR_VOLUME="$PROJECT-aistor"
+  AISTOR_LICENSE_VOLUME="$PROJECT-aistor-license"
   POSTGRES_CONTAINER="$PROJECT-postgres"
   AISTOR_CONTAINER="$PROJECT-aistor"
   REDIS_CONTAINER="$PROJECT-redis"
@@ -212,16 +285,70 @@ initialize_workspace() {
     mktemp -d "${TMPDIR:-/tmp}/phase5-restore-verify.XXXXXX"
   )" || return 1
   chmod 0700 "$WORK_DIRECTORY" || return 1
+  CONTROL_DIRECTORY="$WORK_DIRECTORY/control"
+  mkdir "$CONTROL_DIRECTORY" || return 1
+  chmod 0700 "$CONTROL_DIRECTORY" || return 1
   RESTORE_DIRECTORY="$WORK_DIRECTORY/restored"
   mkdir "$RESTORE_DIRECTORY" || return 1
   chmod 0700 "$RESTORE_DIRECTORY" || return 1
-  CONTAINER_RECORD="$WORK_DIRECTORY/containers"
+  CONTAINER_RECORD="$CONTROL_DIRECTORY/containers"
   : >"$CONTAINER_RECORD" || return 1
   chmod 0600 "$CONTAINER_RECORD" || return 1
+  CLEANUP_INTENT_LEDGER="$CONTROL_DIRECTORY/cleanup.intent"
+  : >"$CLEANUP_INTENT_LEDGER" || return 1
+  chmod 0600 "$CLEANUP_INTENT_LEDGER" || return 1
   printf 'postgres:5432:happylearn:happylearn:%s\n' \
-    "$DATABASE_PASSWORD" >"$WORK_DIRECTORY/pgpass" ||
+    "$DATABASE_PASSWORD" >"$CONTROL_DIRECTORY/pgpass" ||
     return 1
-  chmod 0400 "$WORK_DIRECTORY/pgpass" || return 1
+  chmod 0400 "$CONTROL_DIRECTORY/pgpass" || return 1
+  printf '%s\n' \
+    'POSTGRES_USER=happylearn' \
+    'POSTGRES_DB=happylearn' \
+    "POSTGRES_PASSWORD=$DATABASE_PASSWORD" \
+    >"$CONTROL_DIRECTORY/postgres.env" ||
+    return 1
+  printf '%s\n' \
+    "MINIO_ROOT_USER=$MINIO_ACCESS_KEY" \
+    "MINIO_ROOT_PASSWORD=$MINIO_SECRET_KEY" \
+    >"$CONTROL_DIRECTORY/aistor.env" ||
+    return 1
+  printf '%s\n' \
+    'HAPPYLEARN_ENV=development' \
+    'HAPPYLEARN_LISTEN=:8080' \
+    "HAPPYLEARN_DATABASE_URL=postgres://happylearn:$DATABASE_PASSWORD@postgres:5432/happylearn?sslmode=disable" \
+    'HAPPYLEARN_REDIS_URL=redis://redis:6379/0' \
+    "HAPPYLEARN_LOGIN_THROTTLE_SECRET=$SIGNING_EPOCH" \
+    'HAPPYLEARN_PUBLIC_ORIGIN=http://app:8080' \
+    'HAPPYLEARN_MINIO_ENDPOINT=minio:9000' \
+    "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
+    "HAPPYLEARN_MINIO_SECRET_KEY=$MINIO_SECRET_KEY" \
+    'HAPPYLEARN_MINIO_ORIGINALS_BUCKET=happylearn-originals' \
+    'HAPPYLEARN_MINIO_PREVIEWS_BUCKET=happylearn-previews' \
+    >"$CONTROL_DIRECTORY/app.env" ||
+    return 1
+  printf '%s\n' \
+    'HAPPYLEARN_DATABASE_HOST=postgres' \
+    'HAPPYLEARN_DATABASE_PORT=5432' \
+    'HAPPYLEARN_DATABASE_USER=happylearn' \
+    'HAPPYLEARN_DATABASE_NAME=happylearn' \
+    'HAPPYLEARN_DATABASE_SSLMODE=disable' \
+    'PGPASSFILE=/run/secrets/pgpass' \
+    'HAPPYLEARN_MINIO_ENDPOINT=minio:9000' \
+    "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
+    "HAPPYLEARN_MINIO_SECRET_KEY=$MINIO_SECRET_KEY" \
+    >"$CONTROL_DIRECTORY/restore-check.env" ||
+    return 1
+  chmod 0400 \
+    "$CONTROL_DIRECTORY/postgres.env" \
+    "$CONTROL_DIRECTORY/aistor.env" \
+    "$CONTROL_DIRECTORY/app.env" \
+    "$CONTROL_DIRECTORY/restore-check.env" ||
+    return 1
+  owner_only_secret "$CONTROL_DIRECTORY/pgpass" &&
+    owner_only_secret "$CONTROL_DIRECTORY/postgres.env" &&
+    owner_only_secret "$CONTROL_DIRECTORY/aistor.env" &&
+    owner_only_secret "$CONTROL_DIRECTORY/app.env" &&
+    owner_only_secret "$CONTROL_DIRECTORY/restore-check.env"
 }
 
 terminate_external_group() {
@@ -272,49 +399,233 @@ poll_until() {
 
 resource_labels() {
   local kind="$1"
-  printf '%s|%s|%s' "$PROJECT" "$OWNER_TOKEN" "$kind"
+  printf '%s|%s|%s|%s' "$PROJECT" "$OWNER_TOKEN" "$kind" "$BACKUP_ID"
+}
+
+record_cleanup_intent() {
+  local class="$1"
+  local name="$2"
+  local kind="$3"
+  [[ "$class" =~ ^(containers|volumes|networks)$ &&
+    "$name" =~ ^happylearn-phase5-restore-[a-f0-9]{12}[-a-z0-9]*$ &&
+    "$kind" =~ ^[a-z0-9-]+$ &&
+    -f "$CLEANUP_INTENT_LEDGER" &&
+    ! -L "$CLEANUP_INTENT_LEDGER" ]] ||
+    return 1
+  grep -Fxq "$class|$name|$kind" "$CLEANUP_INTENT_LEDGER" ||
+    printf '%s|%s|%s\n' "$class" "$name" "$kind" \
+      >>"$CLEANUP_INTENT_LEDGER"
+}
+
+cleanup_intended() {
+  local class="$1"
+  local name="$2"
+  local kind="$3"
+  [[ -f "$CLEANUP_INTENT_LEDGER" &&
+    ! -L "$CLEANUP_INTENT_LEDGER" ]] ||
+    return 1
+  grep -Fxq "$class|$name|$kind" "$CLEANUP_INTENT_LEDGER"
+}
+
+inspect_not_found_message() {
+  local class="$1"
+  local name="$2"
+  local path="$3"
+  local singular
+  case "$class" in
+    containers) singular=container ;;
+    volumes) singular=volume ;;
+    networks) singular=network ;;
+    *) return 1 ;;
+  esac
+  grep -Fxq "Error: No such $singular: $name" "$path" ||
+    grep -Fxq "Error response from daemon: No such $singular: $name" "$path"
+}
+
+inspect_resource_labels() {
+  local class="$1"
+  local name="$2"
+  local format="$3"
+  local output="$CONTROL_DIRECTORY/inspect.output"
+  local error="$CONTROL_DIRECTORY/inspect.error"
+  : >"$output" || return 4
+  : >"$error" || return 4
+  chmod 0600 "$output" "$error" || return 4
+  local -a command
+  case "$class" in
+    containers) command=(docker container inspect --format "$format" "$name") ;;
+    volumes) command=(docker volume inspect --format "$format" "$name") ;;
+    networks) command=(docker network inspect --format "$format" "$name") ;;
+    *) return 4 ;;
+  esac
+  if run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+    "${command[@]}" >"$output" 2>"$error"; then
+    [[ -f "$output" && ! -L "$output" ]] || return 4
+    cat "$output"
+    return 0
+  fi
+  if inspect_not_found_message "$class" "$name" "$error"; then
+    return 3
+  fi
+  return 4
 }
 
 inspect_container_labels() {
   local name="$1"
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker container inspect --format \
-    '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}' \
-    "$name"
+  inspect_resource_labels containers "$name" \
+    '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}|{{index .Config.Labels "io.happylearn.phase5.restore-backup-id"}}'
 }
 
 inspect_volume_labels() {
   local name="$1"
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker volume inspect --format \
-    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}' \
-    "$name"
+  inspect_resource_labels volumes "$name" \
+    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
 }
 
 inspect_network_labels() {
   local name="$1"
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker network inspect --format \
-    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}' \
-    "$name"
+  inspect_resource_labels networks "$name" \
+    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
+}
+
+list_owned_resource_names() {
+  local class="$1"
+  local value line
+  local -a command
+  case "$class" in
+    containers) command=(docker container ls --all --quiet) ;;
+    volumes) command=(docker volume ls --quiet) ;;
+    networks) command=(docker network ls --quiet) ;;
+    *) return 1 ;;
+  esac
+  value="$(
+    run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+      "${command[@]}" \
+      --filter "label=$BACKUP_LABEL=$BACKUP_ID"
+  )" || return 1
+  [[ "${#value}" -le 65536 ]] || return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ||
+      "$line" =~ ^happylearn-phase5-restore-[a-f0-9]{12}[-a-z0-9]*$ ]] ||
+      return 1
+  done <<<"$value"
+  printf '%s' "$value"
+}
+
+valid_observed_resource() {
+  local class="$1"
+  local name="$2"
+  local labels="$3"
+  local project owner kind backup extra
+  IFS='|' read -r project owner kind backup extra <<<"$labels"
+  [[ -z "$extra" &&
+    "$project" =~ ^happylearn-phase5-restore-[a-f0-9]{12}$ &&
+    "$owner" =~ ^[a-f0-9]{64}$ &&
+    "$backup" == "$BACKUP_ID" &&
+    "$name" == "$project-"* ]] ||
+    return 1
+  case "$class:$kind" in
+    volumes:postgres | volumes:aistor | volumes:aistor-license | \
+      networks:network | \
+      containers:volume-probe-postgres | \
+      containers:volume-probe-aistor | \
+      containers:volume-probe-aistor-license | \
+      containers:restic-check | containers:restic-select | \
+      containers:restic-restore | containers:object-restore | \
+      containers:aistor-license-init | containers:postgres | \
+      containers:postgres-restore | containers:aistor | containers:redis | \
+      containers:revoke-sessions | containers:app | \
+      containers:restore-check | containers:student-one | \
+      containers:student-two) ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_owned_orphan() {
+  local class="$1"
+  local name="$2"
+  local labels status
+  case "$class" in
+    containers)
+      if labels="$(inspect_container_labels "$name")"; then
+        :
+      else
+        status=$?
+        [[ "$status" -eq 3 ]] && return 0
+        return 1
+      fi
+      valid_observed_resource "$class" "$name" "$labels" || return 1
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker rm --force "$name" >/dev/null
+      ;;
+    volumes)
+      if labels="$(inspect_volume_labels "$name")"; then
+        :
+      else
+        status=$?
+        [[ "$status" -eq 3 ]] && return 0
+        return 1
+      fi
+      valid_observed_resource "$class" "$name" "$labels" || return 1
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker volume rm "$name" >/dev/null
+      ;;
+    networks)
+      if labels="$(inspect_network_labels "$name")"; then
+        :
+      else
+        status=$?
+        [[ "$status" -eq 3 ]] && return 0
+        return 1
+      fi
+      valid_observed_resource "$class" "$name" "$labels" || return 1
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker network rm "$name" >/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+reap_orphan_resources() {
+  local class names name
+  for class in containers volumes networks; do
+    names="$(list_owned_resource_names "$class")" || return 1
+    while IFS= read -r name; do
+      [[ -z "$name" ]] || remove_owned_orphan "$class" "$name" || return 1
+    done <<<"$names"
+  done
+}
+
+owned_resources_absent() {
+  local class names
+  for class in containers volumes networks; do
+    names="$(list_owned_resource_names "$class")" || return 1
+    [[ -z "$names" ]] || return 1
+  done
 }
 
 create_volume() {
   local name="$1"
   local kind="$2"
-  if run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker volume inspect "$name" >/dev/null 2>&1; then
+  local labels status
+  if labels="$(inspect_volume_labels "$name")"; then
     return 1
+  else
+    status=$?
   fi
+  [[ "$status" -eq 3 ]] || return 1
+  record_cleanup_intent volumes "$name" "$kind" || return 1
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker volume create \
     --label "com.docker.compose.project=$PROJECT" \
     --label "$OWNER_LABEL=$OWNER_TOKEN" \
     --label "$KIND_LABEL=$kind" \
+    --label "$BACKUP_LABEL=$BACKUP_ID" \
     "$name" >/dev/null
   case "$kind" in
     postgres) POSTGRES_VOLUME_CREATED=true ;;
     aistor) AISTOR_VOLUME_CREATED=true ;;
+    aistor-license) AISTOR_LICENSE_VOLUME_CREATED=true ;;
     *) return 1 ;;
   esac
   [[ "$(inspect_volume_labels "$name")" == "$(resource_labels "$kind")" ]] ||
@@ -322,15 +633,20 @@ create_volume() {
 }
 
 create_network() {
-  if run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+  local labels status
+  if labels="$(inspect_network_labels "$NETWORK_NAME")"; then
     return 1
+  else
+    status=$?
   fi
+  [[ "$status" -eq 3 ]] || return 1
+  record_cleanup_intent networks "$NETWORK_NAME" network || return 1
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker network create --internal \
     --label "com.docker.compose.project=$PROJECT" \
     --label "$OWNER_LABEL=$OWNER_TOKEN" \
     --label "$KIND_LABEL=network" \
+    --label "$BACKUP_LABEL=$BACKUP_ID" \
     "$NETWORK_NAME" >/dev/null
   NETWORK_CREATED=true
   [[ "$(inspect_network_labels "$NETWORK_NAME")" == \
@@ -345,13 +661,19 @@ run_named_container() {
   [[ -n "$CONTAINER_RECORD" && -f "$CONTAINER_RECORD" &&
     ! -L "$CONTAINER_RECORD" ]] ||
     return 1
+  record_cleanup_intent containers "$name" "$kind" || return 1
   printf '%s|%s\n' "$name" "$kind" >>"$CONTAINER_RECORD"
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker run \
     --name "$name" \
+    --cpus "$CONTAINER_CPUS" \
+    --memory "$CONTAINER_MEMORY" \
+    --memory-swap "$CONTAINER_MEMORY_SWAP" \
+    --pids-limit "$CONTAINER_PIDS_LIMIT" \
     --label "com.docker.compose.project=$PROJECT" \
     --label "$OWNER_LABEL=$OWNER_TOKEN" \
     --label "$KIND_LABEL=$kind" \
+    --label "$BACKUP_LABEL=$BACKUP_ID" \
     "$@"
 }
 
@@ -381,6 +703,7 @@ restic_container() {
     "$kind" \
     --network none \
     --read-only \
+    --user "$HOST_UID:$HOST_GID" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository,readonly" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password,dst=/run/secrets/local_password,readonly" \
     --env RESTIC_REPOSITORY=/repository \
@@ -388,7 +711,7 @@ restic_container() {
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
-    restic "$@"
+    restic --no-cache "$@"
 }
 
 restic_restore_container() {
@@ -400,6 +723,7 @@ restic_restore_container() {
     "$kind" \
     --network none \
     --read-only \
+    --user "$HOST_UID:$HOST_GID" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository,readonly" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password,dst=/run/secrets/local_password,readonly" \
     --mount "type=bind,src=$RESTORE_DIRECTORY,dst=/restore" \
@@ -408,7 +732,7 @@ restic_restore_container() {
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
-    restic "$@"
+    restic --no-cache "$@"
 }
 
 repository_check() {
@@ -475,6 +799,26 @@ restore_object_data() {
     >/dev/null
 }
 
+initialize_aistor_license() {
+  run_named_container \
+    "$PROJECT-aistor-license-init" aistor-license-init \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges \
+    --mount "type=bind,src=$HAPPYLEARN_AISTOR_LICENSE_FILE,dst=/license-source/minio.license,readonly" \
+    --mount "type=volume,src=$AISTOR_LICENSE_VOLUME,dst=/license-target" \
+    --entrypoint /usr/bin/timeout \
+    "$BACKUP_IMAGE" \
+    --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
+    /bin/sh -ceu \
+    'test -z "$(find /license-target -mindepth 1 -maxdepth 1 -print -quit)"; cp /license-source/minio.license /license-target/minio.license; chown 1000:0 /license-target/minio.license; chmod 0400 /license-target/minio.license; test "$(stat -c %u:%g:%a /license-target/minio.license)" = 1000:0:400; printf "%s\n" PHASE5_RESTORE_AISTOR_LICENSE' \
+    >/dev/null
+}
+
 start_postgres() {
   run_named_container \
     "$POSTGRES_CONTAINER" postgres \
@@ -483,10 +827,9 @@ start_postgres() {
     --network-alias postgres \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+    --tmpfs /var/run/postgresql:rw,noexec,nosuid,size=8m \
     --mount "type=volume,src=$POSTGRES_VOLUME,dst=/var/lib/postgresql" \
-    --env POSTGRES_USER=happylearn \
-    --env POSTGRES_DB=happylearn \
-    --env POSTGRES_PASSWORD="$DATABASE_PASSWORD" \
+    --env-file "$CONTROL_DIRECTORY/postgres.env" \
     "$POSTGRES_IMAGE" >/dev/null
   poll_until "$READY_TIMEOUT_SECONDS" \
     docker exec "$POSTGRES_CONTAINER" \
@@ -498,8 +841,9 @@ restore_database() {
     "$PROJECT-postgres-restore" postgres-restore \
     --network "$NETWORK_NAME" \
     --read-only \
+    --user "$HOST_UID:$HOST_GID" \
     --mount "type=bind,src=$RESTORE_DIRECTORY/database.dump,dst=/restore/database.dump,readonly" \
-    --mount "type=bind,src=$WORK_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
     --env PGHOST=postgres \
     --env PGPORT=5432 \
     --env PGUSER=happylearn \
@@ -522,11 +866,10 @@ start_dependencies() {
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=16m \
     --mount "type=volume,src=$AISTOR_VOLUME,dst=/data" \
-    --mount "type=bind,src=$HAPPYLEARN_AISTOR_LICENSE_FILE,dst=/minio.license,readonly" \
-    --env "MINIO_ROOT_USER=$MINIO_ACCESS_KEY" \
-    --env "MINIO_ROOT_PASSWORD=$MINIO_SECRET_KEY" \
+    --mount "type=volume,src=$AISTOR_LICENSE_VOLUME,dst=/minio-license,readonly" \
+    --env-file "$CONTROL_DIRECTORY/aistor.env" \
     "$AISTOR_IMAGE" \
-    minio server /data --license /minio.license >/dev/null
+    minio server /data --license /minio-license/minio.license >/dev/null
   run_named_container \
     "$REDIS_CONTAINER" redis \
     --detach \
@@ -546,7 +889,8 @@ revoke_restored_sessions() {
     "$PROJECT-revoke-sessions" revoke-sessions \
     --network "$NETWORK_NAME" \
     --read-only \
-    --mount "type=bind,src=$WORK_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --user "$HOST_UID:$HOST_GID" \
+    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
     --env PGHOST=postgres \
     --env PGPORT=5432 \
     --env PGUSER=happylearn \
@@ -569,17 +913,7 @@ start_restored_app() {
     --user 10001:10001 \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-    --env HAPPYLEARN_ENV=development \
-    --env HAPPYLEARN_LISTEN=:8080 \
-    --env "HAPPYLEARN_DATABASE_URL=postgres://happylearn:$DATABASE_PASSWORD@postgres:5432/happylearn?sslmode=disable" \
-    --env HAPPYLEARN_REDIS_URL=redis://redis:6379/0 \
-    --env "HAPPYLEARN_LOGIN_THROTTLE_SECRET=$SIGNING_EPOCH" \
-    --env HAPPYLEARN_PUBLIC_ORIGIN=http://app:8080 \
-    --env HAPPYLEARN_MINIO_ENDPOINT=minio:9000 \
-    --env "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
-    --env "HAPPYLEARN_MINIO_SECRET_KEY=$MINIO_SECRET_KEY" \
-    --env HAPPYLEARN_MINIO_ORIGINALS_BUCKET=happylearn-originals \
-    --env HAPPYLEARN_MINIO_PREVIEWS_BUCKET=happylearn-previews \
+    --env-file "$CONTROL_DIRECTORY/app.env" \
     "$APP_IMAGE" >/dev/null
 }
 
@@ -595,17 +929,10 @@ run_restore_check() {
     "$PROJECT-restore-check" restore-check \
     --network "$NETWORK_NAME" \
     --read-only \
-    --mount "type=bind,src=$WORK_DIRECTORY,dst=/work" \
-    --mount "type=bind,src=$WORK_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
-    --env HAPPYLEARN_DATABASE_HOST=postgres \
-    --env HAPPYLEARN_DATABASE_PORT=5432 \
-    --env HAPPYLEARN_DATABASE_USER=happylearn \
-    --env HAPPYLEARN_DATABASE_NAME=happylearn \
-    --env HAPPYLEARN_DATABASE_SSLMODE=disable \
-    --env PGPASSFILE=/run/secrets/pgpass \
-    --env HAPPYLEARN_MINIO_ENDPOINT=minio:9000 \
-    --env "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
-    --env "HAPPYLEARN_MINIO_SECRET_KEY=$MINIO_SECRET_KEY" \
+    --user "$HOST_UID:$HOST_GID" \
+    --mount "type=bind,src=$CONTROL_DIRECTORY,dst=/work" \
+    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --env-file "$CONTROL_DIRECTORY/restore-check.env" \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
@@ -624,7 +951,8 @@ run_student_isolation_probe() {
     )" \
     --network "$NETWORK_NAME" \
     --read-only \
-    --mount "type=bind,src=$WORK_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --user "$HOST_UID:$HOST_GID" \
+    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
     --env HAPPYLEARN_DATABASE_HOST=postgres \
     --env HAPPYLEARN_DATABASE_PORT=5432 \
     --env HAPPYLEARN_DATABASE_USER=happylearn \
@@ -642,7 +970,7 @@ run_student_isolation_probe() {
 }
 
 load_safe_restore_counts() {
-  local path="$WORK_DIRECTORY/restore-check.report"
+  local path="$CONTROL_DIRECTORY/restore-check.report"
   local line key value
   local seen_schema=false
   local seen_migration=false
@@ -763,12 +1091,15 @@ write_sanitized_report() {
 cleanup_container() {
   local name="$1"
   local kind="$2"
-  local labels
-  [[ -n "$CONTAINER_RECORD" && -f "$CONTAINER_RECORD" &&
-    ! -L "$CONTAINER_RECORD" ]] ||
+  local labels status
+  cleanup_intended containers "$name" "$kind" || return 0
+  if labels="$(inspect_container_labels "$name")"; then
+    :
+  else
+    status=$?
+    [[ "$status" -eq 3 ]] && return 0
     return 1
-  grep -Fxq "$name|$kind" "$CONTAINER_RECORD" || return 0
-  labels="$(inspect_container_labels "$name" 2>/dev/null)" || return 1
+  fi
   [[ "$labels" == "$(resource_labels "$kind")" ]] || return 1
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker rm --force "$name" >/dev/null
@@ -777,16 +1108,30 @@ cleanup_container() {
 cleanup_volume() {
   local name="$1"
   local kind="$2"
-  local labels
-  labels="$(inspect_volume_labels "$name" 2>/dev/null)" || return 0
+  local labels status
+  cleanup_intended volumes "$name" "$kind" || return 0
+  if labels="$(inspect_volume_labels "$name")"; then
+    :
+  else
+    status=$?
+    [[ "$status" -eq 3 ]] && return 0
+    return 1
+  fi
   [[ "$labels" == "$(resource_labels "$kind")" ]] || return 1
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker volume rm "$name" >/dev/null
 }
 
 cleanup_network() {
-  local labels
-  labels="$(inspect_network_labels "$NETWORK_NAME" 2>/dev/null)" || return 0
+  local labels status
+  cleanup_intended networks "$NETWORK_NAME" network || return 0
+  if labels="$(inspect_network_labels "$NETWORK_NAME")"; then
+    :
+  else
+    status=$?
+    [[ "$status" -eq 3 ]] && return 0
+    return 1
+  fi
   [[ "$labels" == "$(resource_labels network)" ]] || return 1
   run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
     docker network rm "$NETWORK_NAME" >/dev/null
@@ -799,7 +1144,10 @@ cleanup_restore() {
     return "$status"
   fi
   CLEANING_UP=true
-  if valid_project "$PROJECT" && valid_owner_token "$OWNER_TOKEN"; then
+  if valid_project "$PROJECT" &&
+    valid_owner_token "$OWNER_TOKEN" &&
+    [[ -f "$CLEANUP_INTENT_LEDGER" &&
+      ! -L "$CLEANUP_INTENT_LEDGER" ]]; then
     while IFS='|' read -r name kind; do
       [[ -n "$name" && -n "$kind" ]] || continue
       cleanup_container "$name" "$kind" || status=1
@@ -814,27 +1162,29 @@ $PROJECT-aistor|aistor
 $PROJECT-postgres-restore|postgres-restore
 $PROJECT-postgres|postgres
 $PROJECT-object-restore|object-restore
+$PROJECT-aistor-license-init|aistor-license-init
 $PROJECT-restic-restore|restic-restore
 $PROJECT-restic-select|restic-select
 $PROJECT-restic-check|restic-check
 $PROJECT-volume-probe-aistor|volume-probe-aistor
+$PROJECT-volume-probe-aistor-license|volume-probe-aistor-license
 $PROJECT-volume-probe-postgres|volume-probe-postgres
 EOF
-    if [[ "$AISTOR_VOLUME_CREATED" == true ]]; then
-      cleanup_volume "$AISTOR_VOLUME" aistor || status=1
-    fi
-    if [[ "$POSTGRES_VOLUME_CREATED" == true ]]; then
-      cleanup_volume "$POSTGRES_VOLUME" postgres || status=1
-    fi
-    if [[ "$NETWORK_CREATED" == true ]]; then
-      cleanup_network || status=1
-    fi
+    cleanup_volume "$AISTOR_LICENSE_VOLUME" aistor-license || status=1
+    cleanup_volume "$AISTOR_VOLUME" aistor || status=1
+    cleanup_volume "$POSTGRES_VOLUME" postgres || status=1
+    cleanup_network || status=1
+    owned_resources_absent || status=1
   fi
   if [[ -n "$WORK_DIRECTORY" &&
     "$WORK_DIRECTORY" == "${TMPDIR:-/tmp}/phase5-restore-verify."* &&
     -d "$WORK_DIRECTORY" && ! -L "$WORK_DIRECTORY" ]]; then
     chmod -R u+rwX "$WORK_DIRECTORY" 2>/dev/null || status=1
     rm -rf "$WORK_DIRECTORY" || status=1
+  fi
+  if [[ "$RESTORE_LOCK_FD_OPEN" == true ]]; then
+    exec 10>&-
+    RESTORE_LOCK_FD_OPEN=false
   fi
   return "$status"
 }
@@ -882,6 +1232,10 @@ main() {
     safe_log 'invalid_restore_paths'
     return 1
   }
+  acquire_restore_lock || {
+    safe_log 'restore_lock_unavailable'
+    return 1
+  }
   initialize_identity || {
     safe_log 'restore_identity_failed'
     return 1
@@ -894,18 +1248,25 @@ main() {
     safe_log 'restore_workspace_failed'
     return 1
   }
+  reap_orphan_resources || {
+    safe_log 'restore_orphan_reap_failed'
+    return 1
+  }
 
   create_network
   create_volume "$POSTGRES_VOLUME" postgres
   create_volume "$AISTOR_VOLUME" aistor
+  create_volume "$AISTOR_LICENSE_VOLUME" aistor-license
   assert_new_empty_volume "$POSTGRES_VOLUME" postgres
   assert_new_empty_volume "$AISTOR_VOLUME" aistor
+  assert_new_empty_volume "$AISTOR_LICENSE_VOLUME" aistor-license
 
   repository_check
   local snapshot_id
   snapshot_id="$(select_snapshot)"
   restore_snapshot "$snapshot_id"
   restore_object_data
+  initialize_aistor_license
   start_postgres
   restore_database
   start_dependencies
