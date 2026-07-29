@@ -9,7 +9,10 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"time"
 )
+
+const defaultConnectTimeout = 5 * time.Second
 
 // Resolver resolves network addresses for an outbound hostname.
 type Resolver interface {
@@ -76,7 +79,13 @@ func (p Policy) ValidateResolved(ctx context.Context, host string) ([]netip.Addr
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
-	answers, err := resolver.LookupNetIP(ctx, "ip", host)
+	resolveCtx := ctx
+	cancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		resolveCtx, cancel = context.WithTimeout(ctx, defaultConnectTimeout)
+	}
+	defer cancel()
+	answers, err := resolver.LookupNetIP(resolveCtx, "ip", host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve provider hostname %q: %w", host, err)
 	}
@@ -158,6 +167,7 @@ var forbiddenPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("3ffe::/16"),
 	netip.MustParsePrefix("3fff::/20"),
 	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fec0::/10"),
 }
 
 func isASCII(value string) bool {

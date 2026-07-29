@@ -54,9 +54,15 @@ type ClientOptions struct {
 // NewClient returns a client that resolves and pins an address immediately
 // before each request. It never inherits proxy settings.
 func NewClient(policy Policy, options ClientOptions) *http.Client {
+	return newClientWithDialContext(policy, options, nil)
+}
+
+type dialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func newClientWithDialContext(policy Policy, options ClientOptions, dialContext dialContextFunc) *http.Client {
 	options.Timeouts = normalizeTimeouts(options.Timeouts)
 	return &http.Client{
-		Transport: safeRoundTripper{policy: policy, options: options},
+		Transport: safeRoundTripper{policy: policy, options: options, dialContext: dialContext},
 		Timeout:   options.Timeouts.Total,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if options.Redirects == RejectRedirects {
@@ -86,7 +92,7 @@ func NewClient(policy Policy, options ClientOptions) *http.Client {
 
 func normalizeTimeouts(timeouts Timeouts) Timeouts {
 	if timeouts.Connect <= 0 {
-		timeouts.Connect = 5 * time.Second
+		timeouts.Connect = defaultConnectTimeout
 	}
 	if timeouts.ResponseHeader <= 0 {
 		timeouts.ResponseHeader = 30 * time.Second
@@ -104,12 +110,17 @@ func normalizeTimeouts(timeouts Timeouts) Timeouts {
 }
 
 type safeRoundTripper struct {
-	policy  Policy
-	options ClientOptions
+	policy      Policy
+	options     ClientOptions
+	dialContext dialContextFunc
 }
 
 func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	addresses, err := s.policy.ValidateRequestURL(req.Context(), req.URL)
+	connectCtx, cancelConnect := context.WithTimeout(req.Context(), s.options.Timeouts.Connect)
+	defer cancelConnect()
+	connectDeadline, _ := connectCtx.Deadline()
+
+	addresses, err := s.policy.ValidateRequestURL(connectCtx, req.URL)
 	if err != nil {
 		scrubRequestURL(req)
 		return nil, err
@@ -126,11 +137,17 @@ func (s safeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	timeouts := s.options.Timeouts
-	dialer := net.Dialer{Timeout: timeouts.Connect}
+	dialContext := s.dialContext
+	if dialContext == nil {
+		dialer := &net.Dialer{}
+		dialContext = dialer.DialContext
+	}
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].String(), port))
+			dialCtx, cancelDial := context.WithDeadline(ctx, connectDeadline)
+			defer cancelDial()
+			return dialContext(dialCtx, network, net.JoinHostPort(addresses[0].String(), port))
 		},
 		ForceAttemptHTTP2:     true,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: s.options.RootCAs},
@@ -340,9 +357,9 @@ func (b *responseLimitBody) Read(p []byte) (int, error) {
 		}
 		return 0, err
 	}
-	readSize := int64(len(p))
-	if readSize > b.remaining+1 {
-		readSize = b.remaining + 1
+	readSize := len(p)
+	if b.remaining < int64(readSize) {
+		readSize = int(b.remaining) + 1
 	}
 	n, err := b.body.Read(p[:readSize])
 	if int64(n) > b.remaining {

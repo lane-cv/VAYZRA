@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 type fakeResolver struct {
@@ -33,6 +34,17 @@ func (r *sequenceResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.
 		index = len(r.answers) - 1
 	}
 	return r.answers[index], nil
+}
+
+type deadlineResolver struct {
+	answer   netip.Addr
+	deadline time.Time
+	has      bool
+}
+
+func (r *deadlineResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	r.deadline, r.has = ctx.Deadline()
+	return []netip.Addr{r.answer}, nil
 }
 
 func TestPolicyNormalizeBaseURL(t *testing.T) {
@@ -93,7 +105,7 @@ func TestPolicyValidateResolvedRejectsNonPublicAddresses(t *testing.T) {
 		"2002:0a00:0001::1", "2001:0000::1", "192.88.99.1",
 		"192.31.196.1", "192.52.193.1", "192.175.48.1", "2001:3::1",
 		"2001:4:112::1", "2620:4f:8000::1", "3fff::1", "fe80::1",
-		"ff02::1",
+		"ff02::1", "fec0::1",
 	} {
 		t.Run(address, func(t *testing.T) {
 			policy := Policy{Resolver: &fakeResolver{answers: map[string][]netip.Addr{
@@ -103,6 +115,43 @@ func TestPolicyValidateResolvedRejectsNonPublicAddresses(t *testing.T) {
 				t.Fatal("expected non-public address to be rejected")
 			}
 		})
+	}
+}
+
+func TestPolicyValidateResolvedRejectsSiteLocalIPv6DirectAndMixed(t *testing.T) {
+	t.Parallel()
+	policy := Policy{}
+	if _, err := policy.ValidateResolved(context.Background(), "fec0::1"); err == nil {
+		t.Fatal("direct site-local IPv6 address was accepted")
+	}
+
+	policy.Resolver = &fakeResolver{answers: map[string][]netip.Addr{
+		"mixed.test": {
+			netip.MustParseAddr("93.184.216.34"),
+			netip.MustParseAddr("fec0::1"),
+		},
+	}}
+	if _, err := policy.ValidateResolved(context.Background(), "mixed.test"); err == nil {
+		t.Fatal("mixed public/site-local DNS answer was accepted")
+	}
+}
+
+func TestPolicyNormalizeBaseURLBoundsResolverWhenCallerHasNoDeadline(t *testing.T) {
+	t.Parallel()
+	resolver := &deadlineResolver{answer: netip.MustParseAddr("93.184.216.34")}
+	started := time.Now()
+	if _, err := (Policy{Resolver: resolver}).NormalizeBaseURL(
+		context.Background(),
+		"https://api.example.com/v1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !resolver.has {
+		t.Fatal("resolver context had no deadline")
+	}
+	remaining := resolver.deadline.Sub(started)
+	if remaining < 4*time.Second || remaining > 6*time.Second {
+		t.Fatalf("resolver deadline remaining = %s, want about 5s", remaining)
 	}
 }
 

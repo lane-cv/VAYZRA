@@ -1,10 +1,12 @@
 package safehttp
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -363,6 +365,49 @@ func TestSafeTransportAppliesResponseHeaderAndTotalTimeouts(t *testing.T) {
 	}
 }
 
+func TestSafeTransportSharesAbsoluteConnectDeadlineWithResolverAndDial(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		connect time.Duration
+		want    time.Duration
+	}{
+		{name: "default", want: 5 * time.Second},
+		{name: "custom", connect: 80 * time.Millisecond, want: 80 * time.Millisecond},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &deadlineResolver{answer: netip.MustParseAddr("127.0.0.1")}
+			var dialDeadline time.Time
+			client := newClientWithDialContext(
+				Policy{DevelopmentAllowPrivate: true, Resolver: resolver},
+				ClientOptions{Timeouts: Timeouts{Connect: tt.connect, Total: 30 * time.Second}},
+				func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var ok bool
+					dialDeadline, ok = ctx.Deadline()
+					if !ok {
+						t.Error("dial context had no deadline")
+					}
+					return nil, errors.New("dial stopped")
+				},
+			)
+			started := time.Now()
+			if _, err := client.Get("http://supplier.test/"); err == nil {
+				t.Fatal("expected dial error")
+			}
+			if !resolver.has {
+				t.Fatal("resolver context had no deadline")
+			}
+			if !resolver.deadline.Equal(dialDeadline) {
+				t.Fatalf("resolver deadline %s != dial deadline %s", resolver.deadline, dialDeadline)
+			}
+			remaining := resolver.deadline.Sub(started)
+			if remaining < tt.want-20*time.Millisecond || remaining > tt.want+500*time.Millisecond {
+				t.Fatalf("connect deadline remaining = %s, want about %s", remaining, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeTimeoutsBoundsEveryNetworkStage(t *testing.T) {
 	got := normalizeTimeouts(Timeouts{})
 	if got.Connect != 5*time.Second ||
@@ -371,6 +416,21 @@ func TestNormalizeTimeoutsBoundsEveryNetworkStage(t *testing.T) {
 		got.IdleStream != 30*time.Second ||
 		got.Total != 120*time.Second {
 		t.Fatalf("unexpected defaults: %+v", got)
+	}
+}
+
+func TestResponseLimitBodyMaxInt64DoesNotOverflow(t *testing.T) {
+	body := &responseLimitBody{
+		body:      io.NopCloser(strings.NewReader("x")),
+		remaining: math.MaxInt64,
+	}
+	buffer := make([]byte, 1)
+	n, err := body.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || buffer[0] != 'x' {
+		t.Fatalf("read n=%d buffer=%q", n, buffer[:n])
 	}
 }
 
