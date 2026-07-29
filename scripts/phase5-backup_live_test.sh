@@ -912,14 +912,15 @@ monitor_backup_runtime() {
   local backup_pid="$1"
   local result_file="$2"
   local saw_backup=false
-  local overlap=false
+  local saw_heavy=false
+  local exclusive_overlap=false
   local peak_cpu='0'
   local peak_memory='0'
   while kill -0 "$backup_pid" 2>/dev/null; do
     local listing
     local ids=''
     local worker_running=false
-    local backup_running=false
+    local heavy_running=false
     listing="$(
       docker ps \
         --filter "label=com.docker.compose.project=${PROJECT}" \
@@ -935,14 +936,40 @@ monitor_backup_runtime() {
       [[ "$service" == worker ]] && worker_running=true
       case "$service" in
         backup-storage-init|backup-secrets-init|backup)
-          backup_running=true
           saw_backup=true
+          if [[ "$service" == backup ]]; then
+            local container_arguments
+            if ! container_arguments="$(
+              docker container inspect --format '{{json .Config.Cmd}}' \
+                "$container_id"
+            )"; then
+              local still_running
+              still_running="$(
+                docker ps --quiet --no-trunc \
+                  --filter "id=${container_id}"
+              )" || return 1
+              [[ -z "$still_running" ]] && continue
+              return 1
+            fi
+            if {
+              [[ "$container_arguments" == *'/app/happylearn-backup'* &&
+                "$container_arguments" =~ \"(snapshot|verify|sync)\" ]]
+            } ||
+              [[ "$container_arguments" == *'happylearn-backup-retention'* ]] ||
+              {
+                [[ "$container_arguments" == *'restic'* &&
+                  "$container_arguments" == *'check'* ]]
+              }; then
+              heavy_running=true
+              saw_heavy=true
+            fi
+          fi
           ;;
         *) ;;
       esac
     done <<<"$listing"
-    if [[ "$worker_running" == true && "$backup_running" == true ]]; then
-      overlap=true
+    if [[ "$worker_running" == true && "$heavy_running" == true ]]; then
+      exclusive_overlap=true
     fi
     if [[ -n "$ids" ]]; then
       local raw_stats
@@ -961,8 +988,9 @@ monitor_backup_runtime() {
     fi
     sleep 0.2
   done
-  printf '%s|%s|%s|%s\n' \
-    "$saw_backup" "$overlap" "$peak_cpu" "$peak_memory" >"$result_file"
+  printf '%s|%s|%s|%s|%s\n' \
+    "$saw_backup" "$saw_heavy" "$exclusive_overlap" \
+    "$peak_cpu" "$peak_memory" >"$result_file"
 }
 
 diagnose_snapshot_failure() {
@@ -1055,14 +1083,18 @@ SQL
     fail "real backup failed: ${label}"
   fi
   local saw_backup
-  local overlap
+  local saw_heavy
+  local exclusive_overlap
   local peak_cpu
   local peak_memory
-  IFS='|' read -r saw_backup overlap peak_cpu peak_memory <"$result_file"
+  IFS='|' read -r saw_backup saw_heavy exclusive_overlap \
+    peak_cpu peak_memory <"$result_file"
   [[ "$saw_backup" == true ]] ||
     fail "runtime monitor missed the backup container: ${label}"
-  [[ "$overlap" == true || "$overlap" == false ]] ||
-    fail "runtime overlap sample was invalid: ${label}"
+  [[ "$saw_heavy" == true ]] ||
+    fail "runtime monitor missed a heavy backup stage: ${label}"
+  [[ "$exclusive_overlap" == false ]] ||
+    fail "worker and heavy backup stage overlapped: ${label}"
   awk -v actual="$peak_memory" \
     'BEGIN { exit !(actual > 0) }' ||
     fail "runtime resource sample was empty: ${label}"

@@ -86,7 +86,7 @@ require_literal "$TARGET" 'ORDER BY finished_at DESC,id DESC'
 require_literal "$TARGET" 'LIMIT 32'
 require_literal "$TARGET" 'restic unlock'
 require_literal "$TARGET" 'LOCK_OWNER_TOKEN'
-require_literal "$TARGET" 'process_holds_liveness_file'
+require_literal "$TARGET" 'system_holds_liveness_file'
 require_literal "$TARGET" 'host_lock_owner_matches'
 require_literal "$TARGET" 'publish_host_lock'
 
@@ -214,7 +214,15 @@ require_literal "$LIVE_FIXTURE" '"$FIXTURE_ROOT/ca-context"'
 require_literal "$LIVE_FIXTURE" '"$FIXTURE_ROOT/server-certs:/certs:ro"'
 require_literal "$LIVE_FIXTURE" 'monitor_backup_runtime'
 require_literal "$LIVE_FIXTURE" 'backup-storage-init|backup-secrets-init|backup'
-forbid_pattern "$LIVE_FIXTURE" 'worker and backup container overlapped'
+require_literal "$LIVE_FIXTURE" 'local saw_heavy=false'
+require_literal "$LIVE_FIXTURE" 'local exclusive_overlap=false'
+require_literal "$LIVE_FIXTURE" '.Config.Cmd'
+require_literal "$LIVE_FIXTURE" 'snapshot|verify|sync'
+require_literal "$LIVE_FIXTURE" 'happylearn-backup-retention'
+require_literal "$LIVE_FIXTURE" 'restic'
+require_literal "$LIVE_FIXTURE" 'check'
+require_literal "$LIVE_FIXTURE" 'runtime monitor missed a heavy backup stage'
+require_literal "$LIVE_FIXTURE" 'worker and heavy backup stage overlapped'
 require_literal "$LIVE_FIXTURE" '--foreground --kill-after=5s 30s /bin/sh'
 require_literal "$LIVE_FIXTURE" '/usr/bin/timeout --foreground --kill-after=5s 300s'
 require_literal "$LIVE_FIXTURE" 'base backup image unexpectedly trusted the fixture CA'
@@ -476,6 +484,7 @@ if [[ -n "${PHASE5_FAKE_DELAY_MATCH:-}" &&
     while [[ ! -e "$PHASE5_FAKE_DELAY_RELEASE_FILE" ]]; do
       sleep 0.01
     done
+    printf '%s\n' finished >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.finished"
   else
     sleep "${PHASE5_FAKE_DELAY_SECONDS:-3}"
   fi
@@ -831,13 +840,17 @@ printf 'remote-access-key\n' \
 printf 'remote-secret-key\n' \
   >"$degraded_retention_fixture/secrets/remote_secret_access_key"
 chmod 0400 "$degraded_retention_fixture/secrets/remote_"*
-if ! run_fixture "$degraded_retention_fixture" \
+if run_fixture "$degraded_retention_fixture" \
   '/app/happylearn-backup-retention --repository local' 'outage'; then
-  fail "remote degradation plus conservative local retention failure became failed"
+  fail "remote degradation disguised local retention failure as degraded"
 fi
-grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category remote_unavailable' \
+grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category retention' \
   "$degraded_retention_fixture/docker.log" ||
-  fail "remote degradation plus local retention failure was not degraded"
+  fail "remote degradation did not preserve local retention failure"
+if grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category remote_unavailable' \
+  "$degraded_retention_fixture/docker.log"; then
+  fail "local retention failure recorded a false remote_unavailable terminal"
+fi
 
 remote_probe_recovery_fixture="$(make_fixture)"
 printf 's3:https://remote.test/happylearn\n' \
@@ -1090,7 +1103,25 @@ fi
 [[ -L "$stale_lock_fixture/host.lock" &&
   -d "$stale_lock_owner" ]] ||
   fail "SIGKILL did not leave the published stale lock fixture"
+stale_log_lines_before="$(
+  wc -l <"$stale_lock_fixture/docker.log" | tr -d '[:space:]'
+)"
+if run_fixture "$stale_lock_fixture"; then
+  touch "$stale_lock_release"
+  wait_for_file "${stale_lock_release}.finished" || true
+  fail "inherited liveness descriptor was treated as stale"
+fi
+stale_log_lines_after="$(
+  wc -l <"$stale_lock_fixture/docker.log" | tr -d '[:space:]'
+)"
+test "$stale_log_lines_before" -eq "$stale_log_lines_after" ||
+  fail "inherited liveness lock rejection accessed Compose"
+[[ -L "$stale_lock_fixture/host.lock" &&
+  "$(readlink "$stale_lock_fixture/host.lock")" == "$stale_lock_owner" ]] ||
+  fail "inherited liveness owner lock was replaced"
 touch "$stale_lock_release"
+wait_for_file "${stale_lock_release}.finished" ||
+  fail "inherited liveness holder did not finish after release"
 wait "$stale_lock_runner" 2>/dev/null || true
 if ! run_fixture "$stale_lock_fixture"; then
   fail "verified SIGKILL-stale host lock was not reclaimed"

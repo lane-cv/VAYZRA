@@ -324,28 +324,45 @@ portable_file_identity() {
   fi
 }
 
-process_holds_liveness_file() {
-  local pid="$1"
-  local path="$2"
-  local descriptor
-  local output
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
-  if [[ -d "/proc/$pid/fd" ]]; then
-    [[ -r "/proc/$pid/fd" && -x "/proc/$pid/fd" ]] || return 2
-    for descriptor in "/proc/$pid/fd/"*; do
-      if [[ -e "$descriptor" && "$descriptor" -ef "$path" ]]; then
-        return 0
+system_holds_liveness_file() {
+  local path="$1"
+  local identity="$2"
+  local process_directory descriptor process_owner output
+  local current_pid="$$"
+  [[ -f "$path" && ! -L "$path" &&
+    "$(portable_file_identity "$path")" == "$identity" ]] ||
+    return 2
+  if [[ -d /proc ]]; then
+    [[ -r /proc && -x /proc ]] || return 2
+    for process_directory in /proc/[1-9]*; do
+      [[ -d "$process_directory" ]] || continue
+      if ! process_owner="$(portable_owner "$process_directory" 2>/dev/null)"; then
+        [[ ! -e "$process_directory" ]] && continue
+        return 2
       fi
+      [[ "$process_owner" == "$(id -u)" ]] || continue
+      if [[ ! -d "$process_directory/fd" ]]; then
+        [[ ! -e "$process_directory" ]] && continue
+        return 2
+      fi
+      [[ -r "$process_directory/fd" && -x "$process_directory/fd" ]] ||
+        return 2
+      for descriptor in "$process_directory/fd/"*; do
+        [[ -e "$descriptor" ]] || continue
+        if [[ "$descriptor" -ef "$path" ]]; then
+          return 0
+        fi
+      done
     done
     return 1
   fi
   command -v lsof >/dev/null 2>&1 || return 2
-  if output="$(lsof -a -p "$pid" -Fn -- "$path" 2>/dev/null)"; then
+  if output="$(lsof -Fn -- "$path" 2>/dev/null)"; then
     grep -Fxq "n$path" <<<"$output" && return 0
     return 2
   fi
-  if lsof -a -p "$pid" -Fp -d cwd 2>/dev/null |
-    grep -Eq "^p${pid}$"; then
+  if lsof -a -p "$current_pid" -Fp -d cwd 2>/dev/null |
+    grep -Eq "^p${current_pid}$"; then
     return 1
   fi
   return 2
@@ -399,11 +416,8 @@ host_lock_is_stale() {
   local directory="$1"
   local liveness_status
   load_host_lock_owner "$directory" || return 1
-  if ! kill -0 "$OBSERVED_LOCK_OWNER_PID" 2>/dev/null; then
-    return 0
-  fi
-  if process_holds_liveness_file \
-    "$OBSERVED_LOCK_OWNER_PID" "$directory/liveness"; then
+  if system_holds_liveness_file \
+    "$directory/liveness" "$OBSERVED_LOCK_OWNER_IDENTITY"; then
     return 1
   else
     liveness_status=$?
@@ -1760,11 +1774,6 @@ main() {
   FAILURE_CATEGORY='retention'
   CURRENT_STAGE='local_retention'
   if ! run_retention local; then
-    if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == true ]]; then
-      safe_log 'local_retention_deferred_after_remote_failure'
-      complete_remote_degraded
-      return
-    fi
     return 1
   fi
   assert_lease_heartbeat
