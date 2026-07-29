@@ -68,6 +68,7 @@ type programFactories struct {
 		restoreCheckInput,
 		func(string) string,
 	) error
+	runRestoreHTTPProbe func(context.Context) error
 }
 
 func productionProgramFactories() programFactories {
@@ -78,7 +79,8 @@ func productionProgramFactories() programFactories {
 		) (commandActions, func(), error) {
 			return newProductionActions(ctx, getenv)
 		},
-		runRestoreCheck: runProductionRestoreCheck,
+		runRestoreCheck:     runProductionRestoreCheck,
+		runRestoreHTTPProbe: runProductionRestoreHTTPProbe,
 	}
 }
 
@@ -90,6 +92,18 @@ func runProgram(
 ) error {
 	if ctx == nil || getenv == nil || len(args) == 0 {
 		return errInvalidCommand
+	}
+	if args[0] == "restore-http-probe" {
+		if len(args) != 1 {
+			return errInvalidCommand
+		}
+		if factories.runRestoreHTTPProbe == nil {
+			return errRestoreHTTPProbeUnavailable
+		}
+		if err := factories.runRestoreHTTPProbe(ctx); err != nil {
+			return errRestoreHTTPProbeUnavailable
+		}
+		return nil
 	}
 	if args[0] == "restore-check" {
 		input, err := parseRestoreCheckInput(args)
