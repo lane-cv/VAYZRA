@@ -7,6 +7,8 @@ readonly OPERATIONS_ADVISORY_KEY='845103120'
 readonly BACKUP_ADVISORY_KEY='845103121'
 readonly SYNC_RUN_LABEL='io.happylearn.phase5.sync-run'
 readonly SYNC_OWNER_LABEL='io.happylearn.phase5.sync-owner'
+readonly HEARTBEAT_HANDSHAKE_ATTEMPTS=500
+readonly HEARTBEAT_HANDSHAKE_POLL_SECONDS='0.01'
 
 PROJECT=''
 EFFECTIVE_PROJECT=''
@@ -365,6 +367,59 @@ heartbeat_owner_matches() {
   [[ "$actual_parent" == "$owner_pid" ]]
 }
 
+write_heartbeat_handshake_file() {
+  local target="$1"
+  local pending="$2"
+  local value="$3"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  case "$target:$pending" in
+    "$LOCK_OWNER_DIRECTORY/heartbeat.pid:$LOCK_OWNER_DIRECTORY/heartbeat.pid.pending" | \
+      "$LOCK_OWNER_DIRECTORY/heartbeat.ready:$LOCK_OWNER_DIRECTORY/heartbeat.ready.pending") ;;
+    *) return 1 ;;
+  esac
+  [[ ! -e "$target" && ! -L "$target" &&
+    ! -e "$pending" && ! -L "$pending" ]] ||
+    return 1
+  if ! (umask 077 && printf '%s\n' "$value" >"$pending") ||
+    ! chmod 0600 "$pending" ||
+    ! mv "$pending" "$target"; then
+    rm -f "$pending"
+    return 1
+  fi
+  [[ -f "$target" && ! -L "$target" &&
+    "$(portable_mode "$target")" == '600' ]]
+}
+
+read_heartbeat_handshake_file() {
+  local path="$1"
+  local value
+  [[ -f "$path" && ! -L "$path" &&
+    "$(portable_mode "$path")" == '600' &&
+    "$(portable_owner "$path")" == "$(id -u)" ]] ||
+    return 1
+  value="$(<"$path")"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s' "$value"
+}
+
+wait_for_heartbeat_handshake() {
+  local path="$1"
+  local expected_pid="$2"
+  local attempts=0
+  local observed
+  while [[ "$attempts" -lt "$HEARTBEAT_HANDSHAKE_ATTEMPTS" ]]; do
+    kill -0 "$expected_pid" 2>/dev/null || return 1
+    observed="$(read_heartbeat_handshake_file "$path" 2>/dev/null || true)"
+    if [[ "$observed" == "$expected_pid" ]] &&
+      kill -0 "$expected_pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 system_holds_liveness_file() {
   local path="$1"
   local identity="$2"
@@ -489,6 +544,9 @@ remove_host_lock_owner_directory() {
     "$directory/operational.stdin" \
     "$directory/operational.stdout" \
     "$directory/heartbeat.pid" \
+    "$directory/heartbeat.pid.pending" \
+    "$directory/heartbeat.ready" \
+    "$directory/heartbeat.ready.pending" \
     "$directory/heartbeat.failed" \
     "$directory/liveness"
   do
@@ -997,28 +1055,50 @@ SQL
 start_lease_heartbeat() {
   local original_owner_pid="$LOCK_OWNER_PID"
   local original_owner_process_identity
-  local heartbeat_pid_fifo="$LOCK_OWNER_DIRECTORY/heartbeat.pid"
+  local heartbeat_pid_file="$LOCK_OWNER_DIRECTORY/heartbeat.pid"
+  local heartbeat_pid_pending="$LOCK_OWNER_DIRECTORY/heartbeat.pid.pending"
+  local heartbeat_ready_file="$LOCK_OWNER_DIRECTORY/heartbeat.ready"
+  local heartbeat_ready_pending="$LOCK_OWNER_DIRECTORY/heartbeat.ready.pending"
   original_owner_process_identity="$(
     portable_process_identity "$original_owner_pid"
   )" || return 1
   LEASE_HEARTBEAT_FAILED="$LOCK_OWNER_DIRECTORY/heartbeat.failed"
   [[ ! -e "$LEASE_HEARTBEAT_FAILED" &&
-    ! -e "$heartbeat_pid_fifo" &&
-    ! -L "$heartbeat_pid_fifo" ]] ||
+    ! -e "$heartbeat_pid_file" && ! -L "$heartbeat_pid_file" &&
+    ! -e "$heartbeat_pid_pending" && ! -L "$heartbeat_pid_pending" &&
+    ! -e "$heartbeat_ready_file" && ! -L "$heartbeat_ready_file" &&
+    ! -e "$heartbeat_ready_pending" && ! -L "$heartbeat_ready_pending" ]] ||
     return 1
-  mkfifo "$heartbeat_pid_fifo" || return 1
-  if ! chmod 0600 "$heartbeat_pid_fifo"; then
-    rm -f "$heartbeat_pid_fifo"
-    return 1
-  fi
   set -m
   (
     heartbeat_process_pid=''
+    handshake_attempts=0
     set +m
     exec 8<&-
     exec 9>&-
-    IFS= read -r heartbeat_process_pid <"$heartbeat_pid_fifo" || exit 0
+    while [[ "$handshake_attempts" -lt "$HEARTBEAT_HANDSHAKE_ATTEMPTS" ]]; do
+      process_identity_matches \
+        "$original_owner_pid" "$original_owner_process_identity" ||
+        exit 0
+      heartbeat_process_pid="$(
+        read_heartbeat_handshake_file "$heartbeat_pid_file" 2>/dev/null ||
+          true
+      )"
+      [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] && break
+      sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+      handshake_attempts=$((handshake_attempts + 1))
+    done
     [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] || exit 0
+    heartbeat_owner_matches \
+      "$heartbeat_process_pid" \
+      "$original_owner_pid" \
+      "$original_owner_process_identity" ||
+      exit 0
+    write_heartbeat_handshake_file \
+      "$heartbeat_ready_file" \
+      "$heartbeat_ready_pending" \
+      "$heartbeat_process_pid" ||
+      exit 0
     ALLOW_LOST_LEASE_ACTIONS=true
     SEPARATE_EXTERNAL_GROUP=false
     while heartbeat_owner_matches \
@@ -1044,12 +1124,18 @@ start_lease_heartbeat() {
   ) &
   LEASE_HEARTBEAT_PID="$!"
   set +m
-  if ! printf '%s\n' "$LEASE_HEARTBEAT_PID" >"$heartbeat_pid_fifo"; then
+  if ! write_heartbeat_handshake_file \
+    "$heartbeat_pid_file" \
+    "$heartbeat_pid_pending" \
+    "$LEASE_HEARTBEAT_PID" ||
+    ! wait_for_heartbeat_handshake \
+      "$heartbeat_ready_file" "$LEASE_HEARTBEAT_PID"; then
     stop_lease_heartbeat
-    rm -f "$heartbeat_pid_fifo"
+    rm -f \
+      "$heartbeat_pid_file" "$heartbeat_pid_pending" \
+      "$heartbeat_ready_file" "$heartbeat_ready_pending"
     return 1
   fi
-  rm -f "$heartbeat_pid_fifo"
 }
 
 assert_lease_heartbeat() {
@@ -1796,6 +1882,7 @@ main() {
   acquire_durable_lease
   CURRENT_STAGE='heartbeat'
   start_lease_heartbeat
+  assert_lease_heartbeat
 
   FAILURE_CATEGORY='integrity'
   CURRENT_STAGE='prior_sync_lock_cleanup'

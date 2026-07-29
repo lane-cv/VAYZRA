@@ -9,14 +9,50 @@ PACKAGE_JSON="$ROOT/package.json"
 LIVE_FIXTURE="$ROOT/scripts/phase5-backup_live_test.sh"
 LIVE_COMPOSE="$ROOT/deploy/compose.backup-live.yml"
 CONTRACT_TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/phase5-backup-contract-root.XXXXXX")"
+ACTIVE_FIXTURE_PID=''
+ACTIVE_FIXTURE_RELEASE_FILES=('')
+ACTIVE_FIXTURE_FINISH_FILES=('')
 
 cleanup_contract() {
+  local path
+  for path in "${ACTIVE_FIXTURE_RELEASE_FILES[@]}"; do
+    [[ -n "$path" ]] && touch "$path"
+  done
+  if [[ -n "$ACTIVE_FIXTURE_PID" ]] &&
+    command -v terminate_direct_fixture_child >/dev/null 2>&1; then
+    terminate_direct_fixture_child "$ACTIVE_FIXTURE_PID" || true
+  fi
+  if command -v wait_for_file >/dev/null 2>&1; then
+    for path in "${ACTIVE_FIXTURE_FINISH_FILES[@]}"; do
+      [[ -z "$path" ]] || wait_for_file "$path" || true
+    done
+  fi
   if [[ -d "$CONTRACT_TEMP_ROOT" &&
     "$CONTRACT_TEMP_ROOT" == "${TMPDIR:-/tmp}/phase5-backup-contract-root."* ]]; then
     rm -rf "$CONTRACT_TEMP_ROOT"
   fi
 }
 trap cleanup_contract EXIT
+
+register_active_fixture() {
+  local pid="$1"
+  shift
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -z "$ACTIVE_FIXTURE_PID" ]] ||
+    return 1
+  ACTIVE_FIXTURE_PID="$pid"
+  ACTIVE_FIXTURE_RELEASE_FILES=("$@")
+  ACTIVE_FIXTURE_FINISH_FILES=('')
+}
+
+register_active_fixture_finish() {
+  ACTIVE_FIXTURE_FINISH_FILES+=("$1")
+}
+
+clear_active_fixture() {
+  ACTIVE_FIXTURE_PID=''
+  ACTIVE_FIXTURE_RELEASE_FILES=('')
+  ACTIVE_FIXTURE_FINISH_FILES=('')
+}
 
 fail() {
   printf 'phase5 backup contract: %s\n' "$1" >&2
@@ -87,6 +123,9 @@ require_literal "$TARGET" 'LIMIT 32'
 require_literal "$TARGET" 'restic unlock'
 require_literal "$TARGET" 'LOCK_OWNER_TOKEN'
 require_literal "$TARGET" 'system_holds_liveness_file'
+require_literal "$TARGET" 'heartbeat.ready'
+require_literal "$TARGET" 'heartbeat.ready.pending'
+forbid_pattern "$TARGET" 'mkfifo[^[:cntrl:]]*heartbeat\.pid'
 require_literal "$TARGET" 'command -v flock'
 require_literal "$TARGET" '--conflict-exit-code 75'
 require_literal "$TARGET" 'host_lock_owner_matches'
@@ -371,6 +410,40 @@ wait_for_file() {
   [[ -f "$path" ]]
 }
 
+wait_for_process_gone() {
+  local pid="$1"
+  local attempts=0
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  while kill -0 "$pid" 2>/dev/null && [[ "$attempts" -lt 1000 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+terminate_direct_fixture_child() {
+  local pid="$1"
+  local attempts=0
+  local running_pid
+  local still_running
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -KILL "$pid" 2>/dev/null || true
+  while [[ "$attempts" -lt 1000 ]]; do
+    still_running=false
+    for running_pid in $(jobs -pr); do
+      if [[ "$running_pid" == "$pid" ]]; then
+        still_running=true
+        break
+      fi
+    done
+    [[ "$still_running" == false ]] && break
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ "$still_running" == false ]] || return 1
+  wait "$pid" 2>/dev/null || true
+}
+
 log_count() {
   local path="$1"
   local pattern="$2"
@@ -640,6 +713,15 @@ FAKE_DOCKER
 set -euo pipefail
 if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'lstart=' &&
   "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ -n "${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE:-}" ]]; then
+    if [[ -f "$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE" ]]; then
+      printf '%s\n' failed \
+        >"${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE}.failed"
+      exit 83
+    fi
+    printf '%s\n' first \
+      >"$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE"
+  fi
   if [[ -n "${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}" &&
     -f "$PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE" &&
     "$(<"$PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE")" == "$4" ]]; then
@@ -650,9 +732,74 @@ if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'lstart=' &&
   printf 'phase5-contract-process-%s\n' "$4"
   exit 0
 fi
+if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'ppid=' &&
+  "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
+  fixture="${PHASE5_FAKE_PROCESS_STATE_ROOT:-}"
+  [[ -n "$fixture" && -d "$fixture" && ! -L "$fixture" ]] || exit 81
+  fixture="$(cd "$fixture" && pwd -P)" || exit 81
+  kill -0 "$4" 2>/dev/null || exit 81
+  owner_directory="$(readlink "$fixture/host.lock" 2>/dev/null)" || exit 81
+  [[ "$owner_directory" == "$fixture/host.lock.owner."?????? &&
+    -d "$owner_directory" && ! -L "$owner_directory" ]] ||
+    exit 81
+  owner_pid="$(sed -n 's/^pid=//p' "$owner_directory/owner")"
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || exit 81
+  heartbeat_pid_file="$fixture/fake-heartbeat.pid"
+  if [[ -f "$heartbeat_pid_file" && ! -L "$heartbeat_pid_file" ]]; then
+    recorded_heartbeat_pid="$(<"$heartbeat_pid_file")"
+    [[ "$recorded_heartbeat_pid" =~ ^[1-9][0-9]*$ ]] || exit 81
+    if [[ "$recorded_heartbeat_pid" != "$4" ]]; then
+      kill -0 "$recorded_heartbeat_pid" 2>/dev/null && exit 81
+      printf '%s\n' "$4" >"$heartbeat_pid_file"
+    fi
+  elif [[ ! -e "$heartbeat_pid_file" && ! -L "$heartbeat_pid_file" ]]; then
+    printf '%s\n' "$4" >"$heartbeat_pid_file"
+    chmod 0600 "$heartbeat_pid_file"
+  else
+    exit 81
+  fi
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    printf '%s\n' "$owner_pid"
+  else
+    printf '%s\n' '1'
+  fi
+  exit 0
+fi
 exec /bin/ps "$@"
 FAKE_PS
   chmod 0700 "$fixture/bin/ps"
+  cat >"$fixture/bin/mv" <<'FAKE_MV'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$#" -eq 2 &&
+  -n "${PHASE5_FAKE_HEARTBEAT_PUBLISH_FAIL_KIND:-}" &&
+  -n "${PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER:-}" ]]; then
+  case "$PHASE5_FAKE_HEARTBEAT_PUBLISH_FAIL_KIND:$2" in
+    "child_before_pid:"*/heartbeat.pid)
+      identity_file="${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE:-}"
+      [[ -n "$identity_file" ]] || exit 82
+      attempts=0
+      while [[ ! -f "${identity_file}.failed" && "$attempts" -lt 500 ]]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+      done
+      [[ -f "${identity_file}.failed" ]] || exit 82
+      value="$(<"$1")"
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || exit 82
+      printf '%s\n' "$value" >"$PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER"
+      exec /bin/mv "$@"
+      ;;
+    "ready:"*/heartbeat.ready)
+      value="$(<"$1")"
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || exit 82
+      printf '%s\n' "$value" >"$PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER"
+      exit 82
+      ;;
+  esac
+fi
+exec /bin/mv "$@"
+FAKE_MV
+  chmod 0700 "$fixture/bin/mv"
   printf '%s\n' "$fixture"
 }
 
@@ -742,46 +889,93 @@ run_fixture() {
   local fail_match="${2:-}"
   local remote_result="${3:-success}"
   local run_response="${4:-queued|scheduled|11111111-1111-4111-8111-111111111111}"
-  PATH="$fixture/bin:$PATH" \
-  PHASE5_FAKE_DOCKER_LOG="${PHASE5_FAKE_DOCKER_LOG:-$fixture/docker.log}" \
-  PHASE5_FAKE_CONTAINER_STATE="$fixture/sync-container.state" \
-  PHASE5_FAKE_SYNC_TIMEOUT="${PHASE5_FAKE_SYNC_TIMEOUT:-}" \
-  PHASE5_FAKE_DEGRADED_RUNS="${PHASE5_FAKE_DEGRADED_RUNS:-}" \
-  PHASE5_FAKE_SECRET_VOLUME="$fixture/secret-volume" \
-  PHASE5_FAKE_SECRET_COPY_FAIL_NAME="${PHASE5_FAKE_SECRET_COPY_FAIL_NAME:-}" \
-  PHASE5_FAKE_FAIL_MATCH="$fail_match" \
-  PHASE5_FAKE_REMOTE_RESULT="$remote_result" \
-  PHASE5_FAKE_FAIL_SQL_MATCH="${PHASE5_FAKE_FAIL_SQL_MATCH:-}" \
-  PHASE5_FAKE_BLOCK_SQL_MATCH="${PHASE5_FAKE_BLOCK_SQL_MATCH:-}" \
-  PHASE5_FAKE_BLOCK_SQL_SECONDS="${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}" \
-  PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE="${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}" \
-  PHASE5_FAKE_BLOCK_SQL_ARM_FILE="${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}" \
-  PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE="${PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE-acquired}" \
-  PHASE5_FAKE_DELAY_MATCH="${PHASE5_FAKE_DELAY_MATCH:-}" \
-  PHASE5_FAKE_DELAY_SECONDS="${PHASE5_FAKE_DELAY_SECONDS:-3}" \
-  PHASE5_FAKE_DELAY_RELEASE_FILE="${PHASE5_FAKE_DELAY_RELEASE_FILE:-}" \
-  PHASE5_FAKE_BLOCK_LOCK_SECONDS="${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}" \
-  PHASE5_FAKE_FAIL_BACKUP_FAIL="${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}" \
-  PHASE5_FAKE_RENEW_OWNER_PID_FILE="${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}" \
-  PHASE5_FAKE_ORPHAN_RENEW_MARKER="${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}" \
-  PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}" \
-  PHASE5_FAKE_RUN_RESPONSE="$run_response" \
-  HAPPYLEARN_AISTOR_LICENSE_FILE="$fixture/minio.license" \
-  HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$fixture/secrets" \
-  HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$fixture/repository" \
-  HAPPYLEARN_BACKUP_STATE_DIRECTORY="$fixture/state" \
-  HAPPYLEARN_BACKUP_AGE_RECIPIENT='age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp5m40h' \
-  HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID='phase5-contract-key' \
-  HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS="${HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS:-0.01}" \
-  HAPPYLEARN_BACKUP_DRAIN_TIMEOUT_SECONDS='2' \
-  HAPPYLEARN_BACKUP_READY_TIMEOUT_SECONDS='2' \
-  HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS="${HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS:-1}" \
-  HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}" \
-  HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-1}" \
-  HAPPYLEARN_BACKUP_DATABASE_CONNECT_TIMEOUT_SECONDS='1' \
-  HAPPYLEARN_BACKUP_LOCK_DIRECTORY="$fixture/host.lock" \
+  local -a fixture_environment=(
+    "PATH=$fixture/bin:$PATH"
+    "PHASE5_FAKE_DOCKER_LOG=${PHASE5_FAKE_DOCKER_LOG:-$fixture/docker.log}"
+    "PHASE5_FAKE_CONTAINER_STATE=$fixture/sync-container.state"
+    "PHASE5_FAKE_SYNC_TIMEOUT=${PHASE5_FAKE_SYNC_TIMEOUT:-}"
+    "PHASE5_FAKE_DEGRADED_RUNS=${PHASE5_FAKE_DEGRADED_RUNS:-}"
+    "PHASE5_FAKE_SECRET_VOLUME=$fixture/secret-volume"
+    "PHASE5_FAKE_SECRET_COPY_FAIL_NAME=${PHASE5_FAKE_SECRET_COPY_FAIL_NAME:-}"
+    "PHASE5_FAKE_FAIL_MATCH=$fail_match"
+    "PHASE5_FAKE_REMOTE_RESULT=$remote_result"
+    "PHASE5_FAKE_FAIL_SQL_MATCH=${PHASE5_FAKE_FAIL_SQL_MATCH:-}"
+    "PHASE5_FAKE_BLOCK_SQL_MATCH=${PHASE5_FAKE_BLOCK_SQL_MATCH:-}"
+    "PHASE5_FAKE_BLOCK_SQL_SECONDS=${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}"
+    "PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE=${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}"
+    "PHASE5_FAKE_BLOCK_SQL_ARM_FILE=${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}"
+    "PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE=${PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE-acquired}"
+    "PHASE5_FAKE_DELAY_MATCH=${PHASE5_FAKE_DELAY_MATCH:-}"
+    "PHASE5_FAKE_DELAY_SECONDS=${PHASE5_FAKE_DELAY_SECONDS:-3}"
+    "PHASE5_FAKE_DELAY_RELEASE_FILE=${PHASE5_FAKE_DELAY_RELEASE_FILE:-}"
+    "PHASE5_FAKE_BLOCK_LOCK_SECONDS=${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}"
+    "PHASE5_FAKE_FAIL_BACKUP_FAIL=${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}"
+    "PHASE5_FAKE_RENEW_OWNER_PID_FILE=${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}"
+    "PHASE5_FAKE_ORPHAN_RENEW_MARKER=${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}"
+    "PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE=${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}"
+    "PHASE5_FAKE_PROCESS_STATE_ROOT=$fixture"
+    "PHASE5_FAKE_HEARTBEAT_PUBLISH_FAIL_KIND=${PHASE5_FAKE_HEARTBEAT_PUBLISH_FAIL_KIND:-}"
+    "PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER=${PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER:-}"
+    "PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE=${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE:-}"
+    "PHASE5_FAKE_RUN_RESPONSE=$run_response"
+    "HAPPYLEARN_AISTOR_LICENSE_FILE=$fixture/minio.license"
+    "HAPPYLEARN_BACKUP_SECRET_DIRECTORY=$fixture/secrets"
+    "HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY=$fixture/repository"
+    "HAPPYLEARN_BACKUP_STATE_DIRECTORY=$fixture/state"
+    'HAPPYLEARN_BACKUP_AGE_RECIPIENT=age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp5m40h'
+    'HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID=phase5-contract-key'
+    "HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS=${HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS:-0.01}"
+    'HAPPYLEARN_BACKUP_DRAIN_TIMEOUT_SECONDS=2'
+    'HAPPYLEARN_BACKUP_READY_TIMEOUT_SECONDS=2'
+    "HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS=${HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS:-1}"
+    "HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS=${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}"
+    "HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS=${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-1}"
+    'HAPPYLEARN_BACKUP_DATABASE_CONNECT_TIMEOUT_SECONDS=1'
+    "HAPPYLEARN_BACKUP_LOCK_DIRECTORY=$fixture/host.lock"
+  )
+  local -a fixture_command=(
     "$TARGET" --project happylearn-dev --trigger scheduled
+  )
+  if [[ "${PHASE5_FAKE_EXEC_FIXTURE:-}" == true ]]; then
+    exec env "${fixture_environment[@]}" "${fixture_command[@]}"
+  fi
+  env "${fixture_environment[@]}" "${fixture_command[@]}"
 }
+
+FIXTURE_BACKGROUND_PID=''
+
+start_fixture_background() {
+  PHASE5_FAKE_EXEC_FIXTURE=true \
+    run_fixture "$@" >/dev/null 2>&1 &
+  FIXTURE_BACKGROUND_PID="$!"
+}
+
+for heartbeat_publish_failure in child_before_pid ready; do
+  heartbeat_publish_fixture="$(make_fixture)"
+  heartbeat_publish_marker="$heartbeat_publish_fixture/heartbeat-publish.pid"
+  heartbeat_identity_state=''
+  if [[ "$heartbeat_publish_failure" == child_before_pid ]]; then
+    heartbeat_identity_state="$heartbeat_publish_fixture/heartbeat-owner-identity"
+  fi
+  heartbeat_publish_started="$SECONDS"
+  if PHASE5_FAKE_HEARTBEAT_PUBLISH_FAIL_KIND="$heartbeat_publish_failure" \
+    PHASE5_FAKE_HEARTBEAT_PUBLISH_PID_MARKER="$heartbeat_publish_marker" \
+    PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE="$heartbeat_identity_state" \
+    run_fixture "$heartbeat_publish_fixture"; then
+    fail "heartbeat $heartbeat_publish_failure publication failure was accepted"
+  fi
+  if ((SECONDS - heartbeat_publish_started >= 5)); then
+    fail "heartbeat $heartbeat_publish_failure publication failure exceeded five seconds"
+  fi
+  heartbeat_publish_pid="$(<"$heartbeat_publish_marker")"
+  [[ "$heartbeat_publish_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail "heartbeat $heartbeat_publish_failure failure captured an invalid PID"
+  ! kill -0 "$heartbeat_publish_pid" 2>/dev/null ||
+    fail "heartbeat $heartbeat_publish_failure failure left an orphan process"
+  [[ ! -e "$heartbeat_publish_fixture/host.lock" &&
+    ! -L "$heartbeat_publish_fixture/host.lock" ]] ||
+    fail "heartbeat $heartbeat_publish_failure failure left its host lock"
+done
 
 success_fixture="$(make_fixture)"
 if ! run_fixture "$success_fixture"; then
@@ -1302,10 +1496,12 @@ PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
   PHASE5_FAKE_ORPHAN_RENEW_MARKER="$post_heartbeat_orphan_renew" \
   PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="$post_heartbeat_owner_pid_file" \
   HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
-  run_fixture "$post_heartbeat_fixture" >/dev/null 2>&1 &
-post_heartbeat_runner="$!"
+  start_fixture_background "$post_heartbeat_fixture"
+post_heartbeat_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$post_heartbeat_runner" "$post_heartbeat_release"
+register_active_fixture_finish "${post_heartbeat_release}.finished"
 if ! wait_for_file "${post_heartbeat_release}.started"; then
-  kill -KILL "$post_heartbeat_runner" 2>/dev/null || true
+  terminate_direct_fixture_child "$post_heartbeat_runner" || true
   fail "post-heartbeat fixture did not reach the blocked external descendant"
 fi
 post_heartbeat_owner="$(readlink "$post_heartbeat_fixture/host.lock")"
@@ -1314,6 +1510,8 @@ post_heartbeat_owner_pid="$(
 )"
 [[ "$post_heartbeat_owner_pid" =~ ^[1-9][0-9]*$ ]] ||
   fail "post-heartbeat owner PID was invalid"
+[[ "$post_heartbeat_owner_pid" == "$post_heartbeat_runner" ]] ||
+  fail "post-heartbeat owner was not the direct fixture child"
 printf '%s\n' "$post_heartbeat_owner_pid" \
   >"$post_heartbeat_owner_pid_file"
 post_heartbeat_renew_baseline="$(
@@ -1325,20 +1523,13 @@ if ! wait_for_log_count_greater \
   'SQL PHASE5_QUERY_LEASE_RENEW' \
   "$post_heartbeat_renew_baseline"; then
   touch "$post_heartbeat_release"
-  wait "$post_heartbeat_runner" 2>/dev/null || true
+  terminate_direct_fixture_child "$post_heartbeat_runner" || true
+  wait_for_file "${post_heartbeat_release}.finished" || true
   fail "heartbeat did not renew while the external descendant was blocked"
 fi
-kill -KILL "$post_heartbeat_owner_pid"
-attempts=0
-while kill -0 "$post_heartbeat_owner_pid" 2>/dev/null &&
-  [[ "$attempts" -lt 500 ]]; do
-  sleep 0.01
-  attempts=$((attempts + 1))
-done
-if kill -0 "$post_heartbeat_owner_pid" 2>/dev/null; then
+if ! terminate_direct_fixture_child "$post_heartbeat_runner"; then
   touch "$post_heartbeat_release"
-  wait "$post_heartbeat_runner" 2>/dev/null || true
-  fail "post-heartbeat owner survived SIGKILL"
+  fail "post-heartbeat direct child did not terminate"
 fi
 post_heartbeat_second_rejected=true
 if PHASE5_FAKE_DOCKER_LOG="$post_heartbeat_second_log" \
@@ -1354,7 +1545,7 @@ fi
 touch "$post_heartbeat_release"
 wait_for_file "${post_heartbeat_release}.finished" ||
   fail "post-heartbeat external descendant did not finish after release"
-wait "$post_heartbeat_runner" 2>/dev/null || true
+clear_active_fixture
 post_heartbeat_reclaimed=false
 attempts=0
 while [[ "$attempts" -lt 100 ]]; do
@@ -1396,12 +1587,14 @@ PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
   PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="$inflight_owner_pid_file" \
   HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
   HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS='10' \
-  run_fixture "$inflight_renew_fixture" >/dev/null 2>&1 &
-inflight_runner="$!"
+  start_fixture_background "$inflight_renew_fixture"
+inflight_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture \
+  "$inflight_runner" "$inflight_external_release" "$inflight_renew_release"
+register_active_fixture_finish "${inflight_external_release}.finished"
 if ! wait_for_file "${inflight_external_release}.started"; then
   touch "$inflight_external_release" "$inflight_renew_release"
-  kill -KILL "$inflight_runner" 2>/dev/null || true
-  wait "$inflight_runner" 2>/dev/null || true
+  terminate_direct_fixture_child "$inflight_runner" || true
   fail "in-flight renewal fixture did not reach its external descendant"
 fi
 inflight_owner="$(readlink "$inflight_renew_fixture/host.lock")"
@@ -1410,33 +1603,40 @@ inflight_owner_pid="$(
 )"
 [[ "$inflight_owner_pid" =~ ^[1-9][0-9]*$ ]] || {
   touch "$inflight_external_release" "$inflight_renew_release"
-  kill -KILL "$inflight_runner" 2>/dev/null || true
-  wait "$inflight_runner" 2>/dev/null || true
+  terminate_direct_fixture_child "$inflight_runner" || true
+  wait_for_file "${inflight_external_release}.finished" || true
   fail "in-flight renewal owner PID was invalid"
+}
+[[ "$inflight_owner_pid" == "$inflight_runner" ]] || {
+  touch "$inflight_external_release" "$inflight_renew_release"
+  terminate_direct_fixture_child "$inflight_runner" || true
+  fail "in-flight renewal owner was not the direct fixture child"
+}
+inflight_heartbeat_pid="$(
+  read_heartbeat_pid="$inflight_owner/heartbeat.pid"
+  [[ -f "$read_heartbeat_pid" && ! -L "$read_heartbeat_pid" ]] || exit 1
+  printf '%s' "$(<"$read_heartbeat_pid")"
+)"
+[[ "$inflight_heartbeat_pid" =~ ^[1-9][0-9]*$ ]] || {
+  touch "$inflight_external_release" "$inflight_renew_release"
+  terminate_direct_fixture_child "$inflight_runner" || true
+  fail "in-flight heartbeat PID was invalid"
 }
 printf '%s\n' "$inflight_owner_pid" >"$inflight_owner_pid_file"
 touch "$inflight_renew_arm"
 if ! wait_for_file "${inflight_renew_release}.started"; then
   touch "$inflight_external_release" "$inflight_renew_release"
-  kill -KILL "$inflight_owner_pid" 2>/dev/null || true
-  wait "$inflight_runner" 2>/dev/null || true
+  terminate_direct_fixture_child "$inflight_runner" || true
+  wait_for_file "${inflight_external_release}.finished" || true
   fail "heartbeat renewal did not enter its bounded in-flight window"
 fi
 inflight_renew_baseline="$(
   log_count "$inflight_renew_fixture/docker.log" \
     'SQL PHASE5_QUERY_LEASE_RENEW'
 )"
-kill -KILL "$inflight_owner_pid"
-attempts=0
-while kill -0 "$inflight_owner_pid" 2>/dev/null &&
-  [[ "$attempts" -lt 500 ]]; do
-  sleep 0.01
-  attempts=$((attempts + 1))
-done
-if kill -0 "$inflight_owner_pid" 2>/dev/null; then
+if ! terminate_direct_fixture_child "$inflight_runner"; then
   touch "$inflight_external_release" "$inflight_renew_release"
-  wait "$inflight_runner" 2>/dev/null || true
-  fail "in-flight renewal owner survived SIGKILL"
+  fail "in-flight renewal direct child did not terminate"
 fi
 touch "$inflight_renew_release"
 if ! wait_for_log_count_greater \
@@ -1444,23 +1644,22 @@ if ! wait_for_log_count_greater \
   'SQL PHASE5_QUERY_LEASE_RENEW' \
   "$inflight_renew_baseline"; then
   touch "$inflight_external_release"
-  wait "$inflight_runner" 2>/dev/null || true
+  wait_for_file "${inflight_external_release}.finished" || true
   fail "the already in-flight renewal did not complete"
 fi
-inflight_renew_after_release="$(
-  log_count "$inflight_renew_fixture/docker.log" \
-    'SQL PHASE5_QUERY_LEASE_RENEW'
-)"
-sleep 0.2
-inflight_renew_after_wait="$(
-  log_count "$inflight_renew_fixture/docker.log" \
-    'SQL PHASE5_QUERY_LEASE_RENEW'
-)"
-[[ "$inflight_renew_after_release" -eq \
-  $((inflight_renew_baseline + 1)) &&
-  "$inflight_renew_after_wait" -eq "$inflight_renew_after_release" ]] || {
+if ! wait_for_process_gone "$inflight_heartbeat_pid"; then
   touch "$inflight_external_release"
-  wait "$inflight_runner" 2>/dev/null || true
+  wait_for_file "${inflight_external_release}.finished" || true
+  fail "in-flight heartbeat did not exit after owner death"
+fi
+inflight_renew_after_heartbeat_exit="$(
+  log_count "$inflight_renew_fixture/docker.log" \
+    'SQL PHASE5_QUERY_LEASE_RENEW'
+)"
+[[ "$inflight_renew_after_heartbeat_exit" -eq \
+  $((inflight_renew_baseline + 1)) ]] || {
+  touch "$inflight_external_release"
+  wait_for_file "${inflight_external_release}.finished" || true
   fail "owner death allowed more than one already in-flight renewal"
 }
 inflight_second_rejected=true
@@ -1473,13 +1672,13 @@ fi
   -L "$inflight_renew_fixture/host.lock" &&
   "$(readlink "$inflight_renew_fixture/host.lock")" == "$inflight_owner" ]] || {
   touch "$inflight_external_release"
-  wait "$inflight_runner" 2>/dev/null || true
+  wait_for_file "${inflight_external_release}.finished" || true
   fail "in-flight renewal descendant host lock was stolen"
 }
 touch "$inflight_external_release"
 wait_for_file "${inflight_external_release}.finished" ||
   fail "in-flight renewal external descendant did not finish"
-wait "$inflight_runner" 2>/dev/null || true
+clear_active_fixture
 if PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE='' \
   PHASE5_FAKE_DOCKER_LOG="$inflight_ttl_log" \
   run_fixture "$inflight_renew_fixture"; then
