@@ -56,6 +56,7 @@ ACTIVE_EXTERNAL_PID=''
 ACTIVE_EXTERNAL_PGID=''
 PENDING_SIGNAL_STATUS=''
 WORKSPACE_INITIALIZED=false
+HTTP_PROBE_SUCCEEDED=false
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -195,11 +196,13 @@ validate_paths() {
   local control_directory="${HAPPYLEARN_RESTORE_CONTROL_DIRECTORY:-}"
   local report_directory="${HAPPYLEARN_RESTORE_REPORT_DIRECTORY:-}"
   local license_file="${HAPPYLEARN_AISTOR_LICENSE_FILE:-}"
+  local teacher_credential_file="${HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE:-}"
   [[ -n "$repository_directory" &&
     -n "$secret_directory" &&
     -n "$control_directory" &&
     -n "$report_directory" &&
-    -n "$license_file" ]] ||
+    -n "$license_file" &&
+    -n "$teacher_credential_file" ]] ||
     return 1
   HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$(
     canonical_directory "$repository_directory"
@@ -216,11 +219,17 @@ validate_paths() {
   [[ "$license_file" == /* && -f "$license_file" && ! -L "$license_file" ]] ||
     return 1
   HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file"
+  [[ "$teacher_credential_file" == /* &&
+    -f "$teacher_credential_file" &&
+    ! -L "$teacher_credential_file" ]] ||
+    return 1
+  HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE="$teacher_credential_file"
   safe_mount_source "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY" || return 1
   safe_mount_source "$HAPPYLEARN_AISTOR_LICENSE_FILE" || return 1
+  safe_mount_source "$HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE" || return 1
   owner_only_directory "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY" || return 1
@@ -230,6 +239,8 @@ validate_paths() {
   owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password" ||
     return 1
   owner_only_secret "$HAPPYLEARN_AISTOR_LICENSE_FILE" || return 1
+  owner_only_secret "$HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE" ||
+    return 1
   REPORT_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/restore-${BACKUP_ID}.json"
   REPORT_TEMPORARY="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new"
   RESTORE_LOCK_FILE="$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY/.phase5-restore-${BACKUP_ID}.lock"
@@ -667,8 +678,9 @@ expected_resource_name() {
     containers:revoke-sessions) printf '%s-revoke-sessions' "$project" ;;
     containers:app) printf '%s-app' "$project" ;;
     containers:restore-check) printf '%s-restore-check' "$project" ;;
-    containers:student-one) printf '%s-student-1' "$project" ;;
-    containers:student-two) printf '%s-student-2' "$project" ;;
+    containers:restore-http-probe)
+      printf '%s-restore-http-probe' "$project"
+      ;;
     *) return 1 ;;
   esac
 }
@@ -696,8 +708,7 @@ valid_observed_resource() {
       containers:aistor-license-init | containers:postgres | \
       containers:postgres-restore | containers:aistor | containers:redis | \
       containers:revoke-sessions | containers:app | \
-      containers:restore-check | containers:student-one | \
-      containers:student-two) ;;
+      containers:restore-check | containers:restore-http-probe) ;;
     *) return 1 ;;
   esac
   expected_name="$(expected_resource_name "$project" "$class" "$kind")" ||
@@ -1124,7 +1135,7 @@ revoke_restored_sessions() {
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 --command \
-    "UPDATE sessions SET revoked_at=COALESCE(revoked_at,now()), revoke_reason=COALESCE(revoke_reason,'restore_verification'); SELECT 'PHASE5_RESTORE_SESSIONS_REVOKED';" \
+    "BEGIN; UPDATE sessions SET revoked_at=COALESCE(revoked_at,now()), revoke_reason=COALESCE(revoke_reason,'restore_verification'); UPDATE operational_modes SET mode='normal', owner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, entered_at=NULL, updated_at=now(), version=version+1 WHERE singleton_id=true; COMMIT; SELECT 'PHASE5_RESTORE_SESSIONS_REVOKED';" \
     >/dev/null
 }
 
@@ -1176,31 +1187,19 @@ run_restore_check() {
     >/dev/null
 }
 
-run_student_isolation_probe() {
-  local index="$1"
-  [[ "$index" == 1 || "$index" == 2 ]] || return 1
+run_restore_http_probe() {
   run_named_container \
-    "$PROJECT-student-$index" "student-$(
-      [[ "$index" == 1 ]] && printf one || printf two
-    )" \
+    "$PROJECT-restore-http-probe" restore-http-probe \
     --network "$NETWORK_NAME" \
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
-    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
-    --env HAPPYLEARN_DATABASE_HOST=postgres \
-    --env HAPPYLEARN_DATABASE_PORT=5432 \
-    --env HAPPYLEARN_DATABASE_USER=happylearn \
-    --env HAPPYLEARN_DATABASE_NAME=happylearn \
-    --env HAPPYLEARN_DATABASE_SSLMODE=disable \
-    --env PGPASSFILE=/run/secrets/pgpass \
+    --mount "type=bind,src=$HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE,dst=/run/secrets/restore-probe-teacher.json,readonly" \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
-    /app/happylearn-backup restore-check \
-    --backup-id "$BACKUP_ID" \
-    --student-isolation-probe "$index" \
-    --expected-status 404 \
+    /app/happylearn-backup restore-http-probe \
     >/dev/null
+  HTTP_PROBE_SUCCEEDED=true
 }
 
 valid_int64_decimal() {
@@ -1385,7 +1384,9 @@ write_sanitized_report() {
   local duration=$((SECONDS - START_SECONDS))
   local canonical="$WORK_DIRECTORY/report.canonical"
   local report_sha256
-  [[ "$duration" -ge 0 && "$duration" -lt "$RTO_LIMIT_SECONDS" ]] ||
+  [[ "$HTTP_PROBE_SUCCEEDED" == true &&
+    "$duration" -ge 0 &&
+    "$duration" -lt "$RTO_LIMIT_SECONDS" ]] ||
     return 1
   printf '%s\n' \
     "schemaVersion=1" \
@@ -1463,8 +1464,7 @@ cleanup_restore() {
       [[ -n "$name" && -n "$kind" ]] || continue
       cleanup_container "$name" "$kind" || status=1
     done <<EOF
-$PROJECT-student-2|student-two
-$PROJECT-student-1|student-one
+$PROJECT-restore-http-probe|restore-http-probe
 $PROJECT-restore-check|restore-check
 $PROJECT-app|app
 $PROJECT-revoke-sessions|revoke-sessions
@@ -1612,8 +1612,7 @@ main() {
   wait_for_restored_app
   run_restore_check
   load_safe_restore_counts
-  run_student_isolation_probe 1
-  run_student_isolation_probe 2
+  run_restore_http_probe
   write_sanitized_report
 }
 

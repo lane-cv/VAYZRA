@@ -8,10 +8,12 @@ TARGET="$ROOT/scripts/phase5-restore-verify.sh"
 MAKEFILE="$ROOT/Makefile"
 BACKUP_ID='11111111-1111-4111-8111-111111111111'
 SNAPSHOT_ID='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+BACKUP_IMAGE='happylearn-backup:phase5'
 SECRET_MARKER='phase5-restore-secret-marker'
 DATABASE_SECRET_MARKER='fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
 OBJECT_SECRET_MARKER='123456789abcdeffedcba98765432100123456789abcdeffedcba98765432100'
 SIGNING_SECRET_MARKER='abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd'
+TEACHER_CREDENTIAL_SECRET='{"username":"restore-probe-teacher","password":"Restore Probe Teacher Secret 42!"}'
 MANIFEST_TEXT='{"schemaVersion":1,"batchId":"11111111-1111-4111-8111-111111111111","createdAt":"2026-07-29T01:02:03.000000004Z","databaseMigrationVersion":42,"databaseDumpSha256":"1111111111111111111111111111111111111111111111111111111111111111","objectSnapshotId":"2222222222222222222222222222222222222222222222222222222222222222","objectCount":1,"referencedBytes":41}'
 
 contract_sha256_stdin() {
@@ -212,6 +214,9 @@ make_fixture() {
   chmod 0400 "$fixture/secrets/local_password"
   printf 'license fixture\n' >"$fixture/minio.license"
   chmod 0400 "$fixture/minio.license"
+  printf '%s\n' "$TEACHER_CREDENTIAL_SECRET" \
+    >"$fixture/restore-probe-teacher.json"
+  chmod 0400 "$fixture/restore-probe-teacher.json"
   : >"$fixture/docker.log"
   : >"$fixture/random.counter"
 
@@ -248,6 +253,15 @@ FAKE_CHMOD
   cat >"$fixture/bin/stat" <<'FAKE_STAT'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${PHASE5_FAKE_MODE:-}" == credential_wrong_owner &&
+  "${*: -1}" == "$PHASE5_FAKE_TEACHER_CREDENTIAL_FILE" ]]; then
+  case "${1:-}:${2:-}" in
+    -c:%u|-f:%u)
+      printf '%s\n' "$((PHASE5_FAKE_HOST_UID + 1))"
+      exit 0
+      ;;
+  esac
+fi
 if [[ "${PHASE5_FAKE_MODE:-}" == gnu_stat ]]; then
   case "${1:-}:${2:-}" in
     --version:)
@@ -607,6 +621,7 @@ if [[ "$mode" == sigterm_delayed_create && "$kind" == restic-check ]]; then
   done
 fi
 if [[ "$*" == *"$PHASE5_FAKE_SECRET_MARKER"* ||
+  "$*" == *"$PHASE5_FAKE_TEACHER_CREDENTIAL_SECRET"* ||
   "$*" == *'POSTGRES_PASSWORD='* ||
   "$*" == *'MINIO_ROOT_PASSWORD='* ||
   "$*" == *'HAPPYLEARN_DATABASE_URL='* ||
@@ -628,7 +643,7 @@ if [[ "$mode" == ambiguous_container_create && "$kind" == restic-check ]]; then
 fi
 
 case "$kind" in
-  restic-*|postgres-restore|revoke-sessions|restore-check|student-one|student-two)
+  restic-*|postgres-restore|revoke-sessions|restore-check|restore-http-probe)
     [[ "$*" == *"--user ${PHASE5_FAKE_HOST_UID}:${PHASE5_FAKE_HOST_GID}"* ]] ||
       exit 64
     ;;
@@ -771,9 +786,8 @@ case "$kind" in
     [[ "$*" == *' pg_restore '* ]] || exit 64
     ;;
   revoke-sessions)
-    [[ "$*" == *'PHASE5_RESTORE_SESSIONS_REVOKED'* &&
-      "$*" == *'UPDATE sessions'* &&
-      "$*" == *"restore_verification"* ]] ||
+    sql="$(arg_after --command "$@")" || exit 64
+    [[ "$sql" == "BEGIN; UPDATE sessions "*"restore_verification"*"UPDATE operational_modes "*"mode='normal'"*"owner_id=NULL"*"lease_token_hash=NULL"*"lease_expires_at=NULL"*"entered_at=NULL"*"version=version+1"*"WHERE singleton_id=true; COMMIT; SELECT 'PHASE5_RESTORE_SESSIONS_REVOKED';" ]] ||
       exit 64
     ;;
   restore-check)
@@ -878,24 +892,53 @@ case "$kind" in
         "evidence_sha256=$report_evidence_sha256"
     } >"$report_mount/restore-check.report"
     ;;
-  student-one|student-two)
-    index=1
-    [[ "$kind" == student-two ]] && index=2
-    [[ "$*" == *"/app/happylearn-backup restore-check --backup-id ${PHASE5_FAKE_BACKUP_ID} --student-isolation-probe ${index} --expected-status 404"* ]] ||
+  restore-http-probe)
+    credential_mount="type=bind,src=$PHASE5_FAKE_TEACHER_CREDENTIAL_FILE,dst=/run/secrets/restore-probe-teacher.json,readonly"
+    mount_count=0
+    previous=''
+    for argument in "$@"; do
+      [[ "$argument" != '--env' &&
+        "$argument" != '--env-file' &&
+        "$argument" != '--publish' &&
+        "$argument" != '-p' ]] ||
+        exit 64
+      if [[ "$previous" == '--mount' ]]; then
+        mount_count=$((mount_count + 1))
+        [[ "$argument" == "$credential_mount" ]] || exit 64
+      fi
+      previous="$argument"
+    done
+    [[ "$name" == "$project-restore-http-probe" &&
+      "$mount_count" -eq 1 &&
+      "$(arg_after --network "$@")" == "$project-network" &&
+      "$(arg_after --user "$@")" == "${PHASE5_FAKE_HOST_UID}:${PHASE5_FAKE_HOST_GID}" &&
+      "$(arg_after --entrypoint "$@")" == /usr/bin/timeout &&
+      "$*" == *"--entrypoint /usr/bin/timeout $PHASE5_FAKE_BACKUP_IMAGE --foreground --kill-after=10s "* &&
+      "$*" == *'--read-only'* &&
+      "$*" != *'/run/secrets/pgpass'* &&
+      "$*" != *'PGPASSFILE'* &&
+      "$*" != *'HAPPYLEARN_DATABASE'* &&
+      "$*" != *'HAPPYLEARN_MINIO'* &&
+      "$*" != *'/run/restore/manifest'* &&
+      "$*" != *'dst=/work'* &&
+      -f "$PHASE5_FAKE_TEACHER_CREDENTIAL_FILE" &&
+      ! -L "$PHASE5_FAKE_TEACHER_CREDENTIAL_FILE" &&
+      "${@: -2:1}" == /app/happylearn-backup &&
+      "${@: -1}" == restore-http-probe ]] ||
       exit 64
-    if [[ "$mode" == ledger_missing && "$index" == 2 ]]; then
+    if [[ "$mode" == ledger_missing ]]; then
       : >"$PHASE5_FAKE_LEDGER_PAUSE_MARKER"
       while [[ ! -e "$PHASE5_FAKE_LEDGER_PAUSE_RELEASE" ]]; do
         sleep 0.01
       done
     fi
-    if [[ "$mode" == report_race && "$index" == 2 ]]; then
+    if [[ "$mode" == report_race ]]; then
       : >"$PHASE5_FAKE_REPORT_PAUSE_MARKER"
       while [[ ! -e "$PHASE5_FAKE_REPORT_PAUSE_RELEASE" ]]; do
         sleep 0.01
       done
     fi
-    if [[ "$mode" == student_probe_failure && "$index" == 2 ]]; then
+    if [[ "$mode" == http_probe_failure ]]; then
       exit 75
     fi
     ;;
@@ -918,11 +961,14 @@ run_fixture() {
     "PHASE5_FAKE_RANDOM_COUNTER=$fixture/random.counter"
     "PHASE5_FAKE_MODE=$mode"
     "PHASE5_FAKE_BACKUP_ID=$BACKUP_ID"
+    "PHASE5_FAKE_BACKUP_IMAGE=$BACKUP_IMAGE"
     "PHASE5_FAKE_SNAPSHOT_ID=$SNAPSHOT_ID"
     "PHASE5_FAKE_SECRET_MARKER=$SECRET_MARKER"
     "PHASE5_FAKE_DATABASE_SECRET_MARKER=$DATABASE_SECRET_MARKER"
     "PHASE5_FAKE_OBJECT_SECRET_MARKER=$OBJECT_SECRET_MARKER"
     "PHASE5_FAKE_SIGNING_SECRET_MARKER=$SIGNING_SECRET_MARKER"
+    "PHASE5_FAKE_TEACHER_CREDENTIAL_FILE=$fixture/restore-probe-teacher.json"
+    "PHASE5_FAKE_TEACHER_CREDENTIAL_SECRET=$TEACHER_CREDENTIAL_SECRET"
     "PHASE5_FAKE_MANIFEST_TEXT=$MANIFEST_TEXT"
     "PHASE5_FAKE_MANIFEST_SHA256=$MANIFEST_SHA256"
     "PHASE5_FAKE_VERIFICATION_REPORT_SHA256=$VERIFICATION_REPORT_SHA256"
@@ -944,6 +990,8 @@ run_fixture() {
     "HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY=$fixture/repository"
     "HAPPYLEARN_BACKUP_SECRET_DIRECTORY=$fixture/secrets"
     "HAPPYLEARN_AISTOR_LICENSE_FILE=$fixture/minio.license"
+    "HAPPYLEARN_BACKUP_IMAGE=${HAPPYLEARN_BACKUP_IMAGE:-$BACKUP_IMAGE}"
+    "HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE=${HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE-$fixture/restore-probe-teacher.json}"
     "HAPPYLEARN_RESTORE_CONTROL_DIRECTORY=${HAPPYLEARN_RESTORE_CONTROL_DIRECTORY:-$fixture/control}"
     "HAPPYLEARN_RESTORE_REPORT_DIRECTORY=${HAPPYLEARN_RESTORE_REPORT_DIRECTORY:-$fixture/reports}"
     "HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-3}"
@@ -1054,6 +1102,24 @@ grep -Fq 'label=$BACKUP_LABEL=$BACKUP_ID' "$TARGET" ||
   fail 'restore orphan reaper lacks the exact backup label'
 grep -Fq 'owned_resources_absent' "$TARGET" ||
   fail 'restore report is not fenced on zero owned resources'
+grep -Fq 'HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE' "$TARGET" ||
+  fail 'restore harness does not require a teacher credential file'
+grep -Fq \
+  'type=bind,src=$HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE,dst=/run/secrets/restore-probe-teacher.json,readonly' \
+  "$TARGET" ||
+  fail 'restore HTTP probe lacks its exact read-only teacher credential mount'
+grep -Fq '/app/happylearn-backup restore-http-probe' "$TARGET" ||
+  fail 'restore harness does not invoke the fixed HTTP isolation probe'
+if grep -Fq -- '--student-isolation-probe' "$TARGET"; then
+  fail 'restore harness retained the legacy fake student isolation probe'
+fi
+grep -Fq 'owner_only_secret "$HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE"' \
+  "$TARGET" ||
+  fail 'restore harness does not enforce the teacher credential ownership contract'
+grep -Fq 'HTTP_PROBE_SUCCEEDED=true' "$TARGET" ||
+  fail 'restore harness does not fence its report on HTTP probe success'
+grep -Fq 'UPDATE operational_modes' "$TARGET" ||
+  fail 'restored operational mode is not normalized before app startup'
 
 unsafe_license_mode_fixture="$(make_fixture)"
 chmod 0600 "$unsafe_license_mode_fixture/minio.license"
@@ -1077,6 +1143,94 @@ if run_fixture "$oversized_license_fixture" \
 fi
 test ! -s "$oversized_license_fixture/docker.log" ||
   fail 'oversized AIStor license accessed Docker'
+
+unsafe_credential_mode_fixture="$(make_fixture)"
+chmod 0600 "$unsafe_credential_mode_fixture/restore-probe-teacher.json"
+if run_fixture "$unsafe_credential_mode_fixture" \
+  >"$unsafe_credential_mode_fixture/stdout" \
+  2>"$unsafe_credential_mode_fixture/stderr"; then
+  fail 'group-readable restore teacher credential was accepted'
+fi
+test ! -s "$unsafe_credential_mode_fixture/docker.log" ||
+  fail 'unsafe restore teacher credential accessed Docker'
+
+empty_credential_fixture="$(make_fixture)"
+chmod 0600 "$empty_credential_fixture/restore-probe-teacher.json"
+: >"$empty_credential_fixture/restore-probe-teacher.json"
+chmod 0400 "$empty_credential_fixture/restore-probe-teacher.json"
+if run_fixture "$empty_credential_fixture" \
+  >"$empty_credential_fixture/stdout" \
+  2>"$empty_credential_fixture/stderr"; then
+  fail 'empty restore teacher credential was accepted'
+fi
+test ! -s "$empty_credential_fixture/docker.log" ||
+  fail 'empty restore teacher credential accessed Docker'
+
+oversized_credential_fixture="$(make_fixture)"
+chmod 0600 "$oversized_credential_fixture/restore-probe-teacher.json"
+dd if=/dev/zero \
+  of="$oversized_credential_fixture/restore-probe-teacher.json" \
+  bs=4097 count=1 >/dev/null 2>&1
+chmod 0400 "$oversized_credential_fixture/restore-probe-teacher.json"
+if run_fixture "$oversized_credential_fixture" \
+  >"$oversized_credential_fixture/stdout" \
+  2>"$oversized_credential_fixture/stderr"; then
+  fail 'oversized restore teacher credential was accepted'
+fi
+test ! -s "$oversized_credential_fixture/docker.log" ||
+  fail 'oversized restore teacher credential accessed Docker'
+
+symlink_credential_fixture="$(make_fixture)"
+mv "$symlink_credential_fixture/restore-probe-teacher.json" \
+  "$symlink_credential_fixture/restore-probe-teacher.target"
+ln -s "$symlink_credential_fixture/restore-probe-teacher.target" \
+  "$symlink_credential_fixture/restore-probe-teacher.json"
+if run_fixture "$symlink_credential_fixture" \
+  >"$symlink_credential_fixture/stdout" \
+  2>"$symlink_credential_fixture/stderr"; then
+  fail 'symlinked restore teacher credential was accepted'
+fi
+test ! -s "$symlink_credential_fixture/docker.log" ||
+  fail 'symlinked restore teacher credential accessed Docker'
+
+relative_credential_fixture="$(make_fixture)"
+if HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE=restore-probe-teacher.json \
+  run_fixture "$relative_credential_fixture" \
+  >"$relative_credential_fixture/stdout" \
+  2>"$relative_credential_fixture/stderr"; then
+  fail 'relative restore teacher credential path was accepted'
+fi
+test ! -s "$relative_credential_fixture/docker.log" ||
+  fail 'relative restore teacher credential accessed Docker'
+
+directory_credential_fixture="$(make_fixture)"
+if HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE="$directory_credential_fixture/control" \
+  run_fixture "$directory_credential_fixture" \
+  >"$directory_credential_fixture/stdout" \
+  2>"$directory_credential_fixture/stderr"; then
+  fail 'directory restore teacher credential was accepted'
+fi
+test ! -s "$directory_credential_fixture/docker.log" ||
+  fail 'directory restore teacher credential accessed Docker'
+
+wrong_owner_credential_fixture="$(make_fixture)"
+if run_fixture "$wrong_owner_credential_fixture" credential_wrong_owner \
+  >"$wrong_owner_credential_fixture/stdout" \
+  2>"$wrong_owner_credential_fixture/stderr"; then
+  fail 'non-owner restore teacher credential was accepted'
+fi
+test ! -s "$wrong_owner_credential_fixture/docker.log" ||
+  fail 'non-owner restore teacher credential accessed Docker'
+
+missing_credential_fixture="$(make_fixture)"
+if HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE='' \
+  run_fixture "$missing_credential_fixture" \
+  >"$missing_credential_fixture/stdout" \
+  2>"$missing_credential_fixture/stderr"; then
+  fail 'missing restore teacher credential was accepted'
+fi
+test ! -s "$missing_credential_fixture/docker.log" ||
+  fail 'missing restore teacher credential accessed Docker'
 
 invalid_fixture="$(make_fixture)"
 if "$TARGET" --backup-id 'NOT-A-CANONICAL-UUID' \
@@ -1170,7 +1324,10 @@ test -f "$shared_report_directory/restore-$BACKUP_ID.json" ||
   fail 'shared report lock holder did not publish after release'
 
 success_fixture="$(make_fixture)"
-if ! run_fixture "$success_fixture"; then
+if ! run_fixture "$success_fixture" \
+  >"$success_fixture/stdout" 2>"$success_fixture/stderr"; then
+  sed -n '1,120p' "$success_fixture/stdout" >&2
+  sed -n '1,120p' "$success_fixture/stderr" >&2
   sed -n '1,240p' "$success_fixture/docker.log" >&2
   find "$success_fixture/state" -mindepth 1 -maxdepth 2 -print >&2
   fail 'strict success restore fixture failed'
@@ -1258,8 +1415,32 @@ grep -Fq "restic --no-cache restore $SNAPSHOT_ID --target /restore" \
 if grep -Fq "$SECRET_MARKER" "$success_fixture/docker.log" ||
   grep -Fq "$DATABASE_SECRET_MARKER" "$success_fixture/docker.log" ||
   grep -Fq "$OBJECT_SECRET_MARKER" "$success_fixture/docker.log" ||
-  grep -Fq "$SIGNING_SECRET_MARKER" "$success_fixture/docker.log"; then
+  grep -Fq "$SIGNING_SECRET_MARKER" "$success_fixture/docker.log" ||
+  grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$success_fixture/docker.log"; then
   fail 'restore secret appeared in Docker argv'
+fi
+success_credential="$success_fixture/restore-probe-teacher.json"
+credential_path_count="$(
+  grep -Fc "$success_credential" "$success_fixture/docker.log" ||
+    true
+)"
+[[ "$credential_path_count" -eq 1 ]] ||
+  fail 'restore teacher credential path escaped its single probe mount'
+probe_run_count="$(
+  grep -F -- \
+    '--label io.happylearn.phase5.restore-kind=restore-http-probe' \
+    "$success_fixture/docker.log" |
+    grep -Fc '/app/happylearn-backup restore-http-probe' ||
+    true
+)"
+[[ "$probe_run_count" -eq 1 ]] ||
+  fail 'restore HTTP probe did not run exactly once with its immutable kind'
+grep -Fq -- \
+  "--mount type=bind,src=$success_credential,dst=/run/secrets/restore-probe-teacher.json,readonly" \
+  "$success_fixture/docker.log" ||
+  fail 'restore HTTP probe did not use the exact read-only credential mount'
+if grep -Fq -- '--student-isolation-probe' "$success_fixture/docker.log"; then
+  fail 'legacy fake student isolation probe reached Docker'
 fi
 grep -Fq 'restore-kind=aistor-license-init' "$success_fixture/docker.log" ||
   fail 'AIStor license was not copied through a dedicated init container'
@@ -1273,6 +1454,9 @@ assert_before "$success_fixture" \
   ' restic --no-cache restore ' \
   ' pg_restore '
 assert_before "$success_fixture" \
+  ' pg_restore ' \
+  'UPDATE operational_modes'
+assert_before "$success_fixture" \
   'PHASE5_RESTORE_OBJECT_DATA' \
   'PHASE5_RESTORE_SESSIONS_REVOKED'
 assert_before "$success_fixture" \
@@ -1283,10 +1467,7 @@ assert_before "$success_fixture" \
   '/app/happylearn-backup restore-check --backup-id'
 assert_before "$success_fixture" \
   '--report-file /work/restore-check.report' \
-  '--student-isolation-probe 1 --expected-status 404'
-assert_before "$success_fixture" \
-  '--student-isolation-probe 1 --expected-status 404' \
-  '--student-isolation-probe 2 --expected-status 404'
+  '/app/happylearn-backup restore-http-probe'
 
 report="$success_fixture/reports/restore-$BACKUP_ID.json"
 test -f "$report" || fail 'sanitized restore report was not written'
@@ -1309,7 +1490,15 @@ grep -Fq "\"evidenceSHA256\":\"$EVIDENCE_SHA256\"" "$report" ||
   fail 'restore report omitted its independently checked evidence hash'
 grep -Eq '"reportSHA256":"[a-f0-9]{64}"' "$report" ||
   fail 'restore report omitted its safe hash'
+grep -Fq '"isolation404ProbeCount":2' "$report" ||
+  fail 'successful HTTP probe did not publish both isolation observations'
 if grep -Fq "$SECRET_MARKER" "$report" ||
+  grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$report" ||
+  grep -Fq "$success_credential" "$report" ||
+  grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$success_fixture/stdout" ||
+  grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$success_fixture/stderr" ||
+  grep -Fq "$success_credential" "$success_fixture/stdout" ||
+  grep -Fq "$success_credential" "$success_fixture/stderr" ||
   grep -Fq "$success_fixture" "$report" ||
   grep -Eiq '(password|secret|repository|objectKey|student|cookie|token|path)' \
     "$report"; then
@@ -1477,23 +1666,40 @@ test ! -e "$ledger_missing_fixture/reports/restore-$BACKUP_ID.json" ||
 
 for mode in wrong_secret tampered_pack check_failure; do
   fixture="$(make_fixture)"
-  if run_fixture "$fixture" "$mode"; then
+  if run_fixture "$fixture" "$mode" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
     fail "$mode repository corruption was accepted"
   fi
   assert_failure_before_restore "$fixture"
 done
 
 for mode in missing_snapshot duplicate_snapshot missing_object stale_session \
-  nonempty_postgres nonempty_aistor student_probe_failure \
+  nonempty_postgres nonempty_aistor http_probe_failure \
   report_unknown_field report_duplicate_field report_missing_field \
   report_wrong_backup report_wrong_manifest report_wrong_evidence \
   report_row_total_mismatch
 do
   fixture="$(make_fixture)"
-  if run_fixture "$fixture" "$mode"; then
+  if run_fixture "$fixture" "$mode" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
     fail "$mode restore failure was accepted"
   fi
   assert_no_resources "$fixture"
+  test ! -e "$fixture/reports/restore-$BACKUP_ID.json" ||
+    fail "$mode restore failure published a success report"
+  if [[ "$mode" == http_probe_failure ]]; then
+    grep -Fq \
+      '/app/happylearn-backup restore-http-probe' \
+      "$fixture/docker.log" ||
+      fail 'HTTP probe failure fixture did not reach the real probe'
+    if grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$fixture/docker.log" ||
+      grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$fixture/stdout" ||
+      grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$fixture/stderr" ||
+      grep -Fq "$fixture/restore-probe-teacher.json" "$fixture/stdout" ||
+      grep -Fq "$fixture/restore-probe-teacher.json" "$fixture/stderr"; then
+      fail 'failed HTTP probe leaked its credential content or host path'
+    fi
+  fi
 done
 
 timeout_fixture="$(make_fixture)"
