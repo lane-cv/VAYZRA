@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract
 
 BACKUP_TRIGGER ?= manual
 
@@ -63,3 +63,6 @@ phase5-backup-live:
 
 phase5-backup:
 	bash scripts/phase5-backup.sh --project happylearn-dev --trigger $(BACKUP_TRIGGER)
+
+phase5-restore-contract:
+	bash scripts/phase5-restore_contract_test.sh
