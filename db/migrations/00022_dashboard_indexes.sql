@@ -7,7 +7,6 @@ CREATE INDEX ai_runs_dashboard_daily_idx
 
 CREATE INDEX ai_runs_dashboard_failed_idx
   ON ai_runs(completed_at)
-  INCLUDE (created_at,updated_at,started_at)
   WHERE status='failed';
 
 CREATE INDEX ai_runs_dashboard_unknown_idx
