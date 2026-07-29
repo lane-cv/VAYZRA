@@ -6,21 +6,25 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeServerLifecycle struct {
-	listen      chan error
-	shutdownErr error
-	closeErr    error
-	shutdown    chan struct{}
-	closeCalled chan struct{}
-	shutdownOne sync.Once
-	closeOnce   sync.Once
-	mu          sync.Mutex
-	stopped     bool
+	listen       chan error
+	shutdownErr  error
+	closeErr     error
+	shutdown     chan struct{}
+	closeCalled  chan struct{}
+	listenCalled chan struct{}
+	shutdownOne  sync.Once
+	closeOnce    sync.Once
+	listenOnce   sync.Once
+	mu           sync.Mutex
+	stopped      bool
 }
 
 func (s *fakeServerLifecycle) ListenAndServe() error {
+	s.listenOnce.Do(func() { close(s.listenCalled) })
 	return <-s.listen
 }
 
@@ -66,9 +70,10 @@ func (s *fakeServerLifecycle) isStopped() bool {
 
 func newFakeServerLifecycle() *fakeServerLifecycle {
 	return &fakeServerLifecycle{
-		listen:      make(chan error, 1),
-		shutdown:    make(chan struct{}),
-		closeCalled: make(chan struct{}),
+		listen:       make(chan error, 1),
+		shutdown:     make(chan struct{}),
+		closeCalled:  make(chan struct{}),
+		listenCalled: make(chan struct{}),
 	}
 }
 
@@ -90,15 +95,15 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 		{name: "listen closed", listenErr: http.ErrServerClosed, wantCleanup: 1},
 		{name: "signal", signal: true, wantCleanup: 1},
 		{
-			name: "shutdown failure force closes but skips cleanup", signal: true,
+			name: "shutdown failure force closes and cleans resources", signal: true,
 			shutdownErr: errors.New("secret shutdown detail"),
-			wantErr:     "server shutdown", wantClose: true,
+			wantErr:     "server shutdown", wantClose: true, wantCleanup: 1,
 		},
 		{
-			name: "failed force close skips cleanup", signal: true,
+			name: "failed force close still cleans resources", signal: true,
 			shutdownErr: errors.New("secret shutdown detail"),
 			closeErr:    errors.New("secret close detail"),
-			wantErr:     "server force close", wantClose: true,
+			wantErr:     "server force close", wantClose: true, wantCleanup: 1,
 		},
 	}
 	for _, tc := range tests {
@@ -120,7 +125,7 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 				if returned {
 					t.Fatal("cleanup ran after lifecycle returned")
 				}
-				if !server.isStopped() {
+				if tc.closeErr == nil && !server.isStopped() {
 					t.Fatal("cleanup ran while server runtime was active")
 				}
 				cleanupCalls++
@@ -156,5 +161,81 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 				t.Fatalf("err=%v want=%q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestInternalServerRuntimeLifecycleStopsBothWhenEitherExits(t *testing.T) {
+	signals, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	public := newFakeServerLifecycle()
+	internal := newFakeServerLifecycle()
+	internal.listen <- errors.New("secret internal listen detail")
+	cleanupCalls := 0
+
+	err := runServerLifecycles(
+		signals,
+		[]serverLifecycle{public, internal},
+		func() {
+			if !public.isStopped() || !internal.isStopped() {
+				t.Fatal("cleanup ran before both listeners stopped")
+			}
+			cleanupCalls++
+		},
+	)
+	if err == nil || err.Error() != "server start" || cleanupCalls != 1 {
+		t.Fatalf("err=%v cleanupCalls=%d", err, cleanupCalls)
+	}
+	for name, server := range map[string]*fakeServerLifecycle{
+		"public": public, "internal": internal,
+	} {
+		select {
+		case <-server.shutdown:
+		default:
+			t.Fatalf("%s shutdown was not attempted", name)
+		}
+	}
+}
+
+func TestInternalServerRuntimeLifecycleSignalStopsBoth(t *testing.T) {
+	signals, cancel := context.WithCancel(context.Background())
+	public := newFakeServerLifecycle()
+	internal := newFakeServerLifecycle()
+	cancel()
+	cleanupCalls := 0
+
+	err := runServerLifecycles(
+		signals,
+		[]serverLifecycle{public, internal},
+		func() { cleanupCalls++ },
+	)
+	if err != nil || cleanupCalls != 1 ||
+		!public.isStopped() || !internal.isStopped() {
+		t.Fatalf(
+			"err=%v cleanupCalls=%d publicStopped=%t internalStopped=%t",
+			err,
+			cleanupCalls,
+			public.isStopped(),
+			internal.isStopped(),
+		)
+	}
+}
+
+func TestInternalServerRuntimeLifecycleValidatesAllServersBeforeStarting(t *testing.T) {
+	signals, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := newFakeServerLifecycle()
+	cleanupCalls := 0
+	err := runServerLifecycles(
+		signals,
+		[]serverLifecycle{server, nil},
+		func() { cleanupCalls++ },
+	)
+	if err == nil || err.Error() != "server configuration" || cleanupCalls != 1 {
+		t.Fatalf("err=%v cleanupCalls=%d", err, cleanupCalls)
+	}
+	select {
+	case <-server.listenCalled:
+		t.Fatal("valid server started before the whole list was validated")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

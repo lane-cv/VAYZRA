@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"happylearn.local/app/internal/platform/secretfile"
 )
 
 const developmentAIMasterKey = "happylearn-dev-ai-master-key-000"
@@ -17,6 +19,7 @@ const developmentAIMasterKey = "happylearn-dev-ai-master-key-000"
 type Config struct {
 	Environment             string
 	ListenAddress           string
+	InternalListenAddress   string
 	DatabaseURL             string
 	RedisURL                string
 	LoginThrottleSecret     string
@@ -37,12 +40,17 @@ type Config struct {
 	AIGlobalConcurrency     int
 	AIPerStudentConcurrency int
 	AIAllowPrivateProvider  bool
+	MetricsBearerSecret     string
+	HostMetricsHMACSecret   []byte
+	WebhookURL              string
+	WebhookAuthorization    string
 }
 
 func Load(getenv func(string) string) (Config, error) {
 	c := Config{
 		Environment:             "development",
 		ListenAddress:           ":8080",
+		InternalListenAddress:   ":9090",
 		SessionIdleTTL:          7 * 24 * time.Hour,
 		SessionAbsoluteTTL:      30 * 24 * time.Hour,
 		AIMasterKeyVersion:      1,
@@ -57,6 +65,9 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if v := getenv("HAPPYLEARN_LISTEN"); v != "" {
 		c.ListenAddress = v
+	}
+	if v := getenv("HAPPYLEARN_INTERNAL_LISTEN"); v != "" {
+		c.InternalListenAddress = v
 	}
 	if c.Environment != "development" && c.Environment != "production" {
 		return Config{}, fmt.Errorf("HAPPYLEARN_ENV must be development or production")
@@ -212,8 +223,78 @@ func Load(getenv func(string) string) (Config, error) {
 	if len(c.LoginThrottleSecret) < 32 {
 		return Config{}, fmt.Errorf("HAPPYLEARN_LOGIN_THROTTLE_SECRET must be at least 32 bytes")
 	}
+	for _, direct := range []string{
+		"HAPPYLEARN_METRICS_BEARER_SECRET",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET",
+		"HAPPYLEARN_WEBHOOK_URL",
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION",
+	} {
+		if getenv(direct) != "" {
+			return Config{}, fmt.Errorf("%s_FILE must be used instead of %s", direct, direct)
+		}
+	}
+	var err error
+	if c.MetricsBearerSecret, err = readSecretString(
+		getenv,
+		"HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+		c.Environment == "production",
+	); err != nil {
+		return Config{}, err
+	}
+	if c.HostMetricsHMACSecret, err = readSecretBytes(
+		getenv,
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+		c.Environment == "production",
+	); err != nil {
+		return Config{}, err
+	}
+	if c.WebhookURL, err = readSecretString(
+		getenv,
+		"HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
+		false,
+	); err != nil {
+		return Config{}, err
+	}
+	if c.WebhookAuthorization, err = readSecretString(
+		getenv,
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
+		false,
+	); err != nil {
+		return Config{}, err
+	}
 
 	return c, nil
+}
+
+func readSecretString(
+	getenv func(string) string,
+	variable string,
+	required bool,
+) (string, error) {
+	value, err := readSecretBytes(getenv, variable, required)
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+func readSecretBytes(
+	getenv func(string) string,
+	variable string,
+	required bool,
+) ([]byte, error) {
+	path := getenv(variable)
+	if path == "" {
+		if required {
+			return nil, fmt.Errorf("%s is required in production", variable)
+		}
+		return nil, nil
+	}
+	value, err := secretfile.Read(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s is invalid", variable)
+	}
+	return value, nil
 }
 
 func normalizePublicOrigin(raw string) (string, error) {

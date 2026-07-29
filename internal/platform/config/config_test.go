@@ -3,12 +3,15 @@ package config
 import (
 	"bytes"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func productionConfigEnv() map[string]string {
+func productionConfigEnv(t *testing.T) map[string]string {
+	t.Helper()
 	return map[string]string{
 		"HAPPYLEARN_ENV":                    "production",
 		"HAPPYLEARN_DATABASE_URL":           "postgres://app:test@localhost/app",
@@ -22,6 +25,16 @@ func productionConfigEnv() map[string]string {
 		"HAPPYLEARN_MINIO_ORIGINALS_BUCKET": "happylearn-originals",
 		"HAPPYLEARN_MINIO_PREVIEWS_BUCKET":  "happylearn-previews",
 		"HAPPYLEARN_AI_MASTER_KEY":          base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"HAPPYLEARN_METRICS_BEARER_SECRET_FILE": writeConfigSecretFixture(
+			t,
+			"test-metrics-bearer-secret-0123456789",
+			0o600,
+		),
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE": writeConfigSecretFixture(
+			t,
+			"test-host-metrics-hmac-secret-0123456789",
+			0o600,
+		),
 	}
 }
 
@@ -40,7 +53,7 @@ func TestProductionRequires32ByteBase64AIMasterKey(t *testing.T) {
 }
 
 func TestLoadParsesAIConfiguration(t *testing.T) {
-	env := productionConfigEnv()
+	env := productionConfigEnv(t)
 	env["HAPPYLEARN_AI_MASTER_KEY"] = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	env["HAPPYLEARN_AI_MASTER_KEY_VERSION"] = "17"
 	env["HAPPYLEARN_AI_BUSINESS_TIMEZONE"] = "Asia/Shanghai"
@@ -116,7 +129,7 @@ func TestLoadRejectsInvalidAIConfiguration(t *testing.T) {
 		"large student concurrency":   {"3", "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			env := productionConfigEnv()
+			env := productionConfigEnv(t)
 			switch tc.wantVariable {
 			case "HAPPYLEARN_AI_MASTER_KEY":
 				env[tc.wantVariable] = tc.value
@@ -135,7 +148,7 @@ func TestLoadRejectsInvalidAIConfiguration(t *testing.T) {
 }
 
 func TestLoadAllowsPrivateAIProvidersOnlyInDevelopment(t *testing.T) {
-	production := productionConfigEnv()
+	production := productionConfigEnv(t)
 	production["HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER"] = "true"
 	if _, err := Load(mapEnv(production)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER") {
 		t.Fatalf("production error=%v", err)
@@ -170,7 +183,7 @@ func TestLoadRejectsMissingMinIOValuesInProduction(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			env := productionConfigEnv()
+			env := productionConfigEnv(t)
 			delete(env, tc.name)
 			_, err := Load(func(k string) string { return env[k] })
 			if err == nil || err.Error() != tc.want {
@@ -185,7 +198,7 @@ func TestLoadRejectsUnsafeMinIOEndpointsWithoutLeakingCredentials(t *testing.T) 
 		"https://minio.internal:9000/private",
 		"https://access:secret@minio.internal:9000",
 	} {
-		env := productionConfigEnv()
+		env := productionConfigEnv(t)
 		env["HAPPYLEARN_MINIO_ENDPOINT"] = endpoint
 		_, err := Load(func(k string) string { return env[k] })
 		if err == nil || err.Error() != "HAPPYLEARN_MINIO_ENDPOINT must be a host and optional port without scheme, credentials, path, query, or fragment" {
@@ -200,7 +213,7 @@ func TestLoadRejectsUnsafeMinIOEndpointsWithoutLeakingCredentials(t *testing.T) 
 func TestLoadRejectsInvalidMinIOBucketNames(t *testing.T) {
 	for _, variable := range []string{"HAPPYLEARN_MINIO_ORIGINALS_BUCKET", "HAPPYLEARN_MINIO_PREVIEWS_BUCKET"} {
 		for _, bucket := range []string{"ab", "HappyLearn", "bad_bucket", "192.0.2.1", "bad..bucket", "-bad-bucket"} {
-			env := productionConfigEnv()
+			env := productionConfigEnv(t)
 			env[variable] = bucket
 			_, err := Load(func(k string) string { return env[k] })
 			want := variable + " must be a valid S3 bucket name"
@@ -212,7 +225,7 @@ func TestLoadRejectsInvalidMinIOBucketNames(t *testing.T) {
 }
 
 func TestLoadParsesMinIOConfiguration(t *testing.T) {
-	env := productionConfigEnv()
+	env := productionConfigEnv(t)
 	cfg, err := Load(func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatal(err)
@@ -327,7 +340,7 @@ func TestLoadValidatesAndNormalizesPublicOrigin(t *testing.T) {
 }
 
 func TestLoadRequiresHTTPSPublicOriginInProduction(t *testing.T) {
-	base := productionConfigEnv()
+	base := productionConfigEnv(t)
 
 	base["HAPPYLEARN_PUBLIC_ORIGIN"] = "http://learn.example.com"
 	if _, err := Load(func(k string) string { return base[k] }); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_PUBLIC_ORIGIN") {
@@ -365,4 +378,169 @@ func TestLoadPreservesIPv6BracketsWhenNormalizingPublicOrigin(t *testing.T) {
 			t.Fatalf("raw=%q cfg=%q err=%v", raw, cfg.PublicOrigin, err)
 		}
 	}
+}
+
+func TestLoadInternalListenAndSecretsFromOwnerOnlyFiles(t *testing.T) {
+	env := productionConfigEnv(t)
+	env["HAPPYLEARN_METRICS_BEARER_SECRET_FILE"] = writeConfigSecretFixture(
+		t,
+		"metrics-bearer-0123456789abcdef\n",
+		0o600,
+	)
+	env["HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE"] = writeConfigSecretFixture(
+		t,
+		"host-hmac-0123456789abcdef012345\n",
+		0o600,
+	)
+	env["HAPPYLEARN_WEBHOOK_URL_SECRET_FILE"] = writeConfigSecretFixture(
+		t,
+		"https://alerts.example.test/operations\n",
+		0o600,
+	)
+	env["HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE"] = writeConfigSecretFixture(
+		t,
+		"Bearer webhook-authorization-value\n",
+		0o600,
+	)
+
+	cfg, err := Load(mapEnv(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InternalListenAddress != ":9090" ||
+		cfg.MetricsBearerSecret != "metrics-bearer-0123456789abcdef" ||
+		string(cfg.HostMetricsHMACSecret) != "host-hmac-0123456789abcdef012345" ||
+		cfg.WebhookURL != "https://alerts.example.test/operations" ||
+		cfg.WebhookAuthorization != "Bearer webhook-authorization-value" {
+		t.Fatalf("unexpected internal configuration: %#v", cfg)
+	}
+
+	env["HAPPYLEARN_INTERNAL_LISTEN"] = "127.0.0.1:19090"
+	cfg, err = Load(mapEnv(env))
+	if err != nil || cfg.InternalListenAddress != "127.0.0.1:19090" {
+		t.Fatalf("listen=%q err=%v", cfg.InternalListenAddress, err)
+	}
+}
+
+func TestLoadInternalSecretsAcceptsOnlyDocumentedFileVariables(t *testing.T) {
+	for _, variable := range []string{
+		"HAPPYLEARN_METRICS_BEARER_SECRET",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET",
+		"HAPPYLEARN_WEBHOOK_URL",
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION",
+	} {
+		t.Run(variable, func(t *testing.T) {
+			env := productionConfigEnv(t)
+			env[variable] = "direct-secret-must-not-be-accepted"
+			_, err := Load(mapEnv(env))
+			if err == nil || !strings.Contains(err.Error(), variable+"_FILE") ||
+				strings.Contains(err.Error(), "direct-secret-must-not-be-accepted") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadProductionRequiresInternalMetricsAndHostSampleSecretFiles(t *testing.T) {
+	for _, variable := range []string{
+		"HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+	} {
+		t.Run(variable, func(t *testing.T) {
+			env := productionConfigEnv(t)
+			delete(env, variable)
+			_, err := Load(mapEnv(env))
+			if err == nil || !strings.Contains(err.Error(), variable) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeInternalSecretFilesWithoutSensitiveDetails(t *testing.T) {
+	secret := "internal-secret-content-must-not-leak"
+	tests := []struct {
+		name     string
+		variable string
+		build    func(*testing.T) string
+	}{
+		{
+			name:     "missing metrics bearer",
+			variable: "HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+			build: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "sensitive-missing-path")
+			},
+		},
+		{
+			name:     "symlink host hmac",
+			variable: "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+			build: func(t *testing.T) string {
+				target := writeConfigSecretFixture(t, secret, 0o600)
+				link := filepath.Join(t.TempDir(), "sensitive-symlink-path")
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+				return link
+			},
+		},
+		{
+			name:     "group writable webhook URL",
+			variable: "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
+			build: func(t *testing.T) string {
+				return writeConfigSecretFixture(t, secret, 0o620)
+			},
+		},
+		{
+			name:     "world writable webhook authorization",
+			variable: "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
+			build: func(t *testing.T) string {
+				return writeConfigSecretFixture(t, secret, 0o602)
+			},
+		},
+		{
+			name:     "empty metrics bearer",
+			variable: "HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+			build: func(t *testing.T) string {
+				return writeConfigSecretFixture(t, "\n", 0o600)
+			},
+		},
+		{
+			name:     "oversized host hmac",
+			variable: "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+			build: func(t *testing.T) string {
+				return writeConfigSecretFixture(t, strings.Repeat("x", 8*1024+1), 0o600)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := productionConfigEnv(t)
+			path := tc.build(t)
+			env[tc.variable] = path
+			_, err := Load(mapEnv(env))
+			if err == nil || !strings.Contains(err.Error(), tc.variable) {
+				t.Fatalf("error=%v", err)
+			}
+			if strings.Contains(err.Error(), path) ||
+				strings.Contains(err.Error(), secret) {
+				t.Fatalf("sensitive detail leaked: %q", err)
+			}
+		})
+	}
+}
+
+func writeConfigSecretFixture(
+	t *testing.T,
+	body string,
+	mode os.FileMode,
+) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

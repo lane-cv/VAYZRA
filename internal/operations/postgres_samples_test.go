@@ -466,6 +466,50 @@ func TestPostgresSampleStoreFreshnessIncludesExactBoundary(t *testing.T) {
 	}
 }
 
+func TestPostgresSampleStoreMetricsSelectsOneLatestFixedSeries(t *testing.T) {
+	ctx := context.Background()
+	_, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	if err := store.InsertSamples(ctx, now, []Sample{
+		{
+			Source: SampleSourceApp, Metric: SampleMetricServiceUp,
+			Scope: SampleScopeApp, Value: 0, Unit: SampleUnitBoolean,
+			ObservedAt: now.Add(-2 * time.Minute),
+		},
+		{
+			Source: SampleSourceHost, Metric: SampleMetricServiceUp,
+			Scope: SampleScopeApp, Value: 1, Unit: SampleUnitBoolean,
+			ObservedAt: now.Add(-time.Minute),
+		},
+		{
+			Source: SampleSourceWorker, Metric: SampleMetricQueueItems,
+			Scope: SampleScopeProcessing, Value: 7, Unit: SampleUnitCount,
+			ObservedAt: now,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.LatestMetrics(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Sample{
+		{
+			Source: SampleSourceWorker, Metric: SampleMetricQueueItems,
+			Scope: SampleScopeProcessing, Value: 7, Unit: SampleUnitCount,
+			ObservedAt: now,
+		},
+		{
+			Source: SampleSourceHost, Metric: SampleMetricServiceUp,
+			Scope: SampleScopeApp, Value: 1, Unit: SampleUnitBoolean,
+			ObservedAt: now.Add(-time.Minute),
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LatestMetrics()=%#v want=%#v", got, want)
+	}
+}
+
 func TestPostgresSampleRetentionSkipsLockedRowsWithoutBlockingAndKeepsExactBatches(t *testing.T) {
 	ctx := context.Background()
 	pool, store := migratedSampleStore(t)

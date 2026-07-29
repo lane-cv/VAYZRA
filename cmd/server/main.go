@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,16 +40,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler, closeResources, err := buildProductionApplication(context.Background(), cfg)
+	runtime, closeResources, err := buildProductionApplication(context.Background(), cfg)
 	if err != nil {
 		log.Printf("startup_error stage=%s", err)
 		os.Exit(1)
 	}
-	server := newServer(cfg.ListenAddress, handler)
+	publicServer := newServer(cfg.ListenAddress, runtime.Public)
+	internalServer := newServer(cfg.InternalListenAddress, runtime.Internal)
 
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := runServerLifecycle(signals, server, closeResources); err != nil {
+	if err := runServerLifecycles(
+		signals,
+		[]serverLifecycle{publicServer, internalServer},
+		closeResources,
+	); err != nil {
 		log.Printf("server_error stage=%s", err)
 		os.Exit(1)
 	}
@@ -65,9 +71,33 @@ func runServerLifecycle(
 	server serverLifecycle,
 	closeResources func(),
 ) error {
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.ListenAndServe() }()
+	return runServerLifecycles(
+		signals,
+		[]serverLifecycle{server},
+		closeResources,
+	)
+}
 
+func runServerLifecycles(
+	signals context.Context,
+	servers []serverLifecycle,
+	closeResources func(),
+) error {
+	if len(servers) == 0 || closeResources == nil {
+		return errors.New("server configuration")
+	}
+	for _, server := range servers {
+		if server == nil {
+			closeResources()
+			return errors.New("server configuration")
+		}
+	}
+	errCh := make(chan error, len(servers))
+	for _, server := range servers {
+		go func(server serverLifecycle) {
+			errCh <- server.ListenAndServe()
+		}(server)
+	}
 	var result error
 	select {
 	case err := <-errCh:
@@ -78,13 +108,23 @@ func runServerLifecycle(
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		if closeErr := server.Close(); closeErr != nil {
-			return errors.New("server force close")
+	shutdownFailed := false
+	forceCloseFailed := false
+	for _, server := range servers {
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			shutdownFailed = true
+			if closeErr := server.Close(); closeErr != nil {
+				forceCloseFailed = true
+			}
 		}
-		return errors.New("server shutdown")
 	}
 	closeResources()
+	if forceCloseFailed {
+		return errors.New("server force close")
+	}
+	if shutdownFailed {
+		return errors.New("server shutdown")
+	}
 	return result
 }
 
@@ -136,6 +176,7 @@ type applicationDependencies struct {
 	newSearchLimiter       func(*redis.Client, config.Config) redisx.SearchRateLimiter
 	newProviderTestLimiter func(*redis.Client, config.Config) redisx.ProviderTestRateLimiter
 	closeRedis             func(*redis.Client)
+	newInternal            func(*pgxpool.Pool, *redis.Client, config.Config) (http.Handler, error)
 }
 
 type operationsRuntime interface {
@@ -144,8 +185,16 @@ type operationsRuntime interface {
 	operations.LeaseSessionCloser
 }
 
-func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Handler, func(), error) {
-	return buildApplication(ctx, cfg, applicationDependencies{
+type applicationRuntime struct {
+	Public   http.Handler
+	Internal http.Handler
+}
+
+func buildProductionApplication(
+	ctx context.Context,
+	cfg config.Config,
+) (*applicationRuntime, func(), error) {
+	return buildApplicationRuntime(ctx, cfg, applicationDependencies{
 		open:               database.Open,
 		migrate:            database.Migrate,
 		newAuth:            newProductionAuthService,
@@ -193,11 +242,24 @@ func buildProductionApplication(ctx context.Context, cfg config.Config) (http.Ha
 		newProviderTestLimiter: func(client *redis.Client, cfg config.Config) redisx.ProviderTestRateLimiter {
 			return redisx.NewProviderTestLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 5})
 		},
-		closeRedis: func(client *redis.Client) { _ = client.Close() },
+		closeRedis:  func(client *redis.Client) { _ = client.Close() },
+		newInternal: newProductionInternalHandler,
 	})
 }
 
 func buildApplication(ctx context.Context, cfg config.Config, deps applicationDependencies) (http.Handler, func(), error) {
+	runtime, closeResources, err := buildApplicationRuntime(ctx, cfg, deps)
+	if err != nil {
+		return nil, nil, err
+	}
+	return runtime.Public, closeResources, nil
+}
+
+func buildApplicationRuntime(
+	ctx context.Context,
+	cfg config.Config,
+	deps applicationDependencies,
+) (*applicationRuntime, func(), error) {
 	pool, err := deps.open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, nil, errors.New("open authentication storage")
@@ -341,6 +403,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 	var progressLimiter redisx.ProgressWriteLimiter
 	var searchLimiter redisx.SearchRateLimiter
 	var providerTestLimiter redisx.ProviderTestRateLimiter
+	var redisClient *redis.Client
 	closeResources := closePool
 	if operationalGate != nil {
 		closeResources = func() {
@@ -376,6 +439,7 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closeResources()
 			return nil, nil, errors.New("initialize login throttling")
 		}
+		redisClient = client
 		if deps.newThrottle == nil || deps.closeRedis == nil {
 			_ = client.Close()
 			closeResources()
@@ -468,7 +532,29 @@ func buildApplication(ctx context.Context, cfg config.Config, deps applicationDe
 			closeOtherResources()
 		}
 	}
-	return handler, closeResources, nil
+	var internalHandler http.Handler
+	if deps.newInternal != nil {
+		internalHandler, err = deps.newInternal(pool, redisClient, cfg)
+		if err != nil || internalHandler == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize internal listener")
+		}
+	}
+	return &applicationRuntime{
+		Public:   publicOnlyHandler(handler),
+		Internal: internalHandler,
+	}, closeResources, nil
+}
+
+func publicOnlyHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/internal" ||
+			strings.HasPrefix(r.URL.Path, "/internal/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 const defaultReadinessTimeout = 5 * time.Second
@@ -692,6 +778,41 @@ func newProductionAdminOperationsService(
 		return nil
 	}
 	return service
+}
+
+func newProductionInternalHandler(
+	pool *pgxpool.Pool,
+	client *redis.Client,
+	cfg config.Config,
+) (http.Handler, error) {
+	if cfg.Environment == "development" &&
+		cfg.MetricsBearerSecret == "" &&
+		len(cfg.HostMetricsHMACSecret) == 0 {
+		return http.NotFoundHandler(), nil
+	}
+	if cfg.MetricsBearerSecret == "" || len(cfg.HostMetricsHMACSecret) == 0 {
+		return nil, errors.New("internal secrets unavailable")
+	}
+	if pool == nil || client == nil {
+		return nil, errors.New("internal dependencies unavailable")
+	}
+	nonces, err := operations.NewRedisHostNonceStore(client)
+	if err != nil {
+		return nil, errors.New("initialize internal nonce store")
+	}
+	samples := operations.NewPostgresSampleStore(pool)
+	handler, err := operations.NewInternalHandler(operations.InternalHTTPConfig{
+		MetricsBearerSecret:   cfg.MetricsBearerSecret,
+		HostMetricsHMACSecret: cfg.HostMetricsHMACSecret,
+		Clock:                 time.Now,
+		Metrics:               samples,
+		Samples:               samples,
+		Nonces:                nonces,
+	})
+	if err != nil {
+		return nil, errors.New("initialize internal handler")
+	}
+	return handler, nil
 }
 
 func newProductionAdminBackupService(pool *pgxpool.Pool) backup.HTTPService {

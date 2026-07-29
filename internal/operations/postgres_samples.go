@@ -177,6 +177,64 @@ LIMIT $4`,
 	return result, nil
 }
 
+func (store *PostgresSampleStore) LatestMetrics(
+	ctx context.Context,
+	now time.Time,
+) ([]Sample, error) {
+	if store == nil || store.pool == nil {
+		return nil, errStoreClosed
+	}
+	if ctx == nil || !validSampleTime(now) {
+		return nil, ErrInvalid
+	}
+	rows, err := store.pool.Query(ctx, `
+SELECT DISTINCT ON(metric_name,scope)
+  source,metric_name,scope,value,unit,observed_at,window_started_at
+FROM operational_samples
+ORDER BY metric_name,scope,observed_at DESC,id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	samples := make([]Sample, 0, len(sampleRules))
+	for rows.Next() {
+		var (
+			source          string
+			metric          string
+			scope           string
+			unit            string
+			value           float64
+			observedAt      time.Time
+			windowStartedAt *time.Time
+		)
+		if err := rows.Scan(
+			&source,
+			&metric,
+			&scope,
+			&value,
+			&unit,
+			&observedAt,
+			&windowStartedAt,
+		); err != nil {
+			return nil, err
+		}
+		sample := Sample{
+			Source: SampleSource(source), Metric: SampleMetric(metric),
+			Scope: SampleScope(scope), Value: value, Unit: SampleUnit(unit),
+			ObservedAt:      observedAt.UTC(),
+			WindowStartedAt: utcSampleTime(windowStartedAt),
+		}
+		if err := ValidateSample(sample, now); err != nil {
+			return nil, ErrInvalid
+		}
+		samples = append(samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return samples, nil
+}
+
 func (store *PostgresSampleStore) DeleteExpiredSamples(
 	ctx context.Context,
 	now time.Time,
