@@ -15,6 +15,7 @@ OBJECT_SECRET_MARKER='123456789abcdeffedcba98765432100123456789abcdeffedcba98765
 SIGNING_SECRET_MARKER='abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd'
 TEACHER_CREDENTIAL_SECRET='{"username":"restore-probe-teacher","password":"Restore Probe Teacher Secret 42!"}'
 MANIFEST_TEXT='{"schemaVersion":1,"batchId":"11111111-1111-4111-8111-111111111111","createdAt":"2026-07-29T01:02:03.000000004Z","databaseMigrationVersion":42,"databaseDumpSha256":"1111111111111111111111111111111111111111111111111111111111111111","objectSnapshotId":"2222222222222222222222222222222222222222222222222222222222222222","objectCount":1,"referencedBytes":41}'
+readonly TIMEOUT_CONTRACT_LIMIT_MILLISECONDS=12000
 
 contract_sha256_stdin() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -24,6 +25,19 @@ contract_sha256_stdin() {
   else
     return 1
   fi
+}
+
+contract_time_milliseconds() {
+  local nanoseconds milliseconds_length
+  nanoseconds="$(date +%s%N 2>/dev/null)" || nanoseconds=''
+  if [[ "$nanoseconds" =~ ^[0-9]{13,}$ ]]; then
+    milliseconds_length=$((${#nanoseconds} - 6))
+    printf '%s\n' "${nanoseconds:0:milliseconds_length}"
+    return 0
+  fi
+  /usr/bin/perl \
+    -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.0f\n", 1000 * clock_gettime(CLOCK_MONOTONIC)'
 }
 
 MANIFEST_SHA256="$(
@@ -806,6 +820,25 @@ case "$kind" in
       "$*" != *'--no-lock'* ]] ||
       exit 64
     case "$mode" in
+      supervisor_identity_timeout|supervisor_identity_term)
+        trap '' HUP INT TERM
+        printf '%s\n' "$$" >"$PHASE5_FAKE_SUPERVISOR_DIRECT_PID"
+        (
+          trap '' HUP INT TERM
+          while :; do
+            printf 'x' >>"$PHASE5_FAKE_SUPERVISOR_HEARTBEAT"
+            IFS= read -r -t 1 -u 7 _ || true
+          done
+        ) &
+        descendant_pid="$!"
+        printf '%s\n' "$descendant_pid" \
+          >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_PID"
+        : >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER"
+        while :; do
+          printf 'x' >>"$PHASE5_FAKE_SUPERVISOR_HEARTBEAT"
+          IFS= read -r -t 1 -u 7 _ || true
+        done
+        ;;
       supervisor_identity_midrun)
         printf '%s\n' "$$" >"$PHASE5_FAKE_SUPERVISOR_DIRECT_PID"
         : >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER"
@@ -1136,6 +1169,7 @@ run_fixture() {
     "PHASE5_FAKE_SUPERVISOR_DIRECT_PID=$fixture/supervisor-direct.pid"
     "PHASE5_FAKE_SUPERVISOR_DESCENDANT_PID=$fixture/supervisor-descendant.pid"
     "PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER=$fixture/supervisor-descendant.started"
+    "PHASE5_FAKE_SUPERVISOR_HEARTBEAT=$fixture/supervisor.heartbeat"
     "PHASE5_FAKE_SUPERVISOR_DIRECT_CONT_MARKER=$fixture/supervisor-direct.cont"
     "PHASE5_FAKE_SUPERVISOR_DESCENDANT_CONT_MARKER=$fixture/supervisor-descendant.cont"
     "PHASE5_FAKE_SUPERVISOR_DIRECT_RELEASE=$fixture/supervisor-direct.release"
@@ -1170,6 +1204,166 @@ start_fixture_background() {
       2>"$fixture/background.stderr" &
   FIXTURE_BACKGROUND_PID="$!"
 }
+
+run_tampered_supervisor_case() {
+  local mode="$1"
+  local expected_status="$2"
+  local fixture outer_pid workspace identity_path supervisor_pid
+  local direct_pid descendant_pid status=0
+  local heartbeat_before heartbeat_after
+  local started_seconds="$SECONDS" duration_seconds
+  local direct_alive=false descendant_alive=false failed=false
+
+  fixture="$(make_fixture)"
+  if [[ "$mode" == supervisor_identity_timeout ]]; then
+    HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=1 \
+      start_fixture_background "$fixture" "$mode"
+  else
+    HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=10 \
+      start_fixture_background "$fixture" "$mode"
+  fi
+  outer_pid="$FIXTURE_BACKGROUND_PID"
+  ACTIVE_FIXTURE_PID="$outer_pid"
+  wait_for_file_long "$fixture/supervisor-descendant.started" ||
+    fail "$mode did not reach its bounded command"
+  wait_for_file "$fixture/supervisor.heartbeat" ||
+    fail "$mode did not publish its command heartbeat"
+  wait_for_file "$fixture/workspace.path" ||
+    fail "$mode did not expose its private workspace"
+  workspace="$(<"$fixture/workspace.path")"
+  identity_path="$(
+    find "$workspace/control" -type f -name identity -print
+  )"
+  [[ -n "$identity_path" &&
+    "$identity_path" != *$'\n'* &&
+    ! -L "$identity_path" ]] ||
+    fail "$mode exposed an invalid identity handshake"
+  supervisor_pid="$(<"$identity_path")"
+  direct_pid="$(<"$fixture/supervisor-direct.pid")"
+  descendant_pid="$(<"$fixture/supervisor-descendant.pid")"
+  [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ &&
+    "$direct_pid" =~ ^[1-9][0-9]*$ &&
+    "$descendant_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail "$mode exposed an invalid process identity"
+  /bin/ln "$identity_path" \
+    "${identity_path}.injected-hardlink"
+  if [[ "$mode" == supervisor_identity_term ]]; then
+    kill -TERM "$outer_pid"
+  fi
+  if wait_for_direct_child "$outer_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  ACTIVE_FIXTURE_PID=''
+  duration_seconds=$((SECONDS - started_seconds))
+
+  heartbeat_before="$(
+    wc -c <"$fixture/supervisor.heartbeat" |
+      tr -d '[:space:]'
+  )"
+  sleep 0.2
+  heartbeat_after="$(
+    wc -c <"$fixture/supervisor.heartbeat" |
+      tr -d '[:space:]'
+  )"
+  kill -0 "$direct_pid" 2>/dev/null && direct_alive=true
+  kill -0 "$descendant_pid" 2>/dev/null && descendant_alive=true
+  [[ "$status" -eq "$expected_status" ]] || failed=true
+  [[ "$duration_seconds" -lt 15 ]] || failed=true
+  [[ "$heartbeat_after" -eq "$heartbeat_before" ]] || failed=true
+  [[ "$direct_alive" == false && "$descendant_alive" == false ]] ||
+    failed=true
+  assert_no_resources "$fixture"
+  test ! -e "$fixture/reports/restore-$BACKUP_ID.json" ||
+    fail "$mode published a final report"
+  test ! -e "$fixture/reports/.restore-${BACKUP_ID}.new" ||
+    fail "$mode left a temporary report"
+  [[ ! -e "$workspace" ]] ||
+    fail "$mode left its private workspace"
+
+  kill -KILL "$direct_pid" "$descendant_pid" 2>/dev/null || true
+  wait_for_pid_absent "$direct_pid" || failed=true
+  wait_for_pid_absent "$descendant_pid" || failed=true
+  [[ "$failed" == false ]] ||
+    fail "$mode failed bounded cleanup after identity tampering (status=$status duration=${duration_seconds}s heartbeat=${heartbeat_before}:${heartbeat_after} direct_alive=$direct_alive descendant_alive=$descendant_alive)"
+}
+
+run_timeout_contract_case() {
+  local fixture outer_pid started finished duration status=0
+  local workspace direct_pid descendant_pid
+  local heartbeat_before heartbeat_after
+  local direct_alive=false descendant_alive=false failed=false
+  fixture="$(make_fixture)"
+  HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=1 \
+    start_fixture_background "$fixture" supervisor_identity_timeout
+  outer_pid="$FIXTURE_BACKGROUND_PID"
+  ACTIVE_FIXTURE_PID="$outer_pid"
+  wait_for_file_long "$fixture/supervisor-descendant.started" ||
+    fail 'restore timeout did not reach its bounded command'
+  wait_for_file "$fixture/supervisor.heartbeat" ||
+    fail 'restore timeout did not publish its command heartbeat'
+  wait_for_file "$fixture/workspace.path" ||
+    fail 'restore timeout did not expose its workspace'
+  wait_for_file "$fixture/supervisor-direct.pid" ||
+    fail 'restore timeout did not expose its direct command PID'
+  wait_for_file "$fixture/supervisor-descendant.pid" ||
+    fail 'restore timeout did not expose its descendant command PID'
+  started="$(contract_time_milliseconds)" ||
+    fail 'restore timeout monotonic clock is unavailable'
+  if wait_for_direct_child "$outer_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  ACTIVE_FIXTURE_PID=''
+  finished="$(contract_time_milliseconds)" ||
+    fail 'restore timeout monotonic clock failed'
+  duration=$((finished - started))
+  workspace="$(<"$fixture/workspace.path")"
+  direct_pid="$(<"$fixture/supervisor-direct.pid")"
+  descendant_pid="$(<"$fixture/supervisor-descendant.pid")"
+  [[ "$direct_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail 'restore timeout exposed an invalid direct command PID'
+  [[ "$descendant_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail 'restore timeout exposed an invalid descendant command PID'
+  heartbeat_before="$(
+    wc -c <"$fixture/supervisor.heartbeat" |
+      tr -d '[:space:]'
+  )"
+  sleep 0.2
+  heartbeat_after="$(
+    wc -c <"$fixture/supervisor.heartbeat" |
+      tr -d '[:space:]'
+  )"
+  kill -0 "$direct_pid" 2>/dev/null && direct_alive=true
+  kill -0 "$descendant_pid" 2>/dev/null && descendant_alive=true
+  [[ "$status" -eq 124 ]] || failed=true
+  [[ "$duration" -lt "$TIMEOUT_CONTRACT_LIMIT_MILLISECONDS" ]] ||
+    failed=true
+  [[ "$heartbeat_after" -eq "$heartbeat_before" ]] || failed=true
+  [[ "$direct_alive" == false && "$descendant_alive" == false ]] ||
+    failed=true
+  assert_no_resources "$fixture"
+  [[ ! -e "$workspace" ]] || failed=true
+  [[ ! -e "$fixture/reports/restore-$BACKUP_ID.json" ]] || failed=true
+  [[ ! -e "$fixture/reports/.restore-${BACKUP_ID}.new" ]] || failed=true
+  kill -KILL "$direct_pid" "$descendant_pid" 2>/dev/null || true
+  wait_for_pid_absent "$direct_pid" || failed=true
+  wait_for_pid_absent "$descendant_pid" || failed=true
+  [[ "$failed" == false ]] ||
+    fail "isolated restore timeout cleanup failed (status=$status duration=${duration}ms heartbeat=${heartbeat_before}:${heartbeat_after} direct_alive=$direct_alive descendant_alive=$descendant_alive)"
+  printf 'phase5 restore timeout contract: PASS status=%s duration_ms=%s heartbeat=%s:%s direct_alive=%s descendant_alive=%s resources=0 workspace=0 reports=0\n' \
+    "$status" "$duration" "$heartbeat_before" "$heartbeat_after" \
+    "$direct_alive" "$descendant_alive"
+}
+
+if [[ "${PHASE5_CONTRACT_TIMEOUT_SELF_TEST:-}" == once ]]; then
+  test -x "$TARGET" || fail 'restore harness is absent'
+  bash -n "$TARGET"
+  run_timeout_contract_case
+  exit 0
+fi
 
 test -x "$TARGET" || fail 'restore harness is absent'
 bash -n "$TARGET"
@@ -1286,6 +1480,30 @@ grep -Fq 'HTTP_PROBE_SUCCEEDED=true' "$TARGET" ||
   fail 'restore harness does not fence its report on HTTP probe success'
 grep -Fq 'UPDATE operational_modes' "$TARGET" ||
   fail 'restored operational mode is not normalized before app startup'
+
+run_tampered_supervisor_case supervisor_identity_timeout 124
+run_tampered_supervisor_case supervisor_identity_term 143
+
+parent_termination_source="$(
+  sed -n \
+    -e '/^terminate_external_pid()/,/^}/p' \
+    -e '/^terminate_external_group()/,/^}/p' \
+    "$TARGET"
+)"
+if grep -Eq \
+  'kill[[:space:]]+-[^[:space:]]+[[:space:]]+--[[:space:]]+"?-\$' \
+  <<<"$parent_termination_source"; then
+  fail 'parent termination still signals a negative PGID'
+fi
+grep -Fq 'terminate_external_pid "$pid"' <<<"$parent_termination_source" ||
+  fail 'parent termination does not fall back to its direct supervisor PID'
+grep -Fq 'kill -TERM "$pid"' <<<"$parent_termination_source" ||
+  fail 'parent termination does not signal its direct supervisor PID'
+
+if [[ "${PHASE5_RESTORE_SUPERVISOR_FOCUSED:-}" == true ]]; then
+  printf '%s\n' 'phase5 restore supervisor contract: PASS'
+  exit 0
+fi
 
 contract_signal_fixture="$(mktemp -d "$CONTRACT_TEMP_ROOT/contract-signal.XXXXXX")"
 contract_signal_ready="$contract_signal_fixture/ready"
@@ -1615,7 +1833,6 @@ supervisor_pid="$(<"$supervisor_identity_paths")"
   fail 'supervisor identity was invalid or reused a command PID'
 (
   trap 'exit 0' HUP INT TERM
-  trap ': >"$supervisor_fixture/supervisor-canary.cont"' CONT
   while :; do
     sleep 0.05
   done
@@ -1623,18 +1840,13 @@ supervisor_pid="$(<"$supervisor_identity_paths")"
 supervisor_canary_pid="$!"
 active_fixture_is_direct_job "$supervisor_canary_pid" ||
   fail 'supervisor canary was not a direct contract job'
-kill -CONT -- "-$supervisor_pid"
-wait_for_file "$supervisor_fixture/supervisor-direct.cont" ||
-  fail 'fake direct command was outside the supervisor PGID'
-wait_for_file "$supervisor_fixture/supervisor-descendant.cont" ||
-  fail 'fake descendant was outside the supervisor PGID'
-test ! -e "$supervisor_fixture/supervisor-canary.cont" ||
-  fail 'different-PGID canary received the supervisor group signal'
 touch "$supervisor_fixture/supervisor-direct.release"
 wait_for_file "$supervisor_fixture/supervisor-direct.exiting" ||
   fail 'supervisor direct command did not reach exit'
 wait_for_pid_absent "$supervisor_direct_pid" ||
   fail 'supervisor direct command did not actually exit'
+kill -0 "$supervisor_descendant_pid" 2>/dev/null ||
+  fail 'supervisor descendant exited before bounded cleanup'
 kill -TERM "$supervisor_target_pid"
 supervisor_status=0
 if wait_for_direct_child "$supervisor_target_pid"; then
@@ -2202,16 +2414,11 @@ do
   fi
 done
 
-timeout_fixture="$(make_fixture)"
-timeout_started="$SECONDS"
-if HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=1 \
-  run_fixture "$timeout_fixture" timeout; then
-  fail 'timed out restore command was accepted'
-fi
-timeout_duration=$((SECONDS - timeout_started))
-[[ "$timeout_duration" -lt 10 ]] ||
-  fail "restore timeout was not bounded (${timeout_duration}s >= 10s)"
-assert_no_resources "$timeout_fixture"
+for timeout_self_test_iteration in 1 2 3; do
+  PHASE5_CONTRACT_TIMEOUT_SELF_TEST=once \
+    bash "$0" ||
+    fail "isolated restore timeout contract $timeout_self_test_iteration failed"
+done
 
 cleanup_fixture="$(make_fixture)"
 if run_fixture "$cleanup_fixture" cleanup_failure; then

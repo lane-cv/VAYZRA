@@ -14,6 +14,9 @@ readonly CONTAINER_CPUS='0.25'
 readonly CONTAINER_MEMORY='512m'
 readonly CONTAINER_MEMORY_SWAP='512m'
 readonly CONTAINER_PIDS_LIMIT='256'
+readonly SUPERVISOR_WAIT_INTERVAL_SECONDS='0.01'
+readonly SUPERVISOR_TERM_GRACE_ATTEMPTS=10
+readonly SUPERVISOR_PARENT_GRACE_ATTEMPTS=200
 
 BACKUP_ID=''
 PROJECT=''
@@ -628,16 +631,46 @@ supervisor_identity_matches() {
 
 terminate_external_pid() {
   local pid="$1"
+  local attempts=0
   direct_running_job "$pid" || {
     wait "$pid" 2>/dev/null || true
     return 0
   }
   kill -TERM "$pid" 2>/dev/null || true
-  sleep "$POLL_INTERVAL_SECONDS"
+  while direct_running_job "$pid" &&
+    [[ "$attempts" -lt "$SUPERVISOR_PARENT_GRACE_ATTEMPTS" ]]; do
+    sleep "$SUPERVISOR_WAIT_INTERVAL_SECONDS"
+    attempts=$((attempts + 1))
+  done
   if direct_running_job "$pid"; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
+}
+
+terminate_supervisor_command_group() {
+  local pid="$1"
+  local attempts=0
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  direct_running_job "$pid" || {
+    wait "$pid" 2>/dev/null || true
+    return 0
+  }
+  kill -TERM -- "-$pid" 2>/dev/null ||
+    kill -TERM "$pid" 2>/dev/null ||
+    true
+  while direct_running_job "$pid" &&
+    [[ "$attempts" -lt "$SUPERVISOR_TERM_GRACE_ATTEMPTS" ]]; do
+    sleep "$SUPERVISOR_WAIT_INTERVAL_SECONDS"
+    attempts=$((attempts + 1))
+  done
+  if direct_running_job "$pid"; then
+    kill -KILL -- "-$pid" 2>/dev/null ||
+      kill -KILL "$pid" 2>/dev/null ||
+      true
+  fi
+  wait "$pid" 2>/dev/null || true
+  ! direct_running_job "$pid"
 }
 
 terminate_external_group() {
@@ -654,25 +687,7 @@ terminate_external_group() {
   }
   supervisor_identity_matches "$pid" "$pgid" "$identity_path" ||
     identity_valid=false
-  if [[ "$identity_valid" != true ]]; then
-    terminate_external_pid "$pid"
-    return 1
-  fi
-  kill -TERM -- "-$pgid" 2>/dev/null ||
-    kill -TERM "$pid" 2>/dev/null ||
-    true
-  sleep "$POLL_INTERVAL_SECONDS"
-  if direct_running_job "$pid"; then
-    if supervisor_identity_matches "$pid" "$pgid" "$identity_path"; then
-      kill -KILL -- "-$pgid" 2>/dev/null ||
-        kill -KILL "$pid" 2>/dev/null ||
-        true
-    else
-      identity_valid=false
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  fi
-  wait "$pid" 2>/dev/null || true
+  terminate_external_pid "$pid"
   [[ "$identity_valid" == true ]]
 }
 
@@ -759,24 +774,65 @@ run_bounded() {
   set -m
   (
     set +e
-    set +m
     local supervisor_signal_seen=false
+    local supervisor_termination_requested=false
     local command_pid command_status wait_status guard_value
     local wait_attempts=0
-    trap 'supervisor_signal_seen=true' HUP INT TERM
+    trap \
+      'supervisor_signal_seen=true; supervisor_termination_requested=true' \
+      HUP INT TERM
     exec 9>&-
     exec 7<"$supervisor_guard" || exit 125
+    set -m
     (
+      set +m
+      local command_signal_seen=false
+      local actual_pid actual_status=0
+      local actual_wait_status=0
       exec 8>"$supervisor_guard" || exit 125
+      trap 'command_signal_seen=true' HUP INT TERM
       publish_supervisor_handshake "$supervisor_ready" ready || exit 125
-      trap - HUP INT TERM
-      "$@"
+      (
+        trap - HUP INT TERM
+        "$@"
+      ) &
+      actual_pid="$!"
+      while :; do
+        command_signal_seen=false
+        wait "$actual_pid"
+        actual_status=$?
+        [[ "$command_signal_seen" == false ]] && break
+      done
+      exec 8>&-
+      while :; do
+        command_signal_seen=false
+        guard_value=''
+        IFS= read -r -u 7 guard_value
+        actual_wait_status=$?
+        if [[ "$command_signal_seen" == true ]]; then
+          continue
+        fi
+        [[ "$actual_wait_status" -eq 1 && -z "$guard_value" ]] ||
+          exit 125
+        break
+      done
+      exec 7<&-
+      [[ "$actual_status" -ge 0 && "$actual_status" -le 255 ]] ||
+        exit 125
+      exit "$actual_status"
     ) &
     command_pid="$!"
+    set +m
     while :; do
       supervisor_signal_seen=false
       wait "$command_pid"
       command_status=$?
+      if [[ "$supervisor_termination_requested" == true ]]; then
+        trap '' HUP INT TERM
+        terminate_supervisor_command_group "$command_pid" || true
+        exec 7<&-
+        exit 125
+      fi
       [[ "$supervisor_signal_seen" == false ]] && break
     done
     while :; do
@@ -785,6 +841,12 @@ run_bounded() {
       IFS= read -r -u 7 guard_value
       wait_status=$?
       if [[ "$supervisor_signal_seen" == true ]]; then
+        if [[ "$supervisor_termination_requested" == true ]]; then
+          trap '' HUP INT TERM
+          terminate_supervisor_command_group "$command_pid" || true
+          exec 7<&-
+          exit 125
+        fi
         continue
       fi
       [[ "$wait_status" -eq 1 && -z "$guard_value" ]] || exit 125
@@ -796,6 +858,10 @@ run_bounded() {
       "$supervisor_status" "$command_status" ||
       exit 125
     while [[ "$wait_attempts" -lt 1000 ]]; do
+      if [[ "$supervisor_termination_requested" == true ]]; then
+        trap '' HUP INT TERM
+        exit 125
+      fi
       if supervisor_handshake_available "$supervisor_ack"; then
         [[ "$(read_supervisor_handshake "$supervisor_ack" '^ack$')" == ack ]] ||
           exit 125
