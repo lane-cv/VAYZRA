@@ -311,6 +311,7 @@ services:
       context: ..
       dockerfile: Dockerfile.backup
     user: "10003:0"
+    hostname: ${HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME:-happylearn-backup}
     entrypoint:
       - /usr/bin/timeout
       - --foreground

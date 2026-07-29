@@ -5,6 +5,8 @@ export LC_ALL=C
 readonly USAGE='Usage: scripts/phase5-backup.sh --project happylearn-dev --trigger scheduled|manual|pre_release'
 readonly OPERATIONS_ADVISORY_KEY='845103120'
 readonly BACKUP_ADVISORY_KEY='845103121'
+readonly SYNC_RUN_LABEL='io.happylearn.phase5.sync-run'
+readonly SYNC_OWNER_LABEL='io.happylearn.phase5.sync-owner'
 
 PROJECT=''
 EFFECTIVE_PROJECT=''
@@ -46,6 +48,10 @@ FAILURE_CATEGORY='internal'
 CURRENT_STAGE='startup'
 LOCAL_SNAPSHOT_ID=''
 REMOTE_SNAPSHOT_ID=''
+SYNC_CONTAINER_NAME=''
+SYNC_CONTAINER_ID=''
+SYNC_CONTAINER_OWNER=''
+SYNC_CONTAINER_HOSTNAME=''
 
 SERVICE_STOP_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_SERVICE_STOP_TIMEOUT_SECONDS:-60}"
 DRAIN_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DRAIN_TIMEOUT_SECONDS:-600}"
@@ -56,6 +62,7 @@ EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}"
 DATABASE_QUERY_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-30}"
 DATABASE_CONNECT_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DATABASE_CONNECT_TIMEOUT_SECONDS:-5}"
 DATABASE_STATEMENT_TIMEOUT_MILLISECONDS="$((DATABASE_QUERY_TIMEOUT_SECONDS * 1000))"
+SYNC_CONTAINER_STOP_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_SYNC_CONTAINER_STOP_TIMEOUT_SECONDS:-30}"
 
 usage_error() {
   printf '%s\n' "$USAGE" >&2
@@ -95,6 +102,8 @@ validate_arguments() {
   valid_uint "$DATABASE_CONNECT_TIMEOUT_SECONDS" || usage_error
   [[ "$DATABASE_CONNECT_TIMEOUT_SECONDS" -le "$DATABASE_QUERY_TIMEOUT_SECONDS" ]] ||
     usage_error
+  valid_uint "$SYNC_CONTAINER_STOP_TIMEOUT_SECONDS" || usage_error
+  [[ "$SYNC_CONTAINER_STOP_TIMEOUT_SECONDS" -le 120 ]] || usage_error
 }
 
 resolve_root() {
@@ -1042,6 +1051,158 @@ bounded_backup_compose() {
     /app/happylearn-backup "$@"
 }
 
+valid_run_uuid() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+}
+
+sync_hostname_for_run() {
+  local run_id="$1"
+  valid_run_uuid "$run_id" || return 1
+  printf 'phase5-sync-%s' "${run_id//-/}"
+}
+
+prepare_sync_container_identity() {
+  valid_run_uuid "$RUN_ID" || return 1
+  SYNC_CONTAINER_NAME="${EFFECTIVE_PROJECT}-phase5-sync-${RUN_ID}"
+  SYNC_CONTAINER_HOSTNAME="$(sync_hostname_for_run "$RUN_ID")" || return 1
+  SYNC_CONTAINER_OWNER="$(
+    od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]'
+  )"
+  [[ "$SYNC_CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$ &&
+    "$SYNC_CONTAINER_HOSTNAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ &&
+    "$SYNC_CONTAINER_OWNER" =~ ^[0-9a-f]{64}$ ]]
+}
+
+bounded_backup_sync_compose() {
+  export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$SYNC_CONTAINER_HOSTNAME"
+  compose run \
+    --name "$SYNC_CONTAINER_NAME" \
+    --label "${SYNC_RUN_LABEL}=${RUN_ID}" \
+    --label "${SYNC_OWNER_LABEL}=${SYNC_CONTAINER_OWNER}" \
+    --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
+    /app/happylearn-backup sync --run-id "$RUN_ID"
+}
+
+sync_container_record() {
+  run_guarded_external 30 docker ps --all --no-trunc \
+    --filter "name=^/${SYNC_CONTAINER_NAME}$" \
+    --format "{{.ID}}|{{.Names}}|{{.Label \"${SYNC_RUN_LABEL}\"}}|{{.Label \"${SYNC_OWNER_LABEL}\"}}|{{.State}}"
+}
+
+validate_sync_container_record() {
+  local record="$1"
+  local container_id name run_id owner state extra
+  IFS='|' read -r container_id name run_id owner state extra <<<"$record"
+  [[ -z "${extra:-}" &&
+    "$container_id" =~ ^[0-9a-f]{64}$ &&
+    "$name" == "$SYNC_CONTAINER_NAME" &&
+    "$run_id" == "$RUN_ID" &&
+    "$owner" == "$SYNC_CONTAINER_OWNER" &&
+    ( -z "$SYNC_CONTAINER_ID" || "$container_id" == "$SYNC_CONTAINER_ID" ) ]] ||
+    return 1
+  SYNC_CONTAINER_ID="$container_id"
+}
+
+cleanup_sync_container() {
+  local saved_failure="$FAILURE_CATEGORY"
+  local record
+  if ! record="$(sync_container_record)"; then
+    FAILURE_CATEGORY="$saved_failure"
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if [[ -z "$record" ]]; then
+    FAILURE_CATEGORY="$saved_failure"
+    return 0
+  fi
+  if [[ "$record" == *$'\n'* ]] ||
+    ! validate_sync_container_record "$record"; then
+    FAILURE_CATEGORY="$saved_failure"
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if ! run_guarded_external "$((SYNC_CONTAINER_STOP_TIMEOUT_SECONDS + 15))" \
+    docker stop --time "$SYNC_CONTAINER_STOP_TIMEOUT_SECONDS" \
+    "$SYNC_CONTAINER_ID" >/dev/null; then
+    if ! record="$(sync_container_record)" || [[ -n "$record" ]]; then
+      FAILURE_CATEGORY="$saved_failure"
+      RECOVERY_UNSAFE=true
+      return 1
+    fi
+    FAILURE_CATEGORY="$saved_failure"
+    return 0
+  fi
+  if ! record="$(sync_container_record)"; then
+    FAILURE_CATEGORY="$saved_failure"
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if [[ -z "$record" ]]; then
+    FAILURE_CATEGORY="$saved_failure"
+    return 0
+  fi
+  validate_sync_container_record "$record" || {
+    FAILURE_CATEGORY="$saved_failure"
+    RECOVERY_UNSAFE=true
+    return 1
+  }
+  if ! run_guarded_external 30 docker container wait \
+    "$SYNC_CONTAINER_ID" >/dev/null; then
+    if ! record="$(sync_container_record)" || [[ -n "$record" ]]; then
+      FAILURE_CATEGORY="$saved_failure"
+      RECOVERY_UNSAFE=true
+      return 1
+    fi
+    FAILURE_CATEGORY="$saved_failure"
+    return 0
+  fi
+  if ! record="$(sync_container_record)"; then
+    FAILURE_CATEGORY="$saved_failure"
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if [[ -n "$record" ]]; then
+    validate_sync_container_record "$record" || {
+      FAILURE_CATEGORY="$saved_failure"
+      RECOVERY_UNSAFE=true
+      return 1
+    }
+    if ! run_guarded_external 30 docker rm \
+      "$SYNC_CONTAINER_ID" >/dev/null; then
+      if ! record="$(sync_container_record)" || [[ -n "$record" ]]; then
+        FAILURE_CATEGORY="$saved_failure"
+        RECOVERY_UNSAFE=true
+        return 1
+      fi
+    fi
+  fi
+  FAILURE_CATEGORY="$saved_failure"
+}
+
+backup_sync_command() {
+  local command_status cleanup_status
+  prepare_sync_container_identity || return 1
+  SYNC_CONTAINER_ID=''
+  if run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
+    bounded_backup_sync_compose; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if cleanup_sync_container; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" -eq 0 ]] || return "$cleanup_status"
+  if [[ "$command_status" -ne 0 ]] &&
+    ! unlock_local_sync_run "$RUN_ID"; then
+    safe_log 'local_sync_lock_cleanup_deferred'
+  fi
+  return "$command_status"
+}
+
 stop_snapshot_services() {
   FAILURE_CATEGORY='object_store_stop'
   WORKER_STOPPED=true
@@ -1145,6 +1306,101 @@ remote_restic() {
       exec /usr/bin/timeout --foreground --kill-after=10s "$deadline" restic \
         --no-cache "$@"
     ' phase5-remote-restic "${EXTERNAL_TIMEOUT_SECONDS}s" "$@"
+}
+
+bounded_local_unlock() {
+  local hostname="$1"
+  export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$hostname"
+  compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    --foreground --kill-after=10s "${SYNC_CONTAINER_STOP_TIMEOUT_SECONDS}s" \
+    restic --no-cache \
+    --repository-file /run/secrets/local_repository \
+    --password-file /run/secrets/local_password \
+    unlock
+}
+
+bounded_remote_unlock() {
+  local hostname="$1"
+  export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$hostname"
+  compose run --rm --no-deps --entrypoint /bin/sh backup \
+    -eu -c '
+      deadline="$1"
+      AWS_ACCESS_KEY_ID="$(sed -n "1p" /run/secrets/remote_access_key_id)"
+      AWS_SECRET_ACCESS_KEY="$(sed -n "1p" /run/secrets/remote_secret_access_key)"
+      RESTIC_REPOSITORY="$(sed -n "1p" /run/secrets/remote_repository)"
+      RESTIC_PASSWORD="$(sed -n "1p" /run/secrets/remote_password)"
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY RESTIC_REPOSITORY RESTIC_PASSWORD
+      exec /usr/bin/timeout --foreground --kill-after=10s "$deadline" restic \
+        --no-cache unlock
+    ' phase5-remote-unlock "${SYNC_CONTAINER_STOP_TIMEOUT_SECONDS}s"
+}
+
+unlock_local_sync_run() {
+  local hostname
+  hostname="$(sync_hostname_for_run "$1")" || return 1
+  # Recovery is intentionally limited to default restic unlock semantics.
+  run_guarded_external "$((SYNC_CONTAINER_STOP_TIMEOUT_SECONDS + 15))" \
+    bounded_local_unlock "$hostname"
+}
+
+unlock_remote_sync_run() {
+  local hostname
+  hostname="$(sync_hostname_for_run "$1")" || return 1
+  run_guarded_external "$((SYNC_CONTAINER_STOP_TIMEOUT_SECONDS + 15))" \
+    bounded_remote_unlock "$hostname"
+}
+
+pending_degraded_sync_runs() {
+  local records line count=0
+  records="$(
+    database_query <<'SQL'
+-- PHASE5_QUERY_DEGRADED_SYNC_RUNS
+SELECT id::text
+FROM backup_runs
+WHERE state='degraded'
+  AND error_category='remote_unavailable'
+  AND finished_at IS NOT NULL
+  AND finished_at>COALESCE(
+    (SELECT max(finished_at)
+     FROM backup_runs
+     WHERE state='succeeded' AND remote_snapshot_id IS NOT NULL),
+    '-infinity'::timestamptz
+  )
+ORDER BY finished_at DESC,id DESC
+LIMIT 32;
+SQL
+  )" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    valid_run_uuid "$line" || {
+      safe_log 'degraded_sync_run_invalid_record'
+      return 1
+    }
+    count=$((count + 1))
+    [[ "$count" -le 32 ]] || {
+      safe_log 'degraded_sync_run_count_exceeded'
+      return 1
+    }
+    printf '%s\n' "$line"
+  done <<<"$records"
+}
+
+cleanup_pending_local_sync_locks() {
+  local records run_id
+  records="$(pending_degraded_sync_runs)" || return 1
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    unlock_local_sync_run "$run_id" || return 1
+  done <<<"$records"
+}
+
+cleanup_pending_remote_sync_locks() {
+  local records run_id
+  records="$(pending_degraded_sync_runs)" || return 1
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    unlock_remote_sync_run "$run_id" || return 1
+  done <<<"$records"
 }
 
 restic_check() {
@@ -1422,6 +1678,11 @@ main() {
   CURRENT_STAGE='heartbeat'
   start_lease_heartbeat
 
+  FAILURE_CATEGORY='integrity'
+  CURRENT_STAGE='prior_sync_lock_cleanup'
+  cleanup_pending_local_sync_locks
+  assert_lease_heartbeat
+
   FAILURE_CATEGORY='internal'
   CURRENT_STAGE='prepare'
   backup_command prepare --run-id "$RUN_ID"
@@ -1457,14 +1718,31 @@ main() {
   assert_lease_heartbeat
 
   if [[ "$REMOTE_ENABLED" == true ]]; then
+    local remote_repository_ready=false
+    local remote_cleanup_ready=true
     FAILURE_CATEGORY='remote_sync'
     if ! ensure_repository remote; then
       safe_log 'remote_repository_unavailable'
       REMOTE_DEGRADED=true
+    else
+      remote_repository_ready=true
+      if ! cleanup_pending_remote_sync_locks; then
+        safe_log 'remote_sync_lock_cleanup_failed'
+        REMOTE_DEGRADED=true
+        remote_cleanup_ready=false
+      fi
     fi
     assert_lease_heartbeat
     FAILURE_CATEGORY='remote_sync'
-    if ! backup_command sync --run-id "$RUN_ID"; then
+    if [[ "$remote_cleanup_ready" == false ]]; then
+      safe_log 'remote_sync_skipped_after_lock_cleanup_failure'
+      REMOTE_SNAPSHOT_ID=''
+    elif ! backup_sync_command; then
+      [[ "$RECOVERY_UNSAFE" == false ]] || return 1
+      if [[ "$remote_repository_ready" == true ]] &&
+        ! unlock_remote_sync_run "$RUN_ID"; then
+        safe_log 'remote_sync_lock_cleanup_deferred'
+      fi
       safe_log 'remote_sync_command_failed'
       REMOTE_DEGRADED=true
       REMOTE_SNAPSHOT_ID=''

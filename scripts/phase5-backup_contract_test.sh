@@ -74,6 +74,17 @@ require_literal "$TARGET" 'arguments+=(--file "$LIVE_COMPOSE_FILE")'
 require_literal "$TARGET" 'HAPPYLEARN_BACKUP_LIVE_TEST'
 require_literal "$TARGET" '^happylearn-phase5-live-[a-f0-9]{12}$'
 require_literal "$TARGET" 'configure_live_context'
+require_literal "$TARGET" 'SYNC_CONTAINER_NAME'
+require_literal "$TARGET" 'sync_hostname_for_run'
+require_literal "$TARGET" 'io.happylearn.phase5.sync-run'
+require_literal "$TARGET" 'io.happylearn.phase5.sync-owner'
+require_literal "$TARGET" 'cleanup_sync_container'
+require_literal "$TARGET" 'pending_degraded_sync_runs'
+require_literal "$TARGET" "error_category='remote_unavailable'"
+require_literal "$TARGET" "WHERE state='succeeded' AND remote_snapshot_id IS NOT NULL"
+require_literal "$TARGET" 'ORDER BY finished_at DESC,id DESC'
+require_literal "$TARGET" 'LIMIT 32'
+require_literal "$TARGET" 'restic unlock'
 require_literal "$TARGET" 'LOCK_OWNER_TOKEN'
 require_literal "$TARGET" 'process_holds_liveness_file'
 require_literal "$TARGET" 'host_lock_owner_matches'
@@ -188,6 +199,7 @@ require_literal "$COMPOSE" '/usr/bin/timeout'
 require_literal "$COMPOSE" '--kill-after=10s'
 require_literal "$COMPOSE" 'mem_limit: 768m'
 require_literal "$COMPOSE" 'cpus: 0.4'
+require_literal "$COMPOSE" 'hostname: ${HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME:-happylearn-backup}'
 test -x "$ROOT/scripts/phase5-backup_live_test.sh" ||
   fail "real Task 4 live fixture is absent or not executable"
 test -f "$LIVE_COMPOSE" ||
@@ -364,6 +376,41 @@ make_fixture() {
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$PHASE5_FAKE_DOCKER_LOG"
+if [[ "${1:-}" == 'ps' ]]; then
+  if [[ -s "${PHASE5_FAKE_CONTAINER_STATE:-}" ]]; then
+    IFS='|' read -r container_id container_name run_id owner state \
+      <"$PHASE5_FAKE_CONTAINER_STATE"
+    printf '%s|%s|%s|%s|%s\n' \
+      "$container_id" "$container_name" "$run_id" "$owner" "$state"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == 'stop' ]]; then
+  IFS='|' read -r container_id container_name run_id owner state \
+    <"$PHASE5_FAKE_CONTAINER_STATE"
+  requested_name="${!#}"
+  [[ "$requested_name" == "$container_id" ]] || exit 75
+  printf '%s|%s|%s|%s|exited\n' \
+    "$container_id" "$container_name" "$run_id" "$owner" \
+    >"$PHASE5_FAKE_CONTAINER_STATE"
+  printf '%s\n' "$container_id"
+  exit 0
+fi
+if [[ "${1:-}" == 'container' && "${2:-}" == 'wait' ]]; then
+  IFS='|' read -r container_id container_name run_id owner state \
+    <"$PHASE5_FAKE_CONTAINER_STATE"
+  [[ "${3:-}" == "$container_id" && "$state" == 'exited' ]] || exit 76
+  printf '%s\n' 124
+  exit 0
+fi
+if [[ "${1:-}" == 'rm' ]]; then
+  IFS='|' read -r container_id container_name run_id owner state \
+    <"$PHASE5_FAKE_CONTAINER_STATE"
+  [[ "${2:-}" == "$container_id" && "$state" == 'exited' ]] || exit 77
+  rm -f "$PHASE5_FAKE_CONTAINER_STATE"
+  printf '%s\n' "$container_id"
+  exit 0
+fi
 if [[ "$*" == *"run --rm --no-deps backup-secrets-init"* ]]; then
   for name in database_password local_repository local_password; do
     test -f "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/$name"
@@ -385,6 +432,42 @@ if [[ "$*" == *"run --rm --no-deps backup-secrets-init"* ]]; then
       rm -f "$PHASE5_FAKE_SECRET_VOLUME/$name"
     fi
   done
+fi
+if [[ "$*" == *"/app/happylearn-backup sync --run-id "* &&
+  "${PHASE5_FAKE_SYNC_TIMEOUT:-}" == true ]]; then
+  container_name=''
+  run_id=''
+  owner=''
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --name)
+        container_name="${2:-}"
+        shift 2
+        ;;
+      --label)
+        case "${2:-}" in
+          io.happylearn.phase5.sync-run=*)
+            run_id="${2#*=}"
+            ;;
+          io.happylearn.phase5.sync-owner=*)
+            owner="${2#*=}"
+            ;;
+        esac
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$container_name" &&
+    "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
+    "$owner" =~ ^[0-9a-f]{64}$ ]] || exit 78
+  printf '%s|%s|%s|%s|running\n' \
+    'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+    "$container_name" "$run_id" "$owner" \
+    >"$PHASE5_FAKE_CONTAINER_STATE"
+  exit 124
 fi
 if [[ -n "${PHASE5_FAKE_DELAY_MATCH:-}" &&
       "$*" == *"$PHASE5_FAKE_DELAY_MATCH"* ]]; then
@@ -460,6 +543,12 @@ if [[ "$*" == *postgres*psql* ]]; then
         printf '%s\n' 'SQL PHASE5_QUERY_LOCAL_SNAPSHOT' >>"$PHASE5_FAKE_DOCKER_LOG"
         printf '%064d\n' 1
         ;;
+      *PHASE5_QUERY_DEGRADED_SYNC_RUNS*)
+        printf '%s\n' 'SQL PHASE5_QUERY_DEGRADED_SYNC_RUNS' >>"$PHASE5_FAKE_DOCKER_LOG"
+        if [[ -n "${PHASE5_FAKE_DEGRADED_RUNS:-}" ]]; then
+          printf '%s\n' "$PHASE5_FAKE_DEGRADED_RUNS"
+        fi
+        ;;
       *PHASE5_QUERY_REMOTE_RESULT*)
         printf '%s\n' 'SQL PHASE5_QUERY_REMOTE_RESULT' >>"$PHASE5_FAKE_DOCKER_LOG"
         if [[ "${PHASE5_FAKE_REMOTE_RESULT:-success}" == "success" ]]; then
@@ -494,6 +583,9 @@ run_fixture() {
   local run_response="${4:-queued|scheduled|11111111-1111-4111-8111-111111111111}"
   PATH="$fixture/bin:$PATH" \
   PHASE5_FAKE_DOCKER_LOG="$fixture/docker.log" \
+  PHASE5_FAKE_CONTAINER_STATE="$fixture/sync-container.state" \
+  PHASE5_FAKE_SYNC_TIMEOUT="${PHASE5_FAKE_SYNC_TIMEOUT:-}" \
+  PHASE5_FAKE_DEGRADED_RUNS="${PHASE5_FAKE_DEGRADED_RUNS:-}" \
   PHASE5_FAKE_SECRET_VOLUME="$fixture/secret-volume" \
   PHASE5_FAKE_SECRET_COPY_FAIL_NAME="${PHASE5_FAKE_SECRET_COPY_FAIL_NAME:-}" \
   PHASE5_FAKE_FAIL_MATCH="$fail_match" \
@@ -668,8 +760,11 @@ remote_sync_failure_log="$remote_sync_failure_fixture/docker.log"
 assert_before "$remote_sync_failure_log" \
   '/app/happylearn-backup sync --run-id 11111111-1111-4111-8111-111111111111' \
   '/app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111'
-if grep -Fq 'local_password unlock' "$remote_sync_failure_log"; then
-  fail "remote sync failure removed locks owned by other Restic clients"
+grep -Fq \
+  'local_password unlock' "$remote_sync_failure_log" ||
+  fail "remote sync failure did not run default local lock cleanup"
+if grep -Eq 'unlock[^[:cntrl:]]*--remove-all' "$remote_sync_failure_log"; then
+  fail "remote sync failure used destructive Restic lock cleanup"
 fi
 if grep -Fq '/app/happylearn-backup-retention --repository remote' \
   "$remote_sync_failure_log"; then
@@ -678,6 +773,53 @@ fi
 grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category remote_unavailable' \
   "$remote_sync_failure_log" ||
   fail "failed remote sync did not complete the local point as degraded"
+
+sync_timeout_fixture="$(make_fixture)"
+printf 's3:https://remote.test/happylearn\n' \
+  >"$sync_timeout_fixture/secrets/remote_repository"
+printf 'remote-repository-password\n' \
+  >"$sync_timeout_fixture/secrets/remote_password"
+printf 'remote-access-key\n' \
+  >"$sync_timeout_fixture/secrets/remote_access_key_id"
+printf 'remote-secret-key\n' \
+  >"$sync_timeout_fixture/secrets/remote_secret_access_key"
+chmod 0400 "$sync_timeout_fixture/secrets/remote_"*
+printf '%s\n' external-active-lock >"$sync_timeout_fixture/external.lock"
+if ! PHASE5_FAKE_SYNC_TIMEOUT=true run_fixture "$sync_timeout_fixture"; then
+  fail "timed-out managed sync did not preserve the verified local point"
+fi
+sync_timeout_log="$sync_timeout_fixture/docker.log"
+managed_name='happylearn-dev-phase5-sync-11111111-1111-4111-8111-111111111111'
+managed_id='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+grep -Eq \
+  "run --name ${managed_name} --label io\\.happylearn\\.phase5\\.sync-run=11111111-1111-4111-8111-111111111111 --label io\\.happylearn\\.phase5\\.sync-owner=[0-9a-f]{64} --rm .* /app/happylearn-backup sync --run-id 11111111-1111-4111-8111-111111111111" \
+  "$sync_timeout_log" ||
+  fail "sync did not use the exact name and complete ownership labels"
+assert_before "$sync_timeout_log" \
+  "ps --all --no-trunc --filter name=^/${managed_name}$" \
+  "stop --time 30 ${managed_id}"
+assert_before "$sync_timeout_log" \
+  "stop --time 30 ${managed_id}" \
+  "container wait ${managed_id}"
+assert_before "$sync_timeout_log" \
+  "container wait ${managed_id}" \
+  "rm ${managed_id}"
+test ! -e "$sync_timeout_fixture/sync-container.state" ||
+  fail "timed-out managed sync container survived exact cleanup"
+test -f "$sync_timeout_fixture/external.lock" ||
+  fail "default unlock removed an external active lock marker"
+if ! PHASE5_FAKE_DEGRADED_RUNS='11111111-1111-4111-8111-111111111111' \
+  run_fixture "$sync_timeout_fixture"; then
+  fail "next run did not recover after exact stale sync cleanup"
+fi
+grep -Fq 'SQL PHASE5_QUERY_DEGRADED_SYNC_RUNS' "$sync_timeout_log" ||
+  fail "recovery did not query bounded degraded sync owners"
+grep -Fq \
+  '/app/happylearn-backup finish --run-id 11111111-1111-4111-8111-111111111111' \
+  "$sync_timeout_log" ||
+  fail "recovery run did not finish successfully"
+test -f "$sync_timeout_fixture/external.lock" ||
+  fail "recovery removed an external active lock marker"
 
 degraded_retention_fixture="$(make_fixture)"
 printf 's3:https://remote.test/happylearn\n' \
