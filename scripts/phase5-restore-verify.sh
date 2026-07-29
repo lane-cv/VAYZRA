@@ -1076,8 +1076,17 @@ inspect_not_found_message() {
     grep -Fxq "Error response from daemon: No such $singular: $name" "$path"; then
     return 0
   fi
-  [[ "$class" == networks ]] &&
-    grep -Fxq "Error response from daemon: network $name not found" "$path"
+  case "$class" in
+    networks)
+      grep -Fxq "Error response from daemon: network $name not found" "$path"
+      ;;
+    volumes)
+      grep -Fxq "Error response from daemon: get $name: no such volume" "$path"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 inspect_resource_labels() {

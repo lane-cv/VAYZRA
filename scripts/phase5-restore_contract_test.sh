@@ -532,9 +532,16 @@ inspect_resource() {
   if ! file="$(resource_file "$kind" "$name")"; then
     case "$kind" in
       containers) printf 'Error: No such container: %s\n' "$name" >&2 ;;
-      volumes) printf 'Error: No such volume: %s\n' "$name" >&2 ;;
+      volumes)
+        if [[ "$mode" == modern_resource_not_found ]]; then
+          printf 'Error response from daemon: get %s: no such volume\n' \
+            "$name" >&2
+        else
+          printf 'Error: No such volume: %s\n' "$name" >&2
+        fi
+        ;;
       networks)
-        if [[ "$mode" == modern_network_not_found ]]; then
+        if [[ "$mode" == modern_resource_not_found ]]; then
           printf 'Error response from daemon: network %s not found\n' \
             "$name" >&2
         else
@@ -559,9 +566,16 @@ inspect_resource() {
   if [[ ! -f "$file" ]]; then
     case "$kind" in
       containers) printf 'Error: No such container: %s\n' "$name" >&2 ;;
-      volumes) printf 'Error: No such volume: %s\n' "$name" >&2 ;;
+      volumes)
+        if [[ "$mode" == modern_resource_not_found ]]; then
+          printf 'Error response from daemon: get %s: no such volume\n' \
+            "$name" >&2
+        else
+          printf 'Error: No such volume: %s\n' "$name" >&2
+        fi
+        ;;
       networks)
-        if [[ "$mode" == modern_network_not_found ]]; then
+        if [[ "$mode" == modern_resource_not_found ]]; then
           printf 'Error response from daemon: network %s not found\n' \
             "$name" >&2
         else
@@ -1953,7 +1967,7 @@ test -f "$shared_report_directory/restore-$BACKUP_ID.json" ||
   fail 'shared report lock holder did not publish after release'
 
 success_fixture="$(make_fixture)"
-if ! run_fixture "$success_fixture" modern_network_not_found \
+if ! run_fixture "$success_fixture" modern_resource_not_found \
   >"$success_fixture/stdout" 2>"$success_fixture/stderr"; then
   sed -n '1,120p' "$success_fixture/stdout" >&2
   sed -n '1,120p' "$success_fixture/stderr" >&2
