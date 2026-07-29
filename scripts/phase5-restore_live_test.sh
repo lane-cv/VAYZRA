@@ -1696,18 +1696,36 @@ cleanup_owned_restore_resources() {
   assert_restore_resources_absent "$BACKUP_ID"
 }
 
+repository_find_empty() {
+  local repository="$1"
+  local result
+  shift
+  [[ "$repository" == "$FIXTURE_ROOT/repository" &&
+    "$repository" == "${TMPDIR:-/tmp}/phase5-restore-live."*/repository &&
+    -d "$repository" && ! -L "$repository" ]] ||
+    return 1
+  result="$(find "$repository" -xdev "$@")" || return 1
+  [[ -z "$result" ]]
+}
+
 handoff_repository_to_host_for_cleanup() {
   local repository="$FIXTURE_ROOT/repository"
   local actual_image_id registered_baseline registered_expected extra
+  local repository_entry repository_owner
   [[ "$HOST_UID" =~ ^[1-9][0-9]*$ &&
     "$HOST_GID" =~ ^[0-9]+$ &&
     "$repository" == "${TMPDIR:-/tmp}/phase5-restore-live."*/repository &&
     -d "$repository" && ! -L "$repository" ]] ||
     return 1
-  if [[ -z "$(find "$repository" -mindepth 1 -print -quit)" &&
-    "$(portable_owner "$repository")" == "$HOST_UID" ]]; then
-    REPOSITORY_HOST_HANDOFF=true
-    return 0
+  repository_entry="$(
+    find "$repository" -xdev -mindepth 1 -print -quit
+  )" || return 1
+  if [[ -z "$repository_entry" ]]; then
+    repository_owner="$(portable_owner "$repository")" || return 1
+    if [[ "$repository_owner" == "$HOST_UID" ]]; then
+      REPOSITORY_HOST_HANDOFF=true
+      return 0
+    fi
   fi
   IFS='|' read -r registered_baseline registered_expected extra < <(
     awk -F '|' -v reference="$BACKUP_IMAGE" \
@@ -1752,13 +1770,14 @@ handoff_repository_to_host_for_cleanup() {
       case "$host_uid:$host_gid" in
         *[!0-9:]* | 0:* | :* | *: | *:*:*) exit 1 ;;
       esac
-      test -z "$(find -P /repository -xdev -type l -print -quit)"
-      test -z "$(find -P /repository -xdev ! -type d ! -type f -print -quit)"
-      test -z "$(find -P /repository -xdev -type f -links +1 -print -quit)"
-      owners="$(
-        find -P /repository -xdev -printf "%U:%G\n" |
-          sort -u
-      )"
+      repository_find_empty() {
+        result="$(find -P /repository -xdev "$@")" || return 1
+        test -z "$result"
+      }
+      repository_find_empty -type l -print -quit
+      repository_find_empty ! -type d ! -type f -print -quit
+      repository_find_empty -type f -links +1 -print -quit
+      owners="$(find -P /repository -xdev -printf "%U:%G\n")" || exit 1
       while IFS= read -r owner; do
         case "$owner" in
           "$host_uid:$host_gid" | 10003:0) ;;
@@ -1768,17 +1787,25 @@ handoff_repository_to_host_for_cleanup() {
 $owners
 EOF
       chown -R -- "$host_uid:$host_gid" /repository
-      test -z "$(find -P /repository -xdev ! -user "$host_uid" -print -quit)"
-      test -z "$(find -P /repository -xdev ! -group "$host_gid" -print -quit)"
+      repository_find_empty ! -user "$host_uid" -print -quit
+      repository_find_empty ! -group "$host_gid" -print -quit
     ' cleanup "$HOST_UID" "$HOST_GID" \
     >/dev/null 2>&1 ||
     return 1
-  [[ "$(portable_owner "$repository")" == "$HOST_UID" &&
-    -z "$(find "$repository" -xdev ! -user "$HOST_UID" -print -quit)" &&
-    -z "$(find "$repository" -xdev ! -group "$HOST_GID" -print -quit)" &&
-    -z "$(find "$repository" -xdev -type l -print -quit)" &&
-    -z "$(find "$repository" -xdev ! -type d ! -type f -print -quit)" &&
-    -z "$(find "$repository" -xdev -type f -links +1 -print -quit)" ]] ||
+  repository_owner="$(portable_owner "$repository")" || return 1
+  [[ "$repository_owner" == "$HOST_UID" ]] || return 1
+  repository_find_empty \
+    "$repository" ! -user "$HOST_UID" -print -quit ||
+    return 1
+  repository_find_empty \
+    "$repository" ! -group "$HOST_GID" -print -quit ||
+    return 1
+  repository_find_empty "$repository" -type l -print -quit ||
+    return 1
+  repository_find_empty \
+    "$repository" ! -type d ! -type f -print -quit ||
+    return 1
+  repository_find_empty "$repository" -type f -links +1 -print -quit ||
     return 1
   REPOSITORY_HOST_HANDOFF=true
 }

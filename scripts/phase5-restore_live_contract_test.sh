@@ -152,6 +152,12 @@ require_literal 'backup-storage-init'
 require_literal 'find -P /repository -xdev -type l -print -quit'
 require_literal 'find -P /repository -xdev ! -type d ! -type f -print -quit'
 require_literal 'find -P /repository -xdev -type f -links +1 -print -quit'
+require_literal 'find "$repository" -xdev -mindepth 1 -print -quit'
+require_literal 'result="$(find "$repository" -xdev "$@")" || return 1'
+require_literal 'result="$(find -P /repository -xdev "$@")" || return 1'
+require_literal 'owners="$(find -P /repository -xdev -printf "%U:%G\n")" || exit 1'
+require_literal 'repository_find_empty ! -user "$host_uid" -print -quit'
+require_literal 'repository_find_empty ! -group "$host_gid" -print -quit'
 require_literal 'chown -R -- "$uid:$gid" /repository'
 require_literal 'chown -R -- 10003:0 /repository'
 require_literal '[[ "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" == "$FIXTURE_ROOT/repository" ]]'
@@ -1109,6 +1115,172 @@ review_repository_handoff_daemon_error() (
       '^run |(container|image|network|volume) rm' "$calls"
 )
 
+review_repository_handoff_find_error() (
+  local calls cleanup_root image_id repository counter
+  local stub_dir fail_at
+  calls="$CONTRACT_ROOT/repository-handoff-find.calls"
+
+  (
+    cleanup_root="$(mktemp -d \
+      "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+    trap 'chmod -R u+rwX "$cleanup_root" 2>/dev/null || true
+      rm -rf "$cleanup_root"' EXIT
+    FIXTURE_ROOT="$cleanup_root"
+    repository="$FIXTURE_ROOT/repository"
+    mkdir -m 0700 "$repository"
+    PROJECT='happylearn-phase5-live-111111111111'
+    FIXTURE_SUFFIX='111111111111'
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    REPOSITORY_HOST_HANDOFF=false
+    : >"$calls"
+    find() {
+      return 70
+    }
+    docker() {
+      printf '%s\n' "$*" >>"$calls"
+      return 1
+    }
+    ! handoff_repository_to_host_for_cleanup &&
+      [[ "$REPOSITORY_HOST_HANDOFF" == false &&
+        -d "$repository" ]] &&
+      ! grep -Eq \
+        '^run |(container|image|network|volume) rm' "$calls"
+  ) || return 1
+
+  (
+    cleanup_root="$(mktemp -d \
+      "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+    trap 'chmod -R u+rwX "$cleanup_root" 2>/dev/null || true
+      rm -rf "$cleanup_root"' EXIT
+    FIXTURE_ROOT="$cleanup_root"
+    repository="$FIXTURE_ROOT/repository"
+    mkdir -m 0700 "$repository"
+    printf 'repository data\n' >"$repository/data"
+    PROJECT='happylearn-phase5-live-111111111111'
+    FIXTURE_SUFFIX='111111111111'
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+    CREATED_IMAGE_RECORD="$FIXTURE_ROOT/created-images"
+    image_id="sha256:$(printf '6%.0s' {1..64})"
+    printf '%s|absent|%s\n' \
+      "$BACKUP_IMAGE" "$image_id" >"$CREATED_IMAGE_RECORD"
+    chmod 0600 "$CREATED_IMAGE_RECORD"
+    counter="$FIXTURE_ROOT/find-count"
+    printf '0\n' >"$counter"
+    : >"$calls"
+    find() {
+      local count
+      IFS= read -r count <"$counter"
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$counter"
+      if [[ "$count" -eq 1 ]]; then
+        printf '%s\n' "$repository/data"
+        return 0
+      fi
+      return 70
+    }
+    docker() {
+      printf '%s\n' "$*" >>"$calls"
+      if [[ "$1 $2" == 'image inspect' ]]; then
+        printf '%s\n' "$image_id"
+        return 0
+      fi
+      [[ "$1" == run ]]
+    }
+    REPOSITORY_HOST_HANDOFF=false
+    ! handoff_repository_to_host_for_cleanup &&
+      [[ "$REPOSITORY_HOST_HANDOFF" == false &&
+        -f "$repository/data" ]] &&
+      grep -Fq -- '--entrypoint /usr/bin/timeout' "$calls" &&
+      ! grep -Eq \
+        '(container|image|network|volume) rm' "$calls"
+  ) || return 1
+
+  (
+    cleanup_root="$(mktemp -d \
+      "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+    trap 'chmod -R u+rwX "$cleanup_root" 2>/dev/null || true
+      rm -rf "$cleanup_root"' EXIT
+    FIXTURE_ROOT="$cleanup_root"
+    repository="$FIXTURE_ROOT/repository"
+    mkdir -m 0700 "$repository"
+    printf 'repository data\n' >"$repository/data"
+    PROJECT='happylearn-phase5-live-111111111111'
+    FIXTURE_SUFFIX='111111111111'
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
+    BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+    CREATED_IMAGE_RECORD="$FIXTURE_ROOT/created-images"
+    image_id="sha256:$(printf '7%.0s' {1..64})"
+    printf '%s|absent|%s\n' \
+      "$BACKUP_IMAGE" "$image_id" >"$CREATED_IMAGE_RECORD"
+    chmod 0600 "$CREATED_IMAGE_RECORD"
+    stub_dir="$FIXTURE_ROOT/stub-bin"
+    mkdir -m 0700 "$stub_dir"
+    counter="$FIXTURE_ROOT/container-find-count"
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'count=0' \
+      'if [ -f "$FIND_STUB_COUNT" ]; then' \
+      '  IFS= read -r count <"$FIND_STUB_COUNT"' \
+      'fi' \
+      'count=$((count + 1))' \
+      'printf "%s\n" "$count" >"$FIND_STUB_COUNT"' \
+      'if [ "$count" -eq "$FIND_STUB_FAIL_AT" ]; then' \
+      '  exit 70' \
+      'fi' \
+      'exit 0' \
+      >"$stub_dir/find"
+    chmod 0700 "$stub_dir/find"
+    docker() {
+      local argument previous='' script=''
+      printf '%s\n' "$*" >>"$calls"
+      if [[ "$1 $2" == 'image inspect' ]]; then
+        printf '%s\n' "$image_id"
+        return 0
+      fi
+      [[ "$1" == run ]] || return 1
+      for argument in "$@"; do
+        if [[ "$previous" == -ceu ]]; then
+          script="$argument"
+          break
+        fi
+        previous="$argument"
+      done
+      case "$script" in
+        *'repository_find_empty() {'*) ;;
+        *) return 1 ;;
+      esac
+      case "$script" in
+        *'owners="$(find -P /repository -xdev -printf "%U:%G\n")" || exit 1'*)
+          ;;
+        *) return 1 ;;
+      esac
+      PATH="$stub_dir:$PATH" \
+        FIND_STUB_COUNT="$counter" \
+        FIND_STUB_FAIL_AT="$fail_at" \
+        /bin/sh -ceu "$script" cleanup "$HOST_UID" "$HOST_GID"
+    }
+    for fail_at in 1 4; do
+      printf '0\n' >"$counter"
+      : >"$calls"
+      REPOSITORY_HOST_HANDOFF=false
+      ! handoff_repository_to_host_for_cleanup ||
+        return 1
+      [[ "$REPOSITORY_HOST_HANDOFF" == false &&
+        -f "$repository/data" ]] ||
+        return 1
+      grep -Fq -- '--entrypoint /usr/bin/timeout' "$calls" ||
+        return 1
+      ! grep -Eq \
+        '(container|image|network|volume) rm' "$calls" ||
+        return 1
+    done
+  )
+)
+
 review_absence_checks_fail_closed() (
   local status=0
   PROJECT='happylearn-phase5-live-111111111111'
@@ -1219,6 +1391,7 @@ review_dynamic_fault_windows() (
   review_controller_socket_groups || return 1
   review_create_fixture_daemon_error || return 1
   review_repository_handoff_daemon_error || return 1
+  review_repository_handoff_find_error || return 1
   review_absence_checks_fail_closed || return 1
   review_project_fallback_cleanup || return 1
   root="$(mktemp -d \
