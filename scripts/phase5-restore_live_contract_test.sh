@@ -53,6 +53,43 @@ portable_sha256_stdin() {
   fi
 }
 
+write_report_fixture() {
+  local path="$1"
+  local duration="$2"
+  local migration="$3"
+  local row_total="$4"
+  local checked="$5"
+  local missing="$6"
+  local unexpected="$7"
+  local active="$8"
+  local isolation="$9"
+  local canonical="$CONTRACT_ROOT/report-input.canonical"
+  local report_sha256
+  printf '%s\n' \
+    'schemaVersion=1' \
+    'backupId=11111111-1111-4111-8111-111111111111' \
+    'manifestSHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'verificationReportSHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    'evidenceSHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    "durationSeconds=$duration" \
+    "migrationVersion=$migration" \
+    "rowCountTotal=$row_total" \
+    "checkedObjectCount=$checked" \
+    "missingObjectCount=$missing" \
+    "unexpectedObjectCount=$unexpected" \
+    "activeSessionCount=$active" \
+    "isolation404ProbeCount=$isolation" \
+    >"$canonical"
+  report_sha256="$(
+    portable_sha256_stdin <"$canonical" |
+      sed -n '1s/[[:space:]].*$//p'
+  )"
+  printf '%s\n' \
+    "{\"schemaVersion\":1,\"backupId\":\"11111111-1111-4111-8111-111111111111\",\"manifestSHA256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"verificationReportSHA256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"evidenceSHA256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"durationSeconds\":$duration,\"migrationVersion\":$migration,\"rowCountTotal\":$row_total,\"checkedObjectCount\":$checked,\"missingObjectCount\":$missing,\"unexpectedObjectCount\":$unexpected,\"activeSessionCount\":$active,\"isolation404ProbeCount\":$isolation,\"reportSHA256\":\"$report_sha256\"}" \
+    >"$path"
+  chmod 0600 "$path"
+}
+
 [[ -f "$TARGET" && ! -L "$TARGET" ]] ||
   fail 'scripts/phase5-restore_live_test.sh is absent'
 [[ -f "$CONTROLLER_DOCKERFILE" && ! -L "$CONTROLLER_DOCKERFILE" ]] ||
@@ -183,12 +220,13 @@ for stage in \
 done
 
 grep -Fq \
-  'FROM docker@sha256:be132a9f282288de4afaf63379dff75711fda0147c6b72a9df44e51841402144 AS docker_cli' \
+  'FROM docker@sha256:be132a9f282288de4afaf63379dff75711fda0147c6b72a9df44e51841402144 AS restore_live_controller' \
   "$CONTROLLER_DOCKERFILE" ||
   fail 'restore controller Docker CLI base is not pinned'
-grep -Fq 'RUN apk add --no-cache bash coreutils util-linux' \
+grep -Fq \
+  'RUN apk add --no-cache bash=5.3.9-r1 coreutils=9.11-r0 util-linux=2.42.1-r0' \
   "$CONTROLLER_DOCKERFILE" ||
-  fail 'restore controller adds more than the required shell/lock tools'
+  fail 'restore controller shell/lock tools are not pinned'
 grep -Fq 'RUN docker --version && bash --version && flock --version' \
   "$CONTROLLER_DOCKERFILE" ||
   fail 'restore controller does not verify its fixed tools'
@@ -205,6 +243,22 @@ if grep -Fq 'Dockerfile.restore-live-controller' \
   "$ROOT/deploy/compose.ci.yml" \
   "$ROOT/deploy/compose.backup-live.yml"; then
   fail 'test-only restore controller entered a Compose artifact'
+fi
+grep -Fq \
+  'FROM golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS restore_live_fixture_build' \
+  "$CONTROLLER_DOCKERFILE" &&
+  grep -Fq 'FROM scratch AS restore_live_fixture' \
+    "$CONTROLLER_DOCKERFILE" &&
+  grep -Fq 'USER 10004:10004' "$CONTROLLER_DOCKERFILE" &&
+  grep -Fq \
+    'ENTRYPOINT ["/app/happylearn-restore-live-fixture"]' \
+    "$CONTROLLER_DOCKERFILE" ||
+  fail 'source-object fixture target is not pinned and non-root'
+if grep -Fq 'restore_live_fixture' \
+  "$ROOT/deploy/compose.dev.yml" \
+  "$ROOT/deploy/compose.ci.yml" \
+  "$ROOT/deploy/compose.backup-live.yml"; then
+  fail 'test-only source-object fixture entered a Compose artifact'
 fi
 
 portable_file_body="$(
@@ -277,7 +331,7 @@ printf '%s\n' \
   'durationSeconds=42' \
   'migrationVersion=20' \
   'rowCountTotal=3' \
-  'checkedObjectCount=0' \
+  'checkedObjectCount=2' \
   'missingObjectCount=0' \
   'unexpectedObjectCount=0' \
   'activeSessionCount=0' \
@@ -290,7 +344,7 @@ REPORT_SHA256="$(
 [[ "$REPORT_SHA256" =~ ^[a-f0-9]{64}$ ]] ||
   fail 'contract could not create report hash'
 printf '%s\n' \
-  "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":42,\"migrationVersion\":20,\"rowCountTotal\":3,\"checkedObjectCount\":0,\"missingObjectCount\":0,\"unexpectedObjectCount\":0,\"activeSessionCount\":0,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$REPORT_SHA256\"}" \
+  "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":42,\"migrationVersion\":20,\"rowCountTotal\":3,\"checkedObjectCount\":2,\"missingObjectCount\":0,\"unexpectedObjectCount\":0,\"activeSessionCount\":0,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$REPORT_SHA256\"}" \
   >"$REPORT_FILE"
 chmod 0600 "$REPORT_FILE"
 
@@ -377,6 +431,654 @@ printf '%s\n' \
   fail 'safe restore failure category was not extracted'
 if extract_restore_failure_category "$UNSAFE_FAILURE_LOG" >/dev/null; then
   fail 'unsafe restore failure detail was accepted'
+fi
+
+REVIEW_FAILURES=()
+
+record_review_contract() {
+  local finding="$1"
+  local check="$2"
+  if ! "$check"; then
+    REVIEW_FAILURES+=("$finding")
+  fi
+}
+
+review_source_object_fixture() (
+  local calls="$CONTRACT_ROOT/source-fixture.calls"
+  local sql="$CONTRACT_ROOT/source-fixture.sql"
+  : >"$calls"
+  : >"$sql"
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  HOST_UID="$(id -u)"
+  HOST_GID="$(id -g)"
+  FIXTURE_IMAGE='happylearn-restore-live-fixture:phase5-live-111111111111'
+  FIXTURE_CONFIG_FILE="$CONTRACT_ROOT/source-fixture.json"
+  FIXTURE_ORIGINAL_FILE="$CONTRACT_ROOT/source-original.bin"
+  FIXTURE_PREVIEW_FILE="$CONTRACT_ROOT/source-preview.bin"
+  FIXTURE_OBJECT_LOG="$CONTRACT_ROOT/source-fixture.log"
+  FIXTURE_ORIGINAL_KEY='phase5-restore-live/111111111111/original.bin'
+  FIXTURE_PREVIEW_KEY='phase5-restore-live/111111111111/preview.bin'
+  FIXTURE_ORIGINAL_SIZE=31
+  FIXTURE_PREVIEW_SIZE=30
+  FIXTURE_ORIGINAL_SHA256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  FIXTURE_PREVIEW_SHA256='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  SOURCE_MINIO_ACCESS_KEY='fixture-access-key'
+  SOURCE_MINIO_SECRET_KEY='fixture-secret-key'
+  printf '{}\n' >"$FIXTURE_CONFIG_FILE"
+  printf 'original\n' >"$FIXTURE_ORIGINAL_FILE"
+  printf 'preview\n' >"$FIXTURE_PREVIEW_FILE"
+  chmod 0400 \
+    "$FIXTURE_CONFIG_FILE" \
+    "$FIXTURE_ORIGINAL_FILE" \
+    "$FIXTURE_PREVIEW_FILE"
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    printf 'phase5_restore_fixture: PASS originalBytes=31 previewBytes=30\n'
+  }
+  db_query() {
+    tee "$sql" >/dev/null
+  }
+  db_scalar() {
+    printf '1|1|1|31|%s|30|%s\n' \
+      "$FIXTURE_ORIGINAL_SHA256" \
+      "$FIXTURE_PREVIEW_SHA256"
+  }
+  build_source_object_fixture
+  verify_source_object_fixture
+  grep -Fq -- '--network happylearn-phase5-live-111111111111_happylearn' \
+    "$calls" &&
+    grep -Fq -- \
+      "src=$FIXTURE_CONFIG_FILE,dst=/run/secrets/restore-live-object-fixture.json,readonly" \
+      "$calls" &&
+    grep -Fq 'INSERT INTO files' "$sql" &&
+    grep -Fq 'INSERT INTO file_versions' "$sql" &&
+    grep -Fq 'INSERT INTO file_previews' "$sql" &&
+    ! grep -Fq "$SOURCE_MINIO_ACCESS_KEY" "$calls" &&
+    ! grep -Fq "$SOURCE_MINIO_SECRET_KEY" "$calls"
+)
+
+review_report_semantics() {
+  local report="$CONTRACT_ROOT/zero-checked.rehashed.json"
+  write_report_fixture "$report" 42 20 3 0 0 0 0 2
+  ! parse_sanitized_report "$report" "$BACKUP_ID" "$MANIFEST_SHA256"
+}
+
+review_bounded_controller_wait() (
+  local status started
+  FIXTURE_ROOT="$CONTRACT_ROOT/controller-wait"
+  mkdir -m 0700 "$FIXTURE_ROOT" "$FIXTURE_ROOT/control"
+  CONTROLLER_WAIT_STATUS_FILE="$FIXTURE_ROOT/control/controller.wait"
+  CONTROLLER_WAIT_PID=''
+  CONTROLLER_EXIT_STATUS=''
+  docker() {
+    [[ "$1 $2" == 'container wait' ]] || return 1
+    sleep 2
+    printf '0\n'
+  }
+  started=$SECONDS
+  status=0
+  wait_restore_controller_bounded \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 ||
+    status=$?
+  [[ "$status" == 124 &&
+    $((SECONDS - started)) -le 2 &&
+    -z "$CONTROLLER_WAIT_PID" ]] ||
+    return 1
+
+  CONTROLLER_WAIT_STATUS_FILE="$FIXTURE_ROOT/control/controller.wait"
+  docker() {
+    [[ "$1 $2" == 'container wait' ]] || return 1
+    printf '7\n'
+  }
+  wait_restore_controller_bounded \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 &&
+    [[ "$CONTROLLER_EXIT_STATUS" == 7 &&
+      ! -e "$CONTROLLER_WAIT_STATUS_FILE" ]]
+)
+
+exercise_cleanup_signal() {
+  local count="$1"
+  local root="$CONTRACT_ROOT/signal-$count"
+  local pid index
+  mkdir -m 0700 "$root"
+  (
+    CLEANED=false
+    PROJECT=''
+    FIXTURE_ROOT=''
+    remove_restore_controller() {
+      : >"$root/started"
+      sleep 1
+    }
+    remove_created_images() {
+      : >"$root/finished"
+    }
+    cleanup_live 0
+    : >"$root/complete"
+  ) >/dev/null 2>&1 &
+  pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -e "$root/started" ]] && break
+    sleep 0.05
+  done
+  [[ -e "$root/started" ]] || {
+    wait "$pid" 2>/dev/null || true
+    return 1
+  }
+  for ((index = 0; index < count; index++)); do
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.05
+  done
+  wait "$pid" 2>/dev/null || true
+  [[ -e "$root/finished" && -e "$root/complete" ]]
+}
+
+review_cleanup_signals() {
+  exercise_cleanup_signal 1 && exercise_cleanup_signal 2
+}
+
+review_license_source_contract() (
+  declare -F valid_license_source >/dev/null || return 1
+  local valid="$CONTRACT_ROOT/license.valid"
+  local valid600="$CONTRACT_ROOT/license.valid-600"
+  local bad_mode="$CONTRACT_ROOT/license.bad-mode"
+  local symlink="$CONTRACT_ROOT/license.link"
+  local oversized="$CONTRACT_ROOT/license.oversized"
+  printf 'license\n' >"$valid"
+  cp "$valid" "$valid600"
+  cp "$valid" "$bad_mode"
+  cp "$valid" "$oversized"
+  chmod 0400 "$valid"
+  chmod 0600 "$valid600"
+  chmod 0644 "$bad_mode"
+  dd if=/dev/zero of="$oversized" bs=65537 count=1 \
+    >/dev/null 2>&1
+  chmod 0600 "$oversized"
+  ln -s "$valid" "$symlink"
+  valid_license_source "$valid" &&
+    valid_license_source "$valid600" &&
+    ! valid_license_source "$bad_mode" &&
+    ! valid_license_source "$symlink" &&
+    ! valid_license_source "$oversized" ||
+    return 1
+  portable_owner() {
+    printf '99999\n'
+  }
+  ! valid_license_source "$valid"
+)
+
+review_graceful_restore_cleanup() (
+  local calls="$CONTRACT_ROOT/controller-cleanup.calls"
+  local controller_id
+  controller_id="$(printf 'a%.0s' {1..64})"
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  CONTROLLER_NAME="${PROJECT}-restore-controller"
+  CONTROLLER_ID=''
+  CONTROLLER_CREATED=false
+  CONTROLLER_WAIT_PID=''
+  CONTROLLER_WAIT_STATUS_FILE=''
+  local exists=true running=true stop_fails=false wrong_label=false
+  : >"$calls"
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    if [[ "$1 $2" == 'container inspect' ]]; then
+      [[ "$exists" == true ]] || return 1
+      if [[ "$3" == --format && "$4" == *'.State.Running'* ]]; then
+        printf '%s\n' "$running"
+      elif [[ "$3" == --format ]]; then
+        if [[ "$wrong_label" == true ]]; then
+          printf '%s|/%s|wrong-project|%s\n' \
+            "$controller_id" "$CONTROLLER_NAME" "$FIXTURE_SUFFIX"
+        else
+          printf '%s|/%s|%s|%s\n' \
+            "$controller_id" "$CONTROLLER_NAME" \
+            "$PROJECT" "$FIXTURE_SUFFIX"
+        fi
+      fi
+      return 0
+    fi
+    if [[ "$1 $2" == 'container stop' ]]; then
+      [[ "$stop_fails" == false ]] || return 1
+      running=false
+      return 0
+    fi
+    if [[ "$1 $2" == 'container rm' ]]; then
+      exists=false
+      running=false
+      return 0
+    fi
+    return 1
+  }
+  remove_restore_controller
+  grep -Fq \
+    "container stop --signal TERM --timeout 30 $controller_id" "$calls" &&
+    grep -Fq "container rm $controller_id" "$calls" &&
+    ! grep -Fq "container rm --force $controller_id" "$calls" ||
+    return 1
+
+  : >"$calls"
+  exists=true
+  running=true
+  stop_fails=true
+  CONTROLLER_ID=''
+  CONTROLLER_CREATED=false
+  remove_restore_controller
+  grep -Fq \
+    "container stop --signal TERM --timeout 30 $controller_id" "$calls" &&
+    grep -Fq "container rm --force $controller_id" "$calls" ||
+    return 1
+
+  : >"$calls"
+  exists=true
+  running=true
+  stop_fails=false
+  wrong_label=true
+  CONTROLLER_ID=''
+  CONTROLLER_CREATED=false
+  ! remove_restore_controller &&
+    ! grep -Eq 'container (stop|rm)' "$calls" ||
+    return 1
+  review_owned_restore_resource_cleanup
+)
+
+review_owned_restore_resource_cleanup() (
+  local calls="$CONTRACT_ROOT/restore-resource-cleanup.calls"
+  local fixture_owner project container_name volume_name network_name
+  local container_id network_id
+  fixture_owner="$(printf 'e%.0s' {1..64})"
+  project="happylearn-phase5-restore-${fixture_owner:0:12}"
+  container_name="$project-app"
+  volume_name="$project-postgres"
+  network_name="$project-network"
+  container_id="$(printf 'f%.0s' {1..64})"
+  network_id="$(printf '9%.0s' {1..64})"
+  BACKUP_ID='11111111-1111-4111-8111-111111111111'
+  local container_exists=true volume_exists=true network_exists=true
+  local wrong_kind=false
+  : >"$calls"
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    case "$1 $2" in
+      'container ls')
+        [[ "$container_exists" == false ]] ||
+          printf '%s\n' "$container_name"
+        ;;
+      'container inspect')
+        [[ "$container_exists" == true ]] || return 1
+        if [[ "$wrong_kind" == true ]]; then
+          printf '%s|/%s|%s|%s|wrong-kind|%s\n' \
+            "$container_id" "$container_name" "$project" \
+            "$fixture_owner" "$BACKUP_ID"
+        else
+          printf '%s|/%s|%s|%s|app|%s\n' \
+            "$container_id" "$container_name" "$project" \
+            "$fixture_owner" "$BACKUP_ID"
+        fi
+        ;;
+      'container rm')
+        [[ "$3" == --force && "$4" == "$container_id" ]] || return 1
+        container_exists=false
+        ;;
+      'volume ls')
+        [[ "$volume_exists" == false ]] || printf '%s\n' "$volume_name"
+        ;;
+      'volume inspect')
+        [[ "$volume_exists" == true ]] || return 1
+        printf '%s|%s|%s|%s|postgres|%s\n' \
+          "$volume_name" "$volume_name" "$project" \
+          "$fixture_owner" "$BACKUP_ID"
+        ;;
+      'volume rm')
+        [[ "$3" == "$volume_name" ]] || return 1
+        volume_exists=false
+        ;;
+      'network ls')
+        [[ "$network_exists" == false ]] || printf '%s\n' "$network_name"
+        ;;
+      'network inspect')
+        [[ "$network_exists" == true ]] || return 1
+        printf '%s|%s|%s|%s|network|%s\n' \
+          "$network_id" "$network_name" "$project" \
+          "$fixture_owner" "$BACKUP_ID"
+        ;;
+      'network rm')
+        [[ "$3" == "$network_id" ]] || return 1
+        network_exists=false
+        ;;
+      'ps -aq')
+        [[ "$container_exists" == false ]] || printf '%s\n' "$container_id"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  cleanup_owned_restore_resources || return 1
+  [[ "$container_exists" == false &&
+    "$volume_exists" == false &&
+    "$network_exists" == false ]] ||
+    return 1
+  grep -Fq "container rm --force $container_id" "$calls" &&
+    grep -Fq "volume rm $volume_name" "$calls" &&
+    grep -Fq "network rm $network_id" "$calls" ||
+    return 1
+
+  : >"$calls"
+  container_exists=true
+  volume_exists=false
+  network_exists=false
+  wrong_kind=true
+  ! cleanup_owned_restore_resources &&
+    ! grep -Fq 'container rm' "$calls"
+)
+
+review_image_build_registration() (
+  declare -F pre_register_image_references >/dev/null || return 1
+  local calls="$CONTRACT_ROOT/image-registration.calls"
+  local image_id
+  image_id="sha256:$(printf 'b%.0s' {1..64})"
+  : >"$calls"
+  CREATED_IMAGE_RECORD="$CONTRACT_ROOT/image-registration.record"
+  : >"$CREATED_IMAGE_RECORD"
+  chmod 0600 "$CREATED_IMAGE_RECORD"
+  FIXTURE_ROOT="$CONTRACT_ROOT/image-registration"
+  mkdir -m 0700 "$FIXTURE_ROOT" "$FIXTURE_ROOT/control"
+  BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+  APP_IMAGE='happylearn-phase5-live-111111111111-app'
+  WORKER_IMAGE='happylearn-phase5-live-111111111111-worker'
+  CONTROLLER_IMAGE='happylearn-restore-controller:phase5-live-111111111111'
+  FIXTURE_IMAGE='happylearn-restore-live-fixture:phase5-live-111111111111'
+  local current_reference='' current_id=''
+  local list_fails=false
+  docker() {
+    printf 'docker %s\n' "$*" >>"$calls"
+    if [[ "$1" == image && "$2" == inspect ]]; then
+      if [[ "${@: -1}" == "$current_reference" && -n "$current_id" ]]; then
+        printf '%s\n' "$current_id"
+        return 0
+      fi
+      return 1
+    fi
+    if [[ "$1 $2" == 'image ls' ]]; then
+      [[ "$list_fails" == false ]]
+      return
+    fi
+    if [[ "$1 $2" == 'image rm' &&
+      "$3" == "$current_reference" ]]; then
+      current_id=''
+      return 0
+    fi
+  }
+  pre_register_image_references || return 1
+  [[ "$(wc -l <"$CREATED_IMAGE_RECORD" | tr -d '[:space:]')" == 5 ]] ||
+    return 1
+  current_reference="$BACKUP_IMAGE"
+  current_id="$image_id"
+  remove_created_images || return 1
+  [[ -z "$current_id" ]] || return 1
+
+  : >"$CREATED_IMAGE_RECORD"
+  : >"$calls"
+  current_reference="$BACKUP_IMAGE"
+  current_id="$image_id"
+  pre_register_image_references || return 1
+  remove_created_images || return 1
+  [[ "$current_id" == "$image_id" ]] &&
+    ! grep -Fq "image rm $BACKUP_IMAGE" "$calls" ||
+    return 1
+
+  : >"$CREATED_IMAGE_RECORD"
+  : >"$calls"
+  current_reference=''
+  current_id=''
+  pre_register_image_references || return 1
+  current_reference="$BACKUP_IMAGE"
+  current_id="$image_id"
+  record_image "$BACKUP_IMAGE" || return 1
+  : >"$calls"
+  current_id="sha256:$(printf '8%.0s' {1..64})"
+  ! remove_created_images &&
+    ! grep -Fq "image rm $BACKUP_IMAGE" "$calls" ||
+    return 1
+
+  : >"$CREATED_IMAGE_RECORD"
+  current_reference=''
+  current_id=''
+  list_fails=true
+  ! pre_register_image_references
+)
+
+review_repository_cleanup_handoff() (
+  local calls="$CONTRACT_ROOT/repository-cleanup.calls"
+  local image_id repository hardlink special
+  image_id="sha256:$(printf 'c%.0s' {1..64})"
+  FIXTURE_ROOT="$(mktemp -d \
+    "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+  trap 'chmod -R u+rwX "$FIXTURE_ROOT" 2>/dev/null || true
+    rm -rf "$FIXTURE_ROOT"' EXIT
+  repository="$FIXTURE_ROOT/repository"
+  mkdir -m 0700 "$repository"
+  printf 'repository fixture\n' >"$repository/data"
+  chmod 0600 "$repository/data"
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  HOST_UID="$(id -u)"
+  HOST_GID="$(id -g)"
+  BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+  CREATED_IMAGE_RECORD="$FIXTURE_ROOT/created-images"
+  printf '%s|absent|%s\n' \
+    "$BACKUP_IMAGE" "$image_id" >"$CREATED_IMAGE_RECORD"
+  chmod 0600 "$CREATED_IMAGE_RECORD"
+  : >"$calls"
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    if [[ "$1 $2" == 'image inspect' ]]; then
+      printf '%s\n' "$image_id"
+      return 0
+    fi
+    [[ "$1" == run ]]
+  }
+  REPOSITORY_HOST_HANDOFF=false
+  handoff_repository_to_host_for_cleanup || return 1
+  [[ "$REPOSITORY_HOST_HANDOFF" == true ]] || return 1
+  grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE' \
+    "$calls" &&
+    grep -Fq -- '--network none --read-only --user 0:0' "$calls" ||
+    return 1
+
+  hardlink="$repository/data.hardlink"
+  ln "$repository/data" "$hardlink"
+  REPOSITORY_HOST_HANDOFF=false
+  ! handoff_repository_to_host_for_cleanup || return 1
+  rm -f "$hardlink"
+  special="$repository/special"
+  mkfifo "$special"
+  REPOSITORY_HOST_HANDOFF=false
+  ! handoff_repository_to_host_for_cleanup
+)
+
+review_controller_create_capture() (
+  local controller_id
+  controller_id="$(printf 'd%.0s' {1..64})"
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  CONTROLLER_NAME="${PROJECT}-restore-controller"
+  CONTROLLER_ID=''
+  CONTROLLER_CREATED=false
+  local daemon_fails=false discover_status=0
+  docker() {
+    [[ "$daemon_fails" == false ]] || return 1
+    [[ "$1 $2 $3" == 'container inspect --format' ]] || return 1
+    printf '%s|/%s|%s|%s\n' \
+      "$controller_id" "$CONTROLLER_NAME" "$PROJECT" "$FIXTURE_SUFFIX"
+  }
+  discover_restore_controller &&
+    [[ "$CONTROLLER_CREATED" == true &&
+      "$CONTROLLER_ID" == "$controller_id" ]] &&
+    grep -Fq -- '--cidfile "$CONTROLLER_CID_FILE"' "$TARGET" ||
+    return 1
+  daemon_fails=true
+  CONTROLLER_ID=''
+  CONTROLLER_CREATED=false
+  discover_restore_controller || discover_status=$?
+  [[ "$discover_status" == 1 ]]
+)
+
+review_controller_socket_groups() (
+  local body groups
+  body="$(
+    sed -n \
+      '/^        controller_supplementary_groups_match() {/,/^        }/p' \
+      "$TARGET"
+  )"
+  [[ -n "$body" ]] || return 1
+  eval "$body"
+  id() {
+    [[ "${1:-}" == -G ]] || return 1
+    printf '%s\n' "$groups"
+  }
+  groups='20 0'
+  controller_supplementary_groups_match 20 0 || return 1
+  groups='20 0 999'
+  ! controller_supplementary_groups_match 20 0 || return 1
+  groups='20'
+  ! controller_supplementary_groups_match 20 0
+)
+
+review_project_fallback_cleanup() (
+  local fixture_container_id fixture_container_name fixture_volume_name
+  local fixture_network_id fixture_network_name
+  fixture_container_id="$(printf '6%.0s' {1..64})"
+  fixture_network_id="$(printf '7%.0s' {1..64})"
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  fixture_container_name="${PROJECT}-app-1"
+  fixture_volume_name="${PROJECT}_minio_data"
+  fixture_network_name="${PROJECT}_happylearn"
+  local container_exists=true volume_exists=true network_exists=true
+  docker() {
+    case "$1 $2" in
+      'container ls')
+        [[ "$container_exists" == false ]] ||
+          printf '%s\n' "$fixture_container_id"
+        ;;
+      'container inspect')
+        [[ "$container_exists" == true ]] || return 1
+        printf '%s|/%s|%s|app|False||\n' \
+          "$fixture_container_id" "$fixture_container_name" "$PROJECT"
+        ;;
+      'container rm')
+        [[ "$3" == --force && "$4" == "$fixture_container_id" ]] ||
+          return 1
+        container_exists=false
+        ;;
+      'volume ls')
+        [[ "$volume_exists" == false ]] ||
+          printf '%s\n' "$fixture_volume_name"
+        ;;
+      'volume inspect')
+        [[ "$volume_exists" == true ]] || return 1
+        printf '%s|%s|minio_data\n' "$fixture_volume_name" "$PROJECT"
+        ;;
+      'volume rm')
+        [[ "$3" == "$fixture_volume_name" ]] || return 1
+        volume_exists=false
+        ;;
+      'ps -aq')
+        return 0
+        ;;
+      'network ls')
+        [[ "$network_exists" == false ]] ||
+          printf '%s\n' "$fixture_network_name"
+        ;;
+      'network inspect')
+        [[ "$network_exists" == true ]] || return 1
+        printf '%s|%s|%s|happylearn\n' \
+          "$fixture_network_id" "$fixture_network_name" "$PROJECT"
+        ;;
+      'network rm')
+        [[ "$3" == "$fixture_network_id" ]] || return 1
+        network_exists=false
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  remove_labeled_project_containers &&
+    remove_labeled_project_volumes &&
+    remove_labeled_project_networks &&
+    [[ "$container_exists" == false &&
+      "$volume_exists" == false &&
+      "$network_exists" == false ]]
+)
+
+review_dynamic_fault_windows() (
+  local root calls cleanup_status=0
+  review_controller_socket_groups || return 1
+  review_project_fallback_cleanup || return 1
+  root="$(mktemp -d \
+    "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+  mkdir -m 0700 "$root/repository"
+  calls="$CONTRACT_ROOT/dynamic-cleanup.calls"
+  : >"$calls"
+  CLEANED=false
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  FIXTURE_ROOT="$root"
+  REPOSITORY_HOST_HANDOFF=false
+  remove_restore_controller() {
+    printf 'controller\n' >>"$calls"
+  }
+  cleanup_owned_restore_resources() {
+    printf 'restore-resources\n' >>"$calls"
+  }
+  handoff_repository_to_host_for_cleanup() {
+    printf 'repository-handoff\n' >>"$calls"
+    REPOSITORY_HOST_HANDOFF=true
+  }
+  compose() {
+    printf 'compose-partial\n' >>"$calls"
+    return 1
+  }
+  remove_labeled_project_volumes() {
+    printf 'project-volumes\n' >>"$calls"
+  }
+  remove_created_images() {
+    printf 'images\n' >>"$calls"
+  }
+  docker() {
+    return 0
+  }
+  cleanup_live 0 || cleanup_status=$?
+  [[ "$cleanup_status" == 1 &&
+    ! -e "$root" &&
+    "$(sed -n '1p' "$calls")" == controller &&
+    "$(sed -n '2p' "$calls")" == restore-resources &&
+    "$(sed -n '3p' "$calls")" == repository-handoff &&
+    "$(sed -n '4p' "$calls")" == compose-partial &&
+    "$(tail -n1 "$calls")" == images ]]
+)
+
+review_controller_packages_pinned() {
+  grep -Eq \
+    'apk add --no-cache bash=[^[:space:]]+ coreutils=[^[:space:]]+ util-linux=[^[:space:]]+' \
+    "$CONTROLLER_DOCKERFILE"
+}
+
+record_review_contract C0_source_objects review_source_object_fixture
+record_review_contract I1_report_semantics review_report_semantics
+record_review_contract I2_controller_deadline review_bounded_controller_wait
+record_review_contract I3_cleanup_signals review_cleanup_signals
+record_review_contract I4_license_source review_license_source_contract
+record_review_contract I5_restore_cleanup review_graceful_restore_cleanup
+record_review_contract I6_image_window review_image_build_registration
+record_review_contract I7_repository_cleanup review_repository_cleanup_handoff
+record_review_contract I8_controller_capture review_controller_create_capture
+record_review_contract I9_dynamic_windows review_dynamic_fault_windows
+record_review_contract M1_apk_pinning review_controller_packages_pinned
+
+if [[ "${#REVIEW_FAILURES[@]}" -ne 0 ]]; then
+  printf 'phase5 restore live contract: review RED %s\n' \
+    "${REVIEW_FAILURES[*]}" >&2
+  exit 1
 fi
 
 printf 'phase5 restore live contract: PASS\n'

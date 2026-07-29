@@ -9,6 +9,9 @@ readonly TEACHER_USERNAME='phase5_restore_teacher'
 readonly TEACHER_DISPLAY_NAME='Phase 5 Restore Teacher'
 readonly CONTROLLER_SOCKET_GID='0'
 readonly CONTROLLER_SOCKET_MODE='660'
+readonly CONTROLLER_STOP_TIMEOUT_SECONDS=30
+
+CONTROLLER_WAIT_LIMIT_SECONDS="${HAPPYLEARN_PHASE5_RESTORE_LIVE_CONTROLLER_TIMEOUT_SECONDS:-1200}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"
@@ -34,13 +37,33 @@ BACKUP_IMAGE=''
 APP_IMAGE=''
 WORKER_IMAGE=''
 CONTROLLER_IMAGE=''
+FIXTURE_IMAGE=''
 CONTROLLER_NAME=''
 CONTROLLER_ID=''
 CONTROLLER_CREATED=false
+CONTROLLER_WAIT_PID=''
+CONTROLLER_EXIT_STATUS=''
+CONTROLLER_CID_FILE=''
+CONTROLLER_WAIT_STATUS_FILE=''
 DOCKER_SOCKET=''
 CREATED_IMAGE_RECORD=''
+FIXTURE_CONFIG_FILE=''
+FIXTURE_ORIGINAL_FILE=''
+FIXTURE_PREVIEW_FILE=''
+FIXTURE_OBJECT_LOG=''
+FIXTURE_ORIGINAL_KEY=''
+FIXTURE_PREVIEW_KEY=''
+FIXTURE_ORIGINAL_SHA256=''
+FIXTURE_PREVIEW_SHA256=''
+FIXTURE_ORIGINAL_SIZE=''
+FIXTURE_PREVIEW_SIZE=''
+SOURCE_MINIO_ACCESS_KEY_FILE=''
+SOURCE_MINIO_SECRET_KEY_FILE=''
+SOURCE_MINIO_ACCESS_KEY=''
+SOURCE_MINIO_SECRET_KEY=''
 HOST_UID=''
 HOST_GID=''
+REPOSITORY_HOST_HANDOFF=false
 CLEANED=false
 
 LIVE_REPORT_DURATION_SECONDS=''
@@ -155,6 +178,18 @@ owner_only_regular_file() {
   owner_private_regular_file "$1" 400 "$2"
 }
 
+valid_license_source() {
+  local path="$1"
+  local mode size
+  [[ "$path" == /* && -f "$path" && ! -L "$path" ]] ||
+    return 1
+  mode="$(portable_mode "$path")" || return 1
+  [[ "$mode" == 400 || "$mode" == 600 ]] || return 1
+  [[ "$(portable_owner "$path")" == "$(id -u)" ]] || return 1
+  size="$(portable_size "$path")" || return 1
+  [[ "$size" -ge 1 && "$size" -le 65536 ]]
+}
+
 compose() {
   docker compose \
     --project-name "$PROJECT" \
@@ -217,6 +252,7 @@ parse_sanitized_report() {
   [[ "$duration" -lt "$RTO_LIMIT_SECONDS" &&
     "$migration" -ge 20 &&
     "$row_total" -ge 1 &&
+    "$checked" -ge 2 &&
     "$missing" == 0 &&
     "$unexpected" == 0 &&
     "$active" == 0 &&
@@ -326,36 +362,46 @@ extract_restore_failure_category() {
 
 assert_restore_resources_absent() {
   local backup_id="$1"
-  local class
+  local class resources
   valid_uuid "$backup_id" || return 1
   for class in containers volumes networks; do
     case "$class" in
       containers)
-        [[ -z "$(docker ps -aq \
-          --filter "label=io.happylearn.phase5.restore-backup-id=${backup_id}")" ]] ||
-          return 1
+        resources="$(
+          docker ps -aq \
+            --filter \
+            "label=io.happylearn.phase5.restore-backup-id=${backup_id}"
+        )" || return 1
         ;;
       volumes)
-        [[ -z "$(docker volume ls --quiet \
-          --filter "label=io.happylearn.phase5.restore-backup-id=${backup_id}")" ]] ||
-          return 1
+        resources="$(
+          docker volume ls --quiet \
+            --filter \
+            "label=io.happylearn.phase5.restore-backup-id=${backup_id}"
+        )" || return 1
         ;;
       networks)
-        [[ -z "$(docker network ls --quiet \
-          --filter "label=io.happylearn.phase5.restore-backup-id=${backup_id}")" ]] ||
-          return 1
+        resources="$(
+          docker network ls --quiet \
+            --filter \
+            "label=io.happylearn.phase5.restore-backup-id=${backup_id}"
+        )" || return 1
         ;;
     esac
+    [[ -z "$resources" ]] || return 1
   done
 }
 
 require_dependencies() {
-  local license_size
   command -v docker >/dev/null || fail 'docker is required'
   command -v uuidgen >/dev/null || fail 'uuidgen is required'
   command -v sed >/dev/null || fail 'sed is required'
   portable_sha256_stdin </dev/null >/dev/null ||
     fail 'sha256sum or shasum is required'
+  valid_nonnegative_int64 "$CONTROLLER_WAIT_LIMIT_SECONDS" &&
+    [[ "$CONTROLLER_WAIT_LIMIT_SECONDS" -ge 1 &&
+      "$CONTROLLER_WAIT_LIMIT_SECONDS" -lt "$RTO_LIMIT_SECONDS" ]] ||
+    fail 'controller wait limit must be positive and below the restore RTO'
   docker compose version >/dev/null ||
     fail 'Docker Compose v2 is required'
   [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" &&
@@ -383,15 +429,8 @@ require_dependencies() {
     printf '%s' \
       "${HAPPYLEARN_PHASE5_RESTORE_LIVE_LICENSE_SOURCE:-$DEFAULT_LICENSE_SOURCE}"
   )"
-  [[ "$LICENSE_SOURCE" == /* &&
-    -f "$LICENSE_SOURCE" &&
-    ! -L "$LICENSE_SOURCE" &&
-    "$(portable_owner "$LICENSE_SOURCE")" == "$(id -u)" ]] ||
-    fail 'AIStor license source must be an owned regular file'
-  license_size="$(portable_size "$LICENSE_SOURCE")" ||
-    fail 'AIStor license source size is unavailable'
-  [[ "$license_size" -ge 1 && "$license_size" -le 65536 ]] ||
-    fail 'AIStor license source has an invalid size'
+  valid_license_source "$LICENSE_SOURCE" ||
+    fail 'AIStor license source must be owner-only mode 0400 or 0600'
 }
 
 new_uuid() {
@@ -400,6 +439,62 @@ new_uuid() {
   valid_uuid "$value" ||
     fail 'uuidgen did not return a canonical v4 UUID'
   printf '%s\n' "$value"
+}
+
+image_reference_is_expected() {
+  local reference="$1"
+  [[ -n "$reference" &&
+    "$reference" != *'|'* &&
+    ("$reference" == "$BACKUP_IMAGE" ||
+      "$reference" == "$APP_IMAGE" ||
+      "$reference" == "$WORKER_IMAGE" ||
+      "$reference" == "$CONTROLLER_IMAGE" ||
+      "$reference" == "$FIXTURE_IMAGE") ]]
+}
+
+inspect_image_reference_id() {
+  local reference="$1"
+  local image_id listed_ids
+  image_reference_is_expected "$reference" || return 1
+  if image_id="$(
+    docker image inspect --format '{{.Id}}' "$reference" 2>/dev/null
+  )"; then
+    [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
+    printf '%s\n' "$image_id"
+    return 0
+  fi
+  listed_ids="$(
+    docker image ls --quiet --no-trunc \
+      --filter "reference=$reference"
+  )" || return 1
+  [[ -z "$listed_ids" ]] && return 2
+  return 1
+}
+
+pre_register_image_references() {
+  local reference baseline_id inspect_status
+  [[ -f "$CREATED_IMAGE_RECORD" &&
+    ! -L "$CREATED_IMAGE_RECORD" &&
+    "$(portable_mode "$CREATED_IMAGE_RECORD")" == 600 &&
+    "$(portable_owner "$CREATED_IMAGE_RECORD")" == "$(id -u)" &&
+    ! -s "$CREATED_IMAGE_RECORD" ]] ||
+    return 1
+  for reference in \
+    "$BACKUP_IMAGE" "$APP_IMAGE" "$WORKER_IMAGE" \
+    "$CONTROLLER_IMAGE" "$FIXTURE_IMAGE"; do
+    image_reference_is_expected "$reference" || return 1
+    inspect_status=0
+    baseline_id="$(inspect_image_reference_id "$reference")" ||
+      inspect_status=$?
+    case "$inspect_status" in
+      0) ;;
+      2) baseline_id=absent ;;
+      *) return 1 ;;
+    esac
+    printf '%s|%s|pending\n' "$reference" "$baseline_id" \
+      >>"$CREATED_IMAGE_RECORD"
+  done
+  [[ "$(wc -l <"$CREATED_IMAGE_RECORD" | tr -d '[:space:]')" == 5 ]]
 }
 
 create_fixture() {
@@ -429,24 +524,21 @@ create_fixture() {
   APP_IMAGE="${PROJECT}-app"
   WORKER_IMAGE="${PROJECT}-worker"
   CONTROLLER_IMAGE="happylearn-restore-controller:phase5-live-${FIXTURE_SUFFIX}"
+  FIXTURE_IMAGE="happylearn-restore-live-fixture:phase5-live-${FIXTURE_SUFFIX}"
   CONTROLLER_NAME="${PROJECT}-restore-controller"
+  CONTROLLER_CID_FILE="$FIXTURE_ROOT/control/controller.cid"
+  CONTROLLER_WAIT_STATUS_FILE="$FIXTURE_ROOT/control/controller.wait"
   CREATED_IMAGE_RECORD="$FIXTURE_ROOT/created-images"
+  FIXTURE_CONFIG_FILE="$FIXTURE_ROOT/secrets/restore-live-object-fixture.json"
+  FIXTURE_ORIGINAL_FILE="$FIXTURE_ROOT/offline/original.bin"
+  FIXTURE_PREVIEW_FILE="$FIXTURE_ROOT/offline/preview.bin"
+  FIXTURE_OBJECT_LOG="$FIXTURE_ROOT/logs/object-fixture.log"
+  FIXTURE_ORIGINAL_KEY="phase5-restore-live/${FIXTURE_SUFFIX}/original.bin"
+  FIXTURE_PREVIEW_KEY="phase5-restore-live/${FIXTURE_SUFFIX}/preview.bin"
+  SOURCE_MINIO_ACCESS_KEY_FILE="$FIXTURE_ROOT/secrets/source_minio_access_key"
+  SOURCE_MINIO_SECRET_KEY_FILE="$FIXTURE_ROOT/secrets/source_minio_secret_key"
   HOST_UID="$(id -u)"
   HOST_GID="$(id -g)"
-
-  if [[ -n "$(docker ps -aq \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    [[ -n "$(docker volume ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    [[ -n "$(docker network ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1 ||
-    docker image inspect "$APP_IMAGE" >/dev/null 2>&1 ||
-    docker image inspect "$WORKER_IMAGE" >/dev/null 2>&1 ||
-    docker image inspect "$CONTROLLER_IMAGE" >/dev/null 2>&1 ||
-    docker container inspect "$CONTROLLER_NAME" >/dev/null 2>&1; then
-    fail 'randomized live fixture collided with an existing resource'
-  fi
 
   mkdir -m 0700 \
     "$FIXTURE_ROOT/secrets" \
@@ -457,12 +549,31 @@ create_fixture() {
     "$FIXTURE_ROOT/offline" \
     "$FIXTURE_ROOT/logs" \
     "$FIXTURE_ROOT/controller-tmp"
+  : >"$CREATED_IMAGE_RECORD"
+  chmod 0600 "$CREATED_IMAGE_RECORD"
+  pre_register_image_references ||
+    fail 'could not pre-register randomized live fixture images'
+  if [[ -n "$(docker ps -aq \
+      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
+    [[ -n "$(docker volume ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
+    [[ -n "$(docker network ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
+    grep -Evq '\|absent\|pending$' "$CREATED_IMAGE_RECORD" ||
+    docker container inspect "$CONTROLLER_NAME" >/dev/null 2>&1; then
+    fail 'randomized live fixture collided with an existing resource'
+  fi
   install -m 0400 "$LICENSE_SOURCE" "$LICENSE_COPY"
   repository_password="${compact_uuid}$(
     new_uuid |
       tr -d '-'
   )"
   teacher_password="Phase5 Restore ${compact_uuid}!"
+  SOURCE_MINIO_ACCESS_KEY="restore${compact_uuid:0:16}"
+  SOURCE_MINIO_SECRET_KEY="${compact_uuid}$(
+    new_uuid |
+      tr -d '-'
+  )"
   printf '%s\n' 'happylearn_dev' \
     >"$FIXTURE_ROOT/secrets/database_password"
   printf '%s\n' '/repository' \
@@ -470,12 +581,38 @@ create_fixture() {
   printf '%s\n' "$repository_password" \
     >"$FIXTURE_ROOT/secrets/local_password"
   printf '%s\n' "$teacher_password" >"$TEACHER_PASSWORD_FILE"
+  printf '%s\n' "$SOURCE_MINIO_ACCESS_KEY" >"$SOURCE_MINIO_ACCESS_KEY_FILE"
+  printf '%s\n' "$SOURCE_MINIO_SECRET_KEY" >"$SOURCE_MINIO_SECRET_KEY_FILE"
+  printf '%s' 'phase5 restore original fixture v1' >"$FIXTURE_ORIGINAL_FILE"
+  printf '%s' 'phase5 restore preview fixture v1' >"$FIXTURE_PREVIEW_FILE"
+  FIXTURE_ORIGINAL_SIZE="$(portable_size "$FIXTURE_ORIGINAL_FILE")"
+  FIXTURE_PREVIEW_SIZE="$(portable_size "$FIXTURE_PREVIEW_FILE")"
+  FIXTURE_ORIGINAL_SHA256="$(portable_sha256_file "$FIXTURE_ORIGINAL_FILE")"
+  FIXTURE_PREVIEW_SHA256="$(portable_sha256_file "$FIXTURE_PREVIEW_FILE")"
+  valid_nonnegative_int64 "$FIXTURE_ORIGINAL_SIZE" &&
+    valid_nonnegative_int64 "$FIXTURE_PREVIEW_SIZE" &&
+    [[ "$FIXTURE_ORIGINAL_SIZE" -ge 1 &&
+      "$FIXTURE_PREVIEW_SIZE" -ge 1 ]] &&
+    valid_sha256 "$FIXTURE_ORIGINAL_SHA256" &&
+    valid_sha256 "$FIXTURE_PREVIEW_SHA256" ||
+    fail 'source object fixture evidence is invalid'
+  printf '{"schemaVersion":1,"endpoint":"minio:9000","accessKey":"%s","secretKey":"%s","originalKey":"%s","previewKey":"%s"}\n' \
+    "$SOURCE_MINIO_ACCESS_KEY" \
+    "$SOURCE_MINIO_SECRET_KEY" \
+    "$FIXTURE_ORIGINAL_KEY" \
+    "$FIXTURE_PREVIEW_KEY" \
+    >"$FIXTURE_CONFIG_FILE"
   printf '{"username":"%s","password":"%s"}\n' \
     "$TEACHER_USERNAME" "$teacher_password" >"$TEACHER_CREDENTIAL_FILE"
   chmod 0400 \
     "$FIXTURE_ROOT/secrets/database_password" \
     "$FIXTURE_ROOT/secrets/local_repository" \
-    "$FIXTURE_ROOT/secrets/local_password"
+    "$FIXTURE_ROOT/secrets/local_password" \
+    "$SOURCE_MINIO_ACCESS_KEY_FILE" \
+    "$SOURCE_MINIO_SECRET_KEY_FILE" \
+    "$FIXTURE_CONFIG_FILE" \
+    "$FIXTURE_ORIGINAL_FILE" \
+    "$FIXTURE_PREVIEW_FILE"
   chmod 0600 "$TEACHER_PASSWORD_FILE"
   chmod 0400 "$TEACHER_CREDENTIAL_FILE"
   owner_only_regular_file "$LICENSE_COPY" 65536 ||
@@ -486,25 +623,72 @@ create_fixture() {
     fail 'teacher credential file is not owner-only'
   : >"$BACKUP_LOG"
   : >"$RESTORE_LOG"
-  : >"$CREATED_IMAGE_RECORD"
-  chmod 0600 "$BACKUP_LOG" "$RESTORE_LOG" "$CREATED_IMAGE_RECORD"
+  : >"$FIXTURE_OBJECT_LOG"
+  chmod 0600 \
+    "$BACKUP_LOG" \
+    "$RESTORE_LOG" \
+    "$FIXTURE_OBJECT_LOG" \
+    "$CREATED_IMAGE_RECORD"
 }
 
 record_image() {
   local reference="$1"
-  local image_id
+  local image_id record_tmp
+  local record_reference baseline_id expected_id extra
+  local updated=0
+  image_reference_is_expected "$reference" || return 1
   image_id="$(docker image inspect --format '{{.Id}}' "$reference")"
   [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
     fail 'built image ID is invalid'
-  printf '%s|%s\n' "$reference" "$image_id" >>"$CREATED_IMAGE_RECORD"
+  record_tmp="$FIXTURE_ROOT/control/.created-images.new"
+  [[ ! -e "$record_tmp" && ! -L "$record_tmp" ]] || return 1
+  : >"$record_tmp"
+  chmod 0600 "$record_tmp"
+  while IFS='|' read -r \
+      record_reference baseline_id expected_id extra; do
+    [[ -z "$extra" &&
+      "$baseline_id" == absent &&
+      ("$expected_id" == pending ||
+        "$expected_id" =~ ^sha256:[a-f0-9]{64}$) ]] &&
+      image_reference_is_expected "$record_reference" || {
+      rm -f "$record_tmp"
+      return 1
+    }
+    if [[ "$record_reference" == "$reference" ]]; then
+      [[ "$expected_id" == pending && "$updated" == 0 ]] || {
+        rm -f "$record_tmp"
+        return 1
+      }
+      expected_id="$image_id"
+      updated=1
+    fi
+    printf '%s|%s|%s\n' \
+      "$record_reference" "$baseline_id" "$expected_id" >>"$record_tmp"
+  done <"$CREATED_IMAGE_RECORD"
+  [[ "$updated" == 1 &&
+    "$(wc -l <"$record_tmp" | tr -d '[:space:]')" == 5 ]] || {
+    rm -f "$record_tmp"
+    return 1
+  }
+  mv -f "$record_tmp" "$CREATED_IMAGE_RECORD"
 }
 
 build_restore_controller() {
   docker build \
     --file "$CONTROLLER_DOCKERFILE" \
+    --target restore_live_controller \
     --tag "$CONTROLLER_IMAGE" \
     "$ROOT"
   record_image "$CONTROLLER_IMAGE"
+}
+
+build_restore_fixture() {
+  docker build \
+    --file "$CONTROLLER_DOCKERFILE" \
+    --target restore_live_fixture \
+    --tag "$FIXTURE_IMAGE" \
+    "$ROOT"
+  record_image "$FIXTURE_IMAGE"
 }
 
 build_images() {
@@ -518,6 +702,7 @@ build_images() {
   record_image "$APP_IMAGE"
   record_image "$WORKER_IMAGE"
   build_restore_controller
+  build_restore_fixture
 }
 
 generate_age_identity() {
@@ -548,6 +733,8 @@ generate_age_identity() {
 }
 
 configure_backup_context() {
+  local minio_access_variable='HAPPYLEARN_MINIO_ACCESS_KEY'
+  local minio_secret_variable='HAPPYLEARN_MINIO_SECRET_KEY'
   export HAPPYLEARN_BACKUP_LIVE_TEST='1'
   export HAPPYLEARN_BACKUP_LIVE_PROJECT="$PROJECT"
   export HAPPYLEARN_BACKUP_LIVE_ROOT="$FIXTURE_ROOT"
@@ -558,6 +745,9 @@ configure_backup_context() {
   export HAPPYLEARN_BACKUP_LOCK_DIRECTORY="$FIXTURE_ROOT/host.lock"
   export HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS='1800'
   export HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS='60'
+  printf -v "$minio_access_variable" '%s' "$SOURCE_MINIO_ACCESS_KEY"
+  printf -v "$minio_secret_variable" '%s' "$SOURCE_MINIO_SECRET_KEY"
+  export "$minio_access_variable" "$minio_secret_variable"
 }
 
 wait_for_source_stack() {
@@ -638,6 +828,99 @@ bootstrap_teacher() {
   [[ "$(db_scalar \
     "SELECT count(*) FROM users WHERE username='${TEACHER_USERNAME}' AND role='admin' AND status='active';")" == 1 ]] ||
     fail 'teacher bootstrap evidence is invalid'
+}
+
+build_source_object_fixture() {
+  local helper_output expected_output
+  helper_output="$(
+    docker run --rm \
+      --name "${PROJECT}-object-fixture" \
+      --label "com.docker.compose.project=$PROJECT" \
+      --label "io.happylearn.phase5.restore-live=$FIXTURE_SUFFIX" \
+      --label 'io.happylearn.phase5.restore-kind=source-object-fixture' \
+      --network "${PROJECT}_happylearn" \
+      --read-only \
+      --user "$HOST_UID:$HOST_GID" \
+      --cap-drop ALL \
+      --security-opt no-new-privileges:true \
+      --memory 64m \
+      --memory-swap 64m \
+      --cpus 0.1 \
+      --pids-limit 64 \
+      --mount "type=bind,src=$FIXTURE_CONFIG_FILE,dst=/run/secrets/restore-live-object-fixture.json,readonly" \
+      --mount "type=bind,src=$FIXTURE_ORIGINAL_FILE,dst=/run/fixture/original.bin,readonly" \
+      --mount "type=bind,src=$FIXTURE_PREVIEW_FILE,dst=/run/fixture/preview.bin,readonly" \
+      "$FIXTURE_IMAGE"
+  )" || fail 'source object fixture write failed'
+  printf '%s\n' "$helper_output" >"$FIXTURE_OBJECT_LOG"
+  expected_output="phase5_restore_fixture: PASS originalBytes=${FIXTURE_ORIGINAL_SIZE} previewBytes=${FIXTURE_PREVIEW_SIZE}"
+  [[ "$helper_output" == "$expected_output" &&
+    "$(wc -l <"$FIXTURE_OBJECT_LOG" | tr -d '[:space:]')" == 1 ]] ||
+    fail 'source object fixture evidence is invalid'
+
+  printf '%s\n' "
+WITH actor AS (
+  SELECT id
+  FROM users
+  WHERE username='${TEACHER_USERNAME}'
+    AND role='admin'
+    AND status='active'
+),
+created_file AS (
+  INSERT INTO files(created_by)
+  SELECT id FROM actor
+  RETURNING id,created_by
+),
+created_version AS (
+  INSERT INTO file_versions(
+    file_id,version,purpose,object_key,display_name,declared_mime,
+    detected_mime,size_bytes,sha256,processing_state,scan_result,created_by
+  )
+  SELECT
+    id,1,'teaching','${FIXTURE_ORIGINAL_KEY}','restore-live-original.bin',
+    'application/octet-stream','application/octet-stream',
+    ${FIXTURE_ORIGINAL_SIZE},'${FIXTURE_ORIGINAL_SHA256}',
+    'ready','clean',created_by
+  FROM created_file
+  RETURNING id
+)
+INSERT INTO file_previews(
+  file_version_id,preview_kind,object_key,content_type,
+  size_bytes,sha256,processing_state
+)
+SELECT
+  id,'thumbnail','${FIXTURE_PREVIEW_KEY}','application/octet-stream',
+  ${FIXTURE_PREVIEW_SIZE},'${FIXTURE_PREVIEW_SHA256}','ready'
+FROM created_version;" |
+    db_query >/dev/null ||
+    fail 'source object fixture rows failed'
+}
+
+verify_source_object_fixture() {
+  local evidence expected
+  evidence="$(
+    db_scalar "
+SELECT
+  (SELECT count(*)
+   FROM files f
+   JOIN file_versions fv ON fv.file_id=f.id
+   WHERE fv.object_key='${FIXTURE_ORIGINAL_KEY}')::text || '|' ||
+  (SELECT count(*)
+   FROM file_versions
+   WHERE object_key='${FIXTURE_ORIGINAL_KEY}')::text || '|' ||
+  (SELECT count(*)
+   FROM file_previews
+   WHERE object_key='${FIXTURE_PREVIEW_KEY}')::text || '|' ||
+  (SELECT size_bytes::text || '|' || sha256
+   FROM file_versions
+   WHERE object_key='${FIXTURE_ORIGINAL_KEY}') || '|' ||
+  (SELECT size_bytes::text || '|' || sha256
+   FROM file_previews
+   WHERE object_key='${FIXTURE_PREVIEW_KEY}');"
+  )" || fail 'source object fixture row evidence is unavailable'
+  expected="1|1|1|${FIXTURE_ORIGINAL_SIZE}|${FIXTURE_ORIGINAL_SHA256}|${FIXTURE_PREVIEW_SIZE}|${FIXTURE_PREVIEW_SHA256}"
+  [[ "$evidence" == "$expected" ]] ||
+    fail 'source object fixture row evidence is invalid'
 }
 
 run_source_backup() {
@@ -756,13 +1039,106 @@ controller_identity_matches() {
     "$CONTROLLER_ID|/$CONTROLLER_NAME|$PROJECT|$FIXTURE_SUFFIX" ]]
 }
 
+discover_restore_controller() {
+  local details discovered_id discovered_name candidates
+  local project_label restore_label extra
+  [[ "$CONTROLLER_NAME" == "${PROJECT}-restore-controller" &&
+    "$PROJECT" =~ ^happylearn-phase5-live-[a-f0-9]{12}$ &&
+    "$FIXTURE_SUFFIX" =~ ^[a-f0-9]{12}$ ]] ||
+    return 1
+  details="$(
+    docker container inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-live"}}' \
+      "$CONTROLLER_NAME" 2>/dev/null
+  )" || {
+    candidates="$(
+      docker container ls --all --quiet \
+        --filter "name=^/${CONTROLLER_NAME}$"
+    )" || return 1
+    [[ -z "$candidates" ]] && return 2
+    return 1
+  }
+  IFS='|' read -r discovered_id discovered_name \
+    project_label restore_label extra <<<"$details"
+  [[ -z "$extra" &&
+    "$discovered_id" =~ ^[a-f0-9]{64}$ &&
+    "$discovered_name" == "/$CONTROLLER_NAME" &&
+    "$project_label" == "$PROJECT" &&
+    "$restore_label" == "$FIXTURE_SUFFIX" ]] ||
+    return 1
+  if [[ -n "$CONTROLLER_ID" &&
+    "$CONTROLLER_ID" != "$discovered_id" ]]; then
+    return 1
+  fi
+  CONTROLLER_ID="$discovered_id"
+  CONTROLLER_CREATED=true
+}
+
+reap_controller_wait_client() {
+  local deadline
+  [[ -n "$CONTROLLER_WAIT_PID" ]] || return 0
+  [[ "$CONTROLLER_WAIT_PID" =~ ^[1-9][0-9]*$ ]] || return 1
+  deadline=$((SECONDS + 5))
+  while kill -0 "$CONTROLLER_WAIT_PID" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      kill -TERM "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+      sleep 0.1
+      kill -KILL "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+  CONTROLLER_WAIT_PID=''
+  if [[ -n "$CONTROLLER_WAIT_STATUS_FILE" ]]; then
+    rm -f "$CONTROLLER_WAIT_STATUS_FILE"
+  fi
+}
+
+stop_restore_controller_bounded() {
+  local state
+  controller_identity_matches || return 1
+  docker container stop \
+    --signal TERM \
+    --timeout "$CONTROLLER_STOP_TIMEOUT_SECONDS" \
+    "$CONTROLLER_ID" >/dev/null 2>&1 ||
+    return 1
+  reap_controller_wait_client || return 1
+  controller_identity_matches || return 1
+  state="$(
+    docker container inspect --format '{{.State.Running}}' \
+      "$CONTROLLER_ID" 2>/dev/null
+  )" || return 1
+  [[ "$state" == false ]]
+}
+
 remove_restore_controller() {
-  if [[ "$CONTROLLER_CREATED" == false ]]; then
-    return 0
+  local discover_status=0 stop_succeeded=false
+  discover_restore_controller || discover_status=$?
+  if [[ "$discover_status" -ne 0 ]]; then
+    if [[ "$discover_status" == 2 ]]; then
+      reap_controller_wait_client || return 1
+      CONTROLLER_CREATED=false
+      CONTROLLER_ID=''
+      return 0
+    fi
+    return 1
+  fi
+  if stop_restore_controller_bounded; then
+    stop_succeeded=true
   fi
   controller_identity_matches || return 1
-  docker container rm --force "$CONTROLLER_ID" >/dev/null 2>&1 ||
-    return 1
+  if [[ "$stop_succeeded" == true ]]; then
+    if ! docker container rm "$CONTROLLER_ID" >/dev/null 2>&1; then
+      controller_identity_matches || return 1
+      docker container rm --force "$CONTROLLER_ID" >/dev/null 2>&1 ||
+        return 1
+    fi
+  else
+    docker container rm --force "$CONTROLLER_ID" >/dev/null 2>&1 ||
+      return 1
+    reap_controller_wait_client || return 1
+  fi
   if docker container inspect "$CONTROLLER_ID" >/dev/null 2>&1 ||
     docker container inspect "$CONTROLLER_NAME" >/dev/null 2>&1; then
     return 1
@@ -771,15 +1147,63 @@ remove_restore_controller() {
   CONTROLLER_ID=''
 }
 
+wait_restore_controller_bounded() {
+  local container_id="$1"
+  local timeout_seconds="$2"
+  local deadline wait_status
+  [[ "$container_id" =~ ^[a-f0-9]{64}$ &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ &&
+    "$timeout_seconds" -lt "$RTO_LIMIT_SECONDS" &&
+    "$CONTROLLER_WAIT_STATUS_FILE" == \
+      "$FIXTURE_ROOT/control/controller.wait" &&
+    ! -e "$CONTROLLER_WAIT_STATUS_FILE" &&
+    ! -L "$CONTROLLER_WAIT_STATUS_FILE" ]] ||
+    return 1
+  (
+    umask 077
+    docker container wait "$container_id" >"$CONTROLLER_WAIT_STATUS_FILE"
+  ) &
+  CONTROLLER_WAIT_PID=$!
+  deadline=$((SECONDS + timeout_seconds))
+  while kill -0 "$CONTROLLER_WAIT_PID" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      kill -TERM "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+      wait "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+      CONTROLLER_WAIT_PID=''
+      rm -f "$CONTROLLER_WAIT_STATUS_FILE"
+      return 124
+    fi
+    sleep 0.1
+  done
+  if wait "$CONTROLLER_WAIT_PID"; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  CONTROLLER_WAIT_PID=''
+  [[ "$wait_status" -eq 0 &&
+    -f "$CONTROLLER_WAIT_STATUS_FILE" &&
+    ! -L "$CONTROLLER_WAIT_STATUS_FILE" &&
+    "$(portable_mode "$CONTROLLER_WAIT_STATUS_FILE")" == 600 &&
+    "$(portable_owner "$CONTROLLER_WAIT_STATUS_FILE")" == "$(id -u)" &&
+    "$(wc -l <"$CONTROLLER_WAIT_STATUS_FILE" | tr -d '[:space:]')" == 1 ]] ||
+    return 1
+  CONTROLLER_EXIT_STATUS="$(<"$CONTROLLER_WAIT_STATUS_FILE")"
+  rm -f "$CONTROLLER_WAIT_STATUS_FILE"
+  [[ "$CONTROLLER_EXIT_STATUS" =~ ^(0|[1-9][0-9]{0,2})$ &&
+    "$CONTROLLER_EXIT_STATUS" -le 255 ]]
+}
+
 run_restore_controller() {
-  local container_status
+  local container_status create_output create_status=0 cidfile_id
   [[ "$CONTROLLER_CREATED" == false &&
     -z "$CONTROLLER_ID" &&
     -S "$DOCKER_SOCKET" &&
     ! -L "$DOCKER_SOCKET" ]] ||
     return 1
-  CONTROLLER_ID="$(
+  if create_output="$(
     docker container create \
+      --cidfile "$CONTROLLER_CID_FILE" \
       --name "$CONTROLLER_NAME" \
       --label "com.docker.compose.project=$PROJECT" \
       --label "io.happylearn.phase5.restore-live=$FIXTURE_SUFFIX" \
@@ -904,16 +1328,33 @@ run_restore_controller() {
         source "$RESTORE_SCRIPT" --backup-id "$BACKUP_ID"
       ' controller "$HOST_UID" "$HOST_GID" \
       "$CONTROLLER_SOCKET_GID" "$CONTROLLER_SOCKET_MODE"
-  )" || return 1
-  [[ "$CONTROLLER_ID" =~ ^[a-f0-9]{64}$ ]] || return 1
-  CONTROLLER_CREATED=true
-  controller_identity_matches || return 1
+  )"; then
+    create_status=0
+  else
+    create_status=$?
+  fi
+  discover_restore_controller || return 1
+  [[ -f "$CONTROLLER_CID_FILE" &&
+    ! -L "$CONTROLLER_CID_FILE" &&
+    "$(portable_owner "$CONTROLLER_CID_FILE")" == "$(id -u)" &&
+    "$(portable_size "$CONTROLLER_CID_FILE")" -ge 64 &&
+    "$(portable_size "$CONTROLLER_CID_FILE")" -le 65 ]] ||
+    return 1
+  cidfile_id="$(<"$CONTROLLER_CID_FILE")"
+  cidfile_id="${cidfile_id%$'\n'}"
+  [[ "$create_status" == 0 &&
+    "$cidfile_id" == "$CONTROLLER_ID" &&
+    ("$create_output" == "$CONTROLLER_ID" ||
+      -z "$create_output") ]] ||
+    return 1
+  rm -f "$CONTROLLER_CID_FILE"
 
   container_status=125
   if docker container start "$CONTROLLER_ID" >/dev/null; then
-    container_status="$(
-      docker container wait "$CONTROLLER_ID"
-    )" || container_status=125
+    if wait_restore_controller_bounded \
+      "$CONTROLLER_ID" "$CONTROLLER_WAIT_LIMIT_SECONDS"; then
+      container_status="$CONTROLLER_EXIT_STATUS"
+    fi
   fi
   docker container logs "$CONTROLLER_ID" >"$RESTORE_LOG" 2>&1 ||
     container_status=125
@@ -958,6 +1399,12 @@ run_empty_restore() {
         "$FIXTURE_ROOT/secrets/database_password" \
         "$RESTORE_LOG" &&
       assert_single_line_secret_absent \
+        "$SOURCE_MINIO_ACCESS_KEY_FILE" \
+        "$RESTORE_LOG" &&
+      assert_single_line_secret_absent \
+        "$SOURCE_MINIO_SECRET_KEY_FILE" \
+        "$RESTORE_LOG" &&
+      assert_single_line_secret_absent \
         "$LICENSE_COPY" \
         "$RESTORE_LOG" &&
       assert_age_identity_absent \
@@ -990,6 +1437,10 @@ run_empty_restore() {
     fail 'backup or restore evidence exposed the repository credential'
   assert_single_line_secret_absent "$FIXTURE_ROOT/secrets/database_password" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE" ||
     fail 'backup or restore evidence exposed the database credential'
+  assert_single_line_secret_absent "$SOURCE_MINIO_ACCESS_KEY_FILE" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE" ||
+    fail 'backup or restore evidence exposed the source object access key'
+  assert_single_line_secret_absent "$SOURCE_MINIO_SECRET_KEY_FILE" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE" ||
+    fail 'backup or restore evidence exposed the source object secret'
   assert_single_line_secret_absent "$LICENSE_COPY" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE" ||
     fail 'backup or restore evidence exposed the AIStor license'
   assert_age_identity_absent "$FIXTURE_ROOT/offline/age.identity" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE" ||
@@ -998,25 +1449,403 @@ run_empty_restore() {
     fail 'successful restore left disposable resources'
 }
 
+expected_owned_restore_name() {
+  local project="$1"
+  local class="$2"
+  local kind="$3"
+  case "$class:$kind" in
+    volumes:postgres) printf '%s-postgres\n' "$project" ;;
+    volumes:aistor) printf '%s-aistor\n' "$project" ;;
+    volumes:aistor-license) printf '%s-aistor-license\n' "$project" ;;
+    networks:network) printf '%s-network\n' "$project" ;;
+    containers:volume-probe-postgres)
+      printf '%s-volume-probe-postgres\n' "$project"
+      ;;
+    containers:volume-probe-aistor)
+      printf '%s-volume-probe-aistor\n' "$project"
+      ;;
+    containers:volume-probe-aistor-license)
+      printf '%s-volume-probe-aistor-license\n' "$project"
+      ;;
+    containers:restic-check) printf '%s-restic-check\n' "$project" ;;
+    containers:restic-select) printf '%s-restic-select\n' "$project" ;;
+    containers:restic-restore) printf '%s-restic-restore\n' "$project" ;;
+    containers:object-restore) printf '%s-object-restore\n' "$project" ;;
+    containers:aistor-license-init)
+      printf '%s-aistor-license-init\n' "$project"
+      ;;
+    containers:postgres) printf '%s-postgres\n' "$project" ;;
+    containers:postgres-restore)
+      printf '%s-postgres-restore\n' "$project"
+      ;;
+    containers:aistor) printf '%s-aistor\n' "$project" ;;
+    containers:redis) printf '%s-redis\n' "$project" ;;
+    containers:revoke-sessions)
+      printf '%s-revoke-sessions\n' "$project"
+      ;;
+    containers:app) printf '%s-app\n' "$project" ;;
+    containers:restore-check) printf '%s-restore-check\n' "$project" ;;
+    containers:restore-http-'probe')
+      printf '%s-restore-http-%s\n' "$project" probe
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+list_owned_restore_resources() {
+  local class="$1"
+  case "$class" in
+    containers)
+      docker container ls --all --format '{{.Names}}' \
+        --filter \
+        "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID"
+      ;;
+    volumes)
+      docker volume ls --format '{{.Name}}' \
+        --filter \
+        "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID"
+      ;;
+    networks)
+      docker network ls --format '{{.Name}}' \
+        --filter \
+        "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+inspect_owned_restore_resource() {
+  local class="$1"
+  local identifier="$2"
+  case "$class" in
+    containers)
+      docker container inspect --format \
+        '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}|{{index .Config.Labels "io.happylearn.phase5.restore-backup-id"}}' \
+        "$identifier"
+      ;;
+    volumes)
+      docker volume inspect --format \
+        '{{.Name}}|{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}' \
+        "$identifier"
+      ;;
+    networks)
+      docker network inspect --format \
+        '{{.Id}}|{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}' \
+        "$identifier"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_owned_restore_resource() {
+  local class="$1"
+  local listed_name="$2"
+  local observation="$3"
+  local identity observed_name project owner kind backup extra expected
+  IFS='|' read -r identity observed_name project owner kind backup extra \
+    <<<"$observation"
+  [[ -z "$extra" &&
+    "$owner" =~ ^[a-f0-9]{64}$ &&
+    "$project" == "happylearn-phase5-restore-${owner:0:12}" &&
+    "$project" =~ ^happylearn-phase5-restore-[a-f0-9]{12}$ &&
+    "$backup" == "$BACKUP_ID" ]] ||
+    return 1
+  expected="$(expected_owned_restore_name "$project" "$class" "$kind")" ||
+    return 1
+  [[ "$listed_name" == "$expected" ]] || return 1
+  case "$class" in
+    containers)
+      [[ "$identity" =~ ^[a-f0-9]{64}$ &&
+        "$observed_name" == "/$listed_name" ]]
+      ;;
+    volumes)
+      [[ "$identity" == "$listed_name" &&
+        "$observed_name" == "$listed_name" ]]
+      ;;
+    networks)
+      [[ "$identity" =~ ^[a-f0-9]{64}$ &&
+        "$observed_name" == "$listed_name" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_owned_restore_resource() {
+  local class="$1"
+  local name="$2"
+  local observation confirmation identity owner dual_names
+  observation="$(inspect_owned_restore_resource "$class" "$name")" ||
+    return 1
+  validate_owned_restore_resource "$class" "$name" "$observation" ||
+    return 1
+  identity="${observation%%|*}"
+  owner="${observation#*|}"
+  owner="${owner#*|}"
+  owner="${owner#*|}"
+  owner="${owner%%|*}"
+  case "$class" in
+    containers)
+      dual_names="$(
+        docker container ls --all --format '{{.Names}}' \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID" \
+          --filter "label=io.happylearn.phase5.restore-owner=$owner"
+      )" || return 1
+      ;;
+    volumes)
+      dual_names="$(
+        docker volume ls --format '{{.Name}}' \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID" \
+          --filter "label=io.happylearn.phase5.restore-owner=$owner"
+      )" || return 1
+      ;;
+    networks)
+      dual_names="$(
+        docker network ls --format '{{.Name}}' \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=$BACKUP_ID" \
+          --filter "label=io.happylearn.phase5.restore-owner=$owner"
+      )" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$(printf '%s\n' "$dual_names" | grep -Fxc "$name")" == 1 ]] ||
+    return 1
+  confirmation="$(inspect_owned_restore_resource "$class" "$identity")" ||
+    return 1
+  [[ "$confirmation" == "$observation" ]] || return 1
+  case "$class" in
+    containers)
+      docker container rm --force "$identity" >/dev/null || return 1
+      ;;
+    volumes)
+      docker volume rm "$name" >/dev/null || return 1
+      ;;
+    networks)
+      docker network rm "$identity" >/dev/null || return 1
+      ;;
+  esac
+  if inspect_owned_restore_resource "$class" "$identity" \
+    >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
+cleanup_owned_restore_resources() {
+  local class names name
+  valid_uuid "$BACKUP_ID" || return 0
+  for class in containers volumes networks; do
+    names="$(list_owned_restore_resources "$class")" || return 1
+    [[ "${#names}" -le 65536 ]] || return 1
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      [[ "$name" =~ \
+        ^happylearn-phase5-restore-[a-f0-9]{12}[-a-z0-9]*$ ]] ||
+        return 1
+      remove_owned_restore_resource "$class" "$name" || return 1
+    done <<<"$names"
+  done
+  assert_restore_resources_absent "$BACKUP_ID"
+}
+
+handoff_repository_to_host_for_cleanup() {
+  local repository="$FIXTURE_ROOT/repository"
+  local actual_image_id registered_baseline registered_expected extra
+  [[ "$HOST_UID" =~ ^[1-9][0-9]*$ &&
+    "$HOST_GID" =~ ^[0-9]+$ &&
+    "$repository" == "${TMPDIR:-/tmp}/phase5-restore-live."*/repository &&
+    -d "$repository" && ! -L "$repository" ]] ||
+    return 1
+  if [[ -z "$(find "$repository" -mindepth 1 -print -quit)" &&
+    "$(portable_owner "$repository")" == "$HOST_UID" ]]; then
+    REPOSITORY_HOST_HANDOFF=true
+    return 0
+  fi
+  IFS='|' read -r registered_baseline registered_expected extra < <(
+    awk -F '|' -v reference="$BACKUP_IMAGE" \
+      '$1 == reference { print $2 "|" $3 }' \
+      "$CREATED_IMAGE_RECORD"
+  )
+  [[ -z "$extra" &&
+    "$registered_baseline" == absent &&
+    ("$registered_expected" == pending ||
+      "$registered_expected" =~ ^sha256:[a-f0-9]{64}$) ]] ||
+    return 1
+  actual_image_id="$(
+    docker image inspect --format '{{.Id}}' "$BACKUP_IMAGE" 2>/dev/null
+  )" || return 1
+  [[ "$actual_image_id" =~ ^sha256:[a-f0-9]{64}$ &&
+    ("$registered_expected" == pending ||
+      "$actual_image_id" == "$registered_expected") ]] ||
+    return 1
+  docker run --rm \
+    --name "${PROJECT}-repository-cleanup" \
+    --label "com.docker.compose.project=$PROJECT" \
+    --label "io.happylearn.phase5.restore-live=$FIXTURE_SUFFIX" \
+    --label 'io.happylearn.phase5.restore-kind=repository-cleanup' \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges:true \
+    --memory 64m \
+    --memory-swap 64m \
+    --cpus 0.1 \
+    --pids-limit 64 \
+    --mount "type=bind,src=$repository,dst=/repository" \
+    --entrypoint /usr/bin/timeout \
+    "$BACKUP_IMAGE" \
+    --foreground --kill-after=5s 60s \
+    /bin/sh -ceu '
+      host_uid="$1"
+      host_gid="$2"
+      case "$host_uid:$host_gid" in
+        *[!0-9:]* | 0:* | :* | *: | *:*:*) exit 1 ;;
+      esac
+      test -z "$(find -P /repository -xdev -type l -print -quit)"
+      test -z "$(find -P /repository -xdev ! -type d ! -type f -print -quit)"
+      test -z "$(find -P /repository -xdev -type f -links +1 -print -quit)"
+      owners="$(
+        find -P /repository -xdev -printf "%U:%G\n" |
+          sort -u
+      )"
+      while IFS= read -r owner; do
+        case "$owner" in
+          "$host_uid:$host_gid" | 10003:0) ;;
+          *) exit 1 ;;
+        esac
+      done <<EOF
+$owners
+EOF
+      chown -R -- "$host_uid:$host_gid" /repository
+      test -z "$(find -P /repository -xdev ! -user "$host_uid" -print -quit)"
+      test -z "$(find -P /repository -xdev ! -group "$host_gid" -print -quit)"
+    ' cleanup "$HOST_UID" "$HOST_GID" \
+    >/dev/null 2>&1 ||
+    return 1
+  [[ "$(portable_owner "$repository")" == "$HOST_UID" &&
+    -z "$(find "$repository" -xdev ! -user "$HOST_UID" -print -quit)" &&
+    -z "$(find "$repository" -xdev ! -group "$HOST_GID" -print -quit)" &&
+    -z "$(find "$repository" -xdev -type l -print -quit)" &&
+    -z "$(find "$repository" -xdev ! -type d ! -type f -print -quit)" &&
+    -z "$(find "$repository" -xdev -type f -links +1 -print -quit)" ]] ||
+    return 1
+  REPOSITORY_HOST_HANDOFF=true
+}
+
 remove_created_images() {
   [[ -f "$CREATED_IMAGE_RECORD" && ! -L "$CREATED_IMAGE_RECORD" ]] ||
     return 0
-  local reference expected_id actual_id index
+  local reference baseline_id expected_id extra actual_id index
+  local inspect_status
+  local seen='|'
   local -a records=()
-  while IFS='|' read -r reference expected_id; do
-    [[ -n "$reference" && -n "$expected_id" ]] || continue
-    records+=("${reference}|${expected_id}")
+  while IFS='|' read -r reference baseline_id expected_id extra; do
+    [[ -z "$extra" &&
+      "$seen" != *"|${reference}|"* &&
+      ("$baseline_id" == absent ||
+        "$baseline_id" =~ ^sha256:[a-f0-9]{64}$) &&
+      ("$expected_id" == pending ||
+        "$expected_id" =~ ^sha256:[a-f0-9]{64}$) ]] &&
+      image_reference_is_expected "$reference" ||
+      return 1
+    seen="${seen}${reference}|"
+    records+=("${reference}|${baseline_id}|${expected_id}")
   done <"$CREATED_IMAGE_RECORD"
   for ((index = ${#records[@]} - 1; index >= 0; index--)); do
-    IFS='|' read -r reference expected_id <<<"${records[$index]}"
-    actual_id="$(docker image inspect --format '{{.Id}}' \
-      "$reference" 2>/dev/null || true)"
-    if [[ "$actual_id" == "$expected_id" ]]; then
-      docker image rm "$reference" >/dev/null 2>&1 || return 1
-    elif [[ -n "$actual_id" ]]; then
+    IFS='|' read -r reference baseline_id expected_id \
+      <<<"${records[$index]}"
+    inspect_status=0
+    actual_id="$(inspect_image_reference_id "$reference")" ||
+      inspect_status=$?
+    if [[ "$inspect_status" == 2 ]]; then
+      actual_id=''
+    elif [[ "$inspect_status" != 0 ]]; then
+      return 1
+    fi
+    if [[ "$baseline_id" != absent ]]; then
+      [[ "$actual_id" == "$baseline_id" ]] || return 1
+      continue
+    fi
+    [[ -z "$actual_id" ||
+      "$actual_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+      return 1
+    if [[ -z "$actual_id" ]]; then
+      continue
+    fi
+    if [[ "$expected_id" != pending &&
+      "$actual_id" != "$expected_id" ]]; then
+      return 1
+    fi
+    docker image rm "$reference" >/dev/null 2>&1 || return 1
+    inspect_status=0
+    inspect_image_reference_id "$reference" >/dev/null ||
+      inspect_status=$?
+    if [[ "$inspect_status" != 2 ]]; then
       return 1
     fi
   done
+}
+
+project_container_identity_matches() {
+  local identifier="$1"
+  local details identity name project_label service oneoff
+  local restore_label kind extra confirmation
+  details="$(
+    docker container inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "io.happylearn.phase5.restore-live"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}' \
+      "$identifier" 2>/dev/null
+  )" || return 1
+  IFS='|' read -r identity name project_label service oneoff \
+    restore_label kind extra <<<"$details"
+  [[ -z "$extra" &&
+    "$identity" =~ ^[a-f0-9]{64}$ &&
+    "$project_label" == "$PROJECT" ]] ||
+    return 1
+  name="${name#/}"
+  case "$service:$oneoff" in
+    postgres:False | redis:False | minio:False | app:False | worker:False)
+      [[ "$name" == "${PROJECT}-${service}-1" ]] || return 1
+      ;;
+    app:True | backup:True | backup-storage-init:True)
+      [[ "$name" =~ ^${PROJECT}-${service}-run-[a-z0-9]+$ ]] ||
+        return 1
+      ;;
+    :)
+      case "$kind:$name" in
+        "source-object-fixture:${PROJECT}-object-fixture" | \
+          "repository-cleanup:${PROJECT}-repository-cleanup")
+          [[ "$restore_label" == "$FIXTURE_SUFFIX" ]] || return 1
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+  confirmation="$(
+    docker container inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "io.happylearn.phase5.restore-live"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}' \
+      "$identity" 2>/dev/null
+  )" || return 1
+  [[ "$confirmation" == "$details" ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+remove_labeled_project_containers() {
+  local container identity listed
+  listed="$(
+    docker container ls --all --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || return 1
+  while IFS= read -r container; do
+    [[ -n "$container" ]] || continue
+    identity="$(project_container_identity_matches "$container")" ||
+      return 1
+    docker container rm --force "$identity" >/dev/null || return 1
+  done <<<"$listed"
 }
 
 volume_identity_matches() {
@@ -1041,23 +1870,82 @@ volume_identity_matches() {
 }
 
 remove_labeled_project_volumes() {
-  local volume
-  local -a volumes=()
-  while IFS= read -r volume; do
-    [[ -n "$volume" ]] && volumes+=("$volume")
-  done < <(
+  local volume listed
+  listed="$(
     docker volume ls --quiet \
       --filter "label=com.docker.compose.project=${PROJECT}"
-  )
-  for volume in "${volumes[@]}"; do
+  )" || return 1
+  while IFS= read -r volume; do
+    [[ -n "$volume" ]] || continue
     volume_identity_matches "$volume" || return 1
     [[ -z "$(docker ps -aq --filter "volume=${volume}")" ]] ||
       return 1
     docker volume rm "$volume" >/dev/null || return 1
-  done
+  done <<<"$listed"
+}
+
+project_network_identity_matches() {
+  local network="$1"
+  local details identity name project_label compose_network extra
+  local confirmation
+  details="$(
+    docker network inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}' \
+      "$network" 2>/dev/null
+  )" || return 1
+  IFS='|' read -r identity name project_label compose_network extra \
+    <<<"$details"
+  [[ -z "$extra" &&
+    "$identity" =~ ^[a-f0-9]{64}$ &&
+    "$project_label" == "$PROJECT" &&
+    "$compose_network" == happylearn &&
+    "$name" == "${PROJECT}_happylearn" &&
+    "$network" == "$name" ]] ||
+    return 1
+  confirmation="$(
+    docker network inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}' \
+      "$identity" 2>/dev/null
+  )" || return 1
+  [[ "$confirmation" == "$details" ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+remove_labeled_project_networks() {
+  local network identity listed
+  listed="$(
+    docker network ls --format '{{.Name}}' \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || return 1
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    identity="$(project_network_identity_matches "$network")" ||
+      return 1
+    docker network rm "$identity" >/dev/null || return 1
+  done <<<"$listed"
+}
+
+project_resources_absent() {
+  local containers volumes networks
+  [[ "$PROJECT" =~ ^happylearn-phase5-live-[a-f0-9]{12}$ ]] ||
+    return 1
+  containers="$(
+    docker ps -aq \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || return 1
+  volumes="$(
+    docker volume ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || return 1
+  networks="$(
+    docker network ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || return 1
+  [[ -z "$containers" && -z "$volumes" && -z "$networks" ]]
 }
 
 cleanup_live() {
+  trap '' HUP INT TERM
   local status="${1:-0}"
   if [[ "$CLEANED" == true ]]; then
     return "$status"
@@ -1066,45 +1954,54 @@ cleanup_live() {
 
   remove_restore_controller || status=1
   if [[ "$PROJECT" =~ ^happylearn-phase5-live-[a-f0-9]{12}$ ]]; then
+    cleanup_owned_restore_resources || status=1
+    if [[ -n "$FIXTURE_ROOT" &&
+      -d "$FIXTURE_ROOT/repository" &&
+      ! -L "$FIXTURE_ROOT/repository" ]]; then
+      handoff_repository_to_host_for_cleanup || status=1
+    elif [[ -n "$FIXTURE_ROOT" &&
+      "$FIXTURE_ROOT" == "${TMPDIR:-/tmp}/phase5-restore-live."* &&
+      -d "$FIXTURE_ROOT" && ! -L "$FIXTURE_ROOT" &&
+      ! -e "$FIXTURE_ROOT/repository" &&
+      ! -L "$FIXTURE_ROOT/repository" &&
+      "$(portable_owner "$FIXTURE_ROOT")" == "$(id -u)" ]]; then
+      REPOSITORY_HOST_HANDOFF=true
+    else
+      status=1
+    fi
     compose down --volumes --remove-orphans --timeout 30 \
       >/dev/null 2>&1 || status=1
+    remove_labeled_project_containers || status=1
     remove_labeled_project_volumes || status=1
-    [[ -z "$(docker ps -aq \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-      status=1
-    [[ -z "$(docker volume ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-      status=1
-    [[ -z "$(docker network ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-      status=1
+    remove_labeled_project_networks || status=1
+    project_resources_absent || status=1
   fi
   remove_created_images || status=1
 
   if [[ -n "$FIXTURE_ROOT" &&
     "$FIXTURE_ROOT" == "${TMPDIR:-/tmp}/phase5-restore-live."* &&
     -d "$FIXTURE_ROOT" && ! -L "$FIXTURE_ROOT" ]]; then
-    chmod -R u+rwX "$FIXTURE_ROOT" 2>/dev/null || status=1
-    rm -rf "$FIXTURE_ROOT" || status=1
+    if [[ "$REPOSITORY_HOST_HANDOFF" == true &&
+      "$(portable_owner "$FIXTURE_ROOT")" == "$(id -u)" ]]; then
+      rm -rf "$FIXTURE_ROOT" || status=1
+    else
+      status=1
+    fi
   fi
   return "$status"
 }
 
 verify_no_orphans() {
   [[ ! -e "$FIXTURE_ROOT" ]] || return 1
-  [[ -z "$(docker ps -aq \
-    --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    return 1
-  [[ -z "$(docker volume ls --quiet \
-    --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    return 1
-  [[ -z "$(docker network ls --quiet \
-    --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    return 1
-  local image
+  project_resources_absent || return 1
+  local image inspect_status
   for image in \
-    "$BACKUP_IMAGE" "$APP_IMAGE" "$WORKER_IMAGE" "$CONTROLLER_IMAGE"; do
-    if docker image inspect "$image" >/dev/null 2>&1; then
+    "$BACKUP_IMAGE" "$APP_IMAGE" "$WORKER_IMAGE" \
+    "$CONTROLLER_IMAGE" "$FIXTURE_IMAGE"; do
+    inspect_status=0
+    inspect_image_reference_id "$image" >/dev/null ||
+      inspect_status=$?
+    if [[ "$inspect_status" != 2 ]]; then
       return 1
     fi
   done
@@ -1138,6 +2035,8 @@ main() {
   configure_backup_context
   start_source_stack
   bootstrap_teacher
+  build_source_object_fixture
+  verify_source_object_fixture
   run_source_backup
   prepare_restore_repository_access
   run_empty_restore

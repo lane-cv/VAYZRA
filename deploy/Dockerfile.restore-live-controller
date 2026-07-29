@@ -1,9 +1,25 @@
 # syntax=docker/dockerfile:1.7
 # Test-only Phase 5 live-gate controller. It is not referenced by production
 # Compose or copied into any application image.
-FROM docker@sha256:be132a9f282288de4afaf63379dff75711fda0147c6b72a9df44e51841402144 AS docker_cli
-RUN apk add --no-cache bash coreutils util-linux
+FROM docker@sha256:be132a9f282288de4afaf63379dff75711fda0147c6b72a9df44e51841402144 AS restore_live_controller
+RUN apk add --no-cache bash=5.3.9-r1 coreutils=9.11-r0 util-linux=2.42.1-r0
 RUN docker --version && bash --version && flock --version
 LABEL io.happylearn.test-only="phase5-restore-live-controller"
 ENTRYPOINT []
 CMD ["/bin/bash"]
+
+FROM golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS restore_live_fixture_build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY cmd/restore-live-fixture cmd/restore-live-fixture
+COPY internal internal
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' \
+      -o /out/happylearn-restore-live-fixture ./cmd/restore-live-fixture
+
+FROM scratch AS restore_live_fixture
+COPY --from=restore_live_fixture_build --chown=10004:10004 \
+  /out/happylearn-restore-live-fixture /app/happylearn-restore-live-fixture
+USER 10004:10004
+ENTRYPOINT ["/app/happylearn-restore-live-fixture"]
