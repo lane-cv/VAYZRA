@@ -340,6 +340,18 @@ if [[ "${PHASE5_FAKE_MODE:-}" == gnu_stat ]]; then
         "$(/usr/bin/stat -f '%z' "${3:-}")"
       exit 0
       ;;
+    -c:%a\|%u\|%s\|%h\|%i)
+      if /usr/bin/stat --version >/dev/null 2>&1; then
+        exec /usr/bin/stat -c '%a|%u|%s|%h|%i' "${3:-}"
+      fi
+      printf '%s|%s|%s|%s|%s\n' \
+        "$(/usr/bin/stat -f '%Lp' "${3:-}")" \
+        "$(/usr/bin/stat -f '%u' "${3:-}")" \
+        "$(/usr/bin/stat -f '%z' "${3:-}")" \
+        "$(/usr/bin/stat -f '%l' "${3:-}")" \
+        "$(/usr/bin/stat -f '%i' "${3:-}")"
+      exit 0
+      ;;
     -c:%a)
       if /usr/bin/stat --version >/dev/null 2>&1; then
         exec /usr/bin/stat -c '%a' "${3:-}"
@@ -373,6 +385,21 @@ fi
 exec /usr/bin/stat "$@"
 FAKE_STAT
   chmod 0700 "$fixture/bin/stat"
+  cat >"$fixture/bin/ln" <<'FAKE_LN'
+#!/usr/bin/env bash
+set -euo pipefail
+/bin/ln "$@"
+target="${*: -1}"
+case "${PHASE5_FAKE_MODE:-}:$(basename "$target")" in
+  supervisor_ready_hardlink:ready | \
+    supervisor_identity_hardlink:identity | \
+    supervisor_status_hardlink:status | \
+    supervisor_ack_hardlink:ack)
+    /bin/ln "$target" "${target}.injected-hardlink"
+    ;;
+esac
+FAKE_LN
+  chmod 0700 "$fixture/bin/ln"
   cat >"$fixture/bin/flock" <<'FAKE_FLOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -779,6 +806,15 @@ case "$kind" in
       "$*" != *'--no-lock'* ]] ||
       exit 64
     case "$mode" in
+      supervisor_identity_midrun)
+        printf '%s\n' "$$" >"$PHASE5_FAKE_SUPERVISOR_DIRECT_PID"
+        : >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER"
+        while [[ ! -e "$PHASE5_FAKE_SUPERVISOR_DIRECT_RELEASE" ]]; do
+          sleep 0.01
+        done
+        : >"$PHASE5_FAKE_SUPERVISOR_DIRECT_EXITING"
+        exit 0
+        ;;
       supervisor_descendant)
         printf '%s\n' "$$" >"$PHASE5_FAKE_SUPERVISOR_DIRECT_PID"
         trap ': >"$PHASE5_FAKE_SUPERVISOR_DIRECT_CONT_MARKER"' CONT
@@ -1476,6 +1512,72 @@ for occupied_supervisor_fd in 7 8 9; do
     <(printf 'fd-%s\n' "$occupied_supervisor_fd") ||
     fail "pre-opened fd$occupied_supervisor_fd changed its sentinel"
 done
+
+for supervisor_handshake in ready identity status ack; do
+  hardlink_fixture="$(make_fixture)"
+  hardlink_mode="supervisor_${supervisor_handshake}_hardlink"
+  if run_fixture "$hardlink_fixture" "$hardlink_mode" \
+    >"$hardlink_fixture/stdout" 2>"$hardlink_fixture/stderr"; then
+    fail "hardlinked supervisor $supervisor_handshake handshake was accepted"
+  fi
+  assert_no_resources "$hardlink_fixture"
+  test ! -e "$hardlink_fixture/reports/restore-$BACKUP_ID.json" ||
+    fail "hardlinked supervisor $supervisor_handshake published a final report"
+  test ! -e "$hardlink_fixture/reports/.restore-${BACKUP_ID}.new" ||
+    fail "hardlinked supervisor $supervisor_handshake left a temporary report"
+  if [[ -f "$hardlink_fixture/workspace.path" ]]; then
+    hardlink_workspace="$(<"$hardlink_fixture/workspace.path")"
+    [[ -n "$hardlink_workspace" && ! -e "$hardlink_workspace" ]] ||
+      fail "hardlinked supervisor $supervisor_handshake left its workspace"
+  fi
+done
+
+midrun_identity_fixture="$(make_fixture)"
+start_fixture_background \
+  "$midrun_identity_fixture" supervisor_identity_midrun
+midrun_identity_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$midrun_identity_pid"
+wait_for_file_long \
+  "$midrun_identity_fixture/supervisor-descendant.started" ||
+  fail 'mid-run identity fixture did not reach the bounded command'
+wait_for_file "$midrun_identity_fixture/workspace.path" ||
+  fail 'mid-run identity fixture did not expose its private workspace'
+midrun_identity_workspace="$(<"$midrun_identity_fixture/workspace.path")"
+midrun_identity_path="$(
+  find "$midrun_identity_workspace/control" \
+    -type f -name identity -print
+)"
+[[ -n "$midrun_identity_path" &&
+  "$midrun_identity_path" != *$'\n'* &&
+  ! -L "$midrun_identity_path" ]] ||
+  fail 'mid-run identity fixture exposed an invalid identity handshake'
+/bin/ln "$midrun_identity_path" \
+  "${midrun_identity_path}.injected-hardlink"
+touch "$midrun_identity_fixture/supervisor-direct.release"
+midrun_identity_status=0
+if wait_for_direct_child "$midrun_identity_pid"; then
+  fail 'mid-run hardlinked supervisor identity was accepted'
+else
+  midrun_identity_status=$?
+fi
+ACTIVE_FIXTURE_PID=''
+[[ "$midrun_identity_status" -ne 0 ]] ||
+  fail 'mid-run hardlinked supervisor identity returned success'
+assert_no_resources "$midrun_identity_fixture"
+test ! -e "$midrun_identity_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'mid-run hardlinked supervisor identity published a final report'
+test ! -e \
+  "$midrun_identity_fixture/reports/.restore-${BACKUP_ID}.new" ||
+  fail 'mid-run hardlinked supervisor identity left a temporary report'
+[[ ! -e "$midrun_identity_workspace" ]] ||
+  fail 'mid-run hardlinked supervisor identity left its workspace'
+
+grep -Fq "gnu) stat -c '%a|%u|%s|%h|%i'" "$TARGET" ||
+  fail 'GNU supervisor metadata omits link count or inode'
+grep -Fq "bsd) stat -f '%Lp|%u|%z|%l|%i'" "$TARGET" ||
+  fail 'BSD supervisor metadata omits link count or inode'
+grep -Fq 'supervisor_identity_matches "$pid" "$pgid"' "$TARGET" ||
+  fail 'supervisor identity is not revalidated before group termination'
 
 supervisor_fixture="$(make_fixture)"
 start_fixture_background "$supervisor_fixture" supervisor_descendant

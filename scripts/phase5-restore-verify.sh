@@ -54,6 +54,7 @@ HOST_UID=''
 HOST_GID=''
 ACTIVE_EXTERNAL_PID=''
 ACTIVE_EXTERNAL_PGID=''
+ACTIVE_EXTERNAL_IDENTITY=''
 PENDING_SIGNAL_STATUS=''
 WORKSPACE_INITIALIZED=false
 HTTP_PROBE_SUCCEEDED=false
@@ -416,8 +417,8 @@ direct_running_job() {
 portable_supervisor_metadata() {
   local path="$1"
   case "$SUPERVISOR_STAT_STYLE" in
-    gnu) stat -c '%a|%u|%s' "$path" ;;
-    bsd) stat -f '%Lp|%u|%z' "$path" ;;
+    gnu) stat -c '%a|%u|%s|%h|%i' "$path" ;;
+    bsd) stat -f '%Lp|%u|%z|%l|%i' "$path" ;;
     *) return 1 ;;
   esac
 }
@@ -425,7 +426,8 @@ portable_supervisor_metadata() {
 initialize_supervisor_stat_style() {
   if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
     SUPERVISOR_STAT_STYLE=gnu
-  elif stat -f '%Lp|%u|%z' "$CONTROL_DIRECTORY" >/dev/null 2>&1; then
+  elif stat -f '%Lp|%u|%z|%l|%i' \
+      "$CONTROL_DIRECTORY" >/dev/null 2>&1; then
     SUPERVISOR_STAT_STYLE=bsd
   else
     return 1
@@ -434,45 +436,56 @@ initialize_supervisor_stat_style() {
 
 owner_only_supervisor_directory() {
   local path="$1"
-  local metadata mode owner size
+  local metadata mode owner size links inode extra
   metadata="$(portable_supervisor_metadata "$path")" || return 1
-  IFS='|' read -r mode owner size <<<"$metadata"
+  IFS='|' read -r mode owner size links inode extra <<<"$metadata"
   [[ "$path" == "$CONTROL_DIRECTORY/bounded-supervisor."* &&
     -d "$path" &&
     ! -L "$path" &&
     "$mode" == 700 &&
     "$owner" == "$HOST_UID" &&
-    "$size" =~ ^[0-9]+$ ]]
+    "$size" =~ ^[0-9]+$ &&
+    "$links" =~ ^[1-9][0-9]*$ &&
+    "$inode" =~ ^[1-9][0-9]*$ &&
+    -z "$extra" ]]
 }
 
 owner_only_supervisor_fifo() {
   local path="$1"
-  local metadata mode owner size
+  local metadata mode owner size links inode extra
   metadata="$(portable_supervisor_metadata "$path")" || return 1
-  IFS='|' read -r mode owner size <<<"$metadata"
+  IFS='|' read -r mode owner size links inode extra <<<"$metadata"
   [[ -p "$path" &&
     ! -L "$path" &&
     "$mode" == 600 &&
     "$owner" == "$HOST_UID" &&
-    "$size" =~ ^[0-9]+$ ]]
+    "$size" =~ ^[0-9]+$ &&
+    "$links" == 1 &&
+    "$inode" =~ ^[1-9][0-9]*$ &&
+    -z "$extra" ]]
 }
 
 read_supervisor_handshake() {
   local path="$1"
   local pattern="$2"
-  local metadata mode owner size value
+  local metadata metadata_after mode owner size links inode extra value
   metadata="$(portable_supervisor_metadata "$path")" || return 1
-  IFS='|' read -r mode owner size <<<"$metadata"
+  IFS='|' read -r mode owner size links inode extra <<<"$metadata"
   [[ -f "$path" &&
     ! -L "$path" &&
     "$mode" == 600 &&
     "$owner" == "$HOST_UID" &&
-    "$size" =~ ^[0-9]+$ ]] ||
+    "$size" =~ ^[0-9]+$ &&
+    "$links" == 1 &&
+    "$inode" =~ ^[1-9][0-9]*$ &&
+    -z "$extra" ]] ||
     return 1
   [[ "$size" -ge 2 && "$size" -le 8 ]] || return 1
   value="$(<"$path")"
+  metadata_after="$(portable_supervisor_metadata "$path")" || return 1
   [[ "$size" -eq $((${#value} + 1)) &&
-    "$value" =~ $pattern ]] ||
+    "$value" =~ $pattern &&
+    "$metadata_after" == "$metadata" ]] ||
     return 1
   printf '%s' "$value"
 }
@@ -481,7 +494,8 @@ publish_supervisor_handshake() {
   local path="$1"
   local value="$2"
   local pending="${path}.pending"
-  local metadata mode owner size
+  local metadata final_metadata mode owner size links inode extra
+  local final_mode final_owner final_size final_links final_inode final_extra
   [[ "$path" == "$CONTROL_DIRECTORY/bounded-supervisor."*/* &&
     "$value" =~ ^(ready|ack|[0-9]{1,7})$ &&
     ! -e "$path" &&
@@ -494,15 +508,76 @@ publish_supervisor_handshake() {
     printf '%s\n' "$value" >"$pending"
   ) || return 1
   metadata="$(portable_supervisor_metadata "$pending")" || return 1
-  IFS='|' read -r mode owner size <<<"$metadata"
+  IFS='|' read -r mode owner size links inode extra <<<"$metadata"
   [[ -f "$pending" &&
     ! -L "$pending" &&
     "$mode" == 600 &&
     "$owner" == "$HOST_UID" &&
-    "$size" -eq $((${#value} + 1)) ]] ||
+    "$size" -eq $((${#value} + 1)) &&
+    "$links" == 1 &&
+    "$inode" =~ ^[1-9][0-9]*$ &&
+    -z "$extra" &&
+    "$(<"$pending")" == "$value" ]] ||
     return 1
-  ln "$pending" "$path" || return 1
+  ln "$pending" "$path" || {
+    rm -f "$pending" || true
+    return 1
+  }
+  metadata="$(portable_supervisor_metadata "$pending")" || {
+    rm -f "$pending" "$path" || true
+    return 1
+  }
+  final_metadata="$(portable_supervisor_metadata "$path")" || {
+    rm -f "$pending" "$path" || true
+    return 1
+  }
+  IFS='|' read -r mode owner size links inode extra <<<"$metadata"
+  IFS='|' read -r final_mode final_owner final_size \
+    final_links final_inode final_extra <<<"$final_metadata"
+  [[ -f "$pending" &&
+    ! -L "$pending" &&
+    -f "$path" &&
+    ! -L "$path" &&
+    "$pending" -ef "$path" &&
+    "$mode" == 600 &&
+    "$owner" == "$HOST_UID" &&
+    "$size" -eq $((${#value} + 1)) &&
+    "$links" == 2 &&
+    "$inode" =~ ^[1-9][0-9]*$ &&
+    -z "$extra" &&
+    "$final_mode" == "$mode" &&
+    "$final_owner" == "$owner" &&
+    "$final_size" == "$size" &&
+    "$final_links" == "$links" &&
+    "$final_inode" == "$inode" &&
+    -z "$final_extra" &&
+    "$(<"$pending")" == "$value" &&
+    "$(<"$path")" == "$value" ]] || {
+    rm -f "$pending" "$path" || true
+    return 1
+  }
   rm -f "$pending" || {
+    rm -f "$path" || true
+    return 1
+  }
+  [[ ! -e "$pending" &&
+    ! -L "$pending" ]] || {
+    rm -f "$path" || true
+    return 1
+  }
+  final_metadata="$(portable_supervisor_metadata "$path")" || {
+    rm -f "$path" || true
+    return 1
+  }
+  IFS='|' read -r final_mode final_owner final_size \
+    final_links final_inode final_extra <<<"$final_metadata"
+  [[ "$final_mode" == 600 &&
+    "$final_owner" == "$HOST_UID" &&
+    "$final_size" -eq $((${#value} + 1)) &&
+    "$final_links" == 1 &&
+    "$final_inode" == "$inode" &&
+    -z "$final_extra" &&
+    "$(read_supervisor_handshake "$path" "^${value}$")" == "$value" ]] || {
     rm -f "$path" || true
     return 1
   }
@@ -514,15 +589,62 @@ supervisor_descriptors_closed() {
     ! { : <&9; } 2>/dev/null
 }
 
+supervisor_handshake_available() {
+  local path="$1"
+  local pending="${path}.pending"
+  [[ (-e "$path" || -L "$path") &&
+    ! -e "$pending" &&
+    ! -L "$pending" ]]
+}
+
 discard_supervisor_handshake() {
   local directory="$1"
   owner_only_supervisor_directory "$directory" || return 1
   rm -rf "$directory"
 }
 
+supervisor_identity_value_matches() {
+  local pid="$1"
+  local pgid="$2"
+  local identity_path="${3:-$ACTIVE_EXTERNAL_IDENTITY}"
+  local observed
+  [[ "$pid" =~ ^[1-9][0-9]*$ &&
+    "$pgid" == "$pid" &&
+    -n "$identity_path" ]] ||
+    return 1
+  observed="$(
+    read_supervisor_handshake "$identity_path" '^[1-9][0-9]{0,6}$'
+  )" || return 1
+  [[ "$observed" == "$pid" ]]
+}
+
+supervisor_identity_matches() {
+  local pid="$1"
+  local pgid="$2"
+  local identity_path="${3:-$ACTIVE_EXTERNAL_IDENTITY}"
+  direct_running_job "$pid" &&
+    supervisor_identity_value_matches "$pid" "$pgid" "$identity_path"
+}
+
+terminate_external_pid() {
+  local pid="$1"
+  direct_running_job "$pid" || {
+    wait "$pid" 2>/dev/null || true
+    return 0
+  }
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep "$POLL_INTERVAL_SECONDS"
+  if direct_running_job "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 terminate_external_group() {
   local pid="$1"
   local pgid="$2"
+  local identity_path="${3:-$ACTIVE_EXTERNAL_IDENTITY}"
+  local identity_valid=true
   [[ "$pid" =~ ^[1-9][0-9]*$ &&
     "$pgid" =~ ^[1-9][0-9]*$ ]] ||
     return 1
@@ -530,16 +652,28 @@ terminate_external_group() {
     wait "$pid" 2>/dev/null || true
     return 0
   }
+  supervisor_identity_matches "$pid" "$pgid" "$identity_path" ||
+    identity_valid=false
+  if [[ "$identity_valid" != true ]]; then
+    terminate_external_pid "$pid"
+    return 1
+  fi
   kill -TERM -- "-$pgid" 2>/dev/null ||
     kill -TERM "$pid" 2>/dev/null ||
     true
   sleep "$POLL_INTERVAL_SECONDS"
   if direct_running_job "$pid"; then
-    kill -KILL -- "-$pgid" 2>/dev/null ||
-      kill -KILL "$pid" 2>/dev/null ||
-      true
+    if supervisor_identity_matches "$pid" "$pgid" "$identity_path"; then
+      kill -KILL -- "-$pgid" 2>/dev/null ||
+        kill -KILL "$pid" 2>/dev/null ||
+        true
+    else
+      identity_valid=false
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
   fi
   wait "$pid" 2>/dev/null || true
+  [[ "$identity_valid" == true ]]
 }
 
 terminate_active_external() {
@@ -547,10 +681,12 @@ terminate_active_external() {
   local pgid="$ACTIVE_EXTERNAL_PGID"
   if [[ "$pid" =~ ^[1-9][0-9]*$ &&
     "$pgid" =~ ^[1-9][0-9]*$ ]]; then
-    terminate_external_group "$pid" "$pgid" || true
+    terminate_external_group \
+      "$pid" "$pgid" "$ACTIVE_EXTERNAL_IDENTITY" || true
   fi
   ACTIVE_EXTERNAL_PID=''
   ACTIVE_EXTERNAL_PGID=''
+  ACTIVE_EXTERNAL_IDENTITY=''
 }
 
 handle_restore_signal() {
@@ -660,7 +796,7 @@ run_bounded() {
       "$supervisor_status" "$command_status" ||
       exit 125
     while [[ "$wait_attempts" -lt 1000 ]]; do
-      if [[ -e "$supervisor_ack" || -L "$supervisor_ack" ]]; then
+      if supervisor_handshake_available "$supervisor_ack"; then
         [[ "$(read_supervisor_handshake "$supervisor_ack" '^ack$')" == ack ]] ||
           exit 125
         exit 0
@@ -673,12 +809,24 @@ run_bounded() {
   pid="$!"
   ACTIVE_EXTERNAL_PID="$pid"
   ACTIVE_EXTERNAL_PGID="$pid"
+  ACTIVE_EXTERNAL_IDENTITY="$supervisor_identity"
   set +m
   publish_supervisor_handshake "$supervisor_identity" "$pid" || {
     exec 9>&-
-    terminate_external_group "$pid" "$pid"
+    terminate_external_group "$pid" "$pid" "$supervisor_identity" || true
     ACTIVE_EXTERNAL_PID=''
     ACTIVE_EXTERNAL_PGID=''
+    ACTIVE_EXTERNAL_IDENTITY=''
+    discard_supervisor_handshake "$supervisor_directory" || true
+    return 1
+  }
+  supervisor_identity_value_matches \
+      "$pid" "$pid" "$supervisor_identity" || {
+    exec 9>&-
+    terminate_external_group "$pid" "$pid" "$supervisor_identity" || true
+    ACTIVE_EXTERNAL_PID=''
+    ACTIVE_EXTERNAL_PGID=''
+    ACTIVE_EXTERNAL_IDENTITY=''
     discard_supervisor_handshake "$supervisor_directory" || true
     return 1
   }
@@ -686,13 +834,15 @@ run_bounded() {
   honor_pending_restore_signal
   while direct_running_job "$pid"; do
     honor_pending_restore_signal
-    if [[ -e "$supervisor_ready" || -L "$supervisor_ready" ]]; then
+    if supervisor_handshake_available "$supervisor_ready"; then
       [[ "$(read_supervisor_handshake "$supervisor_ready" '^ready$')" == ready ]] ||
         {
           exec 9>&-
-          terminate_external_group "$pid" "$pid"
+          terminate_external_group \
+            "$pid" "$pid" "$supervisor_identity" || true
           ACTIVE_EXTERNAL_PID=''
           ACTIVE_EXTERNAL_PGID=''
+          ACTIVE_EXTERNAL_IDENTITY=''
           discard_supervisor_handshake "$supervisor_directory" || true
           return 1
         }
@@ -700,23 +850,38 @@ run_bounded() {
       supervisor_ready=''
       deadline=$((SECONDS + timeout_seconds + 1))
     fi
-    if [[ -e "$supervisor_status" || -L "$supervisor_status" ]]; then
+    if supervisor_handshake_available "$supervisor_status"; then
+      supervisor_identity_value_matches \
+          "$pid" "$pid" "$supervisor_identity" || {
+        [[ -z "$supervisor_ready" ]] || exec 9>&-
+        terminate_external_group \
+          "$pid" "$pid" "$supervisor_identity" || true
+        ACTIVE_EXTERNAL_PID=''
+        ACTIVE_EXTERNAL_PGID=''
+        ACTIVE_EXTERNAL_IDENTITY=''
+        discard_supervisor_handshake "$supervisor_directory" || true
+        return 1
+      }
       result="$(
         read_supervisor_handshake "$supervisor_status" \
           '^(0|[1-9][0-9]{0,2})$'
       )" || result=256
       [[ "$result" -ge 0 && "$result" -le 255 ]] || {
         [[ -z "$supervisor_ready" ]] || exec 9>&-
-        terminate_external_group "$pid" "$pid"
+        terminate_external_group \
+          "$pid" "$pid" "$supervisor_identity" || true
         ACTIVE_EXTERNAL_PID=''
         ACTIVE_EXTERNAL_PGID=''
+        ACTIVE_EXTERNAL_IDENTITY=''
         discard_supervisor_handshake "$supervisor_directory" || true
         return 1
       }
       publish_supervisor_handshake "$supervisor_ack" ack || {
-        terminate_external_group "$pid" "$pid"
+        terminate_external_group \
+          "$pid" "$pid" "$supervisor_identity" || true
         ACTIVE_EXTERNAL_PID=''
         ACTIVE_EXTERNAL_PGID=''
+        ACTIVE_EXTERNAL_IDENTITY=''
         discard_supervisor_handshake "$supervisor_directory" || true
         return 1
       }
@@ -725,18 +890,22 @@ run_bounded() {
     if [[ -n "$supervisor_ready" ]] &&
       ((SECONDS >= startup_deadline)); then
       exec 9>&-
-      terminate_external_group "$pid" "$pid"
+      terminate_external_group \
+        "$pid" "$pid" "$supervisor_identity" || true
       ACTIVE_EXTERNAL_PID=''
       ACTIVE_EXTERNAL_PGID=''
+      ACTIVE_EXTERNAL_IDENTITY=''
       discard_supervisor_handshake "$supervisor_directory" || true
       return 125
     fi
     if [[ -z "$supervisor_ready" ]] &&
       ((SECONDS >= deadline)); then
       [[ -z "$supervisor_ready" ]] || exec 9>&-
-      terminate_external_group "$pid" "$pid"
+      terminate_external_group \
+        "$pid" "$pid" "$supervisor_identity" || true
       ACTIVE_EXTERNAL_PID=''
       ACTIVE_EXTERNAL_PGID=''
+      ACTIVE_EXTERNAL_IDENTITY=''
       discard_supervisor_handshake "$supervisor_directory" || true
       return 124
     fi
@@ -752,15 +921,20 @@ run_bounded() {
   done
   honor_pending_restore_signal
   if direct_running_job "$pid"; then
-    terminate_external_group "$pid" "$pid"
+    terminate_external_group \
+      "$pid" "$pid" "$supervisor_identity" || true
     supervisor_result=125
   elif wait "$pid"; then
     supervisor_result=0
   else
     supervisor_result=$?
   fi
+  supervisor_identity_value_matches \
+      "$pid" "$pid" "$supervisor_identity" ||
+    supervisor_result=125
   ACTIVE_EXTERNAL_PID=''
   ACTIVE_EXTERNAL_PGID=''
+  ACTIVE_EXTERNAL_IDENTITY=''
   discard_supervisor_handshake "$supervisor_directory" || return 1
   [[ "$supervisor_result" -eq 0 && "$result" -ge 0 && "$result" -le 255 ]] ||
     return 1
