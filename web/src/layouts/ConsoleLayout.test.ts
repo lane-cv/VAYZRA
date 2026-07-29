@@ -53,6 +53,8 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.findAll('a[href="/admin/settings"]')).toHaveLength(1)
     expect(wrapper.get('a[href="/admin/backups"]').text()).toContain('备份记录')
     expect(wrapper.findAll('a[href="/admin/backups"]')).toHaveLength(1)
+    expect(wrapper.get('a[href="/admin/alerts"]').text()).toContain('告警中心')
+    expect(wrapper.findAll('a[href="/admin/alerts"]')).toHaveLength(1)
     expect(wrapper.find('a[href="/admin/audit"]').exists()).toBe(false)
     expect(wrapper.get('a[href="/notifications"]').text()).toContain('通知中心')
     expect(wrapper.find('a[href="/student/questions"]').exists()).toBe(false)
@@ -73,6 +75,7 @@ describe('ConsoleLayout drawer', () => {
     expect(wrapper.find('a[href="/admin/ai-usage"]').exists()).toBe(false)
     expect(wrapper.find('a[href="/admin/settings"]').exists()).toBe(false)
     expect(wrapper.find('a[href="/admin/backups"]').exists()).toBe(false)
+    expect(wrapper.find('a[href="/admin/alerts"]').exists()).toBe(false)
   })
   it('closes for Escape and route changes, restoring focus to the trigger', async () => {
     const { wrapper, route } = mountLayout(); const trigger = wrapper.get('button[aria-label="打开导航"]')

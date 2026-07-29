@@ -7,6 +7,7 @@ import AdminAIUsageView from '../features/ai/AdminAIUsageView.vue'
 import SystemSettingsView from '../features/operations/SystemSettingsView.vue'
 import AuditView from '../features/operations/AuditView.vue'
 import BackupsView from '../features/operations/BackupsView.vue'
+import AlertsView from '../features/operations/AlertsView.vue'
 describe('console router guards', () => {
   beforeEach(() => setActivePinia(createPinia()))
   it('forces first-login students to change password', async () => {
@@ -120,6 +121,19 @@ describe('console router guards', () => {
     session.user = { id: 's1', username: 'student', displayName: '林同学', role: 'student', mustChangePassword: false }
     await router.push('/student')
     await router.push('/admin/backups')
+    expect(router.currentRoute.value.fullPath).toBe('/student')
+  })
+  it('exposes the alert center only inside the admin route tree', async () => {
+    const session = useSessionStore()
+    session.bootstrapStatus = 'ready'
+    session.user = { id: 'a1', username: 'teacher', displayName: '张老师', role: 'admin', mustChangePassword: false }
+    const router = createAppRouter()
+    await router.push('/admin/alerts')
+    expect(router.currentRoute.value.name).toBe('admin-alerts')
+    expect(router.currentRoute.value.matched[router.currentRoute.value.matched.length - 1]?.components?.default).toBe(AlertsView)
+    session.user = { id: 's1', username: 'student', displayName: '林同学', role: 'student', mustChangePassword: false }
+    await router.push('/student')
+    await router.push('/admin/alerts')
     expect(router.currentRoute.value.fullPath).toBe('/student')
   })
   it('allows only admins to open canonical teacher question routes in one persistent workspace',async()=>{const session=useSessionStore();session.bootstrapStatus='ready';session.user={id:'a1',username:'teacher',displayName:'张老师',role:'admin',mustChangePassword:false};const router=createAppRouter();await router.push('/admin/questions');expect(router.currentRoute.value.name).toBe('admin-questions');const workspace=router.currentRoute.value.matched[1].components?.default;await router.push('/admin/questions/not-a-uuid');expect(router.currentRoute.value.name).toBe('admin-questions');await router.push('/admin/questions/11111111-1111-4111-8111-111111111111');expect(router.currentRoute.value.name).toBe('admin-question-detail');expect(router.currentRoute.value.matched[1].components?.default).toBe(workspace);session.user={id:'s1',username:'student',displayName:'学生',role:'student',mustChangePassword:false};await router.push('/admin/questions');expect(router.currentRoute.value.fullPath).toBe('/student')})

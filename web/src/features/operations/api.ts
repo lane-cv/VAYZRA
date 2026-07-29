@@ -4,12 +4,25 @@ import type {
   AuditMetadata,
   AuditPage,
   AuditRecord,
+  AlertCategory,
+  AlertFilters,
+  AlertPage,
+  AlertSeverity,
+  AlertState,
   BackupArtifact,
   BackupCursor,
   BackupPage,
   BackupRun,
   BackupRunDetail,
+  DashboardAuditCategory,
+  DashboardAuditOutcome,
+  DashboardQueue,
+  DashboardService,
+  OperationalAlert,
+  OperationsDashboard,
+  OperationsDataState,
   OperationsSettings,
+  RecoveryState,
   RestoreVerification,
 } from './types'
 
@@ -606,4 +619,383 @@ export async function queueBackup(idempotencyKey: string): Promise<BackupRun> {
     headers: { 'Idempotency-Key': idempotencyKey },
     json: {},
   }))
+}
+
+const operationsDataStates = new Set([
+  'healthy',
+  'degraded',
+  'unavailable',
+  'stale',
+  'timeout',
+  'empty',
+])
+const dashboardServices = new Set([
+  'app',
+  'caddy',
+  'postgres',
+  'redis',
+  'object_store',
+  'worker',
+])
+const dashboardQueues = new Set(['processing', 'ai', 'outbox'])
+const recoveryStates = new Set(['succeeded', 'degraded', 'failed', 'empty'])
+const dashboardAuditCategories = new Set([
+  'authentication',
+  'authorization',
+  'files',
+  'teaching',
+  'ai',
+  'operations',
+  'backup',
+])
+const dashboardAuditOutcomes = new Set(['succeeded', 'failed', 'denied', 'rejected'])
+const alertStates = new Set(['open', 'acknowledged', 'resolved'])
+const alertSeverities = new Set(['warning', 'critical'])
+const alertCategories = new Set(['storage', 'backup', 'ai', 'processing', 'security'])
+const alertCursorPattern = /^[A-Za-z0-9_-]{1,256}$/
+const alertIdentifierPattern = /^[a-z][a-z0-9_]{0,127}$/
+
+function monitoringTime(value: unknown): string {
+  if (typeof value !== 'string' || !validTimestamp(value)) throw invalidResponse()
+  return value
+}
+
+function optionalMonitoringTime(
+  source: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  if (!(key in source)) return undefined
+  return monitoringTime(source[key])
+}
+
+function monitoringNumber(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isFinite(value)
+    || Object.is(value, -0)
+    || value < minimum
+    || value > maximum
+  ) throw invalidResponse()
+  return value
+}
+
+function observedState(
+  source: Record<string, unknown>,
+  allowed: Set<string>,
+): { state: OperationsDataState; observedAt?: string } {
+  const result: { state: OperationsDataState; observedAt?: string } = {
+    state: safeEnum(source.state, allowed),
+  }
+  const observedAt = optionalMonitoringTime(source, 'observedAt')
+  if (observedAt !== undefined) result.observedAt = observedAt
+  return result
+}
+
+function parseDashboard(value: unknown): OperationsDashboard {
+  const source = record(value)
+  exactKeys(source, new Set([
+    'observedAt',
+    'students',
+    'questions',
+    'ai',
+    'storage',
+    'services',
+    'queues',
+    'backup',
+    'alerts',
+    'recentAuditState',
+    'recentAudit',
+  ]))
+
+  const studentsSource = record(source.students)
+  exactKeys(studentsSource, new Set(['state', 'observedAt', 'active', 'disabled']))
+  const students = {
+    ...observedState(studentsSource, operationsDataStates),
+    active: safeInteger(studentsSource.active),
+    disabled: safeInteger(studentsSource.disabled),
+  }
+
+  const questionsSource = record(source.questions)
+  exactKeys(questionsSource, new Set(['state', 'observedAt', 'waiting', 'oldestWaitSeconds']))
+  const questions = {
+    ...observedState(questionsSource, operationsDataStates),
+    waiting: safeInteger(questionsSource.waiting),
+    oldestWaitSeconds: safeInteger(questionsSource.oldestWaitSeconds),
+  }
+
+  const aiSource = record(source.ai)
+  exactKeys(aiSource, new Set([
+    'state',
+    'observedAt',
+    'requests',
+    'successRatePercent',
+    'firstByteLatencyMilliseconds',
+    'totalLatencyMilliseconds',
+    'dailyCostMicroUSD',
+  ]))
+  const ai = {
+    ...observedState(aiSource, operationsDataStates),
+    requests: safeInteger(aiSource.requests),
+    successRatePercent: monitoringNumber(aiSource.successRatePercent, 0, 100),
+    firstByteLatencyMilliseconds: safeInteger(aiSource.firstByteLatencyMilliseconds),
+    totalLatencyMilliseconds: safeInteger(aiSource.totalLatencyMilliseconds),
+    dailyCostMicroUSD: safeInteger(aiSource.dailyCostMicroUSD),
+  }
+
+  const storageSource = record(source.storage)
+  exactKeys(storageSource, new Set([
+    'state',
+    'observedAt',
+    'usedBytes',
+    'capacityBytes',
+    'warningPercent',
+  ]))
+  const storage = {
+    ...observedState(storageSource, operationsDataStates),
+    usedBytes: safeInteger(storageSource.usedBytes),
+    capacityBytes: safeInteger(storageSource.capacityBytes),
+    warningPercent: safeInteger(storageSource.warningPercent, 1),
+  }
+  if (storage.warningPercent > 100 || storage.usedBytes > storage.capacityBytes) {
+    throw invalidResponse()
+  }
+
+  if (!Array.isArray(source.services) || source.services.length > dashboardServices.size) {
+    throw invalidResponse()
+  }
+  const seenServices = new Set<DashboardService>()
+  const services = source.services.map((value) => {
+    const item = record(value)
+    exactKeys(item, new Set(['service', 'state', 'observedAt', 'latencyMilliseconds']))
+    const service = safeEnum<DashboardService>(item.service, dashboardServices)
+    if (seenServices.has(service)) throw invalidResponse()
+    seenServices.add(service)
+    return {
+      ...observedState(item, operationsDataStates),
+      service,
+      latencyMilliseconds: safeInteger(item.latencyMilliseconds),
+    }
+  })
+
+  if (!Array.isArray(source.queues) || source.queues.length > dashboardQueues.size) {
+    throw invalidResponse()
+  }
+  const seenQueues = new Set<DashboardQueue>()
+  const queues = source.queues.map((value) => {
+    const item = record(value)
+    exactKeys(item, new Set([
+      'queue',
+      'state',
+      'observedAt',
+      'queued',
+      'streaming',
+      'failed',
+      'expired',
+    ]))
+    const queue = safeEnum<DashboardQueue>(item.queue, dashboardQueues)
+    if (seenQueues.has(queue)) throw invalidResponse()
+    seenQueues.add(queue)
+    return {
+      ...observedState(item, operationsDataStates),
+      queue,
+      queued: safeInteger(item.queued),
+      streaming: safeInteger(item.streaming),
+      failed: safeInteger(item.failed),
+      expired: safeInteger(item.expired),
+    }
+  })
+
+  const backupSource = record(source.backup)
+  exactKeys(backupSource, new Set(['state', 'observedAt', 'local', 'remote', 'restore']))
+  const recoveryPoint = (
+    value: unknown,
+    extraKeys: string[] = [],
+  ): { state: RecoveryState; completedAt?: string } => {
+    const item = record(value)
+    exactKeys(item, new Set(['state', 'completedAt', ...extraKeys]))
+    const state = safeEnum<RecoveryState>(item.state, recoveryStates)
+    const completedAt = optionalMonitoringTime(item, 'completedAt')
+    if ((state === 'empty') === (completedAt !== undefined)) throw invalidResponse()
+    return completedAt === undefined ? { state } : { state, completedAt }
+  }
+  const restoreSource = record(backupSource.restore)
+  exactKeys(restoreSource, new Set(['state', 'completedAt', 'rtoSeconds']))
+  const restorePoint = recoveryPoint(restoreSource, ['rtoSeconds'])
+  const backup = {
+    ...observedState(backupSource, operationsDataStates),
+    local: recoveryPoint(backupSource.local),
+    remote: recoveryPoint(backupSource.remote),
+    restore: {
+      ...restorePoint,
+      rtoSeconds: safeInteger(restoreSource.rtoSeconds),
+    },
+  }
+
+  const alertSource = record(source.alerts)
+  exactKeys(alertSource, new Set(['state', 'observedAt', 'openWarning', 'openCritical']))
+  const alerts = {
+    ...observedState(alertSource, operationsDataStates),
+    openWarning: safeInteger(alertSource.openWarning),
+    openCritical: safeInteger(alertSource.openCritical),
+  }
+
+  if (!Array.isArray(source.recentAudit) || source.recentAudit.length > 10) {
+    throw invalidResponse()
+  }
+  const recentAudit = source.recentAudit.map((value) => {
+    const item = record(value)
+    exactKeys(item, new Set(['category', 'outcome', 'occurredAt']))
+    return {
+      category: safeEnum<DashboardAuditCategory>(item.category, dashboardAuditCategories),
+      outcome: safeEnum<DashboardAuditOutcome>(item.outcome, dashboardAuditOutcomes),
+      occurredAt: monitoringTime(item.occurredAt),
+    }
+  })
+
+  return {
+    observedAt: monitoringTime(source.observedAt),
+    students,
+    questions,
+    ai,
+    storage,
+    services,
+    queues,
+    backup,
+    alerts,
+    recentAuditState: safeEnum<OperationsDataState>(
+      source.recentAuditState,
+      operationsDataStates,
+    ),
+    recentAudit,
+  }
+}
+
+function parseOperationalAlert(value: unknown): OperationalAlert {
+  const source = record(value)
+  exactKeys(source, new Set([
+    'id',
+    'dedupeKey',
+    'category',
+    'severity',
+    'state',
+    'firstObservedAt',
+    'lastObservedAt',
+    'acknowledgedBy',
+    'acknowledgedAt',
+    'resolvedAt',
+    'currentValue',
+    'thresholdValue',
+    'summary',
+  ]))
+  if (
+    typeof source.id !== 'string'
+    || !canonicalUUID(source.id)
+    || typeof source.dedupeKey !== 'string'
+    || !alertIdentifierPattern.test(source.dedupeKey)
+    || typeof source.summary !== 'string'
+    || !wellFormedUnicode(source.summary)
+    || [...source.summary].length < 1
+    || [...source.summary].length > 240
+  ) throw invalidResponse()
+  const result: OperationalAlert = {
+    id: source.id,
+    dedupeKey: source.dedupeKey,
+    category: safeEnum<AlertCategory>(source.category, alertCategories),
+    severity: safeEnum<AlertSeverity>(source.severity, alertSeverities),
+    state: safeEnum<AlertState>(source.state, alertStates),
+    firstObservedAt: monitoringTime(source.firstObservedAt),
+    lastObservedAt: monitoringTime(source.lastObservedAt),
+    currentValue: monitoringNumber(
+      source.currentValue,
+      -Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    thresholdValue: monitoringNumber(
+      source.thresholdValue,
+      -Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    summary: source.summary,
+  }
+  for (const key of ['acknowledgedAt', 'resolvedAt'] as const) {
+    const value = optionalMonitoringTime(source, key)
+    if (value !== undefined) result[key] = value
+  }
+  if ('acknowledgedBy' in source) {
+    if (typeof source.acknowledgedBy !== 'string' || !canonicalUUID(source.acknowledgedBy)) {
+      throw invalidResponse()
+    }
+    result.acknowledgedBy = source.acknowledgedBy
+  }
+  if (
+    Date.parse(result.lastObservedAt) < Date.parse(result.firstObservedAt)
+    || (result.state === 'open' && (
+      result.acknowledgedAt !== undefined
+      || result.acknowledgedBy !== undefined
+      || result.resolvedAt !== undefined
+    ))
+    || (result.state === 'acknowledged' && (
+      result.acknowledgedAt === undefined
+      || result.acknowledgedBy === undefined
+      || result.resolvedAt !== undefined
+    ))
+    || (result.state === 'resolved' && result.resolvedAt === undefined)
+  ) throw invalidResponse()
+  return result
+}
+
+function validAlertFilters(filters: AlertFilters): void {
+  if (filters.state !== undefined && !alertStates.has(filters.state)) throw invalidResponse()
+  if (filters.severity !== undefined && !alertSeverities.has(filters.severity)) throw invalidResponse()
+  if (filters.category !== undefined && !alertCategories.has(filters.category)) throw invalidResponse()
+  if (
+    filters.before !== undefined
+    && !alertCursorPattern.test(filters.before)
+  ) throw invalidResponse()
+  if (
+    filters.limit !== undefined
+    && (!Number.isInteger(filters.limit) || filters.limit < 1 || filters.limit > 100)
+  ) throw invalidResponse()
+}
+
+export async function readDashboard(signal?: AbortSignal): Promise<OperationsDashboard> {
+  return parseDashboard(await request<unknown>('/admin/operations/dashboard', { signal }))
+}
+
+export async function listAlerts(
+  filters: AlertFilters,
+  signal?: AbortSignal,
+): Promise<AlertPage> {
+  validAlertFilters(filters)
+  const query = new URLSearchParams()
+  for (const key of ['state', 'severity', 'category', 'before'] as const) {
+    const value = filters[key]
+    if (value !== undefined) query.set(key, value)
+  }
+  if (filters.limit !== undefined) query.set('limit', String(filters.limit))
+  const suffix = query.size ? `?${query.toString()}` : ''
+  const response = await requestWithMeta<unknown>(
+    `/admin/operations/alerts${suffix}`,
+    { signal },
+  )
+  if (!Array.isArray(response.data)) throw invalidResponse()
+  const meta = response.meta === undefined ? {} : record(response.meta)
+  exactKeys(meta, new Set(['next']))
+  const next = meta.next
+  if (next !== undefined && (
+    typeof next !== 'string'
+    || !alertCursorPattern.test(next)
+  )) throw invalidResponse()
+  return {
+    items: response.data.map(parseOperationalAlert),
+    next: next ?? null,
+  }
+}
+
+export async function acknowledgeAlert(id: string): Promise<OperationalAlert> {
+  if (!canonicalUUID(id)) throw invalidResponse()
+  return parseOperationalAlert(await request<unknown>(
+    `/admin/operations/alerts/${id}/acknowledge`,
+    { method: 'POST' },
+  ))
 }

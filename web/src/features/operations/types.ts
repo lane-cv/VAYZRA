@@ -125,3 +125,111 @@ export type BackupRunDetail = BackupRun & {
   artifacts: BackupArtifact[]
   restoreVerifications: RestoreVerification[]
 }
+
+export type OperationsDataState =
+  | 'healthy'
+  | 'degraded'
+  | 'unavailable'
+  | 'stale'
+  | 'timeout'
+  | 'empty'
+export type DashboardService =
+  | 'app'
+  | 'caddy'
+  | 'postgres'
+  | 'redis'
+  | 'object_store'
+  | 'worker'
+export type DashboardQueue = 'processing' | 'ai' | 'outbox'
+export type RecoveryState = 'succeeded' | 'degraded' | 'failed' | 'empty'
+export type DashboardAuditCategory =
+  | 'authentication'
+  | 'authorization'
+  | 'files'
+  | 'teaching'
+  | 'ai'
+  | 'operations'
+  | 'backup'
+export type DashboardAuditOutcome = 'succeeded' | 'failed' | 'denied' | 'rejected'
+
+export type ObservedSummary = {
+  state: OperationsDataState
+  observedAt?: string
+}
+
+export type OperationsDashboard = {
+  observedAt: string
+  students: ObservedSummary & { active: number; disabled: number }
+  questions: ObservedSummary & { waiting: number; oldestWaitSeconds: number }
+  ai: ObservedSummary & {
+    requests: number
+    successRatePercent: number
+    firstByteLatencyMilliseconds: number
+    totalLatencyMilliseconds: number
+    dailyCostMicroUSD: number
+  }
+  storage: ObservedSummary & {
+    usedBytes: number
+    capacityBytes: number
+    warningPercent: number
+  }
+  services: Array<ObservedSummary & {
+    service: DashboardService
+    latencyMilliseconds: number
+  }>
+  queues: Array<ObservedSummary & {
+    queue: DashboardQueue
+    queued: number
+    streaming: number
+    failed: number
+    expired: number
+  }>
+  backup: ObservedSummary & {
+    local: { state: RecoveryState; completedAt?: string }
+    remote: { state: RecoveryState; completedAt?: string }
+    restore: { state: RecoveryState; completedAt?: string; rtoSeconds: number }
+  }
+  alerts: ObservedSummary & {
+    openWarning: number
+    openCritical: number
+  }
+  recentAuditState: OperationsDataState
+  recentAudit: Array<{
+    category: DashboardAuditCategory
+    outcome: DashboardAuditOutcome
+    occurredAt: string
+  }>
+}
+
+export type AlertSeverity = 'warning' | 'critical'
+export type AlertState = 'open' | 'acknowledged' | 'resolved'
+export type AlertCategory = 'storage' | 'backup' | 'ai' | 'processing' | 'security'
+
+export type OperationalAlert = {
+  id: string
+  dedupeKey: string
+  category: AlertCategory
+  severity: AlertSeverity
+  state: AlertState
+  firstObservedAt: string
+  lastObservedAt: string
+  acknowledgedBy?: string
+  acknowledgedAt?: string
+  resolvedAt?: string
+  currentValue: number
+  thresholdValue: number
+  summary: string
+}
+
+export type AlertFilters = {
+  state?: AlertState
+  severity?: AlertSeverity
+  category?: AlertCategory
+  before?: string
+  limit?: number
+}
+
+export type AlertPage = {
+  items: OperationalAlert[]
+  next: string | null
+}
