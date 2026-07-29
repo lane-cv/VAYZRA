@@ -15,6 +15,14 @@ LIVE_COMPOSE_FILE=''
 LIVE_ROOT=''
 LOCK_DIRECTORY=''
 LOCK_HELD=false
+LOCK_OWNER_DIRECTORY=''
+LOCK_OWNER_TOKEN=''
+LOCK_OWNER_PID=''
+LOCK_OWNER_IDENTITY=''
+LOCK_OWNER_FD_OPEN=false
+OBSERVED_LOCK_OWNER_PID=''
+OBSERVED_LOCK_OWNER_IDENTITY=''
+OBSERVED_LOCK_OWNER_TOKEN=''
 LEASE_FIFO=''
 LEASE_OUTPUT=''
 LEASE_PID=''
@@ -113,6 +121,15 @@ owner_only_directory() {
   [[ -d "$path" && ! -L "$path" && "$(portable_mode "$path")" == '700' ]]
 }
 
+portable_owner() {
+  local path="$1"
+  if stat -f '%u' "$path" >/dev/null 2>&1; then
+    stat -f '%u' "$path"
+  else
+    stat -c '%u' "$path"
+  fi
+}
+
 owner_only_secret() {
   local path="$1"
   local size
@@ -131,6 +148,10 @@ single_line_secret_value() {
   local value
   local size
   owner_only_secret "$path" || return 1
+  if od -An -tx1 "$path" |
+    grep -Eq '(^|[[:space:]])00([[:space:]]|$)'; then
+    return 1
+  fi
   value="$(<"$path")"
   if stat -f '%z' "$path" >/dev/null 2>&1; then
     size="$(stat -f '%z' "$path")"
@@ -150,7 +171,7 @@ single_line_secret_value() {
 
 valid_remote_repository() {
   local repository="$1"
-  local location authority bucket lower_bucket percent_suffix
+  local location authority bucket lower_bucket percent_suffix port
   [[ "$repository" == s3:https://* &&
     ! "$repository" =~ [[:space:][:cntrl:]] &&
     "$repository" != *'?'* &&
@@ -162,6 +183,16 @@ valid_remote_repository() {
   authority="${location%%/*}"
   bucket="${location#*/}"
   [[ -n "$authority" && "$authority" != *'@'* ]] || return 1
+  if [[ "$authority" =~ ^\[[0-9A-Fa-f:.]+\](:([0-9]{1,5}))?$ ]]; then
+    port="${BASH_REMATCH[2]:-}"
+  elif [[ "$authority" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:([0-9]{1,5}))?$ ]]; then
+    port="${BASH_REMATCH[3]:-}"
+  else
+    return 1
+  fi
+  if [[ -n "$port" ]] && ! ((10#$port <= 65535)); then
+    return 1
+  fi
   while [[ "$bucket" == /* ]]; do
     bucket="${bucket#/}"
   done
@@ -275,14 +306,278 @@ configure_live_context() {
   EFFECTIVE_PROJECT="$live_project"
 }
 
+portable_file_identity() {
+  local path="$1"
+  if stat -f '%d:%i' "$path" >/dev/null 2>&1; then
+    stat -f '%d:%i' "$path"
+  else
+    stat -c '%d:%i' "$path"
+  fi
+}
+
+process_holds_liveness_file() {
+  local pid="$1"
+  local path="$2"
+  local descriptor
+  local output
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+  if [[ -d "/proc/$pid/fd" ]]; then
+    [[ -r "/proc/$pid/fd" && -x "/proc/$pid/fd" ]] || return 2
+    for descriptor in "/proc/$pid/fd/"*; do
+      if [[ -e "$descriptor" && "$descriptor" -ef "$path" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+  command -v lsof >/dev/null 2>&1 || return 2
+  if output="$(lsof -a -p "$pid" -Fn -- "$path" 2>/dev/null)"; then
+    grep -Fxq "n$path" <<<"$output" && return 0
+    return 2
+  fi
+  if lsof -a -p "$pid" -Fp -d cwd 2>/dev/null |
+    grep -Eq "^p${pid}$"; then
+    return 1
+  fi
+  return 2
+}
+
+load_host_lock_owner() {
+  local directory="$1"
+  local owner_file="$directory/owner"
+  local liveness_file="$directory/liveness"
+  local version_line pid_line identity_line token_line extra_line
+  owner_only_directory "$directory" || return 1
+  [[ "$(portable_owner "$directory")" == "$(id -u)" ]] || return 1
+  [[ -f "$owner_file" && ! -L "$owner_file" &&
+    "$(portable_mode "$owner_file")" == '400' &&
+    "$(portable_owner "$owner_file")" == "$(id -u)" ]] ||
+    return 1
+  {
+    IFS= read -r version_line &&
+      IFS= read -r pid_line &&
+      IFS= read -r identity_line &&
+      IFS= read -r token_line &&
+      ! IFS= read -r extra_line
+  } <"$owner_file" || return 1
+  [[ "$version_line" == 'version=1' &&
+    "$pid_line" =~ ^pid=([1-9][0-9]*)$ &&
+    "$identity_line" =~ ^identity=([0-9]+:[0-9]+)$ &&
+    "$token_line" =~ ^token=([0-9a-f]{64})$ ]] ||
+    return 1
+  [[ -f "$liveness_file" && ! -L "$liveness_file" &&
+    "$(portable_mode "$liveness_file")" == '400' &&
+    "$(portable_owner "$liveness_file")" == "$(id -u)" &&
+    "$(portable_file_identity "$liveness_file")" == "${identity_line#identity=}" ]] ||
+    return 1
+  OBSERVED_LOCK_OWNER_PID="${pid_line#pid=}"
+  OBSERVED_LOCK_OWNER_IDENTITY="${identity_line#identity=}"
+  OBSERVED_LOCK_OWNER_TOKEN="${token_line#token=}"
+}
+
+host_lock_owner_matches() {
+  local directory="$1"
+  local token="$2"
+  local pid="$3"
+  local identity="$4"
+  load_host_lock_owner "$directory" &&
+    [[ "$OBSERVED_LOCK_OWNER_TOKEN" == "$token" &&
+      "$OBSERVED_LOCK_OWNER_PID" == "$pid" &&
+      "$OBSERVED_LOCK_OWNER_IDENTITY" == "$identity" ]]
+}
+
+host_lock_is_stale() {
+  local directory="$1"
+  local liveness_status
+  load_host_lock_owner "$directory" || return 1
+  if ! kill -0 "$OBSERVED_LOCK_OWNER_PID" 2>/dev/null; then
+    return 0
+  fi
+  if process_holds_liveness_file \
+    "$OBSERVED_LOCK_OWNER_PID" "$directory/liveness"; then
+    return 1
+  else
+    liveness_status=$?
+  fi
+  case "$liveness_status" in
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_host_lock_owner_directory() {
+  local directory="$1"
+  local token="$2"
+  load_host_lock_owner "$directory" || return 1
+  [[ "$OBSERVED_LOCK_OWNER_TOKEN" == "$token" ]] || return 1
+  local path
+  for path in \
+    "$directory/operational.stdin" \
+    "$directory/operational.stdout" \
+    "$directory/heartbeat.failed" \
+    "$directory/liveness"
+  do
+    if [[ -p "$path" || (-f "$path" && ! -L "$path") ]]; then
+      rm -f "$path"
+    elif [[ -e "$path" || -L "$path" ]]; then
+      return 1
+    fi
+  done
+  rm -f "$directory/owner"
+  rmdir "$directory"
+}
+
+discard_unpublished_host_lock_owner() {
+  local directory="$1"
+  local token="$2"
+  [[ -n "$directory" && -n "$token" ]] || return 0
+  remove_host_lock_owner_directory "$directory" "$token"
+}
+
+existing_lock_owner_directory() {
+  local target
+  [[ -L "$LOCK_DIRECTORY" ]] || return 1
+  target="$(readlink "$LOCK_DIRECTORY")" || return 1
+  [[ "$target" == "${LOCK_DIRECTORY}.owner."?????? ]] || return 1
+  printf '%s' "$target"
+}
+
+publish_host_lock() {
+  local accidental_link
+  if ln -sh "$LOCK_OWNER_DIRECTORY" "$LOCK_DIRECTORY" 2>/dev/null; then
+    :
+  elif ln -sT "$LOCK_OWNER_DIRECTORY" "$LOCK_DIRECTORY" 2>/dev/null; then
+    :
+  else
+    return 1
+  fi
+  if [[ -L "$LOCK_DIRECTORY" &&
+    "$(readlink "$LOCK_DIRECTORY")" == "$LOCK_OWNER_DIRECTORY" ]]; then
+    return 0
+  fi
+  accidental_link="$LOCK_DIRECTORY/$(basename "$LOCK_OWNER_DIRECTORY")"
+  if [[ -L "$accidental_link" &&
+    "$(readlink "$accidental_link")" == "$LOCK_OWNER_DIRECTORY" ]]; then
+    rm -f "$accidental_link"
+  fi
+  return 1
+}
+
+reclaim_stale_host_lock() {
+  local owner_directory="$1"
+  local reclaim_directory="${LOCK_DIRECTORY}.reclaim"
+  local current_owner stale_token
+  host_lock_is_stale "$owner_directory" || return 1
+  stale_token="$OBSERVED_LOCK_OWNER_TOKEN"
+  mkdir "$reclaim_directory" 2>/dev/null || return 1
+  if ! chmod 0700 "$reclaim_directory"; then
+    rmdir "$reclaim_directory" 2>/dev/null || true
+    return 1
+  fi
+  current_owner="$(existing_lock_owner_directory 2>/dev/null || true)"
+  if [[ "$current_owner" != "$owner_directory" ]] ||
+    ! host_lock_is_stale "$owner_directory"; then
+    rmdir "$reclaim_directory" || true
+    return 1
+  fi
+  stale_token="$OBSERVED_LOCK_OWNER_TOKEN"
+  if ! rm -f "$LOCK_DIRECTORY"; then
+    rmdir "$reclaim_directory" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$reclaim_directory" || return 1
+  if ! remove_host_lock_owner_directory "$owner_directory" "$stale_token"; then
+    safe_log 'stale_host_lock_owner_cleanup_failed'
+  fi
+}
+
+discard_host_lock_staging() {
+  local directory="$1"
+  local path
+  [[ "$directory" == "${LOCK_DIRECTORY}.owner."?????? &&
+    -d "$directory" && ! -L "$directory" ]] ||
+    return 1
+  for path in "$directory/owner" "$directory/liveness"; do
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      rm -f "$path"
+    elif [[ -e "$path" || -L "$path" ]]; then
+      return 1
+    fi
+  done
+  rmdir "$directory"
+}
+
 acquire_host_lock() {
+  local existing_owner
+  local lock_parent
+  local lock_basename
+  local liveness_file
+  local owner_file
   LOCK_DIRECTORY="${HAPPYLEARN_BACKUP_LOCK_DIRECTORY:-${TMPDIR:-/tmp}/happylearn-phase5-backup-${PROJECT}.lock}"
-  [[ "$LOCK_DIRECTORY" == /* && ! -e "$LOCK_DIRECTORY" ]] || return 1
-  mkdir "$LOCK_DIRECTORY"
+  [[ "$LOCK_DIRECTORY" == /* ]] || return 1
+  lock_parent="$(dirname "$LOCK_DIRECTORY")"
+  lock_basename="$(basename "$LOCK_DIRECTORY")"
+  [[ -d "$lock_parent" ]] || return 1
+  LOCK_DIRECTORY="$(
+    cd "$lock_parent" &&
+      printf '%s/%s' "$(pwd -P)" "$lock_basename"
+  )" || return 1
+  LOCK_OWNER_PID="$$"
+  LOCK_OWNER_TOKEN="$(
+    od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]'
+  )"
+  [[ "$LOCK_OWNER_TOKEN" =~ ^[0-9a-f]{64}$ ]] || return 1
+  LOCK_OWNER_DIRECTORY="$(
+    mktemp -d "${LOCK_DIRECTORY}.owner.XXXXXX"
+  )" || return 1
+  chmod 0700 "$LOCK_OWNER_DIRECTORY"
+  liveness_file="$LOCK_OWNER_DIRECTORY/liveness"
+  if ! printf '%s\n' "$LOCK_OWNER_TOKEN" >"$liveness_file" ||
+    ! chmod 0400 "$liveness_file" ||
+    ! LOCK_OWNER_IDENTITY="$(portable_file_identity "$liveness_file")" ||
+    [[ ! "$LOCK_OWNER_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]]; then
+    discard_host_lock_staging "$LOCK_OWNER_DIRECTORY" || true
+    LOCK_OWNER_DIRECTORY=''
+    LOCK_OWNER_TOKEN=''
+    return 1
+  fi
+  if ! exec 8<"$liveness_file"; then
+    discard_host_lock_staging "$LOCK_OWNER_DIRECTORY" || true
+    LOCK_OWNER_DIRECTORY=''
+    LOCK_OWNER_TOKEN=''
+    return 1
+  fi
+  LOCK_OWNER_FD_OPEN=true
+  owner_file="$LOCK_OWNER_DIRECTORY/owner"
+  if ! printf 'version=1\npid=%s\nidentity=%s\ntoken=%s\n' \
+    "$LOCK_OWNER_PID" "$LOCK_OWNER_IDENTITY" "$LOCK_OWNER_TOKEN" >"$owner_file" ||
+    ! chmod 0400 "$owner_file"; then
+    exec 8<&-
+    LOCK_OWNER_FD_OPEN=false
+    discard_host_lock_staging "$LOCK_OWNER_DIRECTORY" || true
+    LOCK_OWNER_DIRECTORY=''
+    LOCK_OWNER_TOKEN=''
+    return 1
+  fi
+  if ! publish_host_lock; then
+    existing_owner="$(existing_lock_owner_directory 2>/dev/null || true)"
+    if [[ -z "$existing_owner" ]] ||
+      ! reclaim_stale_host_lock "$existing_owner" ||
+      ! publish_host_lock; then
+      discard_unpublished_host_lock_owner \
+        "$LOCK_OWNER_DIRECTORY" "$LOCK_OWNER_TOKEN" || true
+      if [[ "$LOCK_OWNER_FD_OPEN" == true ]]; then
+        exec 8<&-
+        LOCK_OWNER_FD_OPEN=false
+      fi
+      LOCK_OWNER_DIRECTORY=''
+      LOCK_OWNER_TOKEN=''
+      return 1
+    fi
+  fi
   LOCK_HELD=true
-  chmod 0700 "$LOCK_DIRECTORY"
-  LEASE_FIFO="$LOCK_DIRECTORY/operational.stdin"
-  LEASE_OUTPUT="$LOCK_DIRECTORY/operational.stdout"
+  LEASE_FIFO="$LOCK_OWNER_DIRECTORY/operational.stdin"
+  LEASE_OUTPUT="$LOCK_OWNER_DIRECTORY/operational.stdout"
 }
 
 compose() {
@@ -610,7 +905,7 @@ SQL
 }
 
 start_lease_heartbeat() {
-  LEASE_HEARTBEAT_FAILED="$LOCK_DIRECTORY/heartbeat.failed"
+  LEASE_HEARTBEAT_FAILED="$LOCK_OWNER_DIRECTORY/heartbeat.failed"
   [[ ! -e "$LEASE_HEARTBEAT_FAILED" ]] || return 1
   set -m
   (
@@ -1019,11 +1314,20 @@ SQL
 }
 
 remove_host_lock() {
+  local published_owner
   [[ "$LOCK_HELD" == true ]] || return 0
-  [[ "$LOCK_DIRECTORY" == /* && -d "$LOCK_DIRECTORY" ]] || return 1
-  [[ -z "$LEASE_FIFO" || "$LEASE_FIFO" == "$LOCK_DIRECTORY/operational.stdin" ]] ||
+  [[ "$LOCK_DIRECTORY" == /* && -L "$LOCK_DIRECTORY" ]] || return 1
+  published_owner="$(existing_lock_owner_directory)" || return 1
+  [[ "$published_owner" == "$LOCK_OWNER_DIRECTORY" ]] || return 1
+  host_lock_owner_matches \
+    "$LOCK_OWNER_DIRECTORY" \
+    "$LOCK_OWNER_TOKEN" \
+    "$LOCK_OWNER_PID" \
+    "$LOCK_OWNER_IDENTITY" ||
     return 1
-  [[ -z "$LEASE_OUTPUT" || "$LEASE_OUTPUT" == "$LOCK_DIRECTORY/operational.stdout" ]] ||
+  [[ -z "$LEASE_FIFO" || "$LEASE_FIFO" == "$LOCK_OWNER_DIRECTORY/operational.stdin" ]] ||
+    return 1
+  [[ -z "$LEASE_OUTPUT" || "$LEASE_OUTPUT" == "$LOCK_OWNER_DIRECTORY/operational.stdout" ]] ||
     return 1
   [[ -z "$LEASE_FIFO" || ! -e "$LEASE_FIFO" || -p "$LEASE_FIFO" ]] || return 1
   if [[ -n "$LEASE_FIFO" && -p "$LEASE_FIFO" ]]; then
@@ -1033,12 +1337,20 @@ remove_host_lock() {
     rm -f "$LEASE_OUTPUT"
   fi
   if [[ -n "$LEASE_HEARTBEAT_FAILED" &&
-    "$LEASE_HEARTBEAT_FAILED" == "$LOCK_DIRECTORY/heartbeat.failed" &&
+    "$LEASE_HEARTBEAT_FAILED" == "$LOCK_OWNER_DIRECTORY/heartbeat.failed" &&
     -f "$LEASE_HEARTBEAT_FAILED" && ! -L "$LEASE_HEARTBEAT_FAILED" ]]; then
     rm -f "$LEASE_HEARTBEAT_FAILED"
   fi
-  rmdir "$LOCK_DIRECTORY"
+  rm -f "$LOCK_DIRECTORY"
+  if [[ "$LOCK_OWNER_FD_OPEN" == true ]]; then
+    exec 8<&-
+    LOCK_OWNER_FD_OPEN=false
+  fi
+  remove_host_lock_owner_directory \
+    "$LOCK_OWNER_DIRECTORY" "$LOCK_OWNER_TOKEN"
   LOCK_HELD=false
+  LOCK_OWNER_DIRECTORY=''
+  LOCK_OWNER_TOKEN=''
 }
 
 cleanup() {
@@ -1156,8 +1468,6 @@ main() {
       safe_log 'remote_sync_command_failed'
       REMOTE_DEGRADED=true
       REMOTE_SNAPSHOT_ID=''
-      FAILURE_CATEGORY='integrity'
-      local_restic unlock --remove-all
     elif REMOTE_SNAPSHOT_ID="$(remote_snapshot_id)" &&
       [[ "$REMOTE_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]]; then
       REMOTE_DEGRADED=false
@@ -1171,7 +1481,14 @@ main() {
 
   FAILURE_CATEGORY='retention'
   CURRENT_STAGE='local_retention'
-  run_retention local
+  if ! run_retention local; then
+    if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == true ]]; then
+      safe_log 'local_retention_deferred_after_remote_failure'
+      complete_remote_degraded
+      return
+    fi
+    return 1
+  fi
   assert_lease_heartbeat
 
   if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == true ]]; then

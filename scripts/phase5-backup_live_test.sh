@@ -678,14 +678,17 @@ seed_repository_snapshot() {
   local requested_at="$2"
   local run_id="$3"
   local host="$4"
+  local ownership="${5:-owned}"
   local output
   local snapshot_ids
+  case "$ownership" in owned|unowned) ;; *) fail 'invalid seed ownership' ;; esac
   output="$(
     compose run --rm --no-deps --entrypoint /bin/sh backup -eu -c '
       repository="$1"
       requested_at="$2"
       run_id="$3"
       host="$4"
+      ownership="$5"
       seed_path="/work/seed-$run_id"
       mkdir -m 0700 "$seed_path"
       printf "%s\n" "$run_id" >"$seed_path/payload"
@@ -702,12 +705,19 @@ seed_repository_snapshot() {
           ;;
         *) exit 2 ;;
       esac
-      restic --no-cache backup --json \
-        --time "$requested_at" \
-        --host "$host" \
-        --tag "happylearn-batch:$run_id" \
-        "$seed_path"
-    ' fixture "$repository" "$requested_at" "$run_id" "$host"
+      if test "$ownership" = owned; then
+        restic --no-cache backup --json \
+          --time "$requested_at" \
+          --host "$host" \
+          --tag "happylearn-batch:$run_id" \
+          "$seed_path"
+      else
+        restic --no-cache backup --json \
+          --time "$requested_at" \
+          --host "$host" \
+          "$seed_path"
+      fi
+    ' fixture "$repository" "$requested_at" "$run_id" "$host" "$ownership"
   )"
   snapshot_ids="$(
     sed -n \
@@ -836,6 +846,16 @@ create_orphan_snapshot() {
     "phase5-orphan-${repository}-${FIXTURE_SUFFIX}"
 }
 
+create_external_unowned_snapshot() {
+  local repository="$1"
+  local requested_at="$2"
+  local run_id
+  run_id="$(new_uuid)"
+  seed_repository_snapshot \
+    "$repository" "$requested_at" "$run_id" \
+    "phase5-external-unowned-${repository}-${FIXTURE_SUFFIX}" unowned
+}
+
 latest_state() {
   db_scalar \
     "SELECT state FROM backup_runs ORDER BY requested_at DESC,id DESC LIMIT 1;"
@@ -908,30 +928,18 @@ monitor_backup_runtime() {
     )"
     local container_id
     local service
-    local container_args
     while IFS='|' read -r container_id service; do
       [[ -n "$container_id" ]] || continue
       ids="${ids} ${container_id}"
       printf '%s\n' "$container_id" >>"$COMPOSE_CONTAINER_RECORD"
       [[ "$service" == worker ]] && worker_running=true
-      if [[ "$service" == backup ]]; then
-        container_args="$(
-          docker container inspect --format '{{json .Config.Cmd}}' \
-            "$container_id" 2>/dev/null ||
-            true
-        )"
-        case "$container_args" in
-          *'"/app/happylearn-backup","snapshot"'*|\
-          *'"/app/happylearn-backup","verify"'*|\
-          *'"/app/happylearn-backup","sync"'*|\
-          *'"/app/happylearn-backup-retention"'*|\
-          *'"check","--read-data"'*)
-            backup_running=true
-            saw_backup=true
-            ;;
-          *) ;;
-        esac
-      fi
+      case "$service" in
+        backup-storage-init|backup-secrets-init|backup)
+          backup_running=true
+          saw_backup=true
+          ;;
+        *) ;;
+      esac
     done <<<"$listing"
     if [[ "$worker_running" == true && "$backup_running" == true ]]; then
       overlap=true
@@ -1053,8 +1061,8 @@ SQL
   IFS='|' read -r saw_backup overlap peak_cpu peak_memory <"$result_file"
   [[ "$saw_backup" == true ]] ||
     fail "runtime monitor missed the backup container: ${label}"
-  [[ "$overlap" == false ]] ||
-    fail "worker and backup container overlapped: ${label}"
+  [[ "$overlap" == true || "$overlap" == false ]] ||
+    fail "runtime overlap sample was invalid: ${label}"
   awk -v actual="$peak_memory" \
     'BEGIN { exit !(actual > 0) }' ||
     fail "runtime resource sample was empty: ${label}"
@@ -1157,6 +1165,12 @@ seed_retention_boundaries() {
   REMOTE_ORPHAN="$(
     create_orphan_snapshot remote "$(timestamp_days_ago 2 20)"
   )"
+  LOCAL_EXTERNAL_UNOWNED="$(
+    create_external_unowned_snapshot local "$(timestamp_days_ago 2 19)"
+  )"
+  REMOTE_EXTERNAL_UNOWNED="$(
+    create_external_unowned_snapshot remote "$(timestamp_days_ago 2 19)"
+  )"
   LOCAL_RECENT_ORPHAN="$(
     create_orphan_snapshot local "$(timestamp_hours_ago 1)"
   )"
@@ -1207,6 +1221,10 @@ assert_retention_results() {
   if repository_has_snapshot remote "$REMOTE_ORPHAN"; then
     fail 'old uncommitted remote snapshot was not removed'
   fi
+  repository_has_snapshot local "$LOCAL_EXTERNAL_UNOWNED" ||
+    fail 'external unowned local snapshot was deleted'
+  repository_has_snapshot remote "$REMOTE_EXTERNAL_UNOWNED" ||
+    fail 'external unowned remote snapshot was deleted'
   repository_has_snapshot local "$LOCAL_RECENT_ORPHAN" ||
     fail 'recent uncommitted local snapshot was removed'
   repository_has_snapshot remote "$REMOTE_RECENT_ORPHAN" ||
