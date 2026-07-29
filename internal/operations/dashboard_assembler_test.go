@@ -331,6 +331,249 @@ func TestDashboardAssemblerBoundsDependenciesThatIgnoreContext(t *testing.T) {
 	}
 }
 
+type observedDoneContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func newObservedDoneContext(parent context.Context) *observedDoneContext {
+	return &observedDoneContext{
+		Context:  parent,
+		observed: make(chan struct{}),
+	}
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+type dashboardAssembleResult struct {
+	dashboard Dashboard
+	err       error
+}
+
+func TestDashboardAssemblerSingleFlightKeepsWaiterCancellationIndependentAndCopiesResults(t *testing.T) {
+	now := time.Date(2026, 7, 29, 3, 45, 0, 0, time.UTC)
+	source := validDashboardSource(now)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+	started := make(chan int, 64)
+	var calls [9]atomic.Int32
+	source.backup = func(context.Context, time.Time) (BackupSummary, error) {
+		at := timePointer(now)
+		return BackupSummary{
+			State:      DataStateHealthy,
+			ObservedAt: at,
+			Local: BackupPointSummary{
+				State: RecoveryStateSucceeded, CompletedAt: at,
+			},
+			Remote: BackupPointSummary{
+				State: RecoveryStateSucceeded, CompletedAt: at,
+			},
+			Restore: RestorePointSummary{
+				State: RecoveryStateSucceeded, CompletedAt: at, RTOSeconds: 20,
+			},
+		}, nil
+	}
+	probe := func(ctx context.Context, dependency int) error {
+		calls[dependency].Add(1)
+		started <- dependency
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	originalStudents := source.students
+	source.students = func(ctx context.Context, gotNow time.Time) (StudentSummary, error) {
+		if err := probe(ctx, 0); err != nil {
+			return StudentSummary{}, err
+		}
+		return originalStudents(ctx, gotNow)
+	}
+	originalQuestions := source.questions
+	source.questions = func(ctx context.Context, gotNow time.Time) (QuestionSummary, error) {
+		if err := probe(ctx, 1); err != nil {
+			return QuestionSummary{}, err
+		}
+		return originalQuestions(ctx, gotNow)
+	}
+	originalAI := source.ai
+	source.ai = func(ctx context.Context, gotNow time.Time) (AISummary, error) {
+		if err := probe(ctx, 2); err != nil {
+			return AISummary{}, err
+		}
+		return originalAI(ctx, gotNow)
+	}
+	originalStorage := source.storage
+	source.storage = func(ctx context.Context, gotNow time.Time) (StorageSummary, error) {
+		if err := probe(ctx, 3); err != nil {
+			return StorageSummary{}, err
+		}
+		return originalStorage(ctx, gotNow)
+	}
+	originalServices := source.services
+	source.services = func(ctx context.Context, gotNow time.Time) ([]ServiceHealth, error) {
+		if err := probe(ctx, 4); err != nil {
+			return nil, err
+		}
+		return originalServices(ctx, gotNow)
+	}
+	originalQueues := source.queues
+	source.queues = func(ctx context.Context, gotNow time.Time) ([]QueueSummary, error) {
+		if err := probe(ctx, 5); err != nil {
+			return nil, err
+		}
+		return originalQueues(ctx, gotNow)
+	}
+	originalBackup := source.backup
+	source.backup = func(ctx context.Context, gotNow time.Time) (BackupSummary, error) {
+		if err := probe(ctx, 6); err != nil {
+			return BackupSummary{}, err
+		}
+		return originalBackup(ctx, gotNow)
+	}
+	originalAlerts := source.alerts
+	source.alerts = func(ctx context.Context, gotNow time.Time) (AlertSummary, error) {
+		if err := probe(ctx, 7); err != nil {
+			return AlertSummary{}, err
+		}
+		return originalAlerts(ctx, gotNow)
+	}
+	originalAudit := source.audit
+	source.audit = func(ctx context.Context, gotNow time.Time, limit int) ([]AuditSummary, error) {
+		if err := probe(ctx, 8); err != nil {
+			return nil, err
+		}
+		return originalAudit(ctx, gotNow, limit)
+	}
+	assembler := mustDashboardAssembler(t, now, source)
+
+	startAssemble := func(ctx context.Context) <-chan dashboardAssembleResult {
+		result := make(chan dashboardAssembleResult, 1)
+		go func() {
+			dashboard, err := assembler.Assemble(ctx)
+			result <- dashboardAssembleResult{dashboard: dashboard, err: err}
+		}()
+		return result
+	}
+
+	leaderBase, cancelLeader := context.WithCancel(context.Background())
+	leaderContext := newObservedDoneContext(leaderBase)
+	leaderResult := startAssemble(leaderContext)
+	seen := make(map[int]bool, 9)
+	for len(seen) < 9 {
+		select {
+		case dependency := <-started:
+			seen[dependency] = true
+		case <-time.After(time.Second):
+			t.Fatalf("only dependencies %v started", seen)
+		}
+	}
+	select {
+	case <-leaderContext.observed:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not begin waiting")
+	}
+
+	firstBase, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	firstContext := newObservedDoneContext(firstBase)
+	firstResult := startAssemble(firstContext)
+	secondBase, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	secondContext := newObservedDoneContext(secondBase)
+	secondResult := startAssemble(secondContext)
+	cancelledBase, cancelWaiter := context.WithCancel(context.Background())
+	cancelledContext := newObservedDoneContext(cancelledBase)
+	cancelledResult := startAssemble(cancelledContext)
+	for name, waiter := range map[string]*observedDoneContext{
+		"first": firstContext, "second": secondContext, "cancelled": cancelledContext,
+	} {
+		select {
+		case <-waiter.observed:
+		case <-time.After(time.Second):
+			t.Fatalf("%s waiter did not begin waiting", name)
+		}
+	}
+
+	cancelWaiter()
+	cancelLeader()
+	if result := <-cancelledResult; !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("cancelled waiter error=%v dashboard=%#v", result.err, result.dashboard)
+	}
+	if result := <-leaderResult; !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("cancelled leader error=%v dashboard=%#v", result.err, result.dashboard)
+	}
+
+	select {
+	case dependency := <-started:
+		t.Errorf("shared probe %d restarted after waiter cancellation", dependency)
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseAll()
+	first := <-firstResult
+	second := <-secondResult
+	if first.err != nil || second.err != nil {
+		t.Fatalf("successful waiters errors: first=%v second=%v", first.err, second.err)
+	}
+	for dependency := range calls {
+		if got := calls[dependency].Load(); got != 1 {
+			t.Fatalf("dependency %d calls=%d want=1", dependency, got)
+		}
+	}
+
+	firstDashboard := first.dashboard
+	secondDashboard := second.dashboard
+	for name, pair := range map[string][2]*time.Time{
+		"students":      {firstDashboard.Students.ObservedAt, secondDashboard.Students.ObservedAt},
+		"questions":     {firstDashboard.Questions.ObservedAt, secondDashboard.Questions.ObservedAt},
+		"ai":            {firstDashboard.AI.ObservedAt, secondDashboard.AI.ObservedAt},
+		"storage":       {firstDashboard.Storage.ObservedAt, secondDashboard.Storage.ObservedAt},
+		"service":       {firstDashboard.Services[0].ObservedAt, secondDashboard.Services[0].ObservedAt},
+		"queue":         {firstDashboard.Queues[0].ObservedAt, secondDashboard.Queues[0].ObservedAt},
+		"backup":        {firstDashboard.Backup.ObservedAt, secondDashboard.Backup.ObservedAt},
+		"local backup":  {firstDashboard.Backup.Local.CompletedAt, secondDashboard.Backup.Local.CompletedAt},
+		"remote backup": {firstDashboard.Backup.Remote.CompletedAt, secondDashboard.Backup.Remote.CompletedAt},
+		"restore":       {firstDashboard.Backup.Restore.CompletedAt, secondDashboard.Backup.Restore.CompletedAt},
+		"alerts":        {firstDashboard.Alerts.ObservedAt, secondDashboard.Alerts.ObservedAt},
+	} {
+		if pair[0] == nil || pair[1] == nil || pair[0] == pair[1] {
+			t.Fatalf("%s time pointers are not independently copied: %p %p", name, pair[0], pair[1])
+		}
+	}
+	if &firstDashboard.Services[0] == &secondDashboard.Services[0] ||
+		&firstDashboard.Queues[0] == &secondDashboard.Queues[0] ||
+		&firstDashboard.RecentAudit[0] == &secondDashboard.RecentAudit[0] {
+		t.Fatal("shared dashboard slices alias callers")
+	}
+	originalStudentObservedAt := *secondDashboard.Students.ObservedAt
+	originalServiceObservedAt := *secondDashboard.Services[0].ObservedAt
+	originalQueueObservedAt := *secondDashboard.Queues[0].ObservedAt
+	originalBackupAt := *secondDashboard.Backup.Local.CompletedAt
+	firstDashboard.Services[0].State = DataStateUnavailable
+	firstDashboard.Queues[0].Queued = 999
+	firstDashboard.RecentAudit[0].Category = AuditCategoryBackup
+	*firstDashboard.Students.ObservedAt = firstDashboard.Students.ObservedAt.Add(time.Hour)
+	*firstDashboard.Services[0].ObservedAt = firstDashboard.Services[0].ObservedAt.Add(time.Hour)
+	*firstDashboard.Queues[0].ObservedAt = firstDashboard.Queues[0].ObservedAt.Add(time.Hour)
+	*firstDashboard.Backup.Local.CompletedAt = firstDashboard.Backup.Local.CompletedAt.Add(time.Hour)
+	if secondDashboard.Services[0].State != DataStateHealthy ||
+		secondDashboard.Queues[0].Queued != 0 ||
+		secondDashboard.RecentAudit[0].Category != AuditCategoryOperations ||
+		*secondDashboard.Students.ObservedAt != originalStudentObservedAt ||
+		*secondDashboard.Services[0].ObservedAt != originalServiceObservedAt ||
+		*secondDashboard.Queues[0].ObservedAt != originalQueueObservedAt ||
+		*secondDashboard.Backup.Local.CompletedAt != originalBackupAt {
+		t.Fatalf("shared dashboard result aliases callers: first=%#v second=%#v", firstDashboard, secondDashboard)
+	}
+}
+
 func TestDashboardAssemblerRejectsSensitiveUnknownDuplicateAndOutOfBoundsInput(t *testing.T) {
 	now := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
 	at := timePointer(now)

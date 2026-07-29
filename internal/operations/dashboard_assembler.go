@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -63,6 +64,14 @@ type DashboardAssembler struct {
 	dependencyTimeout time.Duration
 	dependencies      DashboardDependencies
 	dependencySlots   [9]chan struct{}
+	flightMu          sync.Mutex
+	flight            *dashboardFlight
+}
+
+type dashboardFlight struct {
+	done      chan struct{}
+	dashboard Dashboard
+	err       error
 }
 
 func NewDashboardAssembler(
@@ -96,7 +105,51 @@ func (a *DashboardAssembler) Assemble(ctx context.Context) (Dashboard, error) {
 	if err := ctx.Err(); err != nil {
 		return failClosedDashboard(now), err
 	}
+	flight := a.dashboardFlight(now)
+	select {
+	case <-ctx.Done():
+		return failClosedDashboard(now), ctx.Err()
+	case <-flight.done:
+		return cloneDashboard(flight.dashboard), flight.err
+	}
+}
 
+func (a *DashboardAssembler) dashboardFlight(now time.Time) *dashboardFlight {
+	a.flightMu.Lock()
+	defer a.flightMu.Unlock()
+	if a.flight != nil {
+		return a.flight
+	}
+	flight := &dashboardFlight{done: make(chan struct{})}
+	a.flight = flight
+	go a.runDashboardFlight(flight, now)
+	return flight
+}
+
+func (a *DashboardAssembler) runDashboardFlight(flight *dashboardFlight, now time.Time) {
+	dashboard := failClosedDashboard(now)
+	err := errDashboardDependencyUnavailable
+	func() {
+		defer func() {
+			if recover() != nil {
+				dashboard = failClosedDashboard(now)
+				err = errDashboardDependencyUnavailable
+			}
+		}()
+		dashboard, err = a.assembleOnce(context.Background(), now)
+	}()
+
+	a.flightMu.Lock()
+	flight.dashboard = dashboard
+	flight.err = err
+	close(flight.done)
+	if a.flight == flight {
+		a.flight = nil
+	}
+	a.flightMu.Unlock()
+}
+
+func (a *DashboardAssembler) assembleOnce(ctx context.Context, now time.Time) (Dashboard, error) {
 	students := dashboardResultChannel(ctx, a.dependencyTimeout, a.dependencySlots[0], func(callCtx context.Context) (StudentSummary, error) {
 		if a.dependencies.Students == nil {
 			return StudentSummary{}, errDashboardDependencyUnavailable
@@ -161,10 +214,6 @@ func (a *DashboardAssembler) Assemble(ctx context.Context) (Dashboard, error) {
 	backupResult := <-backup
 	alertResult := <-alerts
 	auditResult := <-audit
-
-	if err := ctx.Err(); err != nil {
-		return failClosedDashboard(now), err
-	}
 
 	dashboard := Dashboard{
 		ObservedAt:  now,
@@ -641,4 +690,31 @@ func cloneDashboardTime(value *time.Time) *time.Time {
 	}
 	copy := value.UTC()
 	return &copy
+}
+
+func cloneDashboard(source Dashboard) Dashboard {
+	out := source
+	out.Students.ObservedAt = cloneDashboardTime(source.Students.ObservedAt)
+	out.Questions.ObservedAt = cloneDashboardTime(source.Questions.ObservedAt)
+	out.AI.ObservedAt = cloneDashboardTime(source.AI.ObservedAt)
+	out.Storage.ObservedAt = cloneDashboardTime(source.Storage.ObservedAt)
+	out.Backup.ObservedAt = cloneDashboardTime(source.Backup.ObservedAt)
+	out.Backup.Local.CompletedAt = cloneDashboardTime(source.Backup.Local.CompletedAt)
+	out.Backup.Remote.CompletedAt = cloneDashboardTime(source.Backup.Remote.CompletedAt)
+	out.Backup.Restore.CompletedAt = cloneDashboardTime(source.Backup.Restore.CompletedAt)
+	out.Alerts.ObservedAt = cloneDashboardTime(source.Alerts.ObservedAt)
+
+	out.Services = make([]ServiceHealth, len(source.Services))
+	copy(out.Services, source.Services)
+	for index := range out.Services {
+		out.Services[index].ObservedAt = cloneDashboardTime(source.Services[index].ObservedAt)
+	}
+	out.Queues = make([]QueueSummary, len(source.Queues))
+	copy(out.Queues, source.Queues)
+	for index := range out.Queues {
+		out.Queues[index].ObservedAt = cloneDashboardTime(source.Queues[index].ObservedAt)
+	}
+	out.RecentAudit = make([]AuditSummary, len(source.RecentAudit))
+	copy(out.RecentAudit, source.RecentAudit)
+	return out
 }
