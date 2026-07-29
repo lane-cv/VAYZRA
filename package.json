@@ -16,7 +16,9 @@
     "e2e-phase4": "make e2e-phase4",
     "backup:contract": "bash scripts/phase5-backup_contract_test.sh",
     "backup:live": "bash scripts/phase5-backup_live_test.sh",
-    "backup:run": "make phase5-backup"
+    "backup:run": "make phase5-backup",
+    "host-metrics:contract": "bash scripts/host-metrics_contract_test.sh",
+    "host-metrics:run": "make host-metrics"
   },
   "devDependencies": {
     "@eslint/js": "9.39.2",

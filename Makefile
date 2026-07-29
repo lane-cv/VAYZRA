@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract host-sampler host-metrics-contract host-metrics
 
 BACKUP_TRIGGER ?= manual
 
@@ -66,3 +66,13 @@ phase5-backup:
 
 phase5-restore-contract:
 	bash scripts/phase5-restore_contract_test.sh
+
+host-sampler:
+	@mkdir -p $(GOBIN)
+	$(GO) build -o $(GOBIN)/host-sampler ./cmd/host-sampler
+
+host-metrics-contract:
+	bash scripts/host-metrics_contract_test.sh
+
+host-metrics: host-sampler
+	HOST_SAMPLER_BIN=$(GOBIN)/host-sampler bash scripts/collect-host-metrics.sh --environment development
