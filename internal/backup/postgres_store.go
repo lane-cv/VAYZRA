@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sort"
 	"time"
 
@@ -757,6 +758,204 @@ ORDER BY started_at DESC NULLS LAST,id DESC`, id)
 		return RunDetail{}, ErrUnavailable
 	}
 	return detail, nil
+}
+
+func (s *PostgresStore) RecordRestoreSuccess(
+	ctx context.Context,
+	input RestoreSuccessInput,
+) (RestoreVerification, error) {
+	if s == nil || s.pool == nil || validateRestoreSuccessInput(input) != nil {
+		return RestoreVerification{}, ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return RestoreVerification{}, ErrUnavailable
+	}
+	defer tx.Rollback(ctx)
+
+	var runState State
+	var manifestSHA256 []byte
+	err = tx.QueryRow(ctx, `
+SELECT state,manifest_sha256
+FROM backup_runs
+WHERE id=$1
+FOR SHARE`, input.BackupRunID).Scan(&runState, &manifestSHA256)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RestoreVerification{}, ErrInvalid
+	}
+	if err != nil {
+		return RestoreVerification{}, ErrUnavailable
+	}
+	if (runState != StateSucceeded && runState != StateDegraded) ||
+		!bytes.Equal(manifestSHA256, input.ManifestSHA256) {
+		return RestoreVerification{}, ErrInvalid
+	}
+
+	encodedCounts, err := json.Marshal(input.DatabaseRowCounts)
+	if err != nil {
+		return RestoreVerification{}, ErrInvalid
+	}
+	tag, err := tx.Exec(ctx, `
+INSERT INTO restore_verifications(
+  id,backup_run_id,state,started_at,finished_at,restored_migration_version,
+  database_row_counts,checked_object_count,missing_object_count,
+  unexpected_object_count,session_revocation_verified,rto_seconds,
+  report_sha256,error_category,error_trace_id
+) VALUES(
+  $1,$2,'succeeded',$3,$4,$5,$6, $7,0,0,true,$8,$9,'',''
+)
+ON CONFLICT(id) DO NOTHING`,
+		input.VerificationID,
+		input.BackupRunID,
+		input.StartedAt.UTC(),
+		input.FinishedAt.UTC(),
+		input.RestoredMigrationVersion,
+		encodedCounts,
+		input.CheckedObjectCount,
+		input.RTOSeconds,
+		input.ReportSHA256,
+	)
+	if err != nil {
+		return RestoreVerification{}, ErrUnavailable
+	}
+	expected := restoreVerificationFromSuccessInput(input)
+	result := expected
+	if tag.RowsAffected() == 0 {
+		existing, err := scanRestoreVerification(tx.QueryRow(ctx, `
+SELECT id,backup_run_id,state,started_at,finished_at,
+       restored_migration_version,database_row_counts,
+       checked_object_count,missing_object_count,unexpected_object_count,
+       session_revocation_verified,rto_seconds,report_sha256,
+       error_category,error_trace_id
+FROM restore_verifications
+WHERE id=$1
+FOR SHARE`, input.VerificationID))
+		if err != nil {
+			return RestoreVerification{}, ErrUnavailable
+		}
+		if !sameRestoreVerification(existing, expected) {
+			return RestoreVerification{}, ErrInvalid
+		}
+		result = existing
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RestoreVerification{}, ErrUnavailable
+	}
+	return result, nil
+}
+
+func validateRestoreSuccessInput(input RestoreSuccessInput) error {
+	counts, _, err := validateRestoreExerciseRowCounts(input.DatabaseRowCounts)
+	duration := input.FinishedAt.Sub(input.StartedAt)
+	if err != nil ||
+		input.VerificationID == uuid.Nil ||
+		input.VerificationID.Version() != 4 ||
+		input.VerificationID.Variant() != uuid.RFC4122 ||
+		input.BackupRunID == uuid.Nil ||
+		input.StartedAt.IsZero() ||
+		input.FinishedAt.IsZero() ||
+		input.StartedAt.Location() != time.UTC ||
+		input.FinishedAt.Location() != time.UTC ||
+		duration < 0 ||
+		input.RestoredMigrationVersion < 1 ||
+		len(counts) != len(restoreRowCountAllowlist) ||
+		input.CheckedObjectCount < 0 ||
+		!input.SessionRevocationVerified ||
+		input.RTOSeconds < 0 ||
+		input.RTOSeconds >= restoreExerciseRTOLimit ||
+		len(input.ManifestSHA256) != 32 ||
+		len(input.ReportSHA256) != 32 {
+		return ErrInvalid
+	}
+	if duration != time.Duration(input.RTOSeconds)*time.Second {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func restoreVerificationFromSuccessInput(
+	input RestoreSuccessInput,
+) RestoreVerification {
+	startedAt := input.StartedAt.UTC()
+	finishedAt := input.FinishedAt.UTC()
+	migrationVersion := input.RestoredMigrationVersion
+	rtoSeconds := input.RTOSeconds
+	return RestoreVerification{
+		ID:                        input.VerificationID,
+		BackupRunID:               input.BackupRunID,
+		State:                     RestoreSucceeded,
+		StartedAt:                 &startedAt,
+		FinishedAt:                &finishedAt,
+		RestoredMigrationVersion:  &migrationVersion,
+		DatabaseRowCounts:         maps.Clone(input.DatabaseRowCounts),
+		CheckedObjectCount:        input.CheckedObjectCount,
+		MissingObjectCount:        0,
+		UnexpectedObjectCount:     0,
+		SessionRevocationVerified: true,
+		RTOSeconds:                &rtoSeconds,
+		ReportSHA256:              append([]byte(nil), input.ReportSHA256...),
+	}
+}
+
+func scanRestoreVerification(row pgx.Row) (RestoreVerification, error) {
+	var verification RestoreVerification
+	var rowCounts []byte
+	err := row.Scan(
+		&verification.ID,
+		&verification.BackupRunID,
+		&verification.State,
+		&verification.StartedAt,
+		&verification.FinishedAt,
+		&verification.RestoredMigrationVersion,
+		&rowCounts,
+		&verification.CheckedObjectCount,
+		&verification.MissingObjectCount,
+		&verification.UnexpectedObjectCount,
+		&verification.SessionRevocationVerified,
+		&verification.RTOSeconds,
+		&verification.ReportSHA256,
+		&verification.ErrorCategory,
+		&verification.ErrorTraceID,
+	)
+	if err != nil {
+		return RestoreVerification{}, err
+	}
+	verification.DatabaseRowCounts, err = decodeRestoreRowCounts(rowCounts)
+	if err != nil {
+		return RestoreVerification{}, err
+	}
+	verification.StartedAt = cloneTime(verification.StartedAt)
+	verification.FinishedAt = cloneTime(verification.FinishedAt)
+	return verification, nil
+}
+
+func sameRestoreVerification(
+	left RestoreVerification,
+	right RestoreVerification,
+) bool {
+	return left.ID == right.ID &&
+		left.BackupRunID == right.BackupRunID &&
+		left.State == right.State &&
+		left.StartedAt != nil &&
+		right.StartedAt != nil &&
+		left.FinishedAt != nil &&
+		right.FinishedAt != nil &&
+		left.FinishedAt.Sub(*left.StartedAt) ==
+			right.FinishedAt.Sub(*right.StartedAt) &&
+		left.RestoredMigrationVersion != nil &&
+		right.RestoredMigrationVersion != nil &&
+		*left.RestoredMigrationVersion == *right.RestoredMigrationVersion &&
+		maps.Equal(left.DatabaseRowCounts, right.DatabaseRowCounts) &&
+		left.CheckedObjectCount == right.CheckedObjectCount &&
+		left.MissingObjectCount == right.MissingObjectCount &&
+		left.UnexpectedObjectCount == right.UnexpectedObjectCount &&
+		left.SessionRevocationVerified == right.SessionRevocationVerified &&
+		left.RTOSeconds != nil &&
+		right.RTOSeconds != nil &&
+		*left.RTOSeconds == *right.RTOSeconds &&
+		bytes.Equal(left.ReportSHA256, right.ReportSHA256) &&
+		left.ErrorCategory == right.ErrorCategory &&
+		left.ErrorTraceID == right.ErrorTraceID
 }
 
 func decodeRestoreRowCounts(raw []byte) (map[string]int64, error) {

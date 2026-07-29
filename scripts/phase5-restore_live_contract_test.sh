@@ -63,16 +63,21 @@ write_report_fixture() {
   local unexpected="$7"
   local active="$8"
   local isolation="$9"
+  local verification_id='22222222-2222-4222-8222-222222222222'
+  local database_counts
   local canonical="$CONTRACT_ROOT/report-input.canonical"
   local report_sha256
+  database_counts='{"users":1,"sessions":2,"subjects":0,"grades":0,"terms":0,"chapters":0,"lessons":0,"lesson_revisions":0,"files":0,"file_versions":0,"file_previews":0,"qa_threads":0,"qa_messages":0,"ai_threads":0,"ai_messages":0,"ai_runs":0}'
   printf '%s\n' \
-    'schemaVersion=1' \
+    'schemaVersion=2' \
+    "verificationId=$verification_id" \
     'backupId=11111111-1111-4111-8111-111111111111' \
     'manifestSHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     'verificationReportSHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
     'evidenceSHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
     "durationSeconds=$duration" \
     "migrationVersion=$migration" \
+    "databaseRowCounts=$database_counts" \
     "rowCountTotal=$row_total" \
     "checkedObjectCount=$checked" \
     "missingObjectCount=$missing" \
@@ -85,7 +90,7 @@ write_report_fixture() {
       sed -n '1s/[[:space:]].*$//p'
   )"
   printf '%s\n' \
-    "{\"schemaVersion\":1,\"backupId\":\"11111111-1111-4111-8111-111111111111\",\"manifestSHA256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"verificationReportSHA256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"evidenceSHA256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"durationSeconds\":$duration,\"migrationVersion\":$migration,\"rowCountTotal\":$row_total,\"checkedObjectCount\":$checked,\"missingObjectCount\":$missing,\"unexpectedObjectCount\":$unexpected,\"activeSessionCount\":$active,\"isolation404ProbeCount\":$isolation,\"reportSHA256\":\"$report_sha256\"}" \
+    "{\"schemaVersion\":2,\"verificationId\":\"$verification_id\",\"backupId\":\"11111111-1111-4111-8111-111111111111\",\"manifestSHA256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"verificationReportSHA256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"evidenceSHA256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"durationSeconds\":$duration,\"migrationVersion\":$migration,\"databaseRowCounts\":$database_counts,\"rowCountTotal\":$row_total,\"checkedObjectCount\":$checked,\"missingObjectCount\":$missing,\"unexpectedObjectCount\":$unexpected,\"activeSessionCount\":$active,\"isolation404ProbeCount\":$isolation,\"reportSHA256\":\"$report_sha256\"}" \
     >"$path"
   chmod 0600 "$path"
 }
@@ -167,6 +172,11 @@ require_literal '--password-file /run/secrets/local_password \'
 require_literal 'cat config \'
 require_literal 'HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE="$TEACHER_CREDENTIAL_FILE"'
 require_literal 'parse_sanitized_report "$REPORT_FILE" "$BACKUP_ID" "$EXPECTED_MANIFEST_SHA256"'
+require_literal 'record_restore_verification'
+require_literal 'compose run --rm --no-deps -T backup restore-record \'
+require_literal '<"$REPORT_FILE"'
+require_literal "database_row_counts='\${LIVE_REPORT_DATABASE_ROW_COUNTS}'::jsonb"
+require_literal '|0|0|true|${LIVE_REPORT_DURATION_SECONDS}'
 require_literal 'assert_restore_resources_absent "$BACKUP_ID"'
 require_literal 'assert_secret_absent "$TEACHER_PASSWORD_FILE" "$TEACHER_CREDENTIAL_FILE" "$RESTORE_LOG" "$REPORT_FILE"'
 require_literal 'assert_single_line_secret_absent "$FIXTURE_ROOT/secrets/local_password" "$BACKUP_LOG" "$RESTORE_LOG" "$REPORT_FILE"'
@@ -292,13 +302,15 @@ fixture_line="$(grep -nE '^[[:space:]]*create_fixture$' "$TARGET" | tail -n1 | c
 backup_line="$(grep -nE '^[[:space:]]*run_source_backup$' "$TARGET" | tail -n1 | cut -d: -f1)"
 handoff_line="$(grep -nE '^[[:space:]]*prepare_restore_repository_access$' "$TARGET" | tail -n1 | cut -d: -f1)"
 restore_line="$(grep -nE '^[[:space:]]*run_empty_restore$' "$TARGET" | tail -n1 | cut -d: -f1)"
+record_line="$(grep -nE '^[[:space:]]*record_restore_verification$' "$TARGET" | tail -n1 | cut -d: -f1)"
 return_line="$(grep -nE '^[[:space:]]*restore_backup_repository_access$' "$TARGET" | tail -n1 | cut -d: -f1)"
 cleanup_line="$(grep -nF 'cleanup_live 0' "$TARGET" | tail -n1 | cut -d: -f1)"
 [[ -n "$backup_line" && -n "$handoff_line" && -n "$restore_line" &&
-  -n "$return_line" && -n "$cleanup_line" &&
+  -n "$record_line" && -n "$return_line" && -n "$cleanup_line" &&
   "$backup_line" -lt "$handoff_line" &&
   "$handoff_line" -lt "$restore_line" &&
-  "$restore_line" -lt "$return_line" &&
+  "$restore_line" -lt "$record_line" &&
+  "$record_line" -lt "$return_line" &&
   "$return_line" -lt "$cleanup_line" ]] ||
   fail 'repository ownership transitions are ordered incorrectly'
 
@@ -324,20 +336,24 @@ if extract_restore_failure_stage >/dev/null; then
 fi
 
 BACKUP_ID='11111111-1111-4111-8111-111111111111'
+VERIFICATION_ID='22222222-2222-4222-8222-222222222222'
 MANIFEST_SHA256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 VERIFICATION_SHA256='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 EVIDENCE_SHA256='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+DATABASE_ROW_COUNTS='{"users":1,"sessions":2,"subjects":0,"grades":0,"terms":0,"chapters":0,"lessons":0,"lesson_revisions":0,"files":0,"file_versions":0,"file_previews":0,"qa_threads":0,"qa_messages":0,"ai_threads":0,"ai_messages":0,"ai_runs":0}'
 CANONICAL_FILE="$CONTRACT_ROOT/report.canonical"
 REPORT_FILE="$CONTRACT_ROOT/restore-${BACKUP_ID}.json"
 
 printf '%s\n' \
-  'schemaVersion=1' \
+  'schemaVersion=2' \
+  "verificationId=$VERIFICATION_ID" \
   "backupId=$BACKUP_ID" \
   "manifestSHA256=$MANIFEST_SHA256" \
   "verificationReportSHA256=$VERIFICATION_SHA256" \
   "evidenceSHA256=$EVIDENCE_SHA256" \
   'durationSeconds=42' \
   'migrationVersion=20' \
+  "databaseRowCounts=$DATABASE_ROW_COUNTS" \
   'rowCountTotal=3' \
   'checkedObjectCount=2' \
   'missingObjectCount=0' \
@@ -352,13 +368,15 @@ REPORT_SHA256="$(
 [[ "$REPORT_SHA256" =~ ^[a-f0-9]{64}$ ]] ||
   fail 'contract could not create report hash'
 printf '%s\n' \
-  "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":42,\"migrationVersion\":20,\"rowCountTotal\":3,\"checkedObjectCount\":2,\"missingObjectCount\":0,\"unexpectedObjectCount\":0,\"activeSessionCount\":0,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$REPORT_SHA256\"}" \
+  "{\"schemaVersion\":2,\"verificationId\":\"$VERIFICATION_ID\",\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":42,\"migrationVersion\":20,\"databaseRowCounts\":$DATABASE_ROW_COUNTS,\"rowCountTotal\":3,\"checkedObjectCount\":2,\"missingObjectCount\":0,\"unexpectedObjectCount\":0,\"activeSessionCount\":0,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$REPORT_SHA256\"}" \
   >"$REPORT_FILE"
 chmod 0600 "$REPORT_FILE"
 
 parse_sanitized_report "$REPORT_FILE" "$BACKUP_ID" "$MANIFEST_SHA256" ||
   fail 'strict valid report was rejected'
-[[ "$LIVE_REPORT_DURATION_SECONDS" == 42 &&
+[[ "$LIVE_REPORT_VERIFICATION_ID" == "$VERIFICATION_ID" &&
+  "$LIVE_REPORT_DURATION_SECONDS" == 42 &&
+  "$LIVE_REPORT_DATABASE_ROW_COUNTS" == "$DATABASE_ROW_COUNTS" &&
   "$LIVE_REPORT_ROW_COUNT_TOTAL" == 3 &&
   "$LIVE_REPORT_ISOLATION_404_PROBE_COUNT" == 2 ]] ||
   fail 'valid report fields were not loaded'

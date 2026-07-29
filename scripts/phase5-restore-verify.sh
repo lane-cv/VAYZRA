@@ -19,6 +19,7 @@ readonly SUPERVISOR_TERM_GRACE_ATTEMPTS=10
 readonly SUPERVISOR_PARENT_GRACE_ATTEMPTS=200
 
 BACKUP_ID=''
+RESTORE_VERIFICATION_ID=''
 PROJECT=''
 OWNER_TOKEN=''
 WORK_DIRECTORY=''
@@ -63,6 +64,7 @@ WORKSPACE_INITIALIZED=false
 HTTP_PROBE_SUCCEEDED=false
 BOUNDED_BATCH_ACTIVE=false
 SUPERVISOR_STAT_STYLE=''
+DATABASE_ROW_COUNTS_JSON=''
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -308,10 +310,17 @@ random_token() {
 }
 
 initialize_identity() {
+  local verification_hex variant_nibble
+  local variant_value
   HOST_UID="$(id -u)" || return 1
   HOST_GID="$(id -g)" || return 1
   [[ "$HOST_UID" =~ ^[0-9]+$ && "$HOST_GID" =~ ^[0-9]+$ ]] || return 1
   OWNER_TOKEN="$(random_token)" || return 1
+  verification_hex="${OWNER_TOKEN:0:32}"
+  variant_value=$(((16#${verification_hex:16:1} & 3) | 8))
+  printf -v variant_nibble '%x' "$variant_value"
+  RESTORE_VERIFICATION_ID="${verification_hex:0:8}-${verification_hex:8:4}-4${verification_hex:13:3}-${variant_nibble}${verification_hex:17:3}-${verification_hex:20:12}"
+  canonical_backup_uuid "$RESTORE_VERIFICATION_ID" || return 1
   PROJECT="${PROJECT_PREFIX}${OWNER_TOKEN:0:12}"
   valid_project "$PROJECT" || return 1
   DATABASE_PASSWORD="$(random_token)" || return 1
@@ -1833,9 +1842,10 @@ verify_bound_evidence_sha256() {
 
 load_safe_restore_counts() {
   local path="$CHECK_OUTPUT_DIRECTORY/restore-check.report"
-  local line key value numeric_value
+  local line key value numeric_value table
   local index=0
   local row_sum=0
+  local row_count_separator=''
   local mode size
   local -a expected_keys=(
     schema_version
@@ -1875,6 +1885,7 @@ load_safe_restore_counts() {
   ACTIVE_SESSION_COUNT=''
   VERIFICATION_REPORT_SHA256=''
   EVIDENCE_SHA256=''
+  DATABASE_ROW_COUNTS_JSON='{'
   [[ -f "$path" &&
     ! -L "$path" &&
     "$(portable_owner "$path")" == "$HOST_UID" ]] ||
@@ -1911,6 +1922,10 @@ load_safe_restore_counts() {
         ((row_sum <= 9223372036854775807 - numeric_value)) ||
           return 1
         row_sum=$((row_sum + numeric_value))
+        table="${key#table_}"
+        table="${table%_count}"
+        DATABASE_ROW_COUNTS_JSON="${DATABASE_ROW_COUNTS_JSON}${row_count_separator}\"${table}\":${value}"
+        row_count_separator=','
         ;;
       row_count_total)
         valid_int64_decimal "$value" || return 1
@@ -1944,6 +1959,7 @@ load_safe_restore_counts() {
     esac
     index=$((index + 1))
   done <"$path"
+  DATABASE_ROW_COUNTS_JSON="${DATABASE_ROW_COUNTS_JSON}}"
   [[ "$index" -eq "${#expected_keys[@]}" &&
     "$ROW_COUNT_TOTAL" == "$row_sum" &&
     "$MISSING_OBJECT_COUNT" == 0 &&
@@ -1979,13 +1995,15 @@ write_sanitized_report() {
     "$duration" -lt "$RTO_LIMIT_SECONDS" ]] ||
     return 1
   printf '%s\n' \
-    "schemaVersion=1" \
+    "schemaVersion=2" \
+    "verificationId=$RESTORE_VERIFICATION_ID" \
     "backupId=$BACKUP_ID" \
     "manifestSHA256=$EXPECTED_MANIFEST_SHA256" \
     "verificationReportSHA256=$VERIFICATION_REPORT_SHA256" \
     "evidenceSHA256=$EVIDENCE_SHA256" \
     "durationSeconds=$duration" \
     "migrationVersion=$MIGRATION_VERSION" \
+    "databaseRowCounts=$DATABASE_ROW_COUNTS_JSON" \
     "rowCountTotal=$ROW_COUNT_TOTAL" \
     "checkedObjectCount=$CHECKED_OBJECT_COUNT" \
     "missingObjectCount=$MISSING_OBJECT_COUNT" \
@@ -1996,7 +2014,7 @@ write_sanitized_report() {
   chmod 0600 "$canonical"
   report_sha256="$(portable_sha256 "$canonical")" || return 1
   printf '%s\n' \
-    "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$EXPECTED_MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_REPORT_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":$duration,\"migrationVersion\":$MIGRATION_VERSION,\"rowCountTotal\":$ROW_COUNT_TOTAL,\"checkedObjectCount\":$CHECKED_OBJECT_COUNT,\"missingObjectCount\":$MISSING_OBJECT_COUNT,\"unexpectedObjectCount\":$UNEXPECTED_OBJECT_COUNT,\"activeSessionCount\":$ACTIVE_SESSION_COUNT,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$report_sha256\"}" \
+    "{\"schemaVersion\":2,\"verificationId\":\"$RESTORE_VERIFICATION_ID\",\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$EXPECTED_MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_REPORT_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":$duration,\"migrationVersion\":$MIGRATION_VERSION,\"databaseRowCounts\":$DATABASE_ROW_COUNTS_JSON,\"rowCountTotal\":$ROW_COUNT_TOTAL,\"checkedObjectCount\":$CHECKED_OBJECT_COUNT,\"missingObjectCount\":$MISSING_OBJECT_COUNT,\"unexpectedObjectCount\":$UNEXPECTED_OBJECT_COUNT,\"activeSessionCount\":$ACTIVE_SESSION_COUNT,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$report_sha256\"}" \
     >"$REPORT_TEMPORARY"
   chmod 0600 "$REPORT_TEMPORARY"
 }

@@ -68,7 +68,9 @@ REPOSITORY_HOST_HANDOFF=false
 CLEANED=false
 
 LIVE_REPORT_DURATION_SECONDS=''
+LIVE_REPORT_VERIFICATION_ID=''
 LIVE_REPORT_MIGRATION_VERSION=''
+LIVE_REPORT_DATABASE_ROW_COUNTS=''
 LIVE_REPORT_ROW_COUNT_TOTAL=''
 LIVE_REPORT_CHECKED_OBJECT_COUNT=''
 LIVE_REPORT_ISOLATION_404_PROBE_COUNT=''
@@ -204,7 +206,8 @@ parse_sanitized_report() {
   local expected_backup_id="$2"
   local expected_manifest_sha256="$3"
   local content pattern
-  local backup_id manifest_sha256 verification_sha256 evidence_sha256
+  local verification_id backup_id manifest_sha256
+  local verification_sha256 evidence_sha256 database_counts
   local duration migration row_total checked missing unexpected active
   local isolation report_sha256 calculated_sha256
 
@@ -219,23 +222,26 @@ parse_sanitized_report() {
     return 1
 
   content="$(<"$path")"
-  pattern='^\{"schemaVersion":1,"backupId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","manifestSHA256":"([a-f0-9]{64})","verificationReportSHA256":"([a-f0-9]{64})","evidenceSHA256":"([a-f0-9]{64})","durationSeconds":(0|[1-9][0-9]*),"migrationVersion":(0|[1-9][0-9]*),"rowCountTotal":(0|[1-9][0-9]*),"checkedObjectCount":(0|[1-9][0-9]*),"missingObjectCount":(0|[1-9][0-9]*),"unexpectedObjectCount":(0|[1-9][0-9]*),"activeSessionCount":(0|[1-9][0-9]*),"isolation404ProbeCount":(0|[1-9][0-9]*),"reportSHA256":"([a-f0-9]{64})"\}$'
+  pattern='^\{"schemaVersion":2,"verificationId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","backupId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","manifestSHA256":"([a-f0-9]{64})","verificationReportSHA256":"([a-f0-9]{64})","evidenceSHA256":"([a-f0-9]{64})","durationSeconds":(0|[1-9][0-9]*),"migrationVersion":(0|[1-9][0-9]*),"databaseRowCounts":(\{"users":[0-9]+,"sessions":[0-9]+,"subjects":[0-9]+,"grades":[0-9]+,"terms":[0-9]+,"chapters":[0-9]+,"lessons":[0-9]+,"lesson_revisions":[0-9]+,"files":[0-9]+,"file_versions":[0-9]+,"file_previews":[0-9]+,"qa_threads":[0-9]+,"qa_messages":[0-9]+,"ai_threads":[0-9]+,"ai_messages":[0-9]+,"ai_runs":[0-9]+\}),"rowCountTotal":(0|[1-9][0-9]*),"checkedObjectCount":(0|[1-9][0-9]*),"missingObjectCount":(0|[1-9][0-9]*),"unexpectedObjectCount":(0|[1-9][0-9]*),"activeSessionCount":(0|[1-9][0-9]*),"isolation404ProbeCount":(0|[1-9][0-9]*),"reportSHA256":"([a-f0-9]{64})"\}$'
   [[ "$content" =~ $pattern ]] || return 1
 
-  backup_id="${BASH_REMATCH[1]}"
-  manifest_sha256="${BASH_REMATCH[2]}"
-  verification_sha256="${BASH_REMATCH[3]}"
-  evidence_sha256="${BASH_REMATCH[4]}"
-  duration="${BASH_REMATCH[5]}"
-  migration="${BASH_REMATCH[6]}"
-  row_total="${BASH_REMATCH[7]}"
-  checked="${BASH_REMATCH[8]}"
-  missing="${BASH_REMATCH[9]}"
-  unexpected="${BASH_REMATCH[10]}"
-  active="${BASH_REMATCH[11]}"
-  isolation="${BASH_REMATCH[12]}"
-  report_sha256="${BASH_REMATCH[13]}"
+  verification_id="${BASH_REMATCH[1]}"
+  backup_id="${BASH_REMATCH[2]}"
+  manifest_sha256="${BASH_REMATCH[3]}"
+  verification_sha256="${BASH_REMATCH[4]}"
+  evidence_sha256="${BASH_REMATCH[5]}"
+  duration="${BASH_REMATCH[6]}"
+  migration="${BASH_REMATCH[7]}"
+  database_counts="${BASH_REMATCH[8]}"
+  row_total="${BASH_REMATCH[9]}"
+  checked="${BASH_REMATCH[10]}"
+  missing="${BASH_REMATCH[11]}"
+  unexpected="${BASH_REMATCH[12]}"
+  active="${BASH_REMATCH[13]}"
+  isolation="${BASH_REMATCH[14]}"
+  report_sha256="${BASH_REMATCH[15]}"
 
+  valid_uuid "$verification_id" || return 1
   [[ "$backup_id" == "$expected_backup_id" &&
     "$manifest_sha256" == "$expected_manifest_sha256" ]] ||
     return 1
@@ -262,13 +268,15 @@ parse_sanitized_report() {
 
   calculated_sha256="$(
     printf '%s\n' \
-      'schemaVersion=1' \
+      'schemaVersion=2' \
+      "verificationId=$verification_id" \
       "backupId=$backup_id" \
       "manifestSHA256=$manifest_sha256" \
       "verificationReportSHA256=$verification_sha256" \
       "evidenceSHA256=$evidence_sha256" \
       "durationSeconds=$duration" \
       "migrationVersion=$migration" \
+      "databaseRowCounts=$database_counts" \
       "rowCountTotal=$row_total" \
       "checkedObjectCount=$checked" \
       "missingObjectCount=$missing" \
@@ -280,8 +288,10 @@ parse_sanitized_report() {
   )"
   [[ "$calculated_sha256" == "$report_sha256" ]] || return 1
 
+  LIVE_REPORT_VERIFICATION_ID="$verification_id"
   LIVE_REPORT_DURATION_SECONDS="$duration"
   LIVE_REPORT_MIGRATION_VERSION="$migration"
+  LIVE_REPORT_DATABASE_ROW_COUNTS="$database_counts"
   LIVE_REPORT_ROW_COUNT_TOTAL="$row_total"
   LIVE_REPORT_CHECKED_OBJECT_COUNT="$checked"
   LIVE_REPORT_ISOLATION_404_PROBE_COUNT="$isolation"
@@ -1518,6 +1528,58 @@ run_empty_restore() {
     fail 'successful restore left disposable resources'
 }
 
+record_restore_verification() {
+  local record_log="$FIXTURE_ROOT/logs/restore-record.log"
+  local evidence expected
+  : >"$record_log"
+  chmod 0600 "$record_log"
+  if ! compose run --rm --no-deps -T backup restore-record \
+    <"$REPORT_FILE" >"$record_log" 2>&1; then
+    fail 'successful restore evidence was not recorded in the primary database'
+  fi
+  if ! compose run --rm --no-deps -T backup restore-record \
+    <"$REPORT_FILE" >>"$record_log" 2>&1; then
+    fail 'successful restore evidence replay was not idempotent'
+  fi
+  assert_secret_absent \
+    "$TEACHER_PASSWORD_FILE" \
+    "$TEACHER_CREDENTIAL_FILE" \
+    "$record_log" ||
+    fail 'restore evidence recorder exposed teacher credentials'
+  assert_single_line_secret_absent \
+    "$FIXTURE_ROOT/secrets/database_password" \
+    "$record_log" ||
+    fail 'restore evidence recorder exposed the database credential'
+  evidence="$(
+    db_scalar "
+SELECT
+  count(*)::text || '|' ||
+  min(state) || '|' ||
+  min(restored_migration_version)::text || '|' ||
+  min(checked_object_count)::text || '|' ||
+  min(missing_object_count)::text || '|' ||
+  min(unexpected_object_count)::text || '|' ||
+  bool_and(session_revocation_verified)::text || '|' ||
+  min(rto_seconds)::text || '|' ||
+  min(encode(report_sha256,'hex')) || '|' ||
+  min((
+    SELECT sum((value #>> '{}')::bigint)
+    FROM jsonb_each(database_row_counts)
+  ))::text || '|' ||
+  min((
+    SELECT count(*)
+    FROM jsonb_object_keys(database_row_counts)
+  ))::text
+FROM restore_verifications
+WHERE id='${LIVE_REPORT_VERIFICATION_ID}'::uuid
+  AND backup_run_id='${BACKUP_ID}'::uuid
+  AND database_row_counts='${LIVE_REPORT_DATABASE_ROW_COUNTS}'::jsonb;"
+  )" || fail 'primary restore verification evidence is unavailable'
+  expected="1|succeeded|${LIVE_REPORT_MIGRATION_VERSION}|${LIVE_REPORT_CHECKED_OBJECT_COUNT}|0|0|true|${LIVE_REPORT_DURATION_SECONDS}|${LIVE_REPORT_SHA256}|${LIVE_REPORT_ROW_COUNT_TOTAL}|16"
+  [[ "$evidence" == "$expected" ]] ||
+    fail 'primary restore verification evidence is invalid'
+}
+
 expected_owned_restore_name() {
   local project="$1"
   local class="$2"
@@ -2136,9 +2198,11 @@ main() {
   run_source_backup
   prepare_restore_repository_access
   run_empty_restore
+  record_restore_verification
   restore_backup_repository_access
 
   local result_backup_id="$BACKUP_ID"
+  local result_verification_id="$LIVE_REPORT_VERIFICATION_ID"
   local result_duration="$LIVE_REPORT_DURATION_SECONDS"
   local result_manifest="$LIVE_REPORT_MANIFEST_SHA256"
   local result_evidence="$LIVE_REPORT_EVIDENCE_SHA256"
@@ -2147,8 +2211,9 @@ main() {
   cleanup_live 0 || fail 'live fixture cleanup failed'
   trap - EXIT HUP INT TERM
   verify_no_orphans || fail 'live fixture cleanup evidence failed'
-  printf 'phase5 restore live: PASS backupId=%s durationSeconds=%s manifestSHA256=%s evidenceSHA256=%s rowCountTotal=%s isolation404ProbeCount=%s\n' \
+  printf 'phase5 restore live: PASS backupId=%s verificationId=%s durationSeconds=%s manifestSHA256=%s evidenceSHA256=%s rowCountTotal=%s isolation404ProbeCount=%s\n' \
     "$result_backup_id" \
+    "$result_verification_id" \
     "$result_duration" \
     "$result_manifest" \
     "$result_evidence" \

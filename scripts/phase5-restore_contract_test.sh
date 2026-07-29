@@ -285,7 +285,7 @@ counter="${counter:-0}"
 counter=$((counter + 1))
 printf '%s\n' "$counter" >"$PHASE5_FAKE_RANDOM_COUNTER"
 case "$counter" in
-  1) printf ' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' ;;
+  1) printf ' 0123456789abcdeff123456789abcdef0123456789abcdef0123456789abcdef\n' ;;
   2) printf ' fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\n' ;;
   3) printf ' 123456789abcdeffedcba98765432100123456789abcdeffedcba98765432100\n' ;;
   4) printf ' abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd\n' ;;
@@ -2180,6 +2180,14 @@ assert_before "$success_fixture" \
 
 report="$success_fixture/reports/restore-$BACKUP_ID.json"
 test -f "$report" || fail 'sanitized restore report was not written'
+grep -Eq \
+  '^\{"schemaVersion":2,"verificationId":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-b[0-9a-f]{3}-[0-9a-f]{12}",' \
+  "$report" ||
+  fail 'restore report omitted its canonical verification identity'
+grep -Fq \
+  '"databaseRowCounts":{"users":1,"sessions":2,"subjects":3,"grades":4,"terms":5,"chapters":6,"lessons":7,"lesson_revisions":8,"files":9,"file_versions":10,"file_previews":11,"qa_threads":12,"qa_messages":13,"ai_threads":14,"ai_messages":15,"ai_runs":16}' \
+  "$report" ||
+  fail 'restore report omitted its fixed allowlisted row counts'
 grep -Eq '"durationSeconds":[0-9]+' "$report" ||
   fail 'restore report omitted duration'
 duration="$(sed -n 's/.*"durationSeconds":\([0-9][0-9]*\).*/\1/p' "$report")"

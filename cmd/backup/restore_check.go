@@ -69,6 +69,7 @@ type programFactories struct {
 		func(string) string,
 	) error
 	runRestoreHTTPProbe func(context.Context) error
+	runRestoreRecord    func(context.Context, func(string) string) error
 }
 
 func productionProgramFactories() programFactories {
@@ -81,6 +82,7 @@ func productionProgramFactories() programFactories {
 		},
 		runRestoreCheck:     runProductionRestoreCheck,
 		runRestoreHTTPProbe: runProductionRestoreHTTPProbe,
+		runRestoreRecord:    runProductionRestoreRecord,
 	}
 }
 
@@ -92,6 +94,18 @@ func runProgram(
 ) error {
 	if ctx == nil || getenv == nil || len(args) == 0 {
 		return errInvalidCommand
+	}
+	if args[0] == "restore-record" {
+		if len(args) != 1 {
+			return errInvalidCommand
+		}
+		if factories.runRestoreRecord == nil {
+			return errWorkflowUnavailable
+		}
+		if err := factories.runRestoreRecord(ctx, getenv); err != nil {
+			return errWorkflowUnavailable
+		}
+		return nil
 	}
 	if args[0] == "restore-http-probe" {
 		if len(args) != 1 {

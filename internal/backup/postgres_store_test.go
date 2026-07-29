@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1007,6 +1008,103 @@ INSERT INTO restore_verifications(
 	}
 	if _, err := store.Get(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing err=%v", err)
+	}
+}
+
+func TestPostgresStoreRecordsRestoreSuccessIdempotently(t *testing.T) {
+	pool := backupPool(t)
+	ctx := context.Background()
+	store := NewPostgresStore(pool)
+	runID := uuid.MustParse("31000000-0000-4000-8000-000000000001")
+	verificationID := uuid.MustParse(
+		"32000000-0000-4000-8000-000000000001",
+	)
+	manifestSHA256 := bytes.Repeat([]byte{0xaa}, 32)
+	reportSHA256 := bytes.Repeat([]byte{0xbb}, 32)
+	finishedAt := time.Date(2026, 7, 30, 2, 0, 0, 0, time.UTC)
+	startedAt := finishedAt.Add(-54 * time.Second)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO backup_runs(
+  id,idempotency_key,trigger_kind,state,requested_at,finished_at,
+  database_migration_version,encryption_key_id,local_snapshot_id,
+  manifest_sha256,local_expires_at
+) VALUES(
+  $1,'restore-record-source','manual','succeeded',
+  $2::timestamptz,$2::timestamptz,22,
+  'restore-record-key','opaque-snapshot',$3,
+  $2::timestamptz+interval '7 days'
+)`, runID, startedAt, manifestSHA256); err != nil {
+		t.Fatal(err)
+	}
+	input := RestoreSuccessInput{
+		VerificationID:            verificationID,
+		BackupRunID:               runID,
+		ManifestSHA256:            manifestSHA256,
+		StartedAt:                 startedAt,
+		FinishedAt:                finishedAt,
+		RestoredMigrationVersion:  22,
+		DatabaseRowCounts:         fixedRestoreReportResult().DatabaseRowCounts,
+		CheckedObjectCount:        2,
+		SessionRevocationVerified: true,
+		RTOSeconds:                54,
+		ReportSHA256:              reportSHA256,
+	}
+	first, err := store.RecordRestoreSuccess(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry := input
+	retry.StartedAt = input.StartedAt.Add(time.Hour)
+	retry.FinishedAt = input.FinishedAt.Add(time.Hour)
+	second, err := store.RecordRestoreSuccess(ctx, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != verificationID ||
+		second.ID != first.ID ||
+		second.StartedAt == nil ||
+		first.StartedAt == nil ||
+		!second.StartedAt.Equal(*first.StartedAt) ||
+		second.FinishedAt == nil ||
+		first.FinishedAt == nil ||
+		!second.FinishedAt.Equal(*first.FinishedAt) ||
+		first.BackupRunID != runID ||
+		first.State != RestoreSucceeded ||
+		first.RestoredMigrationVersion == nil ||
+		*first.RestoredMigrationVersion != 22 ||
+		first.RTOSeconds == nil ||
+		*first.RTOSeconds != 54 ||
+		!bytes.Equal(first.ReportSHA256, reportSHA256) {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM restore_verifications WHERE id=$1`, verificationID).
+		Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("rows=%d want=1", count)
+	}
+
+	conflict := input
+	conflict.ReportSHA256 = bytes.Repeat([]byte{0xcc}, 32)
+	if _, err := store.RecordRestoreSuccess(
+		ctx,
+		conflict,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("conflicting replay err=%v", err)
+	}
+	wrongManifest := input
+	wrongManifest.VerificationID = uuid.MustParse(
+		"32000000-0000-4000-8000-000000000002",
+	)
+	wrongManifest.ManifestSHA256 = bytes.Repeat([]byte{0xdd}, 32)
+	if _, err := store.RecordRestoreSuccess(
+		ctx,
+		wrongManifest,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("wrong manifest err=%v", err)
 	}
 }
 

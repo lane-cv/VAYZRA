@@ -164,6 +164,20 @@ type RestoreVerification struct {
 	ErrorTraceID              string
 }
 
+type RestoreSuccessInput struct {
+	VerificationID            uuid.UUID
+	BackupRunID               uuid.UUID
+	ManifestSHA256            []byte
+	StartedAt                 time.Time
+	FinishedAt                time.Time
+	RestoredMigrationVersion  int64
+	DatabaseRowCounts         map[string]int64
+	CheckedObjectCount        int64
+	SessionRevocationVerified bool
+	RTOSeconds                int64
+	ReportSHA256              []byte
+}
+
 type RunDetail struct {
 	Run                  Run
 	Artifacts            []Artifact
