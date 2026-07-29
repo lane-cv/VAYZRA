@@ -525,9 +525,22 @@ fi
 if [[ "$*" == *postgres*psql* ]]; then
   while IFS= read -r line; do
     if [[ -n "${PHASE5_FAKE_BLOCK_SQL_MATCH:-}" &&
-      "$line" == *"$PHASE5_FAKE_BLOCK_SQL_MATCH"* ]]; then
+      "$line" == *"$PHASE5_FAKE_BLOCK_SQL_MATCH"* &&
+      (-z "${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}" ||
+        -e "$PHASE5_FAKE_BLOCK_SQL_ARM_FILE") ]]; then
       trap '' HUP TERM
-      sleep "${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}"
+      if [[ -n "${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}" ]]; then
+        printf '%s\n' started >"${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE}.started"
+        attempts=0
+        while [[ ! -e "$PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE" &&
+          "$attempts" -lt 500 ]]; do
+          sleep 0.01
+          attempts=$((attempts + 1))
+        done
+        [[ -e "$PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE" ]] || exit 80
+      else
+        sleep "${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}"
+      fi
       printf 'SQL PHASE5_BLOCK_COMPLETED %s\n' \
         "$PHASE5_FAKE_BLOCK_SQL_MATCH" >>"$PHASE5_FAKE_DOCKER_LOG"
     fi
@@ -548,7 +561,7 @@ if [[ "$*" == *postgres*psql* ]]; then
         ;;
       *PHASE5_QUERY_LEASE_ACQUIRED*)
         printf '%s\n' 'SQL PHASE5_QUERY_LEASE_ACQUIRED' >>"$PHASE5_FAKE_DOCKER_LOG"
-        printf '%s\n' 'acquired'
+        printf '%s\n' "${PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE-acquired}"
         ;;
       *PHASE5_HOLD_LOCK*)
         printf '%s\n' 'SQL PHASE5_HOLD_LOCK' >>"$PHASE5_FAKE_DOCKER_LOG"
@@ -627,6 +640,12 @@ FAKE_DOCKER
 set -euo pipefail
 if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'lstart=' &&
   "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ -n "${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}" &&
+    -f "$PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE" &&
+    "$(<"$PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE")" == "$4" ]]; then
+    printf 'phase5-contract-process-%s\n' "$4"
+    exit 0
+  fi
   kill -0 "$4" 2>/dev/null || exit 1
   printf 'phase5-contract-process-%s\n' "$4"
   exit 0
@@ -735,6 +754,9 @@ run_fixture() {
   PHASE5_FAKE_FAIL_SQL_MATCH="${PHASE5_FAKE_FAIL_SQL_MATCH:-}" \
   PHASE5_FAKE_BLOCK_SQL_MATCH="${PHASE5_FAKE_BLOCK_SQL_MATCH:-}" \
   PHASE5_FAKE_BLOCK_SQL_SECONDS="${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}" \
+  PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE="${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}" \
+  PHASE5_FAKE_BLOCK_SQL_ARM_FILE="${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}" \
+  PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE="${PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE-acquired}" \
   PHASE5_FAKE_DELAY_MATCH="${PHASE5_FAKE_DELAY_MATCH:-}" \
   PHASE5_FAKE_DELAY_SECONDS="${PHASE5_FAKE_DELAY_SECONDS:-3}" \
   PHASE5_FAKE_DELAY_RELEASE_FILE="${PHASE5_FAKE_DELAY_RELEASE_FILE:-}" \
@@ -742,6 +764,7 @@ run_fixture() {
   PHASE5_FAKE_FAIL_BACKUP_FAIL="${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}" \
   PHASE5_FAKE_RENEW_OWNER_PID_FILE="${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}" \
   PHASE5_FAKE_ORPHAN_RENEW_MARKER="${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}" \
+  PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}" \
   PHASE5_FAKE_RUN_RESPONSE="$run_response" \
   HAPPYLEARN_AISTOR_LICENSE_FILE="$fixture/minio.license" \
   HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$fixture/secrets" \
@@ -1277,6 +1300,7 @@ PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
   PHASE5_FAKE_DELAY_RELEASE_FILE="$post_heartbeat_release" \
   PHASE5_FAKE_RENEW_OWNER_PID_FILE="$post_heartbeat_owner_pid_file" \
   PHASE5_FAKE_ORPHAN_RENEW_MARKER="$post_heartbeat_orphan_renew" \
+  PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="$post_heartbeat_owner_pid_file" \
   HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
   run_fixture "$post_heartbeat_fixture" >/dev/null 2>&1 &
 post_heartbeat_runner="$!"
@@ -1354,6 +1378,124 @@ test ! -e "$post_heartbeat_orphan_renew" ||
 [[ ! -e "$post_heartbeat_fixture/host.lock" &&
   ! -L "$post_heartbeat_fixture/host.lock" ]] ||
   fail "post-heartbeat recovery left its host lock"
+
+inflight_renew_fixture="$(make_fixture)"
+inflight_external_release="$inflight_renew_fixture/inflight-external.release"
+inflight_renew_release="$inflight_renew_fixture/inflight-renew.release"
+inflight_renew_arm="$inflight_renew_fixture/inflight-renew.arm"
+inflight_owner_pid_file="$inflight_renew_fixture/inflight-owner.pid"
+inflight_second_log="$inflight_renew_fixture/inflight-second.log"
+inflight_ttl_log="$inflight_renew_fixture/inflight-ttl.log"
+: >"$inflight_second_log"
+: >"$inflight_ttl_log"
+PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
+  PHASE5_FAKE_DELAY_RELEASE_FILE="$inflight_external_release" \
+  PHASE5_FAKE_BLOCK_SQL_MATCH='PHASE5_QUERY_LEASE_RENEW' \
+  PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE="$inflight_renew_release" \
+  PHASE5_FAKE_BLOCK_SQL_ARM_FILE="$inflight_renew_arm" \
+  PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE="$inflight_owner_pid_file" \
+  HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
+  HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS='10' \
+  run_fixture "$inflight_renew_fixture" >/dev/null 2>&1 &
+inflight_runner="$!"
+if ! wait_for_file "${inflight_external_release}.started"; then
+  touch "$inflight_external_release" "$inflight_renew_release"
+  kill -KILL "$inflight_runner" 2>/dev/null || true
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "in-flight renewal fixture did not reach its external descendant"
+fi
+inflight_owner="$(readlink "$inflight_renew_fixture/host.lock")"
+inflight_owner_pid="$(
+  sed -n 's/^pid=//p' "$inflight_owner/owner"
+)"
+[[ "$inflight_owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+  touch "$inflight_external_release" "$inflight_renew_release"
+  kill -KILL "$inflight_runner" 2>/dev/null || true
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "in-flight renewal owner PID was invalid"
+}
+printf '%s\n' "$inflight_owner_pid" >"$inflight_owner_pid_file"
+touch "$inflight_renew_arm"
+if ! wait_for_file "${inflight_renew_release}.started"; then
+  touch "$inflight_external_release" "$inflight_renew_release"
+  kill -KILL "$inflight_owner_pid" 2>/dev/null || true
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "heartbeat renewal did not enter its bounded in-flight window"
+fi
+inflight_renew_baseline="$(
+  log_count "$inflight_renew_fixture/docker.log" \
+    'SQL PHASE5_QUERY_LEASE_RENEW'
+)"
+kill -KILL "$inflight_owner_pid"
+attempts=0
+while kill -0 "$inflight_owner_pid" 2>/dev/null &&
+  [[ "$attempts" -lt 500 ]]; do
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+if kill -0 "$inflight_owner_pid" 2>/dev/null; then
+  touch "$inflight_external_release" "$inflight_renew_release"
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "in-flight renewal owner survived SIGKILL"
+fi
+touch "$inflight_renew_release"
+if ! wait_for_log_count_greater \
+  "$inflight_renew_fixture/docker.log" \
+  'SQL PHASE5_QUERY_LEASE_RENEW' \
+  "$inflight_renew_baseline"; then
+  touch "$inflight_external_release"
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "the already in-flight renewal did not complete"
+fi
+inflight_renew_after_release="$(
+  log_count "$inflight_renew_fixture/docker.log" \
+    'SQL PHASE5_QUERY_LEASE_RENEW'
+)"
+sleep 0.2
+inflight_renew_after_wait="$(
+  log_count "$inflight_renew_fixture/docker.log" \
+    'SQL PHASE5_QUERY_LEASE_RENEW'
+)"
+[[ "$inflight_renew_after_release" -eq \
+  $((inflight_renew_baseline + 1)) &&
+  "$inflight_renew_after_wait" -eq "$inflight_renew_after_release" ]] || {
+  touch "$inflight_external_release"
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "owner death allowed more than one already in-flight renewal"
+}
+inflight_second_rejected=true
+if PHASE5_FAKE_DOCKER_LOG="$inflight_second_log" \
+  run_fixture "$inflight_renew_fixture"; then
+  inflight_second_rejected=false
+fi
+[[ "$inflight_second_rejected" == true &&
+  ! -s "$inflight_second_log" &&
+  -L "$inflight_renew_fixture/host.lock" &&
+  "$(readlink "$inflight_renew_fixture/host.lock")" == "$inflight_owner" ]] || {
+  touch "$inflight_external_release"
+  wait "$inflight_runner" 2>/dev/null || true
+  fail "in-flight renewal descendant host lock was stolen"
+}
+touch "$inflight_external_release"
+wait_for_file "${inflight_external_release}.finished" ||
+  fail "in-flight renewal external descendant did not finish"
+wait "$inflight_runner" 2>/dev/null || true
+if PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE='' \
+  PHASE5_FAKE_DOCKER_LOG="$inflight_ttl_log" \
+  run_fixture "$inflight_renew_fixture"; then
+  fail "host-lock recovery bypassed the durable database lease TTL"
+fi
+grep -Fq 'SQL PHASE5_QUERY_LEASE_ACQUIRED' "$inflight_ttl_log" ||
+  fail "database lease TTL was not consulted after host-lock recovery"
+if grep -Fq ' /app/happylearn-backup prepare ' "$inflight_ttl_log"; then
+  fail "database lease TTL rejection reached backup mutation"
+fi
+grep -Fq 'SQL PHASE5_QUERY_LEASE_RELEASE' \
+  "$inflight_renew_fixture/docker.log" &&
+  fail "owner death unsafely compensated by releasing the durable lease"
+[[ ! -e "$inflight_renew_fixture/host.lock" &&
+  ! -L "$inflight_renew_fixture/host.lock" ]] ||
+  fail "database lease TTL rejection left its recovered host lock"
 
 gnu_identity_fixture="$(make_fixture)"
 install_linux_lock_tools "$gnu_identity_fixture"

@@ -350,6 +350,21 @@ process_identity_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
+heartbeat_owner_matches() {
+  local heartbeat_pid="$1"
+  local owner_pid="$2"
+  local expected_identity="$3"
+  local actual_parent
+  [[ "$heartbeat_pid" =~ ^[1-9][0-9]*$ &&
+    "$owner_pid" =~ ^[1-9][0-9]*$ ]] ||
+    return 1
+  process_identity_matches "$owner_pid" "$expected_identity" || return 1
+  actual_parent="$(ps -o ppid= -p "$heartbeat_pid" 2>/dev/null)" || return 1
+  actual_parent="${actual_parent#"${actual_parent%%[![:space:]]*}"}"
+  actual_parent="${actual_parent%"${actual_parent##*[![:space:]]}"}"
+  [[ "$actual_parent" == "$owner_pid" ]]
+}
+
 system_holds_liveness_file() {
   local path="$1"
   local identity="$2"
@@ -473,6 +488,7 @@ remove_host_lock_owner_directory() {
   for path in \
     "$directory/operational.stdin" \
     "$directory/operational.stdout" \
+    "$directory/heartbeat.pid" \
     "$directory/heartbeat.failed" \
     "$directory/liveness"
   do
@@ -981,35 +997,59 @@ SQL
 start_lease_heartbeat() {
   local original_owner_pid="$LOCK_OWNER_PID"
   local original_owner_process_identity
+  local heartbeat_pid_fifo="$LOCK_OWNER_DIRECTORY/heartbeat.pid"
   original_owner_process_identity="$(
     portable_process_identity "$original_owner_pid"
   )" || return 1
   LEASE_HEARTBEAT_FAILED="$LOCK_OWNER_DIRECTORY/heartbeat.failed"
-  [[ ! -e "$LEASE_HEARTBEAT_FAILED" ]] || return 1
+  [[ ! -e "$LEASE_HEARTBEAT_FAILED" &&
+    ! -e "$heartbeat_pid_fifo" &&
+    ! -L "$heartbeat_pid_fifo" ]] ||
+    return 1
+  mkfifo "$heartbeat_pid_fifo" || return 1
+  if ! chmod 0600 "$heartbeat_pid_fifo"; then
+    rm -f "$heartbeat_pid_fifo"
+    return 1
+  fi
   set -m
   (
+    heartbeat_process_pid=''
     set +m
     exec 8<&-
     exec 9>&-
+    IFS= read -r heartbeat_process_pid <"$heartbeat_pid_fifo" || exit 0
+    [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] || exit 0
     ALLOW_LOST_LEASE_ACTIONS=true
     SEPARATE_EXTERNAL_GROUP=false
-    while process_identity_matches \
-      "$original_owner_pid" "$original_owner_process_identity"; do
+    while heartbeat_owner_matches \
+      "$heartbeat_process_pid" \
+      "$original_owner_pid" \
+      "$original_owner_process_identity"; do
       sleep "$HEARTBEAT_INTERVAL_SECONDS"
-      process_identity_matches \
-        "$original_owner_pid" "$original_owner_process_identity" ||
+      heartbeat_owner_matches \
+        "$heartbeat_process_pid" \
+        "$original_owner_pid" \
+        "$original_owner_process_identity" ||
         exit 0
       if ! renew_operational_lease; then
         printf '%s\n' 'lease_lost' >"$LEASE_HEARTBEAT_FAILED"
         exit 1
       fi
-      process_identity_matches \
-        "$original_owner_pid" "$original_owner_process_identity" ||
+      heartbeat_owner_matches \
+        "$heartbeat_process_pid" \
+        "$original_owner_pid" \
+        "$original_owner_process_identity" ||
         exit 0
     done
   ) &
   LEASE_HEARTBEAT_PID="$!"
   set +m
+  if ! printf '%s\n' "$LEASE_HEARTBEAT_PID" >"$heartbeat_pid_fifo"; then
+    stop_lease_heartbeat
+    rm -f "$heartbeat_pid_fifo"
+    return 1
+  fi
+  rm -f "$heartbeat_pid_fifo"
 }
 
 assert_lease_heartbeat() {
