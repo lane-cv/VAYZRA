@@ -1519,26 +1519,54 @@ restore_snapshot() {
   local snapshot_id="$1"
   local manifest_path mode size actual_sha256
   [[ "$snapshot_id" =~ ^[a-f0-9]{64}$ ]] || return 1
-  restic_restore_container \
+  if ! restic_restore_container \
     "$PROJECT-restic-restore" restic-restore \
-    restore "$snapshot_id" --target /restore >/dev/null
+    restore "$snapshot_id" --target /restore >/dev/null; then
+    safe_log 'snapshot_restore_command_failed'
+    return 1
+  fi
   [[ -f "$RESTORE_DIRECTORY/database.dump" &&
     ! -L "$RESTORE_DIRECTORY/database.dump" &&
     -d "$RESTORE_DIRECTORY/source/aistor" &&
     ! -L "$RESTORE_DIRECTORY/source/aistor" ]] ||
-    return 1
+    {
+      safe_log 'snapshot_restore_layout_invalid'
+      return 1
+    }
   manifest_path="$RESTORE_DIRECTORY/manifest.json"
   [[ -f "$manifest_path" &&
     ! -L "$manifest_path" &&
     "$(portable_owner "$manifest_path")" == "$HOST_UID" ]] ||
+    {
+      safe_log 'snapshot_restore_manifest_identity_invalid'
+      return 1
+    }
+  mode="$(portable_mode "$manifest_path")" || {
+    safe_log 'snapshot_restore_manifest_mode_invalid'
     return 1
-  mode="$(portable_mode "$manifest_path")" || return 1
-  [[ "$mode" =~ ^[0-7]?([0-7])[0-7][0-7]$ ]] || return 1
-  ((8#${BASH_REMATCH[1]} & 4)) || return 1
-  size="$(portable_size "$manifest_path")" || return 1
-  [[ "$size" -ge 1 && "$size" -le 65536 ]] || return 1
-  actual_sha256="$(portable_sha256 "$manifest_path")" || return 1
-  [[ "$actual_sha256" == "$EXPECTED_MANIFEST_SHA256" ]] || return 1
+  }
+  [[ "$mode" =~ ^[0-7]?([0-7])[0-7][0-7]$ ]] &&
+    ((8#${BASH_REMATCH[1]} & 4)) ||
+    {
+      safe_log 'snapshot_restore_manifest_mode_invalid'
+      return 1
+    }
+  size="$(portable_size "$manifest_path")" || {
+    safe_log 'snapshot_restore_manifest_size_invalid'
+    return 1
+  }
+  [[ "$size" -ge 1 && "$size" -le 65536 ]] || {
+    safe_log 'snapshot_restore_manifest_size_invalid'
+    return 1
+  }
+  actual_sha256="$(portable_sha256 "$manifest_path")" || {
+    safe_log 'snapshot_restore_manifest_hash_invalid'
+    return 1
+  }
+  [[ "$actual_sha256" == "$EXPECTED_MANIFEST_SHA256" ]] || {
+    safe_log 'snapshot_restore_manifest_hash_invalid'
+    return 1
+  }
   RESTORED_MANIFEST="$manifest_path"
 }
 

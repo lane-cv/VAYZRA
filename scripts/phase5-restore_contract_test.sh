@@ -954,10 +954,12 @@ case "$kind" in
       previous="$argument"
     done
     [[ -n "$restore_mount" ]] || exit 64
-    mkdir -p "$restore_mount/source/aistor"
     printf 'database dump fixture\n' >"$restore_mount/database.dump"
-    printf 'object fixture\n' >"$restore_mount/source/aistor/object"
     printf '%s' "$PHASE5_FAKE_MANIFEST_TEXT" >"$restore_mount/manifest.json"
+    if [[ "$mode" != restore_layout_invalid ]]; then
+      mkdir -p "$restore_mount/source/aistor"
+      printf 'object fixture\n' >"$restore_mount/source/aistor/object"
+    fi
     if [[ "$mode" == manifest_hash_mismatch ]]; then
       printf 'x' >>"$restore_mount/manifest.json"
     fi
@@ -2010,12 +2012,31 @@ test ! -e "$report_race_fixture/reports/.restore-${BACKUP_ID}.new" ||
   fail 'raced final report left a temporary artifact'
 
 manifest_mismatch_fixture="$(make_fixture)"
-if run_fixture "$manifest_mismatch_fixture" manifest_hash_mismatch; then
+if run_fixture "$manifest_mismatch_fixture" manifest_hash_mismatch \
+  >"$manifest_mismatch_fixture/stdout" \
+  2>"$manifest_mismatch_fixture/stderr"; then
   fail 'restored manifest bytes were not bound to the snapshot tag'
 fi
+grep -Fxq \
+  'phase5_restore: snapshot_restore_manifest_hash_invalid' \
+  "$manifest_mismatch_fixture/stderr" ||
+  fail 'manifest hash failure did not publish its safe category'
 assert_no_resources "$manifest_mismatch_fixture"
 test ! -e "$manifest_mismatch_fixture/reports/restore-$BACKUP_ID.json" ||
   fail 'manifest hash mismatch published a success report'
+
+restore_layout_fixture="$(make_fixture)"
+if run_fixture "$restore_layout_fixture" restore_layout_invalid \
+  >"$restore_layout_fixture/stdout" 2>"$restore_layout_fixture/stderr"; then
+  fail 'invalid restored snapshot layout was accepted'
+fi
+grep -Fxq \
+  'phase5_restore: snapshot_restore_layout_invalid' \
+  "$restore_layout_fixture/stderr" ||
+  fail 'snapshot layout failure did not publish its safe category'
+assert_no_resources "$restore_layout_fixture"
+test ! -e "$restore_layout_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'invalid restored snapshot layout published a success report'
 
 for mode in extra_snapshot_tag duplicate_manifest_tag; do
   manifest_tag_fixture="$(make_fixture)"
