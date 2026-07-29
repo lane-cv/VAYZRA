@@ -18,7 +18,8 @@ func TestPayloadCanonicalizesAllowlistedComposeStatsAndFilesystems(t *testing.T)
 	  "schemaVersion": 1,
 	  "observedAt": "2026-07-30T04:05:06Z",
 	  "compose": [
-	    {"service":"redis","state":"exited","health":"","restarts":3},
+	    {"service":"backup","state":"exited","health":""},
+	    {"service":"redis","state":"exited","health":""},
 	    {"service":"app","state":"running","health":"healthy","restarts":1}
 	  ],
 	  "stats": [
@@ -39,7 +40,7 @@ func TestPayloadCanonicalizesAllowlistedComposeStatsAndFilesystems(t *testing.T)
 	); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	want := `{"schemaVersion":1,"observedAt":"2026-07-30T04:05:06Z","services":[{"service":"app","up":true,"cpuPercent":12.5,"memoryBytes":1572864,"memoryLimitBytes":2147483648,"restarts":1},{"service":"redis","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":3}],"filesystems":[{"filesystem":"root","usedPercent":37.5},{"filesystem":"backup","usedPercent":75}]}` + "\n"
+	want := `{"schemaVersion":1,"observedAt":"2026-07-30T04:05:06Z","services":[{"service":"caddy","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null},{"service":"app","up":true,"cpuPercent":12.5,"memoryBytes":1572864,"memoryLimitBytes":2147483648,"restarts":1},{"service":"worker","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null},{"service":"postgres","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null},{"service":"redis","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null},{"service":"minio","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null}],"filesystems":[{"filesystem":"root","usedPercent":37.5},{"filesystem":"backup","usedPercent":75}]}` + "\n"
 	if stdout.String() != want {
 		t.Fatalf("stdout=%q want=%q", stdout.String(), want)
 	}
@@ -172,6 +173,68 @@ func TestPayloadRejectsUnsafeRowsAndBrokenInput(t *testing.T) {
 	}
 	assertInvalidPayload(t, fmt.Sprintf(base, ``, ``, strings.Join(rows, ",")))
 	assertInvalidPayload(t, strings.Repeat(" ", 64*1024+1))
+}
+
+func TestParseBytesRoundsFractionalDockerUnitsUpWithoutOverflow(t *testing.T) {
+	for value, want := range map[string]int64{
+		"1.234MiB":            1293943,
+		"0.001KiB":            2,
+		"1.1kB":               1100,
+		"9007199254740990.1B": maxExactValue,
+		"9007199254740991B":   maxExactValue,
+	} {
+		t.Run(value, func(t *testing.T) {
+			got, err := parseBytes(value)
+			if err != nil || got != want {
+				t.Fatalf("parseBytes(%q)=(%d,%v) want=(%d,nil)", value, got, err, want)
+			}
+		})
+	}
+	for _, value := range []string{
+		"9007199254740991.1B",
+		"8796093022208.1KiB",
+	} {
+		t.Run("overflow "+value, func(t *testing.T) {
+			if got, err := parseBytes(value); err == nil || got != 0 {
+				t.Fatalf("parseBytes(%q)=(%d,%v) want=(0,error)", value, got, err)
+			}
+		})
+	}
+}
+
+func TestPayloadAcceptsOnlyFixedAuxiliaryComposeServices(t *testing.T) {
+	for _, service := range []string{
+		"postgres-tls-init",
+		"minio-data-init",
+		"backup-storage-init",
+		"backup-secrets-init",
+		"backup",
+		"migrate",
+		"restore",
+		"acceptance",
+	} {
+		t.Run(service, func(t *testing.T) {
+			input := fmt.Sprintf(
+				`{"schemaVersion":1,"observedAt":"2026-07-30T04:05:06Z","compose":[{"service":%q,"state":"exited","health":"","restarts":null}],"stats":[],"filesystems":[{"filesystem":"root","usedPercent":"1%%"}]}`,
+				service,
+			)
+			var stdout, stderr bytes.Buffer
+			code := run(
+				[]string{"payload"},
+				strings.NewReader(input),
+				&stdout,
+				&stderr,
+				fixedNow,
+			)
+			if code != 0 {
+				t.Fatalf("code=%d stderr=%q", code, stderr.String())
+			}
+			if strings.Contains(stdout.String(), service) ||
+				strings.Count(stdout.String(), `"service":`) != 6 {
+				t.Fatalf("unsafe auxiliary projection=%q", stdout.String())
+			}
+		})
+	}
 }
 
 func TestSignUsesExactCanonicalBodyAndOwnerOnlySecret(t *testing.T) {

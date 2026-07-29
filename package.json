@@ -18,6 +18,7 @@
     "backup:live": "bash scripts/phase5-backup_live_test.sh",
     "backup:run": "make phase5-backup",
     "host-metrics:contract": "bash scripts/host-metrics_contract_test.sh",
+    "host-metrics:live": "bash scripts/host-metrics_live_test.sh",
     "host-metrics:run": "make host-metrics"
   },
   "devDependencies": {

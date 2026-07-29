@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INTERNAL_ENDPOINT='http://127.0.0.1:9090/internal/host-samples'
 MAX_FILE_BYTES=$((64 * 1024))
-service_allowlist=(caddy app worker postgres redis minio)
+BACKUP_RUNTIME_UID=10003
+monitored_service_allowlist=(caddy app worker postgres redis minio)
+auxiliary_service_allowlist=(postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance)
 
 die() {
   printf '%s\n' 'host metrics collection failed' >&2
@@ -27,7 +29,8 @@ case "$2" in
 esac
 
 secret_file="${HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE:-}"
-[[ -n "$secret_file" && -f "$compose_file" ]] || die
+backup_path="${HAPPYLEARN_BACKUP_HOST_PATH:-}"
+[[ -n "$secret_file" && -n "$backup_path" && -f "$compose_file" ]] || die
 sampler_bin="${HOST_SAMPLER_BIN:-$ROOT/.tools/bin/host-sampler}"
 [[ -x "$sampler_bin" ]] || die
 
@@ -39,18 +42,60 @@ else
   die
 fi
 
-run_bounded() {
-  local seconds="$1"
-  shift
-  "$timeout_bin" "$seconds" "$@"
-}
-
 check_bounded_file() {
   local path="$1"
   local size
   size="$(wc -c <"$path")" || return 1
   ((size > 0 && size <= MAX_FILE_BYTES))
 }
+
+run_bounded_capture() {
+  local destination="$1"
+  local seconds="$2"
+  local statuses
+  shift 2
+  "$timeout_bin" "$seconds" "$@" |
+    head -c "$((MAX_FILE_BYTES + 1))" >"$destination"
+  statuses=("${PIPESTATUS[@]}")
+  ((statuses[0] == 0 && statuses[1] == 0)) || return 1
+  check_bounded_file "$destination"
+}
+
+path_mode() {
+  local path="$1"
+  if stat -f '%Lp' "$path" >/dev/null 2>&1; then
+    stat -f '%Lp' "$path"
+  else
+    stat -c '%a' "$path"
+  fi
+}
+
+path_owner() {
+  local path="$1"
+  if stat -f '%u' "$path" >/dev/null 2>&1; then
+    stat -f '%u' "$path"
+  else
+    stat -c '%u' "$path"
+  fi
+}
+
+validate_backup_path() {
+  local path="$1"
+  local canonical mode owner mode_value
+  [[ "$path" == /* && "$path" != "/" &&
+    "$path" != *$'\n'* && "$path" != *$'\r'* &&
+    -d "$path" && ! -L "$path" ]] || return 1
+  canonical="$(cd "$path" && pwd -P)" || return 1
+  [[ "$canonical" == "${path%/}" ]] || return 1
+  mode="$(path_mode "$path")" || return 1
+  owner="$(path_owner "$path")" || return 1
+  [[ "$mode" =~ ^[0-7]{3,4}$ && "$owner" =~ ^[0-9]+$ ]] || return 1
+  mode_value=$((8#$mode))
+  ((owner == EUID || owner == 0 || owner == BACKUP_RUNTIME_UID)) || return 1
+  ((mode_value == 8#700))
+}
+
+validate_backup_path "$backup_path" || die
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/happylearn-host-metrics.XXXXXX")" ||
   die
@@ -61,13 +106,12 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 compose_raw="$temporary/compose-ps.json"
-if ! run_bounded 10 docker compose \
+if ! run_bounded_capture "$compose_raw" 10 docker compose \
   -p "$compose_project" \
   -f "$compose_file" \
-  ps --format json >"$compose_raw"; then
+  ps --format json; then
   die
 fi
-check_bounded_file "$compose_raw" || die
 
 compose_all="$temporary/compose-all.json"
 if ! jq -sce '
@@ -86,16 +130,22 @@ fi
 check_bounded_file "$compose_all" || die
 
 compose_selected="$temporary/compose-selected.json"
-if ! jq -ce '
+compose_allowlist_json="$(
+  printf '%s\n' \
+    "${monitored_service_allowlist[@]}" \
+    "${auxiliary_service_allowlist[@]}" |
+    jq -Rsc 'split("\n")[:-1]'
+)" || die
+if ! jq -ce --argjson allowlist "$compose_allowlist_json" '
   if all(.[];
-    (.Service == "caddy" or .Service == "app" or .Service == "worker" or
-     .Service == "postgres" or .Service == "redis" or .Service == "minio"))
+    (.Service | type) == "string" and
+    (.Service as $service | $allowlist | index($service)) != null)
   then
     map({
       service: .Service,
       state: .State,
       health: (.Health // ""),
-      restarts: (.RestartCount // 0)
+      restarts: (if has("RestartCount") then .RestartCount else null end)
     })
   else
     error("unknown service")
@@ -107,7 +157,7 @@ check_bounded_file "$compose_selected" || die
 
 stats_selected="$temporary/stats-selected.json"
 printf '%s\n' '[]' >"$stats_selected"
-for service in "${service_allowlist[@]}"; do
+for service in "${monitored_service_allowlist[@]}"; do
   state="$(jq -er --arg service "$service" \
     '[.[] | select(.service == $service)] |
      if length > 1 then error("duplicate service")
@@ -119,16 +169,15 @@ for service in "${service_allowlist[@]}"; do
   container_id="$(jq -er --arg service "$service" \
     '[.[] | select(.Service == $service)] |
      if length == 1 and (.[0].ID | type) == "string" and
-        (.[0].ID | length) > 0
+        (.[0].ID | test("^[0-9a-f]{12,64}$"))
      then .[0].ID
      else error("missing container")
      end' "$compose_all")" || die
   stats_raw="$temporary/stats-$service.json"
-  if ! run_bounded 10 docker stats --no-stream \
-    --format '{{json .}}' "$container_id" >"$stats_raw"; then
+  if ! run_bounded_capture "$stats_raw" 10 docker stats --no-stream \
+    --format '{{json .}}' "$container_id"; then
     die
   fi
-  check_bounded_file "$stats_raw" || die
   stats_record="$(jq -sce --arg service "$service" '
     if length != 1 or (.[0] | type) != "object" or
        (.[0] | has("Environment")) or (.[0] | has("Env")) or
@@ -149,10 +198,9 @@ for service in "${service_allowlist[@]}"; do
 done
 
 filesystem_raw="$temporary/filesystem-root.txt"
-if ! run_bounded 10 df -Pk / >"$filesystem_raw"; then
+if ! run_bounded_capture "$filesystem_raw" 10 df -Pk /; then
   die
 fi
-check_bounded_file "$filesystem_raw" || die
 root_used_percent="$(
   awk '
     NR == 2 && $5 ~ /^(0|[1-9][0-9]*)%$/ {
@@ -163,44 +211,63 @@ root_used_percent="$(
   ' "$filesystem_raw"
 )" || die
 
+backup_filesystem_raw="$temporary/filesystem-backup.txt"
+if ! run_bounded_capture "$backup_filesystem_raw" 10 df -Pk "$backup_path"; then
+  die
+fi
+backup_used_percent="$(
+  awk '
+    NR == 2 && $5 ~ /^(0|[1-9][0-9]*)%$/ {
+      print $5
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  ' "$backup_filesystem_raw"
+)" || die
+
 observed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || die
 sampler_input="$temporary/sampler-input.json"
 jq -cn \
   --arg observedAt "$observed_at" \
   --slurpfile compose "$compose_selected" \
   --slurpfile stats "$stats_selected" \
-  --arg usedPercent "$root_used_percent" \
+  --arg rootUsedPercent "$root_used_percent" \
+  --arg backupUsedPercent "$backup_used_percent" \
   '{
     schemaVersion: 1,
     observedAt: $observedAt,
     compose: $compose[0],
     stats: $stats[0],
-    filesystems: [{filesystem: "root", usedPercent: $usedPercent}]
+    filesystems: [
+      {filesystem: "root", usedPercent: $rootUsedPercent},
+      {filesystem: "backup", usedPercent: $backupUsedPercent}
+    ]
   }' >"$sampler_input" || die
 check_bounded_file "$sampler_input" || die
 
 payload="$temporary/payload.json"
-if ! run_bounded 10 "$sampler_bin" payload \
-  <"$sampler_input" >"$payload"; then
+if ! run_bounded_capture "$payload" 10 "$sampler_bin" payload \
+  <"$sampler_input"; then
   die
 fi
-check_bounded_file "$payload" || die
 
 timestamp="$(date -u '+%s')" || die
 [[ "$timestamp" =~ ^[0-9]+$ ]] || die
 nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')" || die
 [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || die
-signature="$(
-  run_bounded 10 "$sampler_bin" sign \
+signature_file="$temporary/signature.txt"
+if ! run_bounded_capture "$signature_file" 10 "$sampler_bin" sign \
     --secret-file "$secret_file" \
     --timestamp "$timestamp" \
     --nonce "$nonce" \
-    <"$payload"
-)" || die
+    <"$payload"; then
+  die
+fi
+signature="$(tr -d '\n' <"$signature_file")" || die
 [[ "$signature" =~ ^sha256=[0-9a-f]{64}$ ]] || die
 
-status="$(
-  run_bounded 10 curl \
+status_file="$temporary/http-status.txt"
+if ! run_bounded_capture "$status_file" 10 curl \
     --silent \
     --show-error \
     --output /dev/null \
@@ -213,8 +280,10 @@ status="$(
     -H "X-HL-Nonce: $nonce" \
     -H "X-HL-Signature: $signature" \
     --data-binary "@$payload" \
-    "$INTERNAL_ENDPOINT"
-)" || die
+    "$INTERNAL_ENDPOINT"; then
+  die
+fi
+status="$(tr -d '\n' <"$status_file")" || die
 [[ "$status" == "204" ]] || die
 
 printf '%s\n' 'host metrics collection: PASS'

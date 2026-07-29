@@ -62,7 +62,7 @@ type HostServiceSample struct {
 	CPUPercent       float64 `json:"cpuPercent"`
 	MemoryBytes      int64   `json:"memoryBytes"`
 	MemoryLimitBytes int64   `json:"memoryLimitBytes"`
-	Restarts         int64   `json:"restarts"`
+	Restarts         *int64  `json:"restarts"`
 }
 
 type FilesystemSample struct {
@@ -311,7 +311,7 @@ func parseHostPayload(
 			!finitePercent(service.CPUPercent) ||
 			service.MemoryBytes < 0 ||
 			service.MemoryLimitBytes < 0 ||
-			service.Restarts < 0 {
+			service.Restarts != nil && *service.Restarts < 0 {
 			return HostPayload{}, nil, ErrInvalid
 		}
 		services[scope] = struct{}{}
@@ -325,8 +325,16 @@ func parseHostPayload(
 			hostSample(payload.ObservedAt, SampleMetricHostServiceCPUPercent, scope, service.CPUPercent, SampleUnitPercent),
 			hostSample(payload.ObservedAt, SampleMetricHostServiceMemoryBytes, scope, float64(service.MemoryBytes), SampleUnitBytes),
 			hostSample(payload.ObservedAt, SampleMetricHostServiceMemoryLimitBytes, scope, float64(service.MemoryLimitBytes), SampleUnitBytes),
-			hostSample(payload.ObservedAt, SampleMetricHostServiceRestarts, scope, float64(service.Restarts), SampleUnitCount),
 		)
+		if service.Restarts != nil {
+			samples = append(samples, hostSample(
+				payload.ObservedAt,
+				SampleMetricHostServiceRestarts,
+				scope,
+				float64(*service.Restarts),
+				SampleUnitCount,
+			))
+		}
 	}
 	filesystems := make(map[SampleScope]struct{}, len(payload.Filesystems))
 	for _, filesystem := range payload.Filesystems {

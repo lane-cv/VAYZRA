@@ -173,7 +173,8 @@ func TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay(t *tes
 		ObservedAt:    now,
 		Services: []HostServiceSample{{
 			Service: "app", Up: true, CPUPercent: 12.5,
-			MemoryBytes: 1024, MemoryLimitBytes: 2048, Restarts: 2,
+			MemoryBytes: 1024, MemoryLimitBytes: 2048,
+			Restarts: hostRestartCount(2),
 		}},
 		Filesystems: []FilesystemSample{{
 			Filesystem:  "root",
@@ -206,6 +207,45 @@ func TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay(t *tes
 	handler.ServeHTTP(replayResult, replay)
 	if replayResult.Code != http.StatusNotFound || len(sink.batches) != 1 {
 		t.Fatalf("status=%d batches=%d", replayResult.Code, len(sink.batches))
+	}
+}
+
+func hostRestartCount(value int64) *int64 {
+	return &value
+}
+
+func TestInternalHostSamplesTreatsNullRestartsAsUnavailable(t *testing.T) {
+	now := time.Date(2026, 7, 30, 3, 0, 0, 0, time.UTC)
+	secret := []byte("host-hmac-secret")
+	sink := &internalSampleSink{}
+	handler := mustInternalHandler(t, InternalHTTPConfig{
+		MetricsBearerSecret:   "metrics-bearer-secret",
+		HostMetricsHMACSecret: secret,
+		Clock:                 func() time.Time { return now },
+		Metrics:               internalMetricsStub{},
+		Samples:               sink,
+		Nonces:                &internalNonceStore{},
+	})
+	body := []byte(`{"schemaVersion":1,"observedAt":"2026-07-30T03:00:00Z","services":[{"service":"app","up":false,"cpuPercent":0,"memoryBytes":0,"memoryLimitBytes":0,"restarts":null}],"filesystems":[{"filesystem":"root","usedPercent":1}]}` + "\n")
+	request := signedHostSampleRequest(
+		t,
+		secret,
+		now.Unix(),
+		"abcdef0123456789abcdef0123456789",
+		body,
+	)
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+	if result.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%q", result.Code, result.Body.String())
+	}
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 5 {
+		t.Fatalf("batches=%#v", sink.batches)
+	}
+	for _, sample := range sink.batches[0] {
+		if sample.Metric == SampleMetricHostServiceRestarts {
+			t.Fatalf("unavailable restart count was persisted: %#v", sample)
+		}
 	}
 }
 

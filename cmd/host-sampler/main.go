@@ -51,7 +51,7 @@ type composeServiceInput struct {
 	Service  string `json:"service"`
 	State    string `json:"state"`
 	Health   string `json:"health"`
-	Restarts int64  `json:"restarts"`
+	Restarts *int64 `json:"restarts"`
 }
 
 type statsInput struct {
@@ -136,19 +136,24 @@ func buildPayload(input samplerInput, now time.Time) (operations.HostPayload, er
 		return operations.HostPayload{}, errInvalid
 	}
 
-	composeByService := make(map[string]composeServiceInput, len(input.Compose))
+	composeByService := make(map[string]composeServiceInput, len(serviceOrder))
+	seenComposeServices := make(map[string]struct{}, len(input.Compose))
 	for _, row := range input.Compose {
-		if !allowedService(row.Service) ||
+		monitored := allowedService(row.Service)
+		if (!monitored && !allowedAuxiliaryService(row.Service)) ||
 			!allowedState(row.State) ||
 			!allowedHealth(row.Health) ||
-			row.Restarts < 0 ||
-			row.Restarts > maxExactValue {
+			row.Restarts != nil &&
+				(*row.Restarts < 0 || *row.Restarts > maxExactValue) {
 			return operations.HostPayload{}, errInvalid
 		}
-		if _, duplicate := composeByService[row.Service]; duplicate {
+		if _, duplicate := seenComposeServices[row.Service]; duplicate {
 			return operations.HostPayload{}, errInvalid
 		}
-		composeByService[row.Service] = row
+		seenComposeServices[row.Service] = struct{}{}
+		if monitored {
+			composeByService[row.Service] = row
+		}
 	}
 
 	statsByService := make(map[string]statsInput, len(input.Stats))
@@ -171,16 +176,13 @@ func buildPayload(input samplerInput, now time.Time) (operations.HostPayload, er
 	}
 	for _, service := range serviceOrder {
 		compose, exists := composeByService[service]
-		if !exists {
-			continue
-		}
 		sample := operations.HostServiceSample{
 			Service:  service,
-			Up:       compose.State == "running" && (compose.Health == "" || compose.Health == "healthy"),
+			Up:       exists && compose.State == "running" && (compose.Health == "" || compose.Health == "healthy"),
 			Restarts: compose.Restarts,
 		}
 		stats, hasStats := statsByService[service]
-		if compose.State == "running" && !hasStats {
+		if exists && compose.State == "running" && !hasStats {
 			return operations.HostPayload{}, errInvalid
 		}
 		if hasStats {
@@ -236,6 +238,23 @@ func allowedService(service string) bool {
 }
 
 var serviceOrderSorted = []string{"app", "caddy", "minio", "postgres", "redis", "worker"}
+
+var auxiliaryServiceOrderSorted = []string{
+	"acceptance",
+	"backup",
+	"backup-secrets-init",
+	"backup-storage-init",
+	"migrate",
+	"minio-data-init",
+	"postgres-tls-init",
+	"restore",
+}
+
+func allowedAuxiliaryService(service string) bool {
+	index := sort.SearchStrings(auxiliaryServiceOrderSorted, service)
+	return index < len(auxiliaryServiceOrderSorted) &&
+		auxiliaryServiceOrderSorted[index] == service
+}
 
 func allowedState(state string) bool {
 	switch state {
@@ -311,10 +330,16 @@ func parseBytes(value string) (int64, error) {
 		return 0, errInvalid
 	}
 	number.Mul(number, new(big.Rat).SetInt64(multiplier))
-	if !number.IsInt() || !number.Num().IsInt64() {
+	rounded := new(big.Int)
+	remainder := new(big.Int)
+	rounded.QuoRem(number.Num(), number.Denom(), remainder)
+	if remainder.Sign() != 0 {
+		rounded.Add(rounded, big.NewInt(1))
+	}
+	if !rounded.IsInt64() {
 		return 0, errInvalid
 	}
-	result := number.Num().Int64()
+	result := rounded.Int64()
 	if result < 0 || result > maxExactValue {
 		return 0, errInvalid
 	}
@@ -408,7 +433,8 @@ func validateCanonicalPayload(body []byte, timestamp time.Time) error {
 			row.MemoryLimitBytes < 0 ||
 			row.MemoryBytes > row.MemoryLimitBytes ||
 			row.MemoryLimitBytes > maxExactValue ||
-			row.Restarts < 0 || row.Restarts > maxExactValue {
+			row.Restarts != nil &&
+				(*row.Restarts < 0 || *row.Restarts > maxExactValue) {
 			return errInvalid
 		}
 		if _, duplicate := services[row.Service]; duplicate {
