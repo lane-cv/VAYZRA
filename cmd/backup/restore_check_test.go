@@ -1,12 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"time"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/db/migrations"
 	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/platform/objectstore"
 )
@@ -206,6 +213,7 @@ func TestRestoreCheckConfigIsDedicatedAndFailClosed(t *testing.T) {
 		"HAPPYLEARN_MINIO_ENDPOINT",
 		"HAPPYLEARN_MINIO_ACCESS_KEY",
 		"HAPPYLEARN_MINIO_SECRET_KEY",
+		"HAPPYLEARN_MINIO_USE_TLS",
 	} {
 		t.Run(key, func(t *testing.T) {
 			broken := make(map[string]string, len(values))
@@ -246,6 +254,19 @@ func TestRestoreCheckConfigIsDedicatedAndFailClosed(t *testing.T) {
 	) {
 		t.Fatalf("non-fixed passfile error=%v", err)
 	}
+	values["PGPASSFILE"] = restoreCheckPassfile
+	values["HAPPYLEARN_MINIO_ENDPOINT"] = "restore-aistor.internal:9000"
+	if _, err := loadRestoreCheckConfig(getenv); !errors.Is(
+		err,
+		errWorkflowUnavailable,
+	) {
+		t.Fatalf("non-isolated plaintext endpoint error=%v", err)
+	}
+	values["HAPPYLEARN_MINIO_USE_TLS"] = "true"
+	config, err = loadRestoreCheckConfig(getenv)
+	if err != nil || !config.useTLS {
+		t.Fatalf("explicit TLS endpoint config=%+v err=%v", config, err)
+	}
 }
 
 func TestRestoreCheckObjectAdapterMapsSizeNotFoundAndBackendFailure(t *testing.T) {
@@ -273,6 +294,240 @@ func TestRestoreCheckObjectAdapterMapsSizeNotFoundAndBackendFailure(t *testing.T
 	); !errors.Is(err, errWorkflowUnavailable) ||
 		strings.Contains(err.Error(), secret) {
 		t.Fatalf("backend error=%v", err)
+	}
+}
+
+func TestLoadRestoreCheckManifestUsesActualCanonicalBytesAndMatchingBackupID(
+	t *testing.T,
+) {
+	backupID := uuid.MustParse(canonicalRestoreBackupID)
+	encoded := restoreCheckManifestBytes(t, backupID, 19)
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadRestoreCheckManifest(path, backupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.manifest.BatchID != canonicalRestoreBackupID ||
+		loaded.manifest.DatabaseMigrationVersion != 19 ||
+		loaded.sha256 != sha256.Sum256(encoded) {
+		t.Fatalf("loaded=%+v", loaded)
+	}
+}
+
+func TestLoadRestoreCheckManifestRejectsMissingTamperedWrongAndUnsafeFiles(
+	t *testing.T,
+) {
+	backupID := uuid.MustParse(canonicalRestoreBackupID)
+	valid := restoreCheckManifestBytes(t, backupID, 19)
+	for _, testCase := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name:  "missing",
+			setup: func(*testing.T, string) {},
+		},
+		{
+			name: "tampered noncanonical",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(
+					path,
+					append(append([]byte(nil), valid...), '\n'),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "wrong backup ID",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				wrongID := uuid.MustParse(
+					"22222222-2222-4222-8222-222222222222",
+				)
+				if err := os.WriteFile(
+					path,
+					restoreCheckManifestBytes(t, wrongID, 19),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				target := path + ".target"
+				if err := os.WriteFile(target, valid, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "too large",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(
+					path,
+					bytes.Repeat(
+						[]byte{'x'},
+						backup.ManifestMaxBytes+1,
+					),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.json")
+			testCase.setup(t, path)
+			_, err := loadRestoreCheckManifest(path, backupID)
+			if !errors.Is(err, errWorkflowUnavailable) {
+				t.Fatalf("error=%v", err)
+			}
+			if strings.Contains(err.Error(), path) ||
+				strings.Contains(err.Error(), canonicalRestoreBackupID) {
+				t.Fatalf("error leaks manifest detail: %v", err)
+			}
+		})
+	}
+}
+
+func restoreCheckManifestBytes(
+	t *testing.T,
+	backupID uuid.UUID,
+	migrationVersion int64,
+) []byte {
+	t.Helper()
+	encoded, err := backup.MarshalManifest(backup.Manifest{
+		SchemaVersion:            1,
+		BatchID:                  backupID.String(),
+		CreatedAt:                time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+		DatabaseMigrationVersion: migrationVersion,
+		DatabaseDumpSHA256: strings.Repeat(
+			"1",
+			sha256.Size*2,
+		),
+		ObjectSnapshotID: strings.Repeat(
+			"2",
+			sha256.Size*2,
+		),
+		ObjectCount:     1,
+		ReferencedBytes: 41,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func TestLatestEmbeddedMigrationVersionIsStrictAndCurrent(t *testing.T) {
+	latest, err := latestEmbeddedMigrationVersion(migrations.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != 20 {
+		t.Fatalf("latest migration=%d", latest)
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		migrations fstest.MapFS
+	}{
+		{
+			name: "noncanonical name",
+			migrations: fstest.MapFS{
+				"20_bad.sql": {Data: []byte("SELECT 1;")},
+			},
+		},
+		{
+			name: "duplicate version",
+			migrations: fstest.MapFS{
+				"00001_first.sql":  {Data: []byte("SELECT 1;")},
+				"00001_second.sql": {Data: []byte("SELECT 1;")},
+			},
+		},
+		{
+			name: "zero version",
+			migrations: fstest.MapFS{
+				"00000_zero.sql": {Data: []byte("SELECT 1;")},
+			},
+		},
+		{
+			name:       "empty",
+			migrations: fstest.MapFS{},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := latestEmbeddedMigrationVersion(
+				testCase.migrations,
+			); !errors.Is(err, errWorkflowUnavailable) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRestoreMigrationVersionsAllowsOldBackupAtLatestSchema(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name            string
+		manifestVersion int64
+		restoredVersion int64
+		embeddedLatest  int64
+		wantError       bool
+	}{
+		{
+			name:            "current manifest",
+			manifestVersion: 20, restoredVersion: 20, embeddedLatest: 20,
+		},
+		{
+			name:            "old manifest migrated forward",
+			manifestVersion: 19, restoredVersion: 20, embeddedLatest: 20,
+		},
+		{
+			name:            "future manifest",
+			manifestVersion: 21, restoredVersion: 20, embeddedLatest: 20,
+			wantError: true,
+		},
+		{
+			name:            "old restored database",
+			manifestVersion: 19, restoredVersion: 19, embeddedLatest: 20,
+			wantError: true,
+		},
+		{
+			name:            "future restored database",
+			manifestVersion: 20, restoredVersion: 21, embeddedLatest: 20,
+			wantError: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateRestoreMigrationVersions(
+				testCase.manifestVersion,
+				testCase.restoredVersion,
+				testCase.embeddedLatest,
+			)
+			if testCase.wantError &&
+				!errors.Is(err, errWorkflowUnavailable) {
+				t.Fatalf("error=%v", err)
+			}
+			if !testCase.wantError && err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

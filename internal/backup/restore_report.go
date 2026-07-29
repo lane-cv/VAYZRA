@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"syscall"
+
+	"github.com/google/uuid"
 )
 
 var ErrRestoreReport = errors.New("restore verification report unavailable")
@@ -41,18 +44,47 @@ func WriteRestoreVerificationReport(
 	)
 }
 
+func WriteBoundRestoreVerificationReport(
+	path string,
+	backupID uuid.UUID,
+	manifestSHA256 [sha256.Size]byte,
+	result RestoreVerificationResult,
+) error {
+	content, err := marshalBoundRestoreVerificationReport(
+		backupID,
+		manifestSHA256,
+		result,
+	)
+	if err != nil {
+		return ErrRestoreReport
+	}
+	return writeRestoreVerificationReportContent(
+		path,
+		content,
+		defaultRestoreReportOperations(),
+	)
+}
+
 func writeRestoreVerificationReport(
 	path string,
 	result RestoreVerificationResult,
 	operations restoreReportOperations,
 ) error {
+	content, err := marshalRestoreVerificationReport(result)
+	if err != nil {
+		return ErrRestoreReport
+	}
+	return writeRestoreVerificationReportContent(path, content, operations)
+}
+
+func writeRestoreVerificationReportContent(
+	path string,
+	content []byte,
+	operations restoreReportOperations,
+) error {
 	if operations.link == nil ||
 		operations.remove == nil ||
 		operations.syncDirectory == nil {
-		return ErrRestoreReport
-	}
-	content, err := marshalRestoreVerificationReport(result)
-	if err != nil {
 		return ErrRestoreReport
 	}
 	directory := filepath.Dir(path)
@@ -142,6 +174,46 @@ func writeRestoreVerificationReport(
 func marshalRestoreVerificationReport(
 	result RestoreVerificationResult,
 ) ([]byte, error) {
+	return marshalRestoreVerificationReportWithBinding(
+		result,
+		nil,
+	)
+}
+
+type restoreReportBinding struct {
+	backupID       uuid.UUID
+	manifestSHA256 [sha256.Size]byte
+	evidenceSHA256 [sha256.Size]byte
+}
+
+func marshalBoundRestoreVerificationReport(
+	backupID uuid.UUID,
+	manifestSHA256 [sha256.Size]byte,
+	result RestoreVerificationResult,
+) ([]byte, error) {
+	if backupID == uuid.Nil ||
+		backupID.Version() != 4 ||
+		backupID.Variant() != uuid.RFC4122 ||
+		manifestSHA256 == [sha256.Size]byte{} ||
+		len(result.ReportSHA256) != sha256.Size {
+		return nil, ErrRestoreReport
+	}
+	evidenceInput := make([]byte, 0, 16+sha256.Size*2)
+	evidenceInput = append(evidenceInput, backupID[:]...)
+	evidenceInput = append(evidenceInput, manifestSHA256[:]...)
+	evidenceInput = append(evidenceInput, result.ReportSHA256...)
+	binding := &restoreReportBinding{
+		backupID:       backupID,
+		manifestSHA256: manifestSHA256,
+		evidenceSHA256: sha256.Sum256(evidenceInput),
+	}
+	return marshalRestoreVerificationReportWithBinding(result, binding)
+}
+
+func marshalRestoreVerificationReportWithBinding(
+	result RestoreVerificationResult,
+	binding *restoreReportBinding,
+) ([]byte, error) {
 	if result.RestoredMigrationVersion < 1 ||
 		!result.SessionRevocationVerified ||
 		result.CheckedObjectCount < 0 ||
@@ -158,10 +230,18 @@ func marshalRestoreVerificationReport(
 	}
 
 	var report bytes.Buffer
+	_, _ = fmt.Fprintf(&report, "schema_version=%d\n", restoreReportFormatVersion)
+	if binding != nil {
+		_, _ = fmt.Fprintf(
+			&report,
+			"backup_id=%s\nmanifest_sha256=%s\n",
+			binding.backupID.String(),
+			hex.EncodeToString(binding.manifestSHA256[:]),
+		)
+	}
 	_, _ = fmt.Fprintf(
 		&report,
-		"schema_version=%d\nmigration_version=%d\n",
-		restoreReportFormatVersion,
+		"migration_version=%d\n",
 		result.RestoredMigrationVersion,
 	)
 	var rowCountTotal int64
@@ -192,6 +272,13 @@ func marshalRestoreVerificationReport(
 		result.UnexpectedObjectCount,
 		hex.EncodeToString(result.ReportSHA256),
 	)
+	if binding != nil {
+		_, _ = fmt.Fprintf(
+			&report,
+			"evidence_sha256=%s\n",
+			hex.EncodeToString(binding.evidenceSHA256[:]),
+		)
+	}
 	if report.Len() < 1 || report.Len() > maxRestoreReportBytes {
 		return nil, ErrRestoreReport
 	}
