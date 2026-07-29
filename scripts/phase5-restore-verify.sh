@@ -1191,6 +1191,7 @@ expected_resource_name() {
     containers:restic-check) printf '%s-restic-check' "$project" ;;
     containers:restic-select) printf '%s-restic-select' "$project" ;;
     containers:restic-restore) printf '%s-restic-restore' "$project" ;;
+    containers:restore-ownership) printf '%s-restore-ownership' "$project" ;;
     containers:object-restore) printf '%s-object-restore' "$project" ;;
     containers:aistor-license-init)
       printf '%s-aistor-license-init' "$project"
@@ -1228,7 +1229,8 @@ valid_observed_resource() {
       containers:volume-probe-aistor | \
       containers:volume-probe-aistor-license | \
       containers:restic-check | containers:restic-select | \
-      containers:restic-restore | containers:object-restore | \
+      containers:restic-restore | containers:restore-ownership | \
+      containers:object-restore | \
       containers:aistor-license-init | containers:postgres | \
       containers:postgres-restore | containers:aistor | containers:redis | \
       containers:revoke-sessions | containers:app | \
@@ -1456,6 +1458,38 @@ restic_restore_container() {
     restic --no-cache "$@"
 }
 
+normalize_restore_ownership() {
+  run_named_container \
+    "$PROJECT-restore-ownership" restore-ownership \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_READ_SEARCH \
+    --security-opt no-new-privileges:true \
+    --mount "type=bind,src=$RESTORE_DIRECTORY,dst=/restore" \
+    --entrypoint /usr/bin/timeout \
+    "$BACKUP_IMAGE" \
+    --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
+    /bin/sh -ceu '
+      target_uid="$1"
+      target_gid="$2"
+      case "$target_uid:$target_gid" in
+        *[!0-9:]* | :* | *: | *:*:*) exit 1 ;;
+      esac
+      chown --recursive --no-dereference \
+        "$target_uid:$target_gid" /restore
+      unexpected="$(
+        find /restore -xdev \
+          \( ! -user "$target_uid" -o ! -group "$target_gid" \) \
+          -print -quit
+      )"
+      [ -z "$unexpected" ]
+    ' restore-ownership "$HOST_UID" "$HOST_GID" \
+    >/dev/null
+}
+
 repository_check() {
   restic_container \
     "$PROJECT-restic-check" restic-check \
@@ -1523,6 +1557,10 @@ restore_snapshot() {
     "$PROJECT-restic-restore" restic-restore \
     restore "$snapshot_id" --target /restore >/dev/null; then
     safe_log 'snapshot_restore_command_failed'
+    return 1
+  fi
+  if ! normalize_restore_ownership; then
+    safe_log 'snapshot_restore_ownership_failed'
     return 1
   fi
   [[ -f "$RESTORE_DIRECTORY/database.dump" &&
@@ -1999,6 +2037,7 @@ $PROJECT-postgres-restore|postgres-restore
 $PROJECT-postgres|postgres
 $PROJECT-object-restore|object-restore
 $PROJECT-aistor-license-init|aistor-license-init
+$PROJECT-restore-ownership|restore-ownership
 $PROJECT-restic-restore|restic-restore
 $PROJECT-restic-select|restic-select
 $PROJECT-restic-check|restic-check
@@ -2048,6 +2087,7 @@ cleanup_ledger_valid() {
     "containers|$PROJECT-restic-check|restic-check" \
     "containers|$PROJECT-restic-select|restic-select" \
     "containers|$PROJECT-restic-restore|restic-restore" \
+    "containers|$PROJECT-restore-ownership|restore-ownership" \
     "containers|$PROJECT-object-restore|object-restore" \
     "containers|$PROJECT-aistor-license-init|aistor-license-init" \
     "containers|$PROJECT-postgres|postgres" \

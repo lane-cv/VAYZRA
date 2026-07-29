@@ -788,6 +788,19 @@ case "$kind" in
     [[ "$*" == *"--user ${PHASE5_FAKE_HOST_UID}:${PHASE5_FAKE_HOST_GID}"* ]] ||
       exit 64
     ;;
+  restore-ownership)
+    [[ "$*" == *'--network none'* &&
+      "$*" == *'--read-only'* &&
+      "$*" == *'--user 0:0'* &&
+      "$*" == *'--cap-drop ALL'* &&
+      "$*" == *'--cap-add CHOWN'* &&
+      "$*" == *'--cap-add DAC_READ_SEARCH'* &&
+      "$*" == *'--security-opt no-new-privileges:true'* &&
+      "$*" == *'dst=/restore'* &&
+      "$*" == *'chown --recursive --no-dereference'* &&
+      "$*" == *'find /restore -xdev'* ]] ||
+      exit 64
+    ;;
 esac
 
 case "$kind" in
@@ -963,6 +976,9 @@ case "$kind" in
     if [[ "$mode" == manifest_hash_mismatch ]]; then
       printf 'x' >>"$restore_mount/manifest.json"
     fi
+    ;;
+  restore-ownership)
+    [[ "$mode" != restore_ownership_failure ]] || exit 75
     ;;
   object-restore)
     [[ "$*" == *'PHASE5_RESTORE_OBJECT_DATA'* ]] || exit 64
@@ -2038,6 +2054,20 @@ assert_no_resources "$restore_layout_fixture"
 test ! -e "$restore_layout_fixture/reports/restore-$BACKUP_ID.json" ||
   fail 'invalid restored snapshot layout published a success report'
 
+restore_ownership_fixture="$(make_fixture)"
+if run_fixture "$restore_ownership_fixture" restore_ownership_failure \
+  >"$restore_ownership_fixture/stdout" \
+  2>"$restore_ownership_fixture/stderr"; then
+  fail 'failed restore ownership normalization was accepted'
+fi
+grep -Fxq \
+  'phase5_restore: snapshot_restore_ownership_failed' \
+  "$restore_ownership_fixture/stderr" ||
+  fail 'restore ownership failure did not publish its safe category'
+assert_no_resources "$restore_ownership_fixture"
+test ! -e "$restore_ownership_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'restore ownership failure published a success report'
+
 for mode in extra_snapshot_tag duplicate_manifest_tag; do
   manifest_tag_fixture="$(make_fixture)"
   if run_fixture "$manifest_tag_fixture" "$mode"; then
@@ -2076,6 +2106,14 @@ grep -Fq "restic --no-cache snapshots --json --tag happylearn-batch:$BACKUP_ID" 
 grep -Fq "restic --no-cache restore $SNAPSHOT_ID --target /restore" \
   "$success_fixture/docker.log" ||
   fail 'selected snapshot was not restored exactly'
+grep -Fq 'restore-kind=restore-ownership' "$success_fixture/docker.log" ||
+  fail 'restore did not normalize restored ownership'
+grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH' \
+  "$success_fixture/docker.log" ||
+  fail 'restore ownership normalization capabilities are not minimal'
+grep -Fq -- '--security-opt no-new-privileges:true' \
+  "$success_fixture/docker.log" ||
+  fail 'restore ownership normalization omitted no-new-privileges'
 if grep -Fq "$SECRET_MARKER" "$success_fixture/docker.log" ||
   grep -Fq "$DATABASE_SECRET_MARKER" "$success_fixture/docker.log" ||
   grep -Fq "$OBJECT_SECRET_MARKER" "$success_fixture/docker.log" ||
@@ -2368,6 +2406,7 @@ do
       "containers|$ledger_project-restic-check|restic-check" \
       "containers|$ledger_project-restic-select|restic-select" \
       "containers|$ledger_project-restic-restore|restic-restore" \
+      "containers|$ledger_project-restore-ownership|restore-ownership" \
       "containers|$ledger_project-object-restore|object-restore" \
       "containers|$ledger_project-aistor-license-init|aistor-license-init" \
       "containers|$ledger_project-postgres|postgres" \
@@ -2380,9 +2419,9 @@ do
       "containers|$ledger_project-restore-http-probe|restore-http-probe" \
       >"$ledger_expected"
     cmp -s "$ledger_path" "$ledger_expected" ||
-      fail 'successful cleanup ledger was not the exact 20-line contract'
-    [[ "$(wc -l <"$ledger_path" | tr -d '[:space:]')" == 20 &&
-      "$(sort "$ledger_path" | uniq | wc -l | tr -d '[:space:]')" == 20 &&
+      fail 'successful cleanup ledger was not the exact 21-line contract'
+    [[ "$(wc -l <"$ledger_path" | tr -d '[:space:]')" == 21 &&
+      "$(sort "$ledger_path" | uniq | wc -l | tr -d '[:space:]')" == 21 &&
       "$(wc -c <"$ledger_path" | tr -d '[:space:]')" -le 4096 ]] ||
       fail 'successful cleanup ledger line, uniqueness, or size bound failed'
   fi
