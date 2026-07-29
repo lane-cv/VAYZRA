@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1.7
+# Test-only Phase 5 live-gate controller. It is not referenced by production
+# Compose or copied into any application image.
+FROM docker@sha256:be132a9f282288de4afaf63379dff75711fda0147c6b72a9df44e51841402144 AS docker_cli
+RUN apk add --no-cache bash coreutils util-linux
+RUN docker --version && bash --version && flock --version
+LABEL io.happylearn.test-only="phase5-restore-live-controller"
+ENTRYPOINT []
+CMD ["/bin/bash"]
