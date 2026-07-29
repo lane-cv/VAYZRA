@@ -424,9 +424,20 @@ wait_for_process_gone() {
 terminate_direct_fixture_child() {
   local pid="$1"
   local attempts=0
+  local direct_child_running=false
   local running_pid
   local still_running
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  for running_pid in $(jobs -pr); do
+    if [[ "$running_pid" == "$pid" ]]; then
+      direct_child_running=true
+      break
+    fi
+  done
+  if [[ "$direct_child_running" == false ]]; then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
   kill -KILL "$pid" 2>/dev/null || true
   while [[ "$attempts" -lt 1000 ]]; do
     still_running=false
@@ -950,6 +961,73 @@ start_fixture_background() {
   FIXTURE_BACKGROUND_PID="$!"
 }
 
+if [[ "${PHASE5_CONTRACT_REAPED_PID_PROBE:-}" == true ]]; then
+  reaped_probe_marker="${PHASE5_CONTRACT_REAPED_PID_MARKER:?}"
+  (
+    exit 0
+  ) &
+  reaped_probe_pid="$!"
+  wait "$reaped_probe_pid"
+  register_active_fixture \
+    "$reaped_probe_pid" "${reaped_probe_marker}.release"
+  kill() {
+    printf '%s\n' "$*" >"$reaped_probe_marker"
+    return 0
+  }
+  exit 0
+fi
+
+if [[ "${PHASE5_CONTRACT_EARLY_FAIL_PROBE:-}" == true ]]; then
+  early_fail_release="${PHASE5_CONTRACT_EARLY_FAIL_RELEASE:?}"
+  early_fail_pid_marker="${PHASE5_CONTRACT_EARLY_FAIL_PID_MARKER:?}"
+  early_fail_fixture="$(make_fixture)"
+  PHASE5_FAKE_DELAY_MATCH='backup-storage-init' \
+    PHASE5_FAKE_DELAY_RELEASE_FILE="$early_fail_release" \
+    start_fixture_background "$early_fail_fixture"
+  early_fail_pid="$FIXTURE_BACKGROUND_PID"
+  register_active_fixture "$early_fail_pid" "$early_fail_release"
+  register_active_fixture_finish "${early_fail_release}.finished"
+  wait_for_file "${early_fail_release}.started" ||
+    fail "early-fail cleanup probe did not start its background fixture"
+  printf '%s\n' "$early_fail_pid" >"$early_fail_pid_marker"
+  fail "intentional early-fail cleanup probe"
+fi
+
+background_fixture_call_count="$(
+  grep -Ec '^[[:space:]]+run_fixture .*&[[:space:]]*$' "${BASH_SOURCE[0]}"
+)"
+[[ "$background_fixture_call_count" -eq 1 ]] ||
+  fail "background fixtures bypass start_fixture_background"
+
+reaped_pid_kill_marker="$CONTRACT_TEMP_ROOT/reaped-pid.kill"
+if ! PHASE5_CONTRACT_REAPED_PID_PROBE=true \
+  PHASE5_CONTRACT_REAPED_PID_MARKER="$reaped_pid_kill_marker" \
+  bash "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+  fail "reaped PID cleanup probe failed"
+fi
+[[ -f "${reaped_pid_kill_marker}.release" ]] ||
+  fail "reaped PID cleanup probe did not reach its EXIT trap"
+[[ ! -e "$reaped_pid_kill_marker" ]] ||
+  fail "reaped PID cleanup attempted to signal a reused PID"
+
+early_fail_release="$CONTRACT_TEMP_ROOT/early-fail.release"
+early_fail_pid_marker="$CONTRACT_TEMP_ROOT/early-fail.pid"
+if PHASE5_CONTRACT_EARLY_FAIL_PROBE=true \
+  PHASE5_CONTRACT_EARLY_FAIL_RELEASE="$early_fail_release" \
+  PHASE5_CONTRACT_EARLY_FAIL_PID_MARKER="$early_fail_pid_marker" \
+  bash "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+  fail "early-fail cleanup probe unexpectedly succeeded"
+fi
+[[ -f "$early_fail_release" &&
+  -f "${early_fail_release}.started" &&
+  -f "${early_fail_release}.finished" ]] ||
+  fail "early-fail EXIT trap did not release and finish its background fixture"
+early_fail_pid="$(<"$early_fail_pid_marker")"
+[[ "$early_fail_pid" =~ ^[1-9][0-9]*$ ]] ||
+  fail "early-fail cleanup probe recorded an invalid PID"
+! kill -0 "$early_fail_pid" 2>/dev/null ||
+  fail "early-fail EXIT trap left its background fixture running"
+
 for heartbeat_publish_failure in child_before_pid ready; do
   heartbeat_publish_fixture="$(make_fixture)"
   heartbeat_publish_marker="$heartbeat_publish_fixture/heartbeat-publish.pid"
@@ -1393,10 +1471,11 @@ FAKE_LSOF
 chmod 0700 "$active_lock_fixture/bin/lsof"
 PHASE5_FAKE_DELAY_MATCH='backup-storage-init' \
   PHASE5_FAKE_DELAY_RELEASE_FILE="$active_lock_release" \
-  run_fixture "$active_lock_fixture" >/dev/null 2>&1 &
-active_lock_runner="$!"
+  start_fixture_background "$active_lock_fixture"
+active_lock_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$active_lock_runner" "$active_lock_release"
+register_active_fixture_finish "${active_lock_release}.finished"
 if ! wait_for_file "${active_lock_release}.started"; then
-  kill -KILL "$active_lock_runner" 2>/dev/null || true
   fail "active lock fixture did not reach the blocked one-shot"
 fi
 [[ -L "$active_lock_fixture/host.lock" ]] ||
@@ -1406,8 +1485,6 @@ active_log_lines_before="$(
   wc -l <"$active_lock_fixture/docker.log" | tr -d '[:space:]'
 )"
 if run_fixture "$active_lock_fixture"; then
-  touch "$active_lock_release"
-  wait "$active_lock_runner" || true
   fail "active host lock was stolen"
 fi
 active_log_lines_after="$(
@@ -1421,6 +1498,9 @@ test "$active_log_lines_before" -eq "$active_log_lines_after" ||
 touch "$active_lock_release"
 wait "$active_lock_runner" ||
   fail "active lock owner did not finish after release"
+wait_for_file "${active_lock_release}.finished" ||
+  fail "active lock descendant did not finish after release"
+clear_active_fixture
 [[ ! -e "$active_lock_fixture/host.lock" &&
   ! -L "$active_lock_fixture/host.lock" ]] ||
   fail "active owner cleanup left its host lock"
@@ -1429,10 +1509,11 @@ stale_lock_fixture="$(make_fixture)"
 stale_lock_release="$stale_lock_fixture/stale-lock.release"
 PHASE5_FAKE_DELAY_MATCH='backup-storage-init' \
   PHASE5_FAKE_DELAY_RELEASE_FILE="$stale_lock_release" \
-  run_fixture "$stale_lock_fixture" >/dev/null 2>&1 &
-stale_lock_runner="$!"
+  start_fixture_background "$stale_lock_fixture"
+stale_lock_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$stale_lock_runner" "$stale_lock_release"
+register_active_fixture_finish "${stale_lock_release}.finished"
 if ! wait_for_file "${stale_lock_release}.started"; then
-  kill -KILL "$stale_lock_runner" 2>/dev/null || true
   fail "stale lock fixture did not reach the blocked one-shot"
 fi
 [[ -L "$stale_lock_fixture/host.lock" ]] ||
@@ -1443,15 +1524,10 @@ stale_lock_pid="$(
 )"
 [[ "$stale_lock_pid" =~ ^[1-9][0-9]*$ ]] ||
   fail "stale lock owner PID was invalid"
-kill -KILL "$stale_lock_pid"
-attempts=0
-while kill -0 "$stale_lock_pid" 2>/dev/null && [[ "$attempts" -lt 500 ]]; do
-  sleep 0.01
-  attempts=$((attempts + 1))
-done
-if kill -0 "$stale_lock_pid" 2>/dev/null; then
+[[ "$stale_lock_pid" == "$stale_lock_runner" ]] ||
+  fail "stale lock owner was not the direct fixture child"
+terminate_direct_fixture_child "$stale_lock_runner" ||
   fail "SIGKILL did not terminate the lock owner"
-fi
 [[ -L "$stale_lock_fixture/host.lock" &&
   -d "$stale_lock_owner" ]] ||
   fail "SIGKILL did not leave the published stale lock fixture"
@@ -1459,8 +1535,6 @@ stale_log_lines_before="$(
   wc -l <"$stale_lock_fixture/docker.log" | tr -d '[:space:]'
 )"
 if run_fixture "$stale_lock_fixture"; then
-  touch "$stale_lock_release"
-  wait_for_file "${stale_lock_release}.finished" || true
   fail "inherited liveness descriptor was treated as stale"
 fi
 stale_log_lines_after="$(
@@ -1474,7 +1548,7 @@ test "$stale_log_lines_before" -eq "$stale_log_lines_after" ||
 touch "$stale_lock_release"
 wait_for_file "${stale_lock_release}.finished" ||
   fail "inherited liveness holder did not finish after release"
-wait "$stale_lock_runner" 2>/dev/null || true
+clear_active_fixture
 if ! run_fixture "$stale_lock_fixture"; then
   fail "verified SIGKILL-stale host lock was not reclaimed"
 fi
@@ -1501,7 +1575,6 @@ post_heartbeat_runner="$FIXTURE_BACKGROUND_PID"
 register_active_fixture "$post_heartbeat_runner" "$post_heartbeat_release"
 register_active_fixture_finish "${post_heartbeat_release}.finished"
 if ! wait_for_file "${post_heartbeat_release}.started"; then
-  terminate_direct_fixture_child "$post_heartbeat_runner" || true
   fail "post-heartbeat fixture did not reach the blocked external descendant"
 fi
 post_heartbeat_owner="$(readlink "$post_heartbeat_fixture/host.lock")"
@@ -1522,13 +1595,9 @@ if ! wait_for_log_count_greater \
   "$post_heartbeat_fixture/docker.log" \
   'SQL PHASE5_QUERY_LEASE_RENEW' \
   "$post_heartbeat_renew_baseline"; then
-  touch "$post_heartbeat_release"
-  terminate_direct_fixture_child "$post_heartbeat_runner" || true
-  wait_for_file "${post_heartbeat_release}.finished" || true
   fail "heartbeat did not renew while the external descendant was blocked"
 fi
 if ! terminate_direct_fixture_child "$post_heartbeat_runner"; then
-  touch "$post_heartbeat_release"
   fail "post-heartbeat direct child did not terminate"
 fi
 post_heartbeat_second_rejected=true
@@ -1593,41 +1662,26 @@ register_active_fixture \
   "$inflight_runner" "$inflight_external_release" "$inflight_renew_release"
 register_active_fixture_finish "${inflight_external_release}.finished"
 if ! wait_for_file "${inflight_external_release}.started"; then
-  touch "$inflight_external_release" "$inflight_renew_release"
-  terminate_direct_fixture_child "$inflight_runner" || true
   fail "in-flight renewal fixture did not reach its external descendant"
 fi
 inflight_owner="$(readlink "$inflight_renew_fixture/host.lock")"
 inflight_owner_pid="$(
   sed -n 's/^pid=//p' "$inflight_owner/owner"
 )"
-[[ "$inflight_owner_pid" =~ ^[1-9][0-9]*$ ]] || {
-  touch "$inflight_external_release" "$inflight_renew_release"
-  terminate_direct_fixture_child "$inflight_runner" || true
-  wait_for_file "${inflight_external_release}.finished" || true
+[[ "$inflight_owner_pid" =~ ^[1-9][0-9]*$ ]] ||
   fail "in-flight renewal owner PID was invalid"
-}
-[[ "$inflight_owner_pid" == "$inflight_runner" ]] || {
-  touch "$inflight_external_release" "$inflight_renew_release"
-  terminate_direct_fixture_child "$inflight_runner" || true
+[[ "$inflight_owner_pid" == "$inflight_runner" ]] ||
   fail "in-flight renewal owner was not the direct fixture child"
-}
 inflight_heartbeat_pid="$(
   read_heartbeat_pid="$inflight_owner/heartbeat.pid"
   [[ -f "$read_heartbeat_pid" && ! -L "$read_heartbeat_pid" ]] || exit 1
   printf '%s' "$(<"$read_heartbeat_pid")"
 )"
-[[ "$inflight_heartbeat_pid" =~ ^[1-9][0-9]*$ ]] || {
-  touch "$inflight_external_release" "$inflight_renew_release"
-  terminate_direct_fixture_child "$inflight_runner" || true
+[[ "$inflight_heartbeat_pid" =~ ^[1-9][0-9]*$ ]] ||
   fail "in-flight heartbeat PID was invalid"
-}
 printf '%s\n' "$inflight_owner_pid" >"$inflight_owner_pid_file"
 touch "$inflight_renew_arm"
 if ! wait_for_file "${inflight_renew_release}.started"; then
-  touch "$inflight_external_release" "$inflight_renew_release"
-  terminate_direct_fixture_child "$inflight_runner" || true
-  wait_for_file "${inflight_external_release}.finished" || true
   fail "heartbeat renewal did not enter its bounded in-flight window"
 fi
 inflight_renew_baseline="$(
@@ -1635,7 +1689,6 @@ inflight_renew_baseline="$(
     'SQL PHASE5_QUERY_LEASE_RENEW'
 )"
 if ! terminate_direct_fixture_child "$inflight_runner"; then
-  touch "$inflight_external_release" "$inflight_renew_release"
   fail "in-flight renewal direct child did not terminate"
 fi
 touch "$inflight_renew_release"
@@ -1643,13 +1696,9 @@ if ! wait_for_log_count_greater \
   "$inflight_renew_fixture/docker.log" \
   'SQL PHASE5_QUERY_LEASE_RENEW' \
   "$inflight_renew_baseline"; then
-  touch "$inflight_external_release"
-  wait_for_file "${inflight_external_release}.finished" || true
   fail "the already in-flight renewal did not complete"
 fi
 if ! wait_for_process_gone "$inflight_heartbeat_pid"; then
-  touch "$inflight_external_release"
-  wait_for_file "${inflight_external_release}.finished" || true
   fail "in-flight heartbeat did not exit after owner death"
 fi
 inflight_renew_after_heartbeat_exit="$(
@@ -1657,11 +1706,8 @@ inflight_renew_after_heartbeat_exit="$(
     'SQL PHASE5_QUERY_LEASE_RENEW'
 )"
 [[ "$inflight_renew_after_heartbeat_exit" -eq \
-  $((inflight_renew_baseline + 1)) ]] || {
-  touch "$inflight_external_release"
-  wait_for_file "${inflight_external_release}.finished" || true
+  $((inflight_renew_baseline + 1)) ]] ||
   fail "owner death allowed more than one already in-flight renewal"
-}
 inflight_second_rejected=true
 if PHASE5_FAKE_DOCKER_LOG="$inflight_second_log" \
   run_fixture "$inflight_renew_fixture"; then
@@ -1670,11 +1716,8 @@ fi
 [[ "$inflight_second_rejected" == true &&
   ! -s "$inflight_second_log" &&
   -L "$inflight_renew_fixture/host.lock" &&
-  "$(readlink "$inflight_renew_fixture/host.lock")" == "$inflight_owner" ]] || {
-  touch "$inflight_external_release"
-  wait_for_file "${inflight_external_release}.finished" || true
+  "$(readlink "$inflight_renew_fixture/host.lock")" == "$inflight_owner" ]] ||
   fail "in-flight renewal descendant host lock was stolen"
-}
 touch "$inflight_external_release"
 wait_for_file "${inflight_external_release}.finished" ||
   fail "in-flight renewal external descendant did not finish"
@@ -1771,24 +1814,20 @@ chmod 0700 "$linux_holder_fixture/bin/lsof"
 linux_holder_release="$linux_holder_fixture/linux-holder.release"
 PHASE5_FAKE_DELAY_MATCH='backup-storage-init' \
   PHASE5_FAKE_DELAY_RELEASE_FILE="$linux_holder_release" \
-  run_fixture "$linux_holder_fixture" >/dev/null 2>&1 &
-linux_holder_runner="$!"
+  start_fixture_background "$linux_holder_fixture"
+linux_holder_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$linux_holder_runner" "$linux_holder_release"
+register_active_fixture_finish "${linux_holder_release}.finished"
 if ! wait_for_file "${linux_holder_release}.started"; then
-  kill -KILL "$linux_holder_runner" 2>/dev/null || true
   fail "Linux holder fixture did not reach the blocked descendant"
 fi
 linux_holder_owner="$(readlink "$linux_holder_fixture/host.lock")"
 linux_holder_pid="$(
   sed -n 's/^pid=//p' "$linux_holder_owner/owner"
 )"
-kill -KILL "$linux_holder_pid"
-attempts=0
-while kill -0 "$linux_holder_pid" 2>/dev/null &&
-  [[ "$attempts" -lt 500 ]]; do
-  sleep 0.01
-  attempts=$((attempts + 1))
-done
-if kill -0 "$linux_holder_pid" 2>/dev/null; then
+[[ "$linux_holder_pid" == "$linux_holder_runner" ]] ||
+  fail "Linux holder owner was not the direct fixture child"
+if ! terminate_direct_fixture_child "$linux_holder_runner"; then
   fail "Linux holder owner survived SIGKILL"
 fi
 linux_holder_log_before="$(
@@ -1804,7 +1843,7 @@ linux_holder_log_after="$(
 touch "$linux_holder_release"
 wait_for_file "${linux_holder_release}.finished" ||
   fail "Linux inherited holder did not finish after release"
-wait "$linux_holder_runner" 2>/dev/null || true
+clear_active_fixture
 linux_holder_failed=false
 if [[ "$linux_holder_rejected" != true ||
   "$linux_holder_log_before" -ne "$linux_holder_log_after" ||
