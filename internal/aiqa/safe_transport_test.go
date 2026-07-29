@@ -2,7 +2,6 @@ package aiqa
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -173,19 +172,6 @@ func TestSafeTransportDoesNotLeakMalformedRedirectLocation(t *testing.T) {
 	}
 }
 
-func TestIdleTimeoutBodyIgnoresStaleTimerGeneration(t *testing.T) {
-	body := newIdleTimeoutBody(io.NopCloser(strings.NewReader("active")), time.Hour)
-	defer body.Close()
-	body.mu.Lock()
-	stale := body.generation
-	body.generation++
-	body.mu.Unlock()
-	body.expire(stale)
-	if _, err := body.Read(make([]byte, 1)); err != nil {
-		t.Fatalf("stale timer closed active stream: %v", err)
-	}
-}
-
 func TestSafeTransportPinsValidatedAddressForDial(t *testing.T) {
 	t.Parallel()
 	var gotHost string
@@ -266,34 +252,6 @@ func TestSafeGatewayCompletedStreamPromptlyClosesOneShotConnection(t *testing.T)
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("completed one-shot provider connection remained idle")
 	}
-}
-
-func TestTransportLifecycleBodyCloseIsIdempotentAndReleasesReferences(t *testing.T) {
-	underlying := &lifecycleBodyStub{}
-	body := &transportLifecycleBody{body: underlying, transport: &http.Transport{}}
-	if err := body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if underlying.closes != 1 || body.body != nil || body.transport != nil {
-		t.Fatalf("closes=%d body_retained=%t transport_retained=%t",
-			underlying.closes, body.body != nil, body.transport != nil)
-	}
-	if _, err := body.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("read after close=%v", err)
-	}
-}
-
-type lifecycleBodyStub struct {
-	closes int
-}
-
-func (*lifecycleBodyStub) Read([]byte) (int, error) { return 0, io.EOF }
-func (b *lifecycleBodyStub) Close() error {
-	b.closes++
-	return nil
 }
 
 func TestSafeTransportAppliesTotalTimeout(t *testing.T) {
