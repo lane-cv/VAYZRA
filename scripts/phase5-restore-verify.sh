@@ -57,6 +57,8 @@ ACTIVE_EXTERNAL_PGID=''
 PENDING_SIGNAL_STATUS=''
 WORKSPACE_INITIALIZED=false
 HTTP_PROBE_SUCCEEDED=false
+BOUNDED_BATCH_ACTIVE=false
+SUPERVISOR_STAT_STYLE=''
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -394,9 +396,10 @@ initialize_workspace() {
     owner_only_secret "$CONTROL_DIRECTORY/postgres.env" &&
     owner_only_secret "$CONTROL_DIRECTORY/aistor.env" &&
     owner_only_secret "$CONTROL_DIRECTORY/app.env" &&
-    owner_only_secret "$CONTROL_DIRECTORY/restore-check.env" &&
+  owner_only_secret "$CONTROL_DIRECTORY/restore-check.env" &&
     owner_only_directory "$CHECK_OUTPUT_DIRECTORY" ||
     return 1
+  initialize_supervisor_stat_style || return 1
   WORKSPACE_INITIALIZED=true
 }
 
@@ -410,24 +413,132 @@ direct_running_job() {
   return 1
 }
 
+portable_supervisor_metadata() {
+  local path="$1"
+  case "$SUPERVISOR_STAT_STYLE" in
+    gnu) stat -c '%a|%u|%s' "$path" ;;
+    bsd) stat -f '%Lp|%u|%z' "$path" ;;
+    *) return 1 ;;
+  esac
+}
+
+initialize_supervisor_stat_style() {
+  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+    SUPERVISOR_STAT_STYLE=gnu
+  elif stat -f '%Lp|%u|%z' "$CONTROL_DIRECTORY" >/dev/null 2>&1; then
+    SUPERVISOR_STAT_STYLE=bsd
+  else
+    return 1
+  fi
+}
+
+owner_only_supervisor_directory() {
+  local path="$1"
+  local metadata mode owner size
+  metadata="$(portable_supervisor_metadata "$path")" || return 1
+  IFS='|' read -r mode owner size <<<"$metadata"
+  [[ "$path" == "$CONTROL_DIRECTORY/bounded-supervisor."* &&
+    -d "$path" &&
+    ! -L "$path" &&
+    "$mode" == 700 &&
+    "$owner" == "$HOST_UID" &&
+    "$size" =~ ^[0-9]+$ ]]
+}
+
+owner_only_supervisor_fifo() {
+  local path="$1"
+  local metadata mode owner size
+  metadata="$(portable_supervisor_metadata "$path")" || return 1
+  IFS='|' read -r mode owner size <<<"$metadata"
+  [[ -p "$path" &&
+    ! -L "$path" &&
+    "$mode" == 600 &&
+    "$owner" == "$HOST_UID" &&
+    "$size" =~ ^[0-9]+$ ]]
+}
+
+read_supervisor_handshake() {
+  local path="$1"
+  local pattern="$2"
+  local metadata mode owner size value
+  metadata="$(portable_supervisor_metadata "$path")" || return 1
+  IFS='|' read -r mode owner size <<<"$metadata"
+  [[ -f "$path" &&
+    ! -L "$path" &&
+    "$mode" == 600 &&
+    "$owner" == "$HOST_UID" &&
+    "$size" =~ ^[0-9]+$ ]] ||
+    return 1
+  [[ "$size" -ge 2 && "$size" -le 8 ]] || return 1
+  value="$(<"$path")"
+  [[ "$size" -eq $((${#value} + 1)) &&
+    "$value" =~ $pattern ]] ||
+    return 1
+  printf '%s' "$value"
+}
+
+publish_supervisor_handshake() {
+  local path="$1"
+  local value="$2"
+  local pending="${path}.pending"
+  local metadata mode owner size
+  [[ "$path" == "$CONTROL_DIRECTORY/bounded-supervisor."*/* &&
+    "$value" =~ ^(ready|ack|[0-9]{1,7})$ &&
+    ! -e "$path" &&
+    ! -L "$path" &&
+    ! -e "$pending" &&
+    ! -L "$pending" ]] ||
+    return 1
+  (
+    set -o noclobber
+    printf '%s\n' "$value" >"$pending"
+  ) || return 1
+  metadata="$(portable_supervisor_metadata "$pending")" || return 1
+  IFS='|' read -r mode owner size <<<"$metadata"
+  [[ -f "$pending" &&
+    ! -L "$pending" &&
+    "$mode" == 600 &&
+    "$owner" == "$HOST_UID" &&
+    "$size" -eq $((${#value} + 1)) ]] ||
+    return 1
+  ln "$pending" "$path" || return 1
+  rm -f "$pending" || {
+    rm -f "$path" || true
+    return 1
+  }
+}
+
+supervisor_descriptors_closed() {
+  ! { : <&7; } 2>/dev/null &&
+    ! { : <&8; } 2>/dev/null &&
+    ! { : <&9; } 2>/dev/null
+}
+
+discard_supervisor_handshake() {
+  local directory="$1"
+  owner_only_supervisor_directory "$directory" || return 1
+  rm -rf "$directory"
+}
+
 terminate_external_group() {
   local pid="$1"
   local pgid="$2"
   [[ "$pid" =~ ^[1-9][0-9]*$ &&
     "$pgid" =~ ^[1-9][0-9]*$ ]] ||
     return 1
-  if direct_running_job "$pid"; then
-    kill -TERM -- "-$pgid" 2>/dev/null ||
-      kill -TERM "$pid" 2>/dev/null ||
-      true
-    sleep "$POLL_INTERVAL_SECONDS"
-  fi
-  kill -KILL -- "-$pgid" 2>/dev/null ||
-    {
-      direct_running_job "$pid" &&
-        kill -KILL "$pid" 2>/dev/null
-    } ||
+  direct_running_job "$pid" || {
+    wait "$pid" 2>/dev/null || true
+    return 0
+  }
+  kill -TERM -- "-$pgid" 2>/dev/null ||
+    kill -TERM "$pid" 2>/dev/null ||
     true
+  sleep "$POLL_INTERVAL_SECONDS"
+  if direct_running_job "$pid"; then
+    kill -KILL -- "-$pgid" 2>/dev/null ||
+      kill -KILL "$pid" 2>/dev/null ||
+      true
+  fi
   wait "$pid" 2>/dev/null || true
 }
 
@@ -446,6 +557,7 @@ handle_restore_signal() {
   local status="$1"
   [[ "$status" =~ ^(129|130|143)$ ]] || status=1
   trap '' HUP INT TERM
+  exec 9>&- || true
   terminate_active_external
   exit "$status"
 }
@@ -460,12 +572,46 @@ install_restore_signal_traps() {
   fi
 }
 
+honor_pending_restore_signal() {
+  if [[ -n "$PENDING_SIGNAL_STATUS" ]]; then
+    handle_restore_signal "$PENDING_SIGNAL_STATUS"
+  fi
+}
+
 run_bounded() {
   local timeout_seconds="$1"
   shift
   valid_uint "$timeout_seconds" || return 1
-  local deadline=$((SECONDS + timeout_seconds))
-  local pid result=0
+  local startup_deadline=$((SECONDS + 5))
+  local deadline=0
+  local supervisor_directory supervisor_guard supervisor_ready
+  local supervisor_identity supervisor_status supervisor_ack
+  local pid result=0 supervisor_result=0 attempts=0
+  supervisor_descriptors_closed || return 1
+  supervisor_directory="$(
+    mktemp -d "$CONTROL_DIRECTORY/bounded-supervisor.XXXXXX"
+  )" || return 1
+  owner_only_supervisor_directory "$supervisor_directory" || {
+    rm -rf "$supervisor_directory"
+    return 1
+  }
+  supervisor_guard="$supervisor_directory/descendant.guard"
+  supervisor_ready="$supervisor_directory/ready"
+  supervisor_identity="$supervisor_directory/identity"
+  supervisor_status="$supervisor_directory/status"
+  supervisor_ack="$supervisor_directory/ack"
+  mkfifo "$supervisor_guard" || {
+    discard_supervisor_handshake "$supervisor_directory" || true
+    return 1
+  }
+  owner_only_supervisor_fifo "$supervisor_guard" || {
+    discard_supervisor_handshake "$supervisor_directory" || true
+    return 1
+  }
+  exec 9<>"$supervisor_guard" || {
+    discard_supervisor_handshake "$supervisor_directory" || true
+    return 1
+  }
   PENDING_SIGNAL_STATUS=''
   if [[ "$CLEANING_UP" == true ]]; then
     trap '' HUP INT TERM
@@ -476,34 +622,159 @@ run_bounded() {
   fi
   set -m
   (
-    trap - HUP INT TERM
-    "$@"
+    set +e
+    set +m
+    local supervisor_signal_seen=false
+    local command_pid command_status wait_status guard_value
+    local wait_attempts=0
+    trap 'supervisor_signal_seen=true' HUP INT TERM
+    exec 9>&-
+    exec 7<"$supervisor_guard" || exit 125
+    (
+      exec 8>"$supervisor_guard" || exit 125
+      publish_supervisor_handshake "$supervisor_ready" ready || exit 125
+      trap - HUP INT TERM
+      "$@"
+    ) &
+    command_pid="$!"
+    while :; do
+      supervisor_signal_seen=false
+      wait "$command_pid"
+      command_status=$?
+      [[ "$supervisor_signal_seen" == false ]] && break
+    done
+    while :; do
+      supervisor_signal_seen=false
+      guard_value=''
+      IFS= read -r -u 7 guard_value
+      wait_status=$?
+      if [[ "$supervisor_signal_seen" == true ]]; then
+        continue
+      fi
+      [[ "$wait_status" -eq 1 && -z "$guard_value" ]] || exit 125
+      break
+    done
+    exec 7<&-
+    [[ "$command_status" -ge 0 && "$command_status" -le 255 ]] || exit 125
+    publish_supervisor_handshake \
+      "$supervisor_status" "$command_status" ||
+      exit 125
+    while [[ "$wait_attempts" -lt 1000 ]]; do
+      if [[ -e "$supervisor_ack" || -L "$supervisor_ack" ]]; then
+        [[ "$(read_supervisor_handshake "$supervisor_ack" '^ack$')" == ack ]] ||
+          exit 125
+        exit 0
+      fi
+      sleep 0.01
+      wait_attempts=$((wait_attempts + 1))
+    done
+    exit 125
   ) &
   pid="$!"
   ACTIVE_EXTERNAL_PID="$pid"
   ACTIVE_EXTERNAL_PGID="$pid"
   set +m
+  publish_supervisor_handshake "$supervisor_identity" "$pid" || {
+    exec 9>&-
+    terminate_external_group "$pid" "$pid"
+    ACTIVE_EXTERNAL_PID=''
+    ACTIVE_EXTERNAL_PGID=''
+    discard_supervisor_handshake "$supervisor_directory" || true
+    return 1
+  }
   install_restore_signal_traps
-  if [[ -n "$PENDING_SIGNAL_STATUS" ]]; then
-    handle_restore_signal "$PENDING_SIGNAL_STATUS"
-  fi
+  honor_pending_restore_signal
   while direct_running_job "$pid"; do
-    if ((SECONDS >= deadline)); then
+    honor_pending_restore_signal
+    if [[ -e "$supervisor_ready" || -L "$supervisor_ready" ]]; then
+      [[ "$(read_supervisor_handshake "$supervisor_ready" '^ready$')" == ready ]] ||
+        {
+          exec 9>&-
+          terminate_external_group "$pid" "$pid"
+          ACTIVE_EXTERNAL_PID=''
+          ACTIVE_EXTERNAL_PGID=''
+          discard_supervisor_handshake "$supervisor_directory" || true
+          return 1
+        }
+      exec 9>&-
+      supervisor_ready=''
+      deadline=$((SECONDS + timeout_seconds + 1))
+    fi
+    if [[ -e "$supervisor_status" || -L "$supervisor_status" ]]; then
+      result="$(
+        read_supervisor_handshake "$supervisor_status" \
+          '^(0|[1-9][0-9]{0,2})$'
+      )" || result=256
+      [[ "$result" -ge 0 && "$result" -le 255 ]] || {
+        [[ -z "$supervisor_ready" ]] || exec 9>&-
+        terminate_external_group "$pid" "$pid"
+        ACTIVE_EXTERNAL_PID=''
+        ACTIVE_EXTERNAL_PGID=''
+        discard_supervisor_handshake "$supervisor_directory" || true
+        return 1
+      }
+      publish_supervisor_handshake "$supervisor_ack" ack || {
+        terminate_external_group "$pid" "$pid"
+        ACTIVE_EXTERNAL_PID=''
+        ACTIVE_EXTERNAL_PGID=''
+        discard_supervisor_handshake "$supervisor_directory" || true
+        return 1
+      }
+      break
+    fi
+    if [[ -n "$supervisor_ready" ]] &&
+      ((SECONDS >= startup_deadline)); then
+      exec 9>&-
       terminate_external_group "$pid" "$pid"
       ACTIVE_EXTERNAL_PID=''
       ACTIVE_EXTERNAL_PGID=''
+      discard_supervisor_handshake "$supervisor_directory" || true
+      return 125
+    fi
+    if [[ -z "$supervisor_ready" ]] &&
+      ((SECONDS >= deadline)); then
+      [[ -z "$supervisor_ready" ]] || exec 9>&-
+      terminate_external_group "$pid" "$pid"
+      ACTIVE_EXTERNAL_PID=''
+      ACTIVE_EXTERNAL_PGID=''
+      discard_supervisor_handshake "$supervisor_directory" || true
       return 124
     fi
-    sleep "$POLL_INTERVAL_SECONDS"
+    sleep 0.01
+    honor_pending_restore_signal
   done
-  if wait "$pid"; then
-    result=0
+  [[ -z "$supervisor_ready" ]] || exec 9>&-
+  attempts=0
+  while direct_running_job "$pid" && [[ "$attempts" -lt 1000 ]]; do
+    honor_pending_restore_signal
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  honor_pending_restore_signal
+  if direct_running_job "$pid"; then
+    terminate_external_group "$pid" "$pid"
+    supervisor_result=125
+  elif wait "$pid"; then
+    supervisor_result=0
   else
-    result=$?
+    supervisor_result=$?
   fi
   ACTIVE_EXTERNAL_PID=''
   ACTIVE_EXTERNAL_PGID=''
+  discard_supervisor_handshake "$supervisor_directory" || return 1
+  [[ "$supervisor_result" -eq 0 && "$result" -ge 0 && "$result" -le 255 ]] ||
+    return 1
   return "$result"
+}
+
+run_cleanup_aware() {
+  local timeout_seconds="$1"
+  shift
+  if [[ "$BOUNDED_BATCH_ACTIVE" == true ]]; then
+    "$@"
+  else
+    run_bounded "$timeout_seconds" "$@"
+  fi
 }
 
 poll_until() {
@@ -581,7 +852,7 @@ inspect_resource_labels() {
     networks) command=(docker network inspect --format "$format" "$name") ;;
     *) return 4 ;;
   esac
-  if run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+  if run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
     "${command[@]}" >"$output" 2>"$error"; then
     [[ -f "$output" && ! -L "$output" ]] || return 4
     cat "$output"
@@ -633,7 +904,7 @@ list_owned_resource_names() {
     *) return 1 ;;
   esac
   value="$(
-    run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+    run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
       "${command[@]}" \
       --filter "label=$BACKUP_LABEL=$BACKUP_ID"
   )" || return 1
@@ -752,19 +1023,19 @@ remove_verified_resource() {
   case "$class" in
     containers)
       remove_target="$identity"
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+      run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
         docker rm --force "$remove_target" >/dev/null ||
         return 1
       ;;
     volumes)
       remove_target="$name"
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+      run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
         docker volume rm "$remove_target" >/dev/null ||
         return 1
       ;;
     networks)
       remove_target="$identity"
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+      run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
         docker network rm "$remove_target" >/dev/null ||
         return 1
       ;;
@@ -1430,40 +1701,13 @@ cleanup_network() {
     networks "$NETWORK_NAME" "$(resource_labels network)"
 }
 
-cleanup_ledger_valid() {
-  local line class name kind extra expected_name count
-  [[ -f "$CLEANUP_INTENT_LEDGER" &&
-    ! -L "$CLEANUP_INTENT_LEDGER" &&
-    "$(portable_mode "$CLEANUP_INTENT_LEDGER")" == 600 &&
-    "$(portable_owner "$CLEANUP_INTENT_LEDGER")" == "$(id -u)" ]] ||
-    return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    IFS='|' read -r class name kind extra <<<"$line"
-    [[ -n "$class" && -n "$name" && -n "$kind" && -z "$extra" ]] ||
-      return 1
-    expected_name="$(expected_resource_name "$PROJECT" "$class" "$kind")" ||
-      return 1
-    [[ "$name" == "$expected_name" ]] || return 1
-    count="$(grep -Fxc "$line" "$CLEANUP_INTENT_LEDGER")" || true
-    [[ "$count" == 1 ]] || return 1
-  done <"$CLEANUP_INTENT_LEDGER"
-}
-
-cleanup_restore() {
-  local status="${1:-0}"
-  local name kind
-  if [[ "$CLEANING_UP" == true ]]; then
-    return "$status"
-  fi
-  CLEANING_UP=true
-  if valid_project "$PROJECT" &&
-    valid_owner_token "$OWNER_TOKEN" &&
-    [[ "$WORKSPACE_INITIALIZED" == true ]]; then
-    cleanup_ledger_valid || status=1
-    while IFS='|' read -r name kind; do
-      [[ -n "$name" && -n "$kind" ]] || continue
-      cleanup_container "$name" "$kind" || status=1
-    done <<EOF
+cleanup_owned_resources_batch() {
+  local name kind status=0
+  BOUNDED_BATCH_ACTIVE=true
+  while IFS='|' read -r name kind; do
+    [[ -n "$name" && -n "$kind" ]] || continue
+    cleanup_container "$name" "$kind" || status=1
+  done <<EOF
 $PROJECT-restore-http-probe|restore-http-probe
 $PROJECT-restore-check|restore-check
 $PROJECT-app|app
@@ -1481,11 +1725,93 @@ $PROJECT-volume-probe-aistor|volume-probe-aistor
 $PROJECT-volume-probe-aistor-license|volume-probe-aistor-license
 $PROJECT-volume-probe-postgres|volume-probe-postgres
 EOF
-    cleanup_volume "$AISTOR_LICENSE_VOLUME" aistor-license || status=1
-    cleanup_volume "$AISTOR_VOLUME" aistor || status=1
-    cleanup_volume "$POSTGRES_VOLUME" postgres || status=1
-    cleanup_network || status=1
-    owned_resources_absent || status=1
+  cleanup_volume "$AISTOR_LICENSE_VOLUME" aistor-license || status=1
+  cleanup_volume "$AISTOR_VOLUME" aistor || status=1
+  cleanup_volume "$POSTGRES_VOLUME" postgres || status=1
+  cleanup_network || status=1
+  owned_resources_absent || status=1
+  return "$status"
+}
+
+cleanup_ledger_valid() {
+  local original_status="$1"
+  local expected prefix line size result=1
+  [[ "$original_status" =~ ^([0-9]|[1-9][0-9]{1,2})$ &&
+    "$original_status" -le 255 ]] ||
+    return 1
+  [[ -f "$CLEANUP_INTENT_LEDGER" &&
+    ! -L "$CLEANUP_INTENT_LEDGER" &&
+    "$(portable_mode "$CLEANUP_INTENT_LEDGER")" == 600 &&
+    "$(portable_owner "$CLEANUP_INTENT_LEDGER")" == "$(id -u)" ]] ||
+    return 1
+  size="$(portable_size "$CLEANUP_INTENT_LEDGER")" || return 1
+  [[ "$size" -ge 0 && "$size" -le 4096 ]] || return 1
+  expected="$(mktemp "$CONTROL_DIRECTORY/cleanup.expected.XXXXXX")" ||
+    return 1
+  prefix="$(mktemp "$CONTROL_DIRECTORY/cleanup.prefix.XXXXXX")" || {
+    rm -f "$expected"
+    return 1
+  }
+  chmod 0600 "$expected" "$prefix" || {
+    rm -f "$expected" "$prefix"
+    return 1
+  }
+  printf '%s\n' \
+    "networks|$NETWORK_NAME|network" \
+    "volumes|$POSTGRES_VOLUME|postgres" \
+    "volumes|$AISTOR_VOLUME|aistor" \
+    "volumes|$AISTOR_LICENSE_VOLUME|aistor-license" \
+    "containers|$PROJECT-volume-probe-postgres|volume-probe-postgres" \
+    "containers|$PROJECT-volume-probe-aistor|volume-probe-aistor" \
+    "containers|$PROJECT-volume-probe-aistor-license|volume-probe-aistor-license" \
+    "containers|$PROJECT-restic-check|restic-check" \
+    "containers|$PROJECT-restic-select|restic-select" \
+    "containers|$PROJECT-restic-restore|restic-restore" \
+    "containers|$PROJECT-object-restore|object-restore" \
+    "containers|$PROJECT-aistor-license-init|aistor-license-init" \
+    "containers|$PROJECT-postgres|postgres" \
+    "containers|$PROJECT-postgres-restore|postgres-restore" \
+    "containers|$PROJECT-aistor|aistor" \
+    "containers|$PROJECT-redis|redis" \
+    "containers|$PROJECT-revoke-sessions|revoke-sessions" \
+    "containers|$PROJECT-app|app" \
+    "containers|$PROJECT-restore-check|restore-check" \
+    "containers|$PROJECT-restore-http-probe|restore-http-probe" \
+    >"$expected"
+  if [[ "$original_status" -eq 0 ]]; then
+    cmp -s "$CLEANUP_INTENT_LEDGER" "$expected" && result=0
+  else
+    : >"$prefix"
+    if cmp -s "$CLEANUP_INTENT_LEDGER" "$prefix"; then
+      result=0
+    else
+      while IFS= read -r line; do
+        printf '%s\n' "$line" >>"$prefix"
+        if cmp -s "$CLEANUP_INTENT_LEDGER" "$prefix"; then
+          result=0
+          break
+        fi
+      done <"$expected"
+    fi
+  fi
+  rm -f "$expected" "$prefix" || return 1
+  return "$result"
+}
+
+cleanup_restore() {
+  local status="${1:-0}"
+  local original_status="$status"
+  local cleanup_timeout=$((EXTERNAL_TIMEOUT_SECONDS + 5))
+  if [[ "$CLEANING_UP" == true ]]; then
+    return "$status"
+  fi
+  CLEANING_UP=true
+  if valid_project "$PROJECT" &&
+    valid_owner_token "$OWNER_TOKEN" &&
+    [[ "$WORKSPACE_INITIALIZED" == true ]]; then
+    cleanup_ledger_valid "$original_status" || status=1
+    run_bounded "$cleanup_timeout" cleanup_owned_resources_batch ||
+      status=1
   fi
   if [[ -n "$WORK_DIRECTORY" &&
     "$WORK_DIRECTORY" == "${TMPDIR:-/tmp}/phase5-restore-verify."* &&

@@ -104,7 +104,10 @@ cleanup_contract() {
 handle_contract_signal() {
   local status="$1"
   [[ "$status" =~ ^(129|130|143)$ ]] || status=1
-  trap - HUP INT TERM
+  trap '' HUP INT TERM
+  if [[ -n "${PHASE5_CONTRACT_SIGNAL_HANDLER_MARKER:-}" ]]; then
+    : >"$PHASE5_CONTRACT_SIGNAL_HANDLER_MARKER"
+  fi
   cleanup_contract
   exit "$status"
 }
@@ -113,6 +116,25 @@ trap cleanup_contract EXIT
 trap 'handle_contract_signal 129' HUP
 trap 'handle_contract_signal 130' INT
 trap 'handle_contract_signal 143' TERM
+
+if [[ "${PHASE5_CONTRACT_SIGNAL_SELF_TEST:-}" == true ]]; then
+  signal_marker="${PHASE5_CONTRACT_SIGNAL_MARKER:?}"
+  signal_root_marker="${PHASE5_CONTRACT_SIGNAL_ROOT_MARKER:?}"
+  signal_child_marker="${PHASE5_CONTRACT_SIGNAL_CHILD_MARKER:?}"
+  (
+    trap '' HUP INT TERM
+    while :; do
+      sleep 0.05
+    done
+  ) &
+  ACTIVE_FIXTURE_PID="$!"
+  printf '%s\n' "$ACTIVE_FIXTURE_PID" >"$signal_child_marker"
+  printf '%s\n' "$CONTRACT_TEMP_ROOT" >"$signal_root_marker"
+  : >"$signal_marker"
+  while :; do
+    sleep 0.05
+  done
+fi
 
 assert_no_resources() {
   local fixture="$1"
@@ -164,11 +186,21 @@ wait_for_file() {
   [[ -f "$path" ]]
 }
 
+wait_for_file_long() {
+  local path="$1"
+  local attempts=0
+  while [[ ! -f "$path" && "$attempts" -lt 5000 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -f "$path" ]]
+}
+
 wait_for_direct_child() {
   local pid="$1"
   local attempts=0
   local running
-  while [[ "$attempts" -lt 1000 ]]; do
+  while [[ "$attempts" -lt 5000 ]]; do
     running=false
     for child in $(jobs -pr); do
       [[ "$child" == "$pid" ]] && running=true
@@ -179,6 +211,17 @@ wait_for_direct_child() {
   done
   [[ "$running" == false ]] || return 1
   wait "$pid"
+}
+
+wait_for_pid_absent() {
+  local pid="$1"
+  local attempts=0
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  while kill -0 "$pid" 2>/dev/null && [[ "$attempts" -lt 500 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  ! kill -0 "$pid" 2>/dev/null
 }
 
 fake_resource_identity() {
@@ -256,6 +299,25 @@ set -euo pipefail
 if [[ "${PHASE5_FAKE_MODE:-}" == credential_wrong_owner &&
   "${*: -1}" == "$PHASE5_FAKE_TEACHER_CREDENTIAL_FILE" ]]; then
   case "${1:-}:${2:-}" in
+    -c:%a\|%u\|%s)
+      if /usr/bin/stat --version >/dev/null 2>&1; then
+        mode="$(/usr/bin/stat -c '%a' "${3:-}")"
+        size="$(/usr/bin/stat -c '%s' "${3:-}")"
+      else
+        mode="$(/usr/bin/stat -f '%Lp' "${3:-}")"
+        size="$(/usr/bin/stat -f '%z' "${3:-}")"
+      fi
+      printf '%s|%s|%s\n' \
+        "$mode" "$((PHASE5_FAKE_HOST_UID + 1))" "$size"
+      exit 0
+      ;;
+    -f:%Lp\|%u\|%z)
+      mode="$(/usr/bin/stat -f '%Lp' "${3:-}")"
+      size="$(/usr/bin/stat -f '%z' "${3:-}")"
+      printf '%s|%s|%s\n' \
+        "$mode" "$((PHASE5_FAKE_HOST_UID + 1))" "$size"
+      exit 0
+      ;;
     -c:%u|-f:%u)
       printf '%s\n' "$((PHASE5_FAKE_HOST_UID + 1))"
       exit 0
@@ -266,6 +328,16 @@ if [[ "${PHASE5_FAKE_MODE:-}" == gnu_stat ]]; then
   case "${1:-}:${2:-}" in
     --version:)
       printf '%s\n' 'stat (GNU coreutils) 9.5'
+      exit 0
+      ;;
+    -c:%a\|%u\|%s)
+      if /usr/bin/stat --version >/dev/null 2>&1; then
+        exec /usr/bin/stat -c '%a|%u|%s' "${3:-}"
+      fi
+      printf '%s|%s|%s\n' \
+        "$(/usr/bin/stat -f '%Lp' "${3:-}")" \
+        "$(/usr/bin/stat -f '%u' "${3:-}")" \
+        "$(/usr/bin/stat -f '%z' "${3:-}")"
       exit 0
       ;;
     -c:%a)
@@ -707,6 +779,26 @@ case "$kind" in
       "$*" != *'--no-lock'* ]] ||
       exit 64
     case "$mode" in
+      supervisor_descendant)
+        printf '%s\n' "$$" >"$PHASE5_FAKE_SUPERVISOR_DIRECT_PID"
+        trap ': >"$PHASE5_FAKE_SUPERVISOR_DIRECT_CONT_MARKER"' CONT
+        (
+          trap '' HUP INT TERM
+          trap ': >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_CONT_MARKER"' CONT
+          while :; do
+            sleep 0.05
+          done
+        ) &
+        descendant_pid="$!"
+        printf '%s\n' "$descendant_pid" \
+          >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_PID"
+        : >"$PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER"
+        while [[ ! -e "$PHASE5_FAKE_SUPERVISOR_DIRECT_RELEASE" ]]; do
+          sleep 0.01
+        done
+        : >"$PHASE5_FAKE_SUPERVISOR_DIRECT_EXITING"
+        exit 0
+        ;;
       wrong_secret|tampered_pack|check_failure) exit 73 ;;
       timeout)
         trap '' TERM
@@ -841,6 +933,9 @@ case "$kind" in
     report_manifest_sha256="$PHASE5_FAKE_MANIFEST_SHA256"
     report_row_count_total=136
     report_evidence_sha256="$PHASE5_FAKE_EVIDENCE_SHA256"
+    report_table_users_count=1
+    report_table_sessions_count=2
+    report_checked_object_count=7
     case "$mode" in
       stale_session) active=1 ;;
       missing_object) missing=1 ;;
@@ -854,6 +949,16 @@ case "$kind" in
         report_evidence_sha256='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
         ;;
       report_row_total_mismatch) report_row_count_total=135 ;;
+      report_leading_zero) report_checked_object_count=07 ;;
+      report_negative) report_checked_object_count=-1 ;;
+      report_int64_overflow)
+        report_checked_object_count=9223372036854775808
+        ;;
+      report_table_sum_overflow)
+        report_table_users_count=9223372036854775807
+        report_table_sessions_count=1
+        report_row_count_total=9223372036854775807
+        ;;
     esac
     {
       printf '%s\n' 'schema_version=1'
@@ -865,8 +970,8 @@ case "$kind" in
         "backup_id=$report_backup_id" \
         "manifest_sha256=$report_manifest_sha256" \
         'migration_version=42' \
-        'table_users_count=1' \
-        'table_sessions_count=2' \
+        "table_users_count=$report_table_users_count" \
+        "table_sessions_count=$report_table_sessions_count" \
         'table_subjects_count=3' \
         'table_grades_count=4' \
         'table_terms_count=5' \
@@ -884,7 +989,7 @@ case "$kind" in
         printf '%s\n' 'table_ai_runs_count=16'
       printf '%s\n' \
         "row_count_total=$report_row_count_total" \
-        'checked_object_count=7' \
+        "checked_object_count=$report_checked_object_count" \
         "missing_object_count=$missing" \
         "unexpected_object_count=$unexpected" \
         "active_session_count=$active" \
@@ -926,7 +1031,12 @@ case "$kind" in
       "${@: -2:1}" == /app/happylearn-backup &&
       "${@: -1}" == restore-http-probe ]] ||
       exit 64
-    if [[ "$mode" == ledger_missing ]]; then
+    if [[ "$mode" == ledger_missing ||
+      "$mode" == ledger_empty ||
+      "$mode" == ledger_truncated ||
+      "$mode" == ledger_reordered ||
+      "$mode" == ledger_duplicate ||
+      "$mode" == ledger_oversized ]]; then
       : >"$PHASE5_FAKE_LEDGER_PAUSE_MARKER"
       while [[ ! -e "$PHASE5_FAKE_LEDGER_PAUSE_RELEASE" ]]; do
         sleep 0.01
@@ -987,6 +1097,13 @@ run_fixture() {
     "PHASE5_FAKE_LEDGER_PAUSE_RELEASE=$fixture/ledger-pause.release"
     "PHASE5_FAKE_REPORT_PAUSE_MARKER=$fixture/report-pause.started"
     "PHASE5_FAKE_REPORT_PAUSE_RELEASE=$fixture/report-pause.release"
+    "PHASE5_FAKE_SUPERVISOR_DIRECT_PID=$fixture/supervisor-direct.pid"
+    "PHASE5_FAKE_SUPERVISOR_DESCENDANT_PID=$fixture/supervisor-descendant.pid"
+    "PHASE5_FAKE_SUPERVISOR_DESCENDANT_MARKER=$fixture/supervisor-descendant.started"
+    "PHASE5_FAKE_SUPERVISOR_DIRECT_CONT_MARKER=$fixture/supervisor-direct.cont"
+    "PHASE5_FAKE_SUPERVISOR_DESCENDANT_CONT_MARKER=$fixture/supervisor-descendant.cont"
+    "PHASE5_FAKE_SUPERVISOR_DIRECT_RELEASE=$fixture/supervisor-direct.release"
+    "PHASE5_FAKE_SUPERVISOR_DIRECT_EXITING=$fixture/supervisor-direct.exiting"
     "HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY=$fixture/repository"
     "HAPPYLEARN_BACKUP_SECRET_DIRECTORY=$fixture/secrets"
     "HAPPYLEARN_AISTOR_LICENSE_FILE=$fixture/minio.license"
@@ -1012,7 +1129,9 @@ start_fixture_background() {
   local fixture="$1"
   local mode="$2"
   PHASE5_FAKE_EXEC_FIXTURE=true \
-    run_fixture "$fixture" "$mode" >/dev/null 2>&1 &
+    run_fixture "$fixture" "$mode" \
+      >"$fixture/background.stdout" \
+      2>"$fixture/background.stderr" &
   FIXTURE_BACKGROUND_PID="$!"
 }
 
@@ -1023,6 +1142,11 @@ if grep -Eq \
   "$0"; then
   fail 'contract signal traps reuse the ordinary EXIT cleanup handler'
 fi
+contract_signal_handler_source="$(
+  sed -n '/^handle_contract_signal()/,/^}/p' "$0"
+)"
+grep -Fq "trap '' HUP INT TERM" <<<"$contract_signal_handler_source" ||
+  fail 'contract signal cleanup does not ignore repeated signals'
 grep -Fq 'handle_contract_signal 129' "$0" ||
   fail 'contract HUP trap does not preserve 128+signal status'
 grep -Fq 'handle_contract_signal 130' "$0" ||
@@ -1031,6 +1155,12 @@ grep -Fq 'handle_contract_signal 143' "$0" ||
   fail 'contract TERM trap does not preserve 128+signal status'
 grep -Fq 'active_fixture_is_direct_job' "$0" ||
   fail 'contract cleanup does not verify the active direct job'
+grep -Fq 'mkfifo "$supervisor_guard"' "$TARGET" ||
+  fail 'bounded commands have no inherited descendant liveness guard'
+grep -Fq 'publish_supervisor_handshake' "$TARGET" ||
+  fail 'bounded commands have no owner-only status/ack handshake'
+grep -Fq 'direct_running_job "$pid"' "$TARGET" ||
+  fail 'negative PGID signaling is not fenced by the direct supervisor job'
 grep -Fq 'stat --version' "$TARGET" ||
   fail 'restore harness does not prefer GNU stat explicitly'
 grep -Fq -- '--cpus "$CONTAINER_CPUS"' "$TARGET" ||
@@ -1120,6 +1250,45 @@ grep -Fq 'HTTP_PROBE_SUCCEEDED=true' "$TARGET" ||
   fail 'restore harness does not fence its report on HTTP probe success'
 grep -Fq 'UPDATE operational_modes' "$TARGET" ||
   fail 'restored operational mode is not normalized before app startup'
+
+contract_signal_fixture="$(mktemp -d "$CONTRACT_TEMP_ROOT/contract-signal.XXXXXX")"
+contract_signal_ready="$contract_signal_fixture/ready"
+contract_signal_root="$contract_signal_fixture/root"
+contract_signal_child="$contract_signal_fixture/child"
+contract_signal_handler="$contract_signal_fixture/handler"
+PHASE5_CONTRACT_SIGNAL_SELF_TEST=true \
+  PHASE5_CONTRACT_SIGNAL_MARKER="$contract_signal_ready" \
+  PHASE5_CONTRACT_SIGNAL_ROOT_MARKER="$contract_signal_root" \
+  PHASE5_CONTRACT_SIGNAL_CHILD_MARKER="$contract_signal_child" \
+  PHASE5_CONTRACT_SIGNAL_HANDLER_MARKER="$contract_signal_handler" \
+  bash "$0" >/dev/null 2>&1 &
+contract_signal_pid="$!"
+ACTIVE_FIXTURE_PID="$contract_signal_pid"
+wait_for_file "$contract_signal_ready" ||
+  fail 'contract signal self-test did not start'
+wait_for_file "$contract_signal_root" ||
+  fail 'contract signal self-test did not expose its temporary root'
+wait_for_file "$contract_signal_child" ||
+  fail 'contract signal self-test did not start its cleanup child'
+contract_signal_temp_root="$(<"$contract_signal_root")"
+contract_signal_child_pid="$(<"$contract_signal_child")"
+kill -TERM "$contract_signal_pid"
+wait_for_file "$contract_signal_handler" ||
+  fail 'contract signal handler did not begin cleanup'
+kill -TERM "$contract_signal_pid" 2>/dev/null || true
+contract_signal_status=0
+if wait_for_direct_child "$contract_signal_pid"; then
+  fail 'double-TERM contract self-test unexpectedly succeeded'
+else
+  contract_signal_status=$?
+fi
+ACTIVE_FIXTURE_PID=''
+[[ "$contract_signal_status" -eq 143 ]] ||
+  fail "double-TERM contract exited with $contract_signal_status"
+[[ ! -e "$contract_signal_temp_root" ]] ||
+  fail 'double-TERM contract left its temporary root'
+wait_for_pid_absent "$contract_signal_child_pid" ||
+  fail 'double-TERM contract left its active child'
 
 unsafe_license_mode_fixture="$(make_fixture)"
 chmod 0600 "$unsafe_license_mode_fixture/minio.license"
@@ -1262,6 +1431,138 @@ workspace_path="$(<"$workspace_fixture/workspace.path")"
 test ! -s "$workspace_fixture/docker.log" ||
   fail 'workspace initialization failure accessed Docker'
 
+for occupied_supervisor_fd in 7 8 9; do
+  occupied_fd_fixture="$(make_fixture)"
+  occupied_fd_sentinel="$occupied_fd_fixture/fd-${occupied_supervisor_fd}.sentinel"
+  printf 'fd-%s\n' "$occupied_supervisor_fd" >"$occupied_fd_sentinel"
+  case "$occupied_supervisor_fd" in
+    7)
+      (
+        exec 7<"$occupied_fd_sentinel"
+        if run_fixture "$occupied_fd_fixture" success; then
+          exit 70
+        fi
+        IFS= read -r occupied_fd_value <&7
+        [[ "$occupied_fd_value" == fd-7 ]]
+      ) >/dev/null 2>&1 ||
+        fail 'pre-opened fd7 was accepted or altered'
+      ;;
+    8)
+      (
+        exec 8<"$occupied_fd_sentinel"
+        if run_fixture "$occupied_fd_fixture" success; then
+          exit 70
+        fi
+        IFS= read -r occupied_fd_value <&8
+        [[ "$occupied_fd_value" == fd-8 ]]
+      ) >/dev/null 2>&1 ||
+        fail 'pre-opened fd8 was accepted or altered'
+      ;;
+    9)
+      (
+        exec 9<"$occupied_fd_sentinel"
+        if run_fixture "$occupied_fd_fixture" success; then
+          exit 70
+        fi
+        IFS= read -r occupied_fd_value <&9
+        [[ "$occupied_fd_value" == fd-9 ]]
+      ) >/dev/null 2>&1 ||
+        fail 'pre-opened fd9 was accepted or altered'
+      ;;
+  esac
+  test ! -s "$occupied_fd_fixture/docker.log" ||
+    fail "pre-opened fd$occupied_supervisor_fd accessed Docker"
+  cmp -s "$occupied_fd_sentinel" \
+    <(printf 'fd-%s\n' "$occupied_supervisor_fd") ||
+    fail "pre-opened fd$occupied_supervisor_fd changed its sentinel"
+done
+
+supervisor_fixture="$(make_fixture)"
+start_fixture_background "$supervisor_fixture" supervisor_descendant
+supervisor_target_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$supervisor_target_pid"
+if ! wait_for_file_long "$supervisor_fixture/supervisor-descendant.started"; then
+  supervisor_early_status=0
+  wait "$supervisor_target_pid" || supervisor_early_status=$?
+  ACTIVE_FIXTURE_PID=''
+  printf 'supervisor fixture early status: %s\n' \
+    "$supervisor_early_status" >&2
+  tail -n 80 "$supervisor_fixture/background.stderr" >&2
+  fail 'supervisor descendant fixture did not start'
+fi
+supervisor_direct_pid="$(<"$supervisor_fixture/supervisor-direct.pid")"
+supervisor_descendant_pid="$(<"$supervisor_fixture/supervisor-descendant.pid")"
+[[ "$supervisor_direct_pid" =~ ^[1-9][0-9]*$ &&
+  "$supervisor_descendant_pid" =~ ^[1-9][0-9]*$ ]] ||
+  fail 'fake direct command or descendant exposed an invalid PID'
+wait_for_file "$supervisor_fixture/workspace.path" ||
+  fail 'supervisor fixture did not expose its private workspace'
+supervisor_workspace="$(<"$supervisor_fixture/workspace.path")"
+supervisor_identity_paths="$(
+  find "$supervisor_workspace/control" \
+    -type f -name identity -print
+)"
+[[ -n "$supervisor_identity_paths" &&
+  "$supervisor_identity_paths" != *$'\n'* &&
+  ! -L "$supervisor_identity_paths" ]] ||
+  fail 'supervisor did not expose one regular identity handshake'
+supervisor_pid="$(<"$supervisor_identity_paths")"
+[[ "$supervisor_pid" =~ ^[1-9][0-9]*$ &&
+  "$supervisor_pid" != "$supervisor_direct_pid" &&
+  "$supervisor_pid" != "$supervisor_descendant_pid" ]] ||
+  fail 'supervisor identity was invalid or reused a command PID'
+(
+  trap 'exit 0' HUP INT TERM
+  trap ': >"$supervisor_fixture/supervisor-canary.cont"' CONT
+  while :; do
+    sleep 0.05
+  done
+) &
+supervisor_canary_pid="$!"
+active_fixture_is_direct_job "$supervisor_canary_pid" ||
+  fail 'supervisor canary was not a direct contract job'
+kill -CONT -- "-$supervisor_pid"
+wait_for_file "$supervisor_fixture/supervisor-direct.cont" ||
+  fail 'fake direct command was outside the supervisor PGID'
+wait_for_file "$supervisor_fixture/supervisor-descendant.cont" ||
+  fail 'fake descendant was outside the supervisor PGID'
+test ! -e "$supervisor_fixture/supervisor-canary.cont" ||
+  fail 'different-PGID canary received the supervisor group signal'
+touch "$supervisor_fixture/supervisor-direct.release"
+wait_for_file "$supervisor_fixture/supervisor-direct.exiting" ||
+  fail 'supervisor direct command did not reach exit'
+wait_for_pid_absent "$supervisor_direct_pid" ||
+  fail 'supervisor direct command did not actually exit'
+kill -TERM "$supervisor_target_pid"
+supervisor_status=0
+if wait_for_direct_child "$supervisor_target_pid"; then
+  fail 'signaled descendant supervisor unexpectedly succeeded'
+else
+  supervisor_status=$?
+fi
+ACTIVE_FIXTURE_PID=''
+if [[ "$supervisor_status" -ne 143 ]]; then
+  grep -E \
+    'handle_restore_signal|cleanup_restore|cleanup_ledger_valid|status=|return 143|exit 143|return 1' \
+    "$supervisor_fixture/background.stderr" |
+    tail -n 160 >&2 ||
+    true
+  fail "descendant supervisor exited with $supervisor_status instead of 143"
+fi
+wait_for_pid_absent "$supervisor_descendant_pid" ||
+  fail 'same-PGID TERM-ignoring descendant survived supervisor cleanup'
+active_fixture_is_direct_job "$supervisor_canary_pid" ||
+  fail 'different-PGID canary was killed by supervisor cleanup'
+kill -TERM "$supervisor_canary_pid"
+wait "$supervisor_canary_pid" 2>/dev/null || true
+assert_no_resources "$supervisor_fixture"
+test ! -e "$supervisor_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'signaled descendant supervisor published a final report'
+test ! -e "$supervisor_fixture/reports/.restore-${BACKUP_ID}.new" ||
+  fail 'signaled descendant supervisor left a temporary report'
+[[ ! -e "$supervisor_workspace" ]] ||
+  fail 'signaled descendant supervisor left its private workspace'
+
 same_directory_fixture="$(make_fixture)"
 if HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$same_directory_fixture/reports" \
   run_fixture "$same_directory_fixture" \
@@ -1350,7 +1651,7 @@ report_race_fixture="$(make_fixture)"
 start_fixture_background "$report_race_fixture" report_race
 report_race_pid="$FIXTURE_BACKGROUND_PID"
 ACTIVE_FIXTURE_PID="$report_race_pid"
-wait_for_file "$report_race_fixture/report-pause.started" ||
+wait_for_file_long "$report_race_fixture/report-pause.started" ||
   fail 'report race fixture did not reach its final external probe'
 report_race_final="$report_race_fixture/reports/restore-$BACKUP_ID.json"
 printf '%s\n' sentinel >"$report_race_final"
@@ -1594,7 +1895,7 @@ sigterm_fixture="$(make_fixture)"
 start_fixture_background "$sigterm_fixture" sigterm
 sigterm_pid="$FIXTURE_BACKGROUND_PID"
 ACTIVE_FIXTURE_PID="$sigterm_pid"
-if ! wait_for_file "$sigterm_fixture/signal.started"; then
+if ! wait_for_file_long "$sigterm_fixture/signal.started"; then
   kill -KILL "$sigterm_pid" 2>/dev/null || true
   fail 'SIGTERM fixture did not reach its bounded external action'
 fi
@@ -1616,7 +1917,7 @@ sigterm_delayed_fixture="$(make_fixture)"
 start_fixture_background "$sigterm_delayed_fixture" sigterm_delayed_create
 sigterm_delayed_pid="$FIXTURE_BACKGROUND_PID"
 ACTIVE_FIXTURE_PID="$sigterm_delayed_pid"
-if ! wait_for_file "$sigterm_delayed_fixture/signal.started"; then
+if ! wait_for_file_long "$sigterm_delayed_fixture/signal.started"; then
   kill -KILL "$sigterm_delayed_pid" 2>/dev/null || true
   fail 'delayed create fixture did not reach its external Docker action'
 fi
@@ -1645,7 +1946,7 @@ ledger_missing_fixture="$(make_fixture)"
 start_fixture_background "$ledger_missing_fixture" ledger_missing
 ledger_missing_pid="$FIXTURE_BACKGROUND_PID"
 ACTIVE_FIXTURE_PID="$ledger_missing_pid"
-wait_for_file "$ledger_missing_fixture/ledger-pause.started" ||
+wait_for_file_long "$ledger_missing_fixture/ledger-pause.started" ||
   fail 'ledger invalidation fixture did not reach the final external probe'
 wait_for_file "$ledger_missing_fixture/workspace.path" ||
   fail 'ledger invalidation fixture did not expose its private workspace'
@@ -1664,6 +1965,102 @@ assert_no_resources "$ledger_missing_fixture"
 test ! -e "$ledger_missing_fixture/reports/restore-$BACKUP_ID.json" ||
   fail 'missing cleanup ledger published a success report'
 
+for ledger_mode in \
+  ledger_empty \
+  ledger_truncated \
+  ledger_reordered \
+  ledger_duplicate \
+  ledger_oversized
+do
+  ledger_fixture="$(make_fixture)"
+  start_fixture_background "$ledger_fixture" "$ledger_mode"
+  ledger_pid="$FIXTURE_BACKGROUND_PID"
+  ACTIVE_FIXTURE_PID="$ledger_pid"
+  wait_for_file_long "$ledger_fixture/ledger-pause.started" ||
+    fail "$ledger_mode fixture did not reach the final probe"
+  wait_for_file "$ledger_fixture/workspace.path" ||
+    fail "$ledger_mode fixture did not expose its workspace"
+  ledger_workspace="$(<"$ledger_fixture/workspace.path")"
+  ledger_path="$ledger_workspace/control/cleanup.intent"
+  [[ -f "$ledger_path" && ! -L "$ledger_path" ]] ||
+    fail "$ledger_mode fixture exposed an invalid ledger"
+  if [[ "$ledger_mode" == ledger_empty ]]; then
+    ledger_project="$(
+      sed -n \
+        's/.*--label com\.docker\.compose\.project=\(happylearn-phase5-restore-[a-f0-9]\{12\}\).*/\1/p' \
+        "$ledger_fixture/docker.log" |
+        head -n1
+    )"
+    [[ "$ledger_project" =~ ^happylearn-phase5-restore-[a-f0-9]{12}$ ]] ||
+      fail 'cleanup ledger baseline did not expose its project'
+    ledger_expected="$ledger_fixture/cleanup.expected"
+    printf '%s\n' \
+      "networks|$ledger_project-network|network" \
+      "volumes|$ledger_project-postgres|postgres" \
+      "volumes|$ledger_project-aistor|aistor" \
+      "volumes|$ledger_project-aistor-license|aistor-license" \
+      "containers|$ledger_project-volume-probe-postgres|volume-probe-postgres" \
+      "containers|$ledger_project-volume-probe-aistor|volume-probe-aistor" \
+      "containers|$ledger_project-volume-probe-aistor-license|volume-probe-aistor-license" \
+      "containers|$ledger_project-restic-check|restic-check" \
+      "containers|$ledger_project-restic-select|restic-select" \
+      "containers|$ledger_project-restic-restore|restic-restore" \
+      "containers|$ledger_project-object-restore|object-restore" \
+      "containers|$ledger_project-aistor-license-init|aistor-license-init" \
+      "containers|$ledger_project-postgres|postgres" \
+      "containers|$ledger_project-postgres-restore|postgres-restore" \
+      "containers|$ledger_project-aistor|aistor" \
+      "containers|$ledger_project-redis|redis" \
+      "containers|$ledger_project-revoke-sessions|revoke-sessions" \
+      "containers|$ledger_project-app|app" \
+      "containers|$ledger_project-restore-check|restore-check" \
+      "containers|$ledger_project-restore-http-probe|restore-http-probe" \
+      >"$ledger_expected"
+    cmp -s "$ledger_path" "$ledger_expected" ||
+      fail 'successful cleanup ledger was not the exact 20-line contract'
+    [[ "$(wc -l <"$ledger_path" | tr -d '[:space:]')" == 20 &&
+      "$(sort "$ledger_path" | uniq | wc -l | tr -d '[:space:]')" == 20 &&
+      "$(wc -c <"$ledger_path" | tr -d '[:space:]')" -le 4096 ]] ||
+      fail 'successful cleanup ledger line, uniqueness, or size bound failed'
+  fi
+  case "$ledger_mode" in
+    ledger_empty)
+      : >"$ledger_path"
+      ;;
+    ledger_truncated)
+      sed '$d' "$ledger_path" >"$ledger_path.tampered"
+      chmod 0600 "$ledger_path.tampered"
+      mv "$ledger_path.tampered" "$ledger_path"
+      ;;
+    ledger_reordered)
+      awk '
+        NR == 1 { first = $0; next }
+        NR == 2 { print; print first; next }
+        { print }
+      ' "$ledger_path" >"$ledger_path.tampered"
+      chmod 0600 "$ledger_path.tampered"
+      mv "$ledger_path.tampered" "$ledger_path"
+      ;;
+    ledger_duplicate)
+      sed -n '1p' "$ledger_path" >>"$ledger_path"
+      ;;
+    ledger_oversized)
+      dd if=/dev/zero bs=4097 count=1 >>"$ledger_path" 2>/dev/null
+      ;;
+    *) fail "unknown ledger tamper mode $ledger_mode" ;;
+  esac
+  touch "$ledger_fixture/ledger-pause.release"
+  if wait_for_direct_child "$ledger_pid"; then
+    fail "$ledger_mode cleanup ledger tamper was accepted"
+  fi
+  ACTIVE_FIXTURE_PID=''
+  assert_no_resources "$ledger_fixture"
+  test ! -e "$ledger_fixture/reports/restore-$BACKUP_ID.json" ||
+    fail "$ledger_mode published a final report"
+  test ! -e "$ledger_fixture/reports/.restore-${BACKUP_ID}.new" ||
+    fail "$ledger_mode left a temporary report"
+done
+
 for mode in wrong_secret tampered_pack check_failure; do
   fixture="$(make_fixture)"
   if run_fixture "$fixture" "$mode" \
@@ -1677,7 +2074,8 @@ for mode in missing_snapshot duplicate_snapshot missing_object stale_session \
   nonempty_postgres nonempty_aistor http_probe_failure \
   report_unknown_field report_duplicate_field report_missing_field \
   report_wrong_backup report_wrong_manifest report_wrong_evidence \
-  report_row_total_mismatch
+  report_row_total_mismatch report_leading_zero report_negative \
+  report_int64_overflow report_table_sum_overflow
 do
   fixture="$(make_fixture)"
   if run_fixture "$fixture" "$mode" \
@@ -1710,7 +2108,7 @@ if HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS=1 \
 fi
 timeout_duration=$((SECONDS - timeout_started))
 [[ "$timeout_duration" -lt 10 ]] ||
-  fail 'restore timeout was not bounded'
+  fail "restore timeout was not bounded (${timeout_duration}s >= 10s)"
 assert_no_resources "$timeout_fixture"
 
 cleanup_fixture="$(make_fixture)"
