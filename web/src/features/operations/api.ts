@@ -629,6 +629,11 @@ const operationsDataStates = new Set([
   'timeout',
   'empty',
 ])
+const terminalOperationsDataStates = new Set<OperationsDataState>([
+  'unavailable',
+  'timeout',
+  'empty',
+])
 const dashboardServices = new Set([
   'app',
   'caddy',
@@ -750,13 +755,24 @@ function parseDashboard(value: unknown): OperationsDashboard {
     'capacityBytes',
     'warningPercent',
   ]))
+  const storageObservation = observedState(storageSource, operationsDataStates)
   const storage = {
-    ...observedState(storageSource, operationsDataStates),
+    ...storageObservation,
     usedBytes: safeInteger(storageSource.usedBytes),
     capacityBytes: safeInteger(storageSource.capacityBytes),
-    warningPercent: safeInteger(storageSource.warningPercent, 1),
+    warningPercent: safeInteger(storageSource.warningPercent),
   }
-  if (storage.warningPercent > 100 || storage.usedBytes > storage.capacityBytes) {
+  const terminalStorage = terminalOperationsDataStates.has(storageObservation.state)
+  if (
+    storage.warningPercent > 100
+    || storage.usedBytes > storage.capacityBytes
+    || (terminalStorage && (
+      storage.usedBytes !== 0
+      || storage.capacityBytes !== 0
+      || storage.warningPercent !== 0
+    ))
+    || (!terminalStorage && storage.warningPercent < 1)
+  ) {
     throw invalidResponse()
   }
 

@@ -45,6 +45,12 @@ const resolved: OperationalAlert = {
 }
 
 const mounted: VueWrapper[] = []
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 function mountView() {
   const wrapper = mount(AlertsView, {
     attachTo: document.body,
@@ -136,6 +142,73 @@ describe('AlertsView', () => {
     ])
   })
 
+  it('keeps the tail cursor across a head poll so three keyset pages remain reachable', async () => {
+    vi.useFakeTimers()
+    const third = {
+      ...warning,
+      id: '10000000-0000-4000-8000-000000000003',
+      summary: 'Third page alert',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
+      .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
+      .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
+      .mockResolvedValueOnce({ items: [third], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    expect(api.listAlerts.mock.calls.map(([filters]) => filters)).toEqual([
+      { limit: 50 },
+      { before: 'page-2', limit: 50 },
+      { limit: 50 },
+      { before: 'page-3', limit: 50 },
+    ])
+    expect(wrapper.findAll('[data-testid="alert-card"]').map((item) => item.attributes('data-id'))).toEqual([
+      critical.id,
+      warning.id,
+      third.id,
+    ])
+  })
+
+  it('does not start load-more while a head refresh is in flight', async () => {
+    vi.useFakeTimers()
+    const refreshing = deferred<AlertPage>()
+    const third = {
+      ...warning,
+      id: '10000000-0000-4000-8000-000000000003',
+      summary: 'Third page alert',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: 'page-2' })
+      .mockResolvedValueOnce({ items: [warning], next: 'page-3' })
+      .mockImplementationOnce(() => refreshing.promise)
+      .mockResolvedValueOnce({ items: [third], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+    expect(api.listAlerts).toHaveBeenCalledTimes(3)
+
+    refreshing.resolve({ items: [critical], next: 'page-2' })
+    await flushPromises()
+    await wrapper.get('[data-testid="alerts-load-more"]').trigger('click')
+    await flushPromises()
+    expect(api.listAlerts).toHaveBeenCalledTimes(4)
+    expect(api.listAlerts.mock.calls[3]?.[0]).toEqual({ before: 'page-3', limit: 50 })
+  })
+
   it('requires confirmation before acknowledgement and updates the alert in place', async () => {
     const acknowledged: OperationalAlert = {
       ...critical,
@@ -156,6 +229,154 @@ describe('AlertsView', () => {
     expect(api.acknowledgeAlert).toHaveBeenCalledWith(critical.id)
     expect(wrapper.get(`[data-id="${critical.id}"]`).text()).toContain('已确认')
     expect(document.activeElement).toBe(wrapper.get(`[data-id="${critical.id}"]`).element)
+  })
+
+  it('gives the acknowledgement dialog an accessible name, focuses it, and restores the trigger on cancel', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    const trigger = wrapper.get(`[data-acknowledge="${critical.id}"]`)
+
+    await trigger.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[data-testid="acknowledge-dialog"]')
+    expect(dialog.attributes('aria-labelledby')).toBe('acknowledge-dialog-title')
+    expect(wrapper.get('#acknowledge-dialog-title').text()).toContain('确认这条告警')
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="cancel-acknowledge"]').element)
+
+    await wrapper.get('[data-testid="cancel-acknowledge"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="acknowledge-dialog"]').exists()).toBe(false)
+    expect(document.activeElement).toBe(trigger.element)
+  })
+
+  it('keeps the dialog open and focuses mutation feedback after an acknowledgement error', async () => {
+    api.acknowledgeAlert.mockRejectedValueOnce(
+      new APIError(500, 'internal_error', '确认失败', 'req-acknowledge'),
+    )
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    await flushPromises()
+
+    const feedback = wrapper.get('[data-testid="acknowledge-error"]')
+    expect(feedback.text()).toContain('req-acknowledge')
+    expect(document.activeElement).toBe(feedback.element)
+    expect(wrapper.get('[data-testid="acknowledge-dialog"]').attributes('open')).toBeDefined()
+  })
+
+  it('removes a locally acknowledged alert from the active open filter', async () => {
+    const acknowledged: OperationalAlert = {
+      ...critical,
+      state: 'acknowledged',
+      acknowledgedBy: '20000000-0000-4000-8000-000000000001',
+      acknowledgedAt: '2026-07-30T08:01:00Z',
+    }
+    api.listAlerts.mockResolvedValue({ items: [critical], next: null })
+    api.acknowledgeAlert.mockResolvedValueOnce(acknowledged)
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alert-state-filter"]').setValue('open')
+    await wrapper.get('[data-testid="alert-filters"]').trigger('submit')
+    await flushPromises()
+
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find(`[data-id="${critical.id}"]`).exists()).toBe(false)
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="alerts-results-title"]').element)
+  })
+
+  it('removes live transitions that no longer match state, severity, or category filters', async () => {
+    vi.useFakeTimers()
+    const transitioned: OperationalAlert = {
+      ...warning,
+      state: 'resolved',
+      severity: 'critical',
+      category: 'backup',
+      resolvedAt: '2026-07-30T08:05:00Z',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [warning], next: null })
+      .mockResolvedValueOnce({ items: [warning], next: null })
+      .mockResolvedValueOnce({ items: [transitioned], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alert-state-filter"]').setValue('open')
+    await wrapper.get('[data-testid="alert-severity-filter"]').setValue('warning')
+    await wrapper.get('[data-testid="alert-category-filter"]').setValue('storage')
+    await wrapper.get('[data-testid="alert-filters"]').trigger('submit')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(wrapper.find(`[data-id="${warning.id}"]`).exists()).toBe(false)
+  })
+
+  it('removes an old head alert that disappears from a filtered live response', async () => {
+    vi.useFakeTimers()
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockResolvedValueOnce({ items: [], next: null })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="alert-state-filter"]').setValue('open')
+    await wrapper.get('[data-testid="alert-filters"]').trigger('submit')
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+
+    expect(wrapper.find(`[data-id="${critical.id}"]`).exists()).toBe(false)
+  })
+
+  it.each([
+    [409, 'alert_already_resolved'],
+    [404, 'alert_not_found'],
+  ])('refreshes a stale alert after acknowledge HTTP %i', async (status, code) => {
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockResolvedValueOnce({ items: [], next: null })
+    api.acknowledgeAlert.mockRejectedValueOnce(new APIError(status, code, '状态已变化', 'req-mutation'))
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    await flushPromises()
+
+    expect(api.listAlerts).toHaveBeenCalledTimes(2)
+    expect(wrapper.find(`[data-id="${critical.id}"]`).exists()).toBe(false)
+  })
+
+  it('does not let an older in-flight poll roll an acknowledged alert back to open', async () => {
+    vi.useFakeTimers()
+    const polling = deferred<AlertPage>()
+    const acknowledged: OperationalAlert = {
+      ...critical,
+      state: 'acknowledged',
+      acknowledgedBy: '20000000-0000-4000-8000-000000000001',
+      acknowledgedAt: '2026-07-30T08:01:00Z',
+    }
+    api.listAlerts
+      .mockResolvedValueOnce({ items: [critical], next: null })
+      .mockImplementationOnce(() => polling.promise)
+    api.acknowledgeAlert.mockResolvedValueOnce(acknowledged)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+    await wrapper.get(`[data-acknowledge="${critical.id}"]`).trigger('click')
+    await wrapper.get('[data-testid="confirm-acknowledge"]').trigger('click')
+    await flushPromises()
+    polling.resolve({ items: [critical], next: null })
+    await flushPromises()
+
+    expect(wrapper.get(`[data-id="${critical.id}"]`).text()).toContain('已确认')
   })
 
   it('shows a live resolution without removing other loaded alerts', async () => {

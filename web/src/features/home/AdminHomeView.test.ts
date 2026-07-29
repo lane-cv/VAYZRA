@@ -151,7 +151,7 @@ describe('AdminHomeView operations dashboard', () => {
         successRatePercent: 0,
       },
       storage: {
-        state: 'empty',
+        state: 'unavailable',
         usedBytes: 0,
         capacityBytes: 0,
         warningPercent: 0,
@@ -181,6 +181,52 @@ describe('AdminHomeView operations dashboard', () => {
       expect(wrapper.get(`[data-testid="service-${service}"]`).text()).toContain('延迟 —')
     }
     expect(wrapper.get('.queues').text()).toContain('运行指标 —')
+  })
+
+  it('surfaces backup and recent-audit dependency state and observation time instead of empty evidence', async () => {
+    api.readDashboard.mockResolvedValueOnce({
+      ...structuredClone(dashboard),
+      storage: { ...dashboard.storage, state: 'stale' },
+      queues: [{ ...dashboard.queues[0], state: 'stale' }],
+      backup: {
+        state: 'unavailable',
+        local: { state: 'empty' },
+        remote: { state: 'empty' },
+        restore: { state: 'empty', rtoSeconds: 0 },
+      },
+      recentAuditState: 'timeout',
+      recentAudit: [],
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="backup-state"]').text()).toContain('未知（不可用）')
+    expect(wrapper.get('[data-testid="backup-summary"]').text()).not.toContain('暂无记录')
+    expect(wrapper.get('[data-testid="backup-summary"]').findAll('.recovery-points strong').map((item) => item.text())).toEqual(['—', '—', '—'])
+    expect(wrapper.get('[data-testid="recent-audit-state"]').text()).toContain('未知（超时）')
+    expect(wrapper.get('.audit').text()).not.toContain('暂无安全活动摘要')
+    expect(wrapper.get('[data-testid="storage-summary"] time').attributes('datetime')).toBe(observedAt)
+    expect(wrapper.get('.queues time').attributes('datetime')).toBe(observedAt)
+  })
+
+  it('shows failed restore completion without inventing an RTO value', async () => {
+    const failedAt = '2026-07-30T06:30:00Z'
+    api.readDashboard.mockResolvedValueOnce({
+      ...structuredClone(dashboard),
+      backup: {
+        ...dashboard.backup,
+        state: 'stale',
+        restore: { state: 'failed', completedAt: failedAt, rtoSeconds: 0 },
+      },
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    const restore = wrapper.get('[data-testid="restore-evidence"]')
+    expect(restore.text()).toContain('失败')
+    expect(restore.get('time').attributes('datetime')).toBe(failedAt)
+    expect(restore.text()).not.toContain('RTO 0 秒')
+    expect(wrapper.get('[data-testid="backup-state"] time').attributes('datetime')).toBe(observedAt)
   })
 
   it('polls every 60 seconds only while visible and refreshes immediately on resume', async () => {

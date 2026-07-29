@@ -149,6 +149,10 @@ function hasObservedValue(state: OperationsDataState): boolean {
   return state === 'healthy' || state === 'degraded' || state === 'stale'
 }
 
+function hasDependencyEvidence(state: OperationsDataState): boolean {
+  return state !== 'unavailable' && state !== 'timeout'
+}
+
 function storagePercent(value: OperationsDashboard['storage']): string {
   if (!hasObservedValue(value.state) || value.capacityBytes === 0) return '—'
   return `${Math.round((value.usedBytes / value.capacityBytes) * 100)}%`
@@ -215,31 +219,52 @@ onBeforeUnmount(() => {
           <div><p class="kicker">恢复能力</p><h2>备份与恢复</h2></div>
           <RouterLink to="/admin/backups">查看备份记录</RouterLink>
         </header>
+        <p
+          data-testid="backup-state"
+          class="state-line"
+          :class="stateClass(dashboard.backup.state)"
+        >
+          {{ stateLabels[dashboard.backup.state] }}
+          <template v-if="dashboard.backup.observedAt">
+            · 观测于
+            <time :datetime="dashboard.backup.observedAt">{{ formatTime(dashboard.backup.observedAt) }}</time>
+          </template>
+        </p>
         <div class="recovery-points">
           <article>
             <span>本地恢复点</span>
             <strong :class="stateClass(dashboard.backup.local.state)">
-              {{ recoveryLabels[dashboard.backup.local.state] }}
+              {{ hasDependencyEvidence(dashboard.backup.state) ? recoveryLabels[dashboard.backup.local.state] : '—' }}
             </strong>
-            <time v-if="dashboard.backup.local.completedAt" :datetime="dashboard.backup.local.completedAt">
+            <time v-if="hasDependencyEvidence(dashboard.backup.state) && dashboard.backup.local.completedAt" :datetime="dashboard.backup.local.completedAt">
               {{ formatTime(dashboard.backup.local.completedAt) }}
             </time>
           </article>
           <article>
             <span>远端恢复点</span>
             <strong :class="stateClass(dashboard.backup.remote.state)">
-              {{ recoveryLabels[dashboard.backup.remote.state] }}
+              {{ hasDependencyEvidence(dashboard.backup.state) ? recoveryLabels[dashboard.backup.remote.state] : '—' }}
             </strong>
-            <time v-if="dashboard.backup.remote.completedAt" :datetime="dashboard.backup.remote.completedAt">
+            <time v-if="hasDependencyEvidence(dashboard.backup.state) && dashboard.backup.remote.completedAt" :datetime="dashboard.backup.remote.completedAt">
               {{ formatTime(dashboard.backup.remote.completedAt) }}
             </time>
           </article>
-          <article>
+          <article data-testid="restore-evidence">
             <span>最近恢复验证</span>
             <strong :class="stateClass(dashboard.backup.restore.state)">
-              {{ recoveryLabels[dashboard.backup.restore.state] }}
+              {{ hasDependencyEvidence(dashboard.backup.state) ? recoveryLabels[dashboard.backup.restore.state] : '—' }}
             </strong>
-            <small v-if="dashboard.backup.restore.state !== 'empty'">
+            <time
+              v-if="hasDependencyEvidence(dashboard.backup.state) && dashboard.backup.restore.completedAt"
+              :datetime="dashboard.backup.restore.completedAt"
+            >{{ formatTime(dashboard.backup.restore.completedAt) }}</time>
+            <small
+              v-if="
+                hasDependencyEvidence(dashboard.backup.state)
+                && dashboard.backup.restore.state === 'succeeded'
+                && dashboard.backup.restore.completedAt
+              "
+            >
               RTO {{ dashboard.backup.restore.rtoSeconds }} 秒
             </small>
           </article>
@@ -277,8 +302,16 @@ onBeforeUnmount(() => {
             <p v-if="hasObservedValue(queue.state)">
               等待 {{ queue.queued }} · 进行中 {{ queue.streaming }} ·
               失败 {{ queue.failed }} · 过期 {{ queue.expired }}
+              <template v-if="queue.observedAt">
+                · 观测于 <time :datetime="queue.observedAt">{{ formatTime(queue.observedAt) }}</time>
+              </template>
             </p>
-            <p v-else>运行指标 —</p>
+            <p v-else>
+              运行指标 —
+              <template v-if="queue.observedAt">
+                · 观测于 <time :datetime="queue.observedAt">{{ formatTime(queue.observedAt) }}</time>
+              </template>
+            </p>
           </li>
         </ul>
       </section>
@@ -318,6 +351,9 @@ onBeforeUnmount(() => {
             <template v-if="hasObservedValue(dashboard.storage.state)">
               · 告警线 {{ dashboard.storage.warningPercent }}%
             </template>
+            <template v-if="dashboard.storage.observedAt">
+              · 观测于 <time :datetime="dashboard.storage.observedAt">{{ formatTime(dashboard.storage.observedAt) }}</time>
+            </template>
           </small>
         </article>
       </section>
@@ -327,8 +363,13 @@ onBeforeUnmount(() => {
           <div><p class="kicker">安全活动</p><h2 id="recent-audit-title">最近审计</h2></div>
           <RouterLink to="/admin/audit">查看审计日志</RouterLink>
         </header>
-        <p v-if="!dashboard.recentAudit.length">暂无安全活动摘要</p>
-        <ol v-else>
+        <p
+          data-testid="recent-audit-state"
+          class="state-line"
+          :class="stateClass(dashboard.recentAuditState)"
+        >{{ stateLabels[dashboard.recentAuditState] }}</p>
+        <p v-if="dashboard.recentAuditState === 'empty'">暂无安全活动摘要</p>
+        <ol v-if="dashboard.recentAudit.length">
           <li v-for="(item, index) in dashboard.recentAudit" :key="`${item.occurredAt}-${index}`" data-testid="recent-audit">
             <span>{{ auditCategoryLabels[item.category] }} · {{ auditOutcomeLabels[item.outcome] }}</span>
             <time :datetime="item.occurredAt">{{ formatTime(item.occurredAt) }}</time>

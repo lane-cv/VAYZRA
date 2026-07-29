@@ -60,6 +60,98 @@ describe('operations monitoring API', () => {
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/operations/dashboard')
   })
 
+  it('accepts the backend fail-closed dashboard and validates storage thresholds by state', async () => {
+    const unavailable: OperationsDashboard = {
+      ...structuredClone(dashboard),
+      students: { state: 'unavailable', active: 0, disabled: 0 },
+      questions: { state: 'unavailable', waiting: 0, oldestWaitSeconds: 0 },
+      ai: {
+        state: 'unavailable',
+        requests: 0,
+        successRatePercent: 0,
+        firstByteLatencyMilliseconds: 0,
+        totalLatencyMilliseconds: 0,
+        dailyCostMicroUSD: 0,
+      },
+      storage: {
+        state: 'unavailable',
+        usedBytes: 0,
+        capacityBytes: 0,
+        warningPercent: 0,
+      },
+      services: dashboard.services.map(({ service }) => ({
+        service,
+        state: 'unavailable',
+        latencyMilliseconds: 0,
+      })),
+      queues: dashboard.queues.map(({ queue }) => ({
+        queue,
+        state: 'unavailable',
+        queued: 0,
+        streaming: 0,
+        failed: 0,
+        expired: 0,
+      })),
+      backup: {
+        state: 'unavailable',
+        local: { state: 'empty' },
+        remote: { state: 'empty' },
+        restore: { state: 'empty', rtoSeconds: 0 },
+      },
+      alerts: { state: 'unavailable', openWarning: 0, openCritical: 0 },
+      recentAuditState: 'unavailable',
+      recentAudit: [],
+    }
+    const empty = {
+      ...structuredClone(dashboard),
+      storage: {
+        state: 'empty' as const,
+        observedAt,
+        usedBytes: 0,
+        capacityBytes: 0,
+        warningPercent: 0,
+      },
+    }
+    const degraded = {
+      ...structuredClone(dashboard),
+      storage: { ...dashboard.storage, state: 'degraded' as const, warningPercent: 1 },
+    }
+    const stale = {
+      ...structuredClone(dashboard),
+      storage: { ...dashboard.storage, state: 'stale' as const, warningPercent: 100 },
+    }
+    const timeout = {
+      ...structuredClone(unavailable),
+      storage: { ...unavailable.storage, state: 'timeout' as const },
+    }
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: unavailable })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: empty })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: timeout })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: degraded })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: stale })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: {
+          ...dashboard,
+          storage: { ...dashboard.storage, warningPercent: 0 },
+        },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: {
+          ...unavailable,
+          storage: { ...unavailable.storage, warningPercent: 1 },
+        },
+      })))
+
+    await expect(readDashboard()).resolves.toStrictEqual(unavailable)
+    await expect(readDashboard()).resolves.toStrictEqual(empty)
+    await expect(readDashboard()).resolves.toStrictEqual(timeout)
+    await expect(readDashboard()).resolves.toStrictEqual(degraded)
+    await expect(readDashboard()).resolves.toStrictEqual(stale)
+    await expect(readDashboard()).rejects.toMatchObject({ code: 'invalid_response' })
+    await expect(readDashboard()).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
   it('serializes alert keyset filters in stable server order', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
       data: [alert],

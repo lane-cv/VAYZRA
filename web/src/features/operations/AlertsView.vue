@@ -39,11 +39,16 @@ const acknowledging = ref(false)
 const pendingAcknowledgement = ref<OperationalAlert>()
 const resultsTitle = ref<HTMLElement>()
 const acknowledgementDialog = ref<HTMLDialogElement>()
+const acknowledgementCancel = ref<HTMLButtonElement>()
+const acknowledgementFeedback = ref<HTMLElement>()
 let alive = true
 let generation = 0
+let loadedPastHead = false
+let headIDs = new Set<string>()
 let replaceController: AbortController | undefined
 let appendController: AbortController | undefined
 let polling: ReturnType<typeof setInterval> | undefined
+let acknowledgementReturnID = ''
 
 const severityLabels: Record<AlertSeverity, string> = {
   warning: '警告',
@@ -68,37 +73,54 @@ function failure(reason: unknown, fallback: string) {
     : { message: fallback, requestId: '' }
 }
 
-function replaceItems(incoming: OperationalAlert[]) {
+function matchesActiveFilters(alert: OperationalAlert): boolean {
+  const active = activeFilters.value
+  return (
+    (active.state === undefined || alert.state === active.state)
+    && (active.severity === undefined || alert.severity === active.severity)
+    && (active.category === undefined || alert.category === active.category)
+  )
+}
+
+function uniqueAlerts(incoming: OperationalAlert[]): OperationalAlert[] {
   const seen = new Set<string>()
-  items.value = incoming.filter((item) => {
+  return incoming.filter((item) => {
     if (seen.has(item.id)) return false
     seen.add(item.id)
     return true
   })
 }
 
+function replaceItems(incoming: OperationalAlert[]) {
+  items.value = uniqueAlerts(incoming).filter(matchesActiveFilters)
+}
+
 function appendItems(incoming: OperationalAlert[]) {
-  const indexes = new Map(items.value.map((item, index) => [item.id, index]))
-  for (const item of incoming) {
-    const index = indexes.get(item.id)
-    if (index === undefined) {
-      indexes.set(item.id, items.value.length)
-      items.value.push(item)
-    } else {
-      items.value[index] = item
-    }
+  const received = uniqueAlerts(incoming)
+  const updates = new Map(received.map((item) => [item.id, item]))
+  items.value = items.value
+    .map((item) => updates.get(item.id) ?? item)
+    .filter(matchesActiveFilters)
+  const known = new Set(items.value.map((item) => item.id))
+  for (const item of received) {
+    if (!matchesActiveFilters(item) || known.has(item.id)) continue
+    known.add(item.id)
+    items.value.push(item)
   }
 }
 
 function mergeLive(incoming: OperationalAlert[]) {
-  const indexes = new Map(items.value.map((item, index) => [item.id, index]))
+  const received = uniqueAlerts(incoming)
+  const updates = new Map(received.map((item) => [item.id, item]))
+  const existing = new Set(items.value.map((item) => item.id))
+  const retained = items.value
+    .map((item) => updates.get(item.id) ?? item)
+    .filter(matchesActiveFilters)
   const additions: OperationalAlert[] = []
-  for (const item of incoming) {
-    const index = indexes.get(item.id)
-    if (index === undefined) additions.push(item)
-    else items.value[index] = item
+  for (const item of received) {
+    if (matchesActiveFilters(item) && !existing.has(item.id)) additions.push(item)
   }
-  if (additions.length) items.value.unshift(...additions)
+  items.value = [...additions, ...retained]
 }
 
 async function focusResults() {
@@ -127,7 +149,9 @@ async function replace(restoreFocus = false) {
     )
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     replaceItems(page.items)
+    headIDs = new Set(items.value.map((item) => item.id))
     nextCursor.value = page.next
+    loadedPastHead = false
     loaded = true
   } catch (reason) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
@@ -163,8 +187,23 @@ async function refreshLive() {
       controller.signal,
     )
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
+    const nextHeadIDs = new Set(
+      uniqueAlerts(page.items)
+        .filter(matchesActiveFilters)
+        .map((item) => item.id),
+    )
+    if (
+      activeFilters.value.state !== undefined
+      || activeFilters.value.severity !== undefined
+      || activeFilters.value.category !== undefined
+    ) {
+      items.value = items.value.filter(
+        (item) => !headIDs.has(item.id) || nextHeadIDs.has(item.id),
+      )
+    }
     mergeLive(page.items)
-    nextCursor.value = page.next
+    headIDs = nextHeadIDs
+    if (!loadedPastHead) nextCursor.value = page.next
   } catch {
     // Background refresh keeps the last explicit state and never hides loaded alerts.
   } finally {
@@ -174,7 +213,7 @@ async function refreshLive() {
 
 async function loadMore(restoreFocus = false) {
   const before = nextCursor.value
-  if (!before || loading.value || loadingMore.value) return
+  if (!before || loading.value || loadingMore.value || replaceController !== undefined) return
   appendController?.abort()
   const controller = new AbortController()
   appendController = controller
@@ -190,6 +229,7 @@ async function loadMore(restoreFocus = false) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     appendItems(page.items)
     nextCursor.value = page.next
+    loadedPastHead = true
   } catch (reason) {
     if (!alive || controller.signal.aborted || requestGeneration !== generation) return
     const details = failure(reason, '更多告警加载失败，请稍后重试')
@@ -224,6 +264,7 @@ function supportsNativeDialog(element: HTMLDialogElement): boolean {
 async function openAcknowledgement(alert: OperationalAlert) {
   acknowledgementError.value = ''
   acknowledgementRequestId.value = ''
+  acknowledgementReturnID = alert.id
   pendingAcknowledgement.value = alert
   await nextTick()
   const dialog = acknowledgementDialog.value
@@ -231,42 +272,79 @@ async function openAcknowledgement(alert: OperationalAlert) {
     if (supportsNativeDialog(dialog)) dialog.showModal()
     else dialog.setAttribute('open', '')
   }
+  await nextTick()
+  acknowledgementCancel.value?.focus()
 }
 
-function closeAcknowledgement() {
-  if (acknowledging.value) return
+async function focusAfterAcknowledgement(target: 'trigger' | 'alert' | 'results') {
+  await nextTick()
+  const selector = target === 'trigger'
+    ? `[data-acknowledge="${acknowledgementReturnID}"]`
+    : `[data-id="${acknowledgementReturnID}"]`
+  const element = target === 'results'
+    ? resultsTitle.value
+    : document.querySelector<HTMLElement>(selector)
+  const focusTarget = element ?? resultsTitle.value
+  focusTarget?.focus()
+}
+
+async function dismissAcknowledgement(target: 'trigger' | 'alert' | 'results') {
   const dialog = acknowledgementDialog.value
   if (dialog?.open && supportsNativeDialog(dialog)) dialog.close()
   else dialog?.removeAttribute('open')
   pendingAcknowledgement.value = undefined
+  await focusAfterAcknowledgement(target)
 }
 
-async function focusAlert(id: string) {
-  await nextTick()
-  document.querySelector<HTMLElement>(`[data-id="${id}"]`)?.focus()
+function closeAcknowledgement() {
+  if (acknowledging.value) return
+  void dismissAcknowledgement('trigger')
 }
 
 async function confirmAcknowledgement() {
   const selected = pendingAcknowledgement.value
   if (!selected || acknowledging.value) return
+  replaceController?.abort()
+  appendController?.abort()
+  replaceController = undefined
+  appendController = undefined
+  loading.value = false
+  loadingMore.value = false
+  const mutationGeneration = ++generation
   acknowledging.value = true
   acknowledgementError.value = ''
   acknowledgementRequestId.value = ''
   try {
     const updated = await acknowledgeAlert(selected.id)
-    if (!alive) return
+    if (!alive || mutationGeneration !== generation) return
+    const remainsVisible = matchesActiveFilters(updated)
     const index = items.value.findIndex((item) => item.id === updated.id)
-    if (index >= 0) items.value[index] = updated
-    const dialog = acknowledgementDialog.value
-    if (dialog?.open && supportsNativeDialog(dialog)) dialog.close()
-    else dialog?.removeAttribute('open')
-    pendingAcknowledgement.value = undefined
-    await focusAlert(updated.id)
+    if (index >= 0 && remainsVisible) items.value[index] = updated
+    else if (index >= 0) {
+      items.value.splice(index, 1)
+      headIDs.delete(updated.id)
+    }
+    await dismissAcknowledgement(remainsVisible ? 'alert' : 'results')
   } catch (reason) {
-    if (!alive) return
+    if (!alive || mutationGeneration !== generation) return
     const details = failure(reason, '告警确认失败，请稍后重试')
     acknowledgementError.value = details.message
     acknowledgementRequestId.value = details.requestId
+    if (
+      reason instanceof APIError
+      && (
+        reason.status === 404
+        || reason.status === 409
+        || reason.code === 'alert_not_found'
+        || reason.code === 'alert_already_resolved'
+      )
+    ) {
+      items.value = items.value.filter((item) => item.id !== selected.id)
+      headIDs.delete(selected.id)
+      await refreshLive()
+    }
+    await nextTick()
+    acknowledgementFeedback.value?.focus()
   } finally {
     if (alive) acknowledging.value = false
   }
@@ -402,7 +480,7 @@ onBeforeUnmount(() => {
         v-if="nextCursor && !error"
         data-testid="alerts-load-more"
         type="button"
-        :disabled="loadingMore"
+        :disabled="loadingMore || replaceController !== undefined"
         @click="loadMore()"
       >{{ loadingMore ? '加载中…' : '加载更多' }}</button>
     </section>
@@ -411,18 +489,31 @@ onBeforeUnmount(() => {
       v-if="pendingAcknowledgement"
       ref="acknowledgementDialog"
       data-testid="acknowledge-dialog"
-      @close="pendingAcknowledgement = undefined"
+      aria-labelledby="acknowledge-dialog-title"
       @cancel.prevent="closeAcknowledgement"
     >
-      <h2>确认这条告警？</h2>
+      <h2 id="acknowledge-dialog-title">确认这条告警？</h2>
       <p>{{ pendingAcknowledgement.summary }}</p>
       <p>确认只记录教师已知悉，告警仍会继续评估，直至系统恢复健康。</p>
-      <div v-if="acknowledgementError" class="feedback error" role="alert">
+      <div
+        v-if="acknowledgementError"
+        ref="acknowledgementFeedback"
+        class="feedback error"
+        role="alert"
+        data-testid="acknowledge-error"
+        tabindex="-1"
+      >
         {{ acknowledgementError }}
         <span v-if="acknowledgementRequestId">（支持编号：{{ acknowledgementRequestId }}）</span>
       </div>
       <div class="dialog-actions">
-        <button type="button" :disabled="acknowledging" @click="closeAcknowledgement">取消</button>
+        <button
+          ref="acknowledgementCancel"
+          data-testid="cancel-acknowledge"
+          type="button"
+          :disabled="acknowledging"
+          @click="closeAcknowledgement"
+        >取消</button>
         <button
           data-testid="confirm-acknowledge"
           type="button"
