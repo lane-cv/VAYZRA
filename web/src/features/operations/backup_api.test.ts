@@ -37,10 +37,33 @@ const verification = {
   rtoSeconds: 120,
 }
 
+const pendingVerification = {
+  id: verification.id,
+  databaseRowCounts: {},
+  checkedObjectCount: 0,
+  missingObjectCount: 0,
+  unexpectedObjectCount: 0,
+  sessionRevocationVerified: false,
+}
+
 function response(data: unknown, meta?: unknown, status = 200): Response {
   return new Response(JSON.stringify(
     meta === undefined ? { data } : { data, meta },
   ), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function detailWithVerification(restoreVerification: unknown): unknown {
+  return {
+    ...run,
+    artifacts: [artifact],
+    restoreVerifications: [restoreVerification],
+  }
+}
+
+function withoutVerificationField(field: string): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...verification }
+  delete result[field]
+  return result
 }
 
 afterEach(() => {
@@ -90,6 +113,134 @@ describe('backup operations API', () => {
       sessionRevocationVerified: true,
     })
     expect(JSON.stringify(detail)).not.toMatch(/sha256|password|repositoryPath|objectKey/i)
+  })
+
+  it.each([
+    ['queued', {
+      ...pendingVerification,
+      state: 'queued',
+    }],
+    ['restoring', {
+      ...pendingVerification,
+      state: 'restoring',
+      startedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['checking', {
+      ...pendingVerification,
+      state: 'checking',
+      startedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['failed without success-only evidence', {
+      ...pendingVerification,
+      state: 'failed',
+      startedAt: '2026-07-28T02:00:00Z',
+      finishedAt: '2026-07-28T02:00:00Z',
+      missingObjectCount: 2,
+      errorCategory: 'reference_check',
+    }],
+  ])('accepts migration-consistent %s restore evidence', async (_name, restoreVerification) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(
+      detailWithVerification(restoreVerification),
+    )))
+    const detail = await readBackup(run.id)
+    expect(detail.restoreVerifications).toEqual([restoreVerification])
+  })
+
+  it.each([
+    ['migration version zero', {
+      ...verification,
+      restoredMigrationVersion: 0,
+    }],
+    ['unknown row-count table', {
+      ...verification,
+      databaseRowCounts: { credentials: 1 },
+    }],
+    ['negative row count', {
+      ...verification,
+      databaseRowCounts: { users: -1 },
+    }],
+    ['fractional row count', {
+      ...verification,
+      databaseRowCounts: { users: 1.5 },
+    }],
+    ['unsafe row count', {
+      ...verification,
+      databaseRowCounts: { users: Number.MAX_SAFE_INTEGER + 1 },
+    }],
+    ['queued with a start time', {
+      ...pendingVerification,
+      state: 'queued',
+      startedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['queued with a finish time', {
+      ...pendingVerification,
+      state: 'queued',
+      finishedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['restoring without a start time', {
+      ...pendingVerification,
+      state: 'restoring',
+    }],
+    ['restoring with a finish time', {
+      ...pendingVerification,
+      state: 'restoring',
+      startedAt: '2026-07-28T02:00:00Z',
+      finishedAt: '2026-07-28T02:01:00Z',
+    }],
+    ['checking without a start time', {
+      ...pendingVerification,
+      state: 'checking',
+    }],
+    ['checking with a finish time', {
+      ...pendingVerification,
+      state: 'checking',
+      startedAt: '2026-07-28T02:00:00Z',
+      finishedAt: '2026-07-28T02:01:00Z',
+    }],
+    ['succeeded without a start time', withoutVerificationField('startedAt')],
+    ['succeeded without a finish time', withoutVerificationField('finishedAt')],
+    ['failed without a start time', {
+      ...pendingVerification,
+      state: 'failed',
+      finishedAt: '2026-07-28T02:01:00Z',
+    }],
+    ['failed without a finish time', {
+      ...pendingVerification,
+      state: 'failed',
+      startedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['succeeded with a finish time one nanosecond before its start', {
+      ...verification,
+      startedAt: '2026-07-28T02:00:00.000000002Z',
+      finishedAt: '2026-07-28T02:00:00.000000001Z',
+    }],
+    ['failed with a finish time before its start', {
+      ...pendingVerification,
+      state: 'failed',
+      startedAt: '2026-07-28T02:00:01Z',
+      finishedAt: '2026-07-28T02:00:00Z',
+    }],
+    ['succeeded without a migration version', withoutVerificationField('restoredMigrationVersion')],
+    ['succeeded with empty row counts', {
+      ...verification,
+      databaseRowCounts: {},
+    }],
+    ['succeeded with missing objects', {
+      ...verification,
+      missingObjectCount: 1,
+    }],
+    ['succeeded without session revocation evidence', {
+      ...verification,
+      sessionRevocationVerified: false,
+    }],
+    ['succeeded without an RTO', withoutVerificationField('rtoSeconds')],
+  ])('rejects migration-inconsistent restore evidence: %s', async (_name, restoreVerification) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(
+      detailWithVerification(restoreVerification),
+    )))
+    await expect(readBackup(run.id)).rejects.toMatchObject({
+      code: 'invalid_response',
+    })
   })
 
   it.each([

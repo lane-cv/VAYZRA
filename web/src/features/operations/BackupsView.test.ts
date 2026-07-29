@@ -67,6 +67,52 @@ const detail: BackupRunDetail = {
   }],
 }
 const wrappers: Array<{ unmount(): void }> = []
+const dialogPrototype = HTMLDialogElement.prototype
+const originalShowModal = Object.getOwnPropertyDescriptor(dialogPrototype, 'showModal')
+const originalClose = Object.getOwnPropertyDescriptor(dialogPrototype, 'close')
+let showModal: ReturnType<typeof vi.fn>
+let closeDialog: ReturnType<typeof vi.fn>
+
+function installNativeDialogStub() {
+  showModal = vi.fn(function (this: HTMLDialogElement) {
+    this.setAttribute('open', '')
+  })
+  closeDialog = vi.fn(function (this: HTMLDialogElement) {
+    this.removeAttribute('open')
+    this.dispatchEvent(new Event('close'))
+  })
+  Object.defineProperty(dialogPrototype, 'showModal', {
+    configurable: true,
+    writable: true,
+    value: showModal,
+  })
+  Object.defineProperty(dialogPrototype, 'close', {
+    configurable: true,
+    writable: true,
+    value: closeDialog,
+  })
+}
+
+function installFallbackDialogStub() {
+  Object.defineProperty(dialogPrototype, 'showModal', {
+    configurable: true,
+    writable: true,
+    value: undefined,
+  })
+  Object.defineProperty(dialogPrototype, 'close', {
+    configurable: true,
+    writable: true,
+    value: undefined,
+  })
+}
+
+function restoreDialogMethod(
+  name: 'showModal' | 'close',
+  descriptor: PropertyDescriptor | undefined,
+) {
+  if (descriptor) Object.defineProperty(dialogPrototype, name, descriptor)
+  else delete dialogPrototype[name]
+}
 
 function mountBackups(role: 'admin' | 'student' = 'admin') {
   const pinia = createPinia()
@@ -93,6 +139,7 @@ function mountBackups(role: 'admin' | 'student' = 'admin') {
 describe('BackupsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    installNativeDialogStub()
     vi.mocked(listBackups).mockResolvedValue({
       items: [first],
       next: { requestedAt: second.requestedAt, id: second.id },
@@ -103,6 +150,8 @@ describe('BackupsView', () => {
   })
   afterEach(() => {
     for (const wrapper of wrappers.splice(0)) wrapper.unmount()
+    restoreDialogMethod('showModal', originalShowModal)
+    restoreDialogMethod('close', originalClose)
     vi.unstubAllGlobals()
   })
 
@@ -148,17 +197,58 @@ describe('BackupsView', () => {
     await flushPromises()
     const dialog = wrapper.get('dialog[open]')
     const cancel = wrapper.get('[data-testid="queue-cancel"]')
+    expect(showModal).toHaveBeenCalledOnce()
+    expect((dialog.element as HTMLDialogElement).open).toBe(true)
     expect(document.activeElement).toBe(cancel.element)
 
-    await dialog.trigger('keydown', { key: 'Escape' })
+    await dialog.trigger('cancel')
     await flushPromises()
+    expect(closeDialog).toHaveBeenCalledOnce()
+    expect((dialog.element as HTMLDialogElement).open).toBe(false)
     expect(wrapper.find('dialog').exists()).toBe(false)
     expect(document.activeElement).toBe(opener.element)
 
     await opener.trigger('click')
     await flushPromises()
+    expect(showModal).toHaveBeenCalledTimes(2)
     await wrapper.get('[data-testid="queue-cancel"]').trigger('click')
     await flushPromises()
+    expect(closeDialog).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('dialog').exists()).toBe(false)
+    expect(document.activeElement).toBe(opener.element)
+  })
+
+  it('closes a successful native modal and focuses its completion notice', async () => {
+    const wrapper = mountBackups()
+    await flushPromises()
+    const opener = wrapper.get('[data-testid="queue-open"]')
+    await opener.trigger('click')
+    await flushPromises()
+    expect(showModal).toHaveBeenCalledOnce()
+
+    await wrapper.get('[data-testid="queue-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(closeDialog).toHaveBeenCalledOnce()
+    expect(wrapper.find('dialog').exists()).toBe(false)
+    const notice = wrapper.get('[data-testid="queue-notice"]')
+    expect(document.activeElement).toBe(notice.element)
+  })
+
+  it('keeps the explicit open-attribute fallback when native dialog APIs are absent', async () => {
+    installFallbackDialogStub()
+    const wrapper = mountBackups()
+    await flushPromises()
+    const opener = wrapper.get('[data-testid="queue-open"]')
+    await opener.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('dialog[open]')
+    expect((dialog.element as HTMLDialogElement).open).toBe(true)
+    expect(showModal).not.toHaveBeenCalled()
+
+    await wrapper.get('[data-testid="queue-cancel"]').trigger('click')
+    await flushPromises()
+    expect(closeDialog).not.toHaveBeenCalled()
     expect(wrapper.find('dialog').exists()).toBe(false)
     expect(document.activeElement).toBe(opener.element)
   })

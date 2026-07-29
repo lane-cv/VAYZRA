@@ -399,6 +399,11 @@ function validCanonicalBackupTimestamp(value: string): boolean {
   return fraction === undefined || !fraction.endsWith('0')
 }
 
+function canonicalBackupTimestampKey(value: string): string {
+  const fraction = rfc3339Nano.exec(value)?.[7] ?? ''
+  return `${value.slice(0, 19)}.${fraction.padEnd(9, '0')}`
+}
+
 function parseBackupRunWithKeys(
   value: unknown,
   allowedKeys: Set<string>,
@@ -485,12 +490,41 @@ function parseRestoreVerification(value: unknown): RestoreVerification {
   for (const field of ['startedAt', 'finishedAt'] as const) {
     if (field in source) result[field] = safeBackupTimestamp(source[field])
   }
-  for (const field of ['restoredMigrationVersion', 'rtoSeconds'] as const) {
-    if (field in source) result[field] = safeInteger(source[field])
+  if ('restoredMigrationVersion' in source) {
+    result.restoredMigrationVersion = safeInteger(source.restoredMigrationVersion, 1)
   }
+  if ('rtoSeconds' in source) result.rtoSeconds = safeInteger(source.rtoSeconds)
   if ('errorCategory' in source) {
     result.errorCategory = safeErrorCategory(source.errorCategory)
   }
+  const hasStarted = result.startedAt !== undefined
+  const hasFinished = result.finishedAt !== undefined
+  if (
+    (result.state === 'queued' && (hasStarted || hasFinished))
+    || (
+      (result.state === 'restoring' || result.state === 'checking')
+      && (!hasStarted || hasFinished)
+    )
+    || (
+      (result.state === 'succeeded' || result.state === 'failed')
+      && (
+        !hasStarted
+        || !hasFinished
+        || canonicalBackupTimestampKey(result.finishedAt!)
+          < canonicalBackupTimestampKey(result.startedAt!)
+      )
+    )
+    || (
+      result.state === 'succeeded'
+      && (
+        result.restoredMigrationVersion === undefined
+        || Object.keys(result.databaseRowCounts).length === 0
+        || result.missingObjectCount !== 0
+        || !result.sessionRevocationVerified
+        || result.rtoSeconds === undefined
+      )
+    )
+  ) throw invalidResponse()
   return result
 }
 
