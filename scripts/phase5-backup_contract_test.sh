@@ -305,6 +305,8 @@ grep -Eq '^[[:space:]]+ports:' <<<"$backup_block" &&
   fail "backup service must not publish ports"
 grep -Eq 'restart:[[:space:]]+(always|unless-stopped)' <<<"$backup_block" &&
   fail "backup service must be one-shot"
+grep -Eq '^[[:space:]]+init:[[:space:]]+true$' <<<"$backup_block" ||
+  fail "backup service must enable an init reaper"
 grep -Fq 'mem_limit: 768m' <<<"$backup_block" ||
   fail "backup service memory limit is missing"
 grep -Fq 'cpus: 0.4' <<<"$backup_block" ||
@@ -373,11 +375,21 @@ HAPPYLEARN_AISTOR_LICENSE_FILE="$CONTRACT_TEMP_ROOT/compose.license" \
 live_rendered="$(
   HAPPYLEARN_AISTOR_LICENSE_FILE="$CONTRACT_TEMP_ROOT/compose.license" \
     docker compose --project-name happylearn-phase5-live-012345abcdef \
+    --profile backup \
     --file "$COMPOSE" --file "$LIVE_COMPOSE" config
 )" || fail "fixed live Compose override does not render"
 if grep -Eq '^[[:space:]]+ports:' <<<"$live_rendered"; then
   fail "live Compose override retained a published host port"
 fi
+live_backup_block="$(
+  awk '
+    /^  backup:$/ { inside=1 }
+    inside && /^  [a-zA-Z0-9_-]+:$/ && $1 != "backup:" { exit }
+    inside { print }
+  ' <<<"$live_rendered"
+)"
+grep -Eq '^[[:space:]]+init:[[:space:]]+true$' <<<"$live_backup_block" ||
+  fail "rendered backup service must enable an init reaper"
 
 require_literal "$MAKEFILE" 'phase5-backup-contract:'
 require_literal "$MAKEFILE" 'bash scripts/phase5-backup_contract_test.sh'

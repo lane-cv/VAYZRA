@@ -1042,10 +1042,28 @@ func TestExecRunnerBoundsOutputClosesStdinAndCancelsProcessGroup(t *testing.T) {
 			t.Fatal(scanErr)
 		}
 		deadline := time.Now().Add(time.Second)
+	waitForStopped:
 		for {
 			killErr := syscall.Kill(pid, 0)
 			if errors.Is(killErr, syscall.ESRCH) {
 				break
+			}
+			if killErr == nil && runtime.GOOS == "linux" {
+				stat, statErr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+				if errors.Is(statErr, os.ErrNotExist) {
+					break
+				}
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				closingParenthesis := bytes.LastIndexByte(stat, ')')
+				if closingParenthesis < 0 || closingParenthesis+2 >= len(stat) {
+					t.Fatalf("malformed process stat for child %d: %q", pid, stat)
+				}
+				switch stat[closingParenthesis+2] {
+				case 'Z', 'X':
+					break waitForStopped
+				}
 			}
 			if time.Now().After(deadline) {
 				t.Fatalf("child process %d survived cancellation: %v", pid, killErr)
