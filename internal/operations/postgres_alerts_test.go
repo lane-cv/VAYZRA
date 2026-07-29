@@ -198,6 +198,182 @@ WHERE dedupe_key=$1 AND state<>'resolved'`, first.Rule.DedupeKey).
 	}
 }
 
+func TestPostgresRemoteReplicationTriStatePreservesAndResolvesHistory(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	if _, err := pool.Exec(ctx, `TRUNCATE operational_alerts CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresAlertStore(pool)
+	now := alertPostgresClock(t, pool)
+	rules, err := DefaultAlertRules(validSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remote Rule
+	for _, rule := range rules {
+		if rule.DedupeKey == "backup_remote_replication" {
+			remote = rule
+			break
+		}
+	}
+	evaluate := func(
+		at time.Time,
+		state RemoteReplicationState,
+		samples []Sample,
+	) {
+		t.Helper()
+		evaluations, err := BuildAlertEvaluations(
+			[]Rule{remote},
+			samples,
+			at,
+			state,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, evaluation := range evaluations {
+			if _, err := store.EvaluateAlert(ctx, evaluation); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for index := 0; index < 3; index++ {
+		evaluate(
+			now.Add(time.Duration(index)*time.Minute),
+			RemoteReplicationDisabled,
+			nil,
+		)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM operational_alerts
+WHERE dedupe_key LIKE 'backup_remote_replication%'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("disabled without history created alerts=%d", count)
+	}
+
+	for index := 3; index < 5; index++ {
+		at := now.Add(time.Duration(index) * time.Minute)
+		evaluate(
+			at,
+			RemoteReplicationEnabled,
+			[]Sample{alertSample(
+				SampleSourceApp,
+				SampleMetricBackupRemoteUp,
+				SampleScopeRemote,
+				0,
+				at,
+				nil,
+			)},
+		)
+	}
+	for index := 5; index < 7; index++ {
+		evaluate(
+			now.Add(time.Duration(index)*time.Minute),
+			RemoteReplicationEnabled,
+			nil,
+		)
+	}
+	beforeUnknown := remoteAlertStateSnapshot(t, ctx, pool)
+	if len(beforeUnknown) != 2 {
+		t.Fatalf("remote history=%+v", beforeUnknown)
+	}
+	for key, state := range beforeUnknown {
+		if state.state != AlertStateOpen || state.successes != 0 {
+			t.Fatalf("remote alert %q before unknown=%+v", key, state)
+		}
+	}
+
+	for index := 7; index < 10; index++ {
+		at := now.Add(time.Duration(index) * time.Minute)
+		evaluate(
+			at,
+			RemoteReplicationUnknown,
+			[]Sample{alertSample(
+				SampleSourceApp,
+				SampleMetricBackupRemoteUp,
+				SampleScopeRemote,
+				0,
+				at.Add(-DashboardSampleFreshFor-time.Nanosecond),
+				nil,
+			)},
+		)
+	}
+	afterUnknown := remoteAlertStateSnapshot(t, ctx, pool)
+	for key, before := range beforeUnknown {
+		after := afterUnknown[key]
+		if after != before {
+			t.Fatalf(
+				"unknown changed remote alert %q: before=%+v after=%+v",
+				key,
+				before,
+				after,
+			)
+		}
+	}
+
+	for index := 10; index < 13; index++ {
+		evaluate(
+			now.Add(time.Duration(index)*time.Minute),
+			RemoteReplicationDisabled,
+			nil,
+		)
+	}
+	afterDisabled := remoteAlertStateSnapshot(t, ctx, pool)
+	for key, state := range afterDisabled {
+		if state.state != AlertStateResolved || state.successes != 3 {
+			t.Fatalf("remote alert %q after disabled=%+v", key, state)
+		}
+	}
+}
+
+type remoteAlertState struct {
+	state     AlertState
+	successes int
+	version   int64
+}
+
+func remoteAlertStateSnapshot(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) map[string]remoteAlertState {
+	t.Helper()
+	rows, err := pool.Query(ctx, `
+SELECT dedupe_key,state,consecutive_successes,version
+FROM operational_alerts
+WHERE dedupe_key LIKE 'backup_remote_replication%'
+ORDER BY dedupe_key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	result := make(map[string]remoteAlertState)
+	for rows.Next() {
+		var key string
+		var state remoteAlertState
+		if err := rows.Scan(
+			&key,
+			&state.state,
+			&state.successes,
+			&state.version,
+		); err != nil {
+			t.Fatal(err)
+		}
+		result[key] = state
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 func TestPostgresAlertInsufficientSamplesDoNotAdvanceOrResolveExistingAlert(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedAlertPool(t)

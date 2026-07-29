@@ -242,7 +242,12 @@ func TestBuildAlertEvaluationsMapsEveryDefaultSeries(t *testing.T) {
 		alertSample(SampleSourceApp, SampleMetricSecurityEventsTotal, SampleScopeLoginFailure, 21, now, &window),
 		alertSample(SampleSourceApp, SampleMetricSecurityEventsTotal, SampleScopeAuthorizationDenial, 51, now, &window),
 	}
-	evaluations, err := BuildAlertEvaluations(rules, samples, now, true)
+	evaluations, err := BuildAlertEvaluations(
+		rules,
+		samples,
+		now,
+		RemoteReplicationEnabled,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,19 +304,28 @@ func TestBuildAlertEvaluationsTreatsMissingAndStaleAsUnavailable(t *testing.T) {
 	samples := []Sample{
 		alertSample(SampleSourceHost, SampleMetricFilesystemUsedPercent, SampleScopeRoot, 10, stale, nil),
 	}
-	evaluations, err := BuildAlertEvaluations(rules, samples, now, false)
+	evaluations, err := BuildAlertEvaluations(
+		rules,
+		samples,
+		now,
+		RemoteReplicationUnknown,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evaluations) != 2*(len(rules)-1) {
-		t.Fatalf("evaluations=%d want=%d", len(evaluations), 2*(len(rules)-1))
+	if len(evaluations) != 2*len(rules)-1 {
+		t.Fatalf("evaluations=%d want=%d", len(evaluations), 2*len(rules)-1)
 	}
 	for _, evaluation := range evaluations {
 		if strings.HasPrefix(
 			evaluation.Rule.DedupeKey,
 			"backup_remote_replication",
 		) {
-			t.Fatal("remote rule evaluated when replication is not configured")
+			if evaluation.Rule.DedupeKey != "backup_remote_replication" ||
+				evaluation.Available {
+				t.Fatalf("remote unknown evaluation=%+v", evaluation)
+			}
+			continue
 		}
 		if strings.HasSuffix(
 			evaluation.Rule.DedupeKey,
@@ -349,7 +363,7 @@ func TestBuildAlertEvaluationsSeparatesDependencyAvailabilityFromThresholds(t *t
 			nil,
 		)},
 		now,
-		false,
+		RemoteReplicationUnknown,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -396,11 +410,21 @@ func TestBuildAlertEvaluationsRejectsDuplicateOrMismatchedSeries(t *testing.T) {
 		now,
 		nil,
 	)
-	if _, err := BuildAlertEvaluations(rules, []Sample{sample, sample}, now, false); err == nil {
+	if _, err := BuildAlertEvaluations(
+		rules,
+		[]Sample{sample, sample},
+		now,
+		RemoteReplicationUnknown,
+	); err == nil {
 		t.Fatal("duplicate series accepted")
 	}
 	sample.Unit = SampleUnitCount
-	if _, err := BuildAlertEvaluations(rules, []Sample{sample}, now, false); err == nil {
+	if _, err := BuildAlertEvaluations(
+		rules,
+		[]Sample{sample},
+		now,
+		RemoteReplicationUnknown,
+	); err == nil {
 		t.Fatal("mismatched sample accepted")
 	}
 	window := now.Add(-15 * time.Minute)
@@ -422,8 +446,176 @@ func TestBuildAlertEvaluationsRejectsDuplicateOrMismatchedSeries(t *testing.T) {
 			&window,
 		),
 	}
-	if _, err := BuildAlertEvaluations(rules, oversizedTotal, now, false); err == nil {
+	if _, err := BuildAlertEvaluations(
+		rules,
+		oversizedTotal,
+		now,
+		RemoteReplicationUnknown,
+	); err == nil {
 		t.Fatal("inexact AI terminal total accepted")
+	}
+}
+
+func TestBuildAlertEvaluationsRemoteReplicationTriState(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	rules, err := DefaultAlertRules(validSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remote Rule
+	for _, rule := range rules {
+		if rule.DedupeKey == "backup_remote_replication" {
+			remote = rule
+			break
+		}
+	}
+	oldOutage := alertSample(
+		SampleSourceApp,
+		SampleMetricBackupRemoteUp,
+		SampleScopeRemote,
+		0,
+		now.Add(-DashboardSampleFreshFor-time.Nanosecond),
+		nil,
+	)
+	tests := []struct {
+		name            string
+		state           RemoteReplicationState
+		wantEvaluations int
+		wantAvailable   bool
+		wantValue       float64
+		wantDependency  bool
+	}{
+		{
+			name:  "unknown is neutral without dependency",
+			state: RemoteReplicationUnknown, wantEvaluations: 1,
+		},
+		{
+			name:  "disabled is explicitly healthy",
+			state: RemoteReplicationDisabled, wantEvaluations: 2,
+			wantAvailable: true, wantValue: 1, wantDependency: true,
+		},
+		{
+			name:  "enabled uses current sample truth",
+			state: RemoteReplicationEnabled, wantEvaluations: 2,
+			wantAvailable: true, wantDependency: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			samples := []Sample{oldOutage}
+			if test.state == RemoteReplicationEnabled {
+				samples[0].ObservedAt = now
+			}
+			evaluations, err := BuildAlertEvaluations(
+				[]Rule{remote},
+				samples,
+				now,
+				test.state,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(evaluations) != test.wantEvaluations {
+				t.Fatalf("evaluations=%+v", evaluations)
+			}
+			threshold := evaluations[0]
+			if threshold.Available != test.wantAvailable ||
+				threshold.Value != test.wantValue {
+				t.Fatalf("threshold=%+v", threshold)
+			}
+			if test.wantDependency {
+				dependency := evaluations[1]
+				if !dependency.Available ||
+					dependency.Value != 0 {
+					t.Fatalf("dependency=%+v", dependency)
+				}
+			}
+		})
+	}
+	if _, err := BuildAlertEvaluations(
+		[]Rule{remote},
+		nil,
+		now,
+		RemoteReplicationState(255),
+	); err == nil {
+		t.Fatal("invalid remote replication state accepted")
+	}
+}
+
+func TestBuildAlertEvaluationsAIErrorRateCountsCancelledAsNonSuccess(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	window := now.Add(-15 * time.Minute)
+	rules, err := DefaultAlertRules(validSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ai Rule
+	for _, rule := range rules {
+		if rule.DedupeKey == "ai_error_rate" {
+			ai = rule
+			break
+		}
+	}
+	for _, test := range []struct {
+		name          string
+		succeeded     float64
+		nonSuccessful float64
+		wantSamples   int
+		wantValue     float64
+		wantCondition alertCondition
+	}{
+		{
+			name:      "nineteen successes and one cancelled",
+			succeeded: 19, nonSuccessful: 1, wantSamples: 20,
+			wantValue:     5,
+			wantCondition: alertConditionHealthy,
+		},
+		{
+			name:      "cancelled participates in the minimum",
+			succeeded: 18, nonSuccessful: 1, wantSamples: 19,
+			wantValue:     100.0 / 19,
+			wantCondition: alertConditionNeutral,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evaluations, err := BuildAlertEvaluations(
+				[]Rule{ai},
+				[]Sample{
+					alertSample(
+						SampleSourceApp,
+						SampleMetricAIRequestsTotal,
+						SampleScopeSucceeded,
+						test.succeeded,
+						now,
+						&window,
+					),
+					// Failed scope intentionally aggregates failed and cancelled
+					// terminal runs so it matches dashboard success-rate semantics.
+					alertSample(
+						SampleSourceApp,
+						SampleMetricAIRequestsTotal,
+						SampleScopeFailed,
+						test.nonSuccessful,
+						now,
+						&window,
+					),
+				},
+				now,
+				RemoteReplicationUnknown,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evaluation := evaluations[0]
+			if evaluation.SampleCount != test.wantSamples ||
+				math.Abs(evaluation.Value-test.wantValue) > 1e-9 {
+				t.Fatalf("evaluation=%+v", evaluation)
+			}
+			condition, err := classifyAlertEvaluation(evaluation)
+			if err != nil || condition != test.wantCondition {
+				t.Fatalf("condition=%q err=%v", condition, err)
+			}
+		})
 	}
 }
 
@@ -504,7 +696,12 @@ func TestBuildAlertEvaluationsRequiresMatchingExactFifteenMinuteWindows(t *testi
 	}
 	for name, samples := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BuildAlertEvaluations(rules, samples, now, false); err == nil {
+			if _, err := BuildAlertEvaluations(
+				rules,
+				samples,
+				now,
+				RemoteReplicationUnknown,
+			); err == nil {
 				t.Fatal("non-exact alert window accepted")
 			}
 		})

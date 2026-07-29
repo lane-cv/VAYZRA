@@ -26,6 +26,14 @@ const (
 	DirectionBelow Direction = "below"
 )
 
+type RemoteReplicationState uint8
+
+const (
+	RemoteReplicationUnknown RemoteReplicationState = iota
+	RemoteReplicationDisabled
+	RemoteReplicationEnabled
+)
+
 type Rule struct {
 	DedupeKey      string
 	Category       string
@@ -236,9 +244,11 @@ func BuildAlertEvaluations(
 	rules []Rule,
 	samples []Sample,
 	now time.Time,
-	remoteReplicationConfigured bool,
+	remoteReplicationState RemoteReplicationState,
 ) ([]Evaluation, error) {
-	if !validSampleTime(now) || len(rules) == 0 {
+	if !validSampleTime(now) ||
+		len(rules) == 0 ||
+		!validRemoteReplicationState(remoteReplicationState) {
 		return nil, ErrInvalid
 	}
 	now = now.UTC()
@@ -262,9 +272,27 @@ func BuildAlertEvaluations(
 		if err := validateAlertRule(rule); err != nil {
 			return nil, err
 		}
-		if rule.DedupeKey == "backup_remote_replication" &&
-			!remoteReplicationConfigured {
-			continue
+		if rule.DedupeKey == "backup_remote_replication" {
+			switch remoteReplicationState {
+			case RemoteReplicationUnknown:
+				evaluations = append(evaluations, Evaluation{
+					Rule: rule, ObservedAt: now,
+					Available: false, SampleCount: 0,
+				})
+				continue
+			case RemoteReplicationDisabled:
+				evaluation := Evaluation{
+					Rule: rule, Value: 1, ObservedAt: now,
+					Available: true, SampleCount: 1,
+				}
+				evaluations = append(evaluations, evaluation)
+				dependency, err := alertDependencyEvaluation(evaluation, now)
+				if err != nil {
+					return nil, err
+				}
+				evaluations = append(evaluations, dependency)
+				continue
+			}
 		}
 		evaluation, err := alertEvaluationForRule(rule, indexed, now)
 		if err != nil {
@@ -278,6 +306,17 @@ func BuildAlertEvaluations(
 		evaluations = append(evaluations, dependency)
 	}
 	return evaluations, nil
+}
+
+func validRemoteReplicationState(state RemoteReplicationState) bool {
+	switch state {
+	case RemoteReplicationUnknown,
+		RemoteReplicationDisabled,
+		RemoteReplicationEnabled:
+		return true
+	default:
+		return false
+	}
 }
 
 func alertDependencyEvaluation(

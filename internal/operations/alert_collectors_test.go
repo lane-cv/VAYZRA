@@ -59,6 +59,7 @@ func TestPostgresActivityAlertCollectorUsesBoundedExactAggregates(t *testing.T) 
 		t.Fatalf("collector query deadline=%v", db.deadline)
 	}
 	for _, fragment := range []string{
+		"status IN ('failed','cancelled')",
 		"completed_at >= $2", "completed_at <= $1",
 		"updated_at >= $2", "updated_at <= $1",
 		"occurred_at >= $2", "occurred_at <= $1",
@@ -70,6 +71,185 @@ func TestPostgresActivityAlertCollectorUsesBoundedExactAggregates(t *testing.T) 
 	}
 	if len(db.args) != 2 || db.args[0] != now || db.args[1] != windowStart {
 		t.Fatalf("args=%v", db.args)
+	}
+}
+
+func TestPostgresActivityAlertCollectorCountsCancelledAtWindowBoundaries(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	if _, err := pool.Exec(ctx, `TRUNCATE users CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	now := alertPostgresClock(t, pool)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	seedDashboardPostgresFixture(t, ctx, tx, now)
+	insertDashboardFutureAIRun(t, ctx, tx, now)
+	if _, err := tx.Exec(
+		ctx,
+		`SET LOCAL session_replication_role=replica`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE ai_runs
+SET status='cancelled',
+    completed_at=$1::timestamptz-interval '15 minutes'
+WHERE id='45000000-0000-4000-8000-000000000002'`,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE ai_runs
+SET status='cancelled'
+WHERE id='45000000-0000-4000-8000-000000000006'`); err != nil {
+		t.Fatal(err)
+	}
+	collector := newPostgresActivityAlertCollectorDB(
+		dashboardPGXTxDB{tx: tx},
+	)
+	beforeEnd, err := collector.Collect(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value := alertCollectionSeriesValue(
+		beforeEnd,
+		SampleScopeFailed,
+	); value != 1 {
+		t.Fatalf("cancelled at start plus future=%v want=1", value)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE ai_runs
+SET completed_at=$1,updated_at=$1
+WHERE id='45000000-0000-4000-8000-000000000006'`,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	atBothBoundaries, err := collector.Collect(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value := alertCollectionSeriesValue(
+		atBothBoundaries,
+		SampleScopeFailed,
+	); value != 2 {
+		t.Fatalf("cancelled at both boundaries=%v want=2", value)
+	}
+}
+
+func TestPostgresActivityAlertCollectorQueryUsesPartialIndexes(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	now := alertPostgresClock(t, pool)
+	if _, err := tx.Exec(
+		ctx,
+		`SET LOCAL session_replication_role=replica`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO ai_runs(
+  id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,
+  status,provider_id,provider_key_version,provider_base_url,protocol_mode,
+  model_id,upstream_model_id,modality,context_window_tokens,
+  max_output_tokens,image_quota_tokens,
+  input_price_micro_usd_per_million_tokens,
+  output_price_micro_usd_per_million_tokens,
+  prompt_id,prompt_subject,prompt_version,prompt_sha256,
+  connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,
+  total_timeout_ms,reserved_request_count,reserved_token_count,
+  quota_day_key,quota_month_key,estimator_version,usage_source,error_code,
+  created_at,updated_at,started_at,completed_at
+)
+SELECT
+  gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),
+  1,'alert-main-plan-fixture-'||value,
+  CASE value%3
+    WHEN 0 THEN 'succeeded'
+    WHEN 1 THEN 'failed'
+    ELSE 'cancelled'
+  END,
+  gen_random_uuid(),1,'https://alert-plan.invalid/v1','chat_completions',
+  gen_random_uuid(),'alert-plan-model','text',8192,1024,1024,0,0,
+  gen_random_uuid(),'math',1,repeat('a',64),
+  1000,30000,30000,120000,1,1024,'2026-07-30','2026-07',1,
+  'unknown',
+  CASE WHEN value%3=0 THEN NULL ELSE 'alert_plan_error' END,
+  $1::timestamptz-interval '1 hour',
+  $1::timestamptz-interval '1 second',
+  $1::timestamptz-interval '30 minutes',
+  $1::timestamptz-(value||' seconds')::interval
+FROM generate_series(1,12000) AS value`,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO login_events(username,success,reason,occurred_at)
+SELECT
+  'alert-main-plan-'||value,
+  value%20=0,
+  CASE WHEN value%20=0 THEN 'authenticated' ELSE 'invalid_credentials' END,
+  $1::timestamptz-(value||' seconds')::interval
+FROM generate_series(1,12000) AS value`,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"ANALYZE ai_runs",
+		"ANALYZE login_events",
+		"SET LOCAL enable_seqscan=off",
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := tx.Query(
+		ctx,
+		"EXPLAIN (COSTS OFF) "+postgresActivityAlertCollectorQuery,
+		now,
+		now.Add(-15*time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var planLines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		planLines = append(planLines, line)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(planLines, "\n")
+	for _, index := range []string{
+		"ai_runs_alert_terminal_idx",
+		"login_events_alert_failed_idx",
+	} {
+		if !strings.Contains(plan, index) {
+			t.Fatalf(
+				"activity collector plan missing %s:\n%s",
+				index,
+				plan,
+			)
+		}
 	}
 }
 
@@ -386,8 +566,12 @@ FROM generate_series(1,20) AS value`); err != nil {
 		!loginDependency.Available || loginDependency.Value != 0 {
 		t.Fatalf("login=%+v dependency=%+v", login, loginDependency)
 	}
-	if _, exists := byKey["backup_remote_replication"]; exists {
-		t.Fatal("remote threshold evaluated without current configuration truth")
+	remote, exists := byKey["backup_remote_replication"]
+	if !exists || remote.Available {
+		t.Fatalf("remote unknown threshold=%+v exists=%t", remote, exists)
+	}
+	if _, exists := byKey["backup_remote_replication_dependency_unavailable"]; exists {
+		t.Fatal("remote dependency evaluated without current configuration truth")
 	}
 	var persisted int
 	if err := pool.QueryRow(ctx, `
@@ -467,6 +651,19 @@ func alertCollectionHasMetric(
 		}
 	}
 	return false
+}
+
+func alertCollectionSeriesValue(
+	collection AlertCollection,
+	scope SampleScope,
+) float64 {
+	for _, sample := range collection.Samples {
+		if sample.Metric == SampleMetricAIRequestsTotal &&
+			sample.Scope == scope {
+			return sample.Value
+		}
+	}
+	return -1
 }
 
 type alertCollectorDBStub struct {

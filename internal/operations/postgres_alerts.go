@@ -572,8 +572,7 @@ func (store *PostgresAlertStore) LoadAlertEvaluations(
 	now = now.UTC()
 	collected := make([]Sample, 0, 8)
 	collectorErrors := make([]error, 0)
-	remoteConfigured := false
-	remoteConfigurationKnown := false
+	remoteReplicationState := RemoteReplicationUnknown
 	for _, collector := range store.collectors {
 		if collector == nil {
 			collectorErrors = append(
@@ -595,12 +594,15 @@ func (store *PostgresAlertStore) LoadAlertEvaluations(
 		}
 		collected = append(collected, collection.Samples...)
 		if collection.RemoteReplicationConfigured != nil {
-			if remoteConfigurationKnown &&
-				remoteConfigured != *collection.RemoteReplicationConfigured {
+			collectedState := RemoteReplicationDisabled
+			if *collection.RemoteReplicationConfigured {
+				collectedState = RemoteReplicationEnabled
+			}
+			if remoteReplicationState != RemoteReplicationUnknown &&
+				remoteReplicationState != collectedState {
 				return nil, ErrInvalid
 			}
-			remoteConfigured = *collection.RemoteReplicationConfigured
-			remoteConfigurationKnown = true
+			remoteReplicationState = collectedState
 		}
 	}
 	indexed := make(map[sampleSeries]struct{}, len(collected))
@@ -631,7 +633,7 @@ func (store *PostgresAlertStore) LoadAlertEvaluations(
 		rules,
 		samples,
 		now,
-		remoteConfigurationKnown && remoteConfigured,
+		remoteReplicationState,
 	)
 	if err != nil {
 		return nil, err

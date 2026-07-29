@@ -205,19 +205,24 @@ SET disk_warning_percent=80,disk_critical_percent=95,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evaluations) != 16 {
+	if len(evaluations) != 17 {
 		t.Fatalf("evaluations=%d", len(evaluations))
 	}
-	var root Evaluation
+	var root, remote Evaluation
 	for _, evaluation := range evaluations {
 		switch evaluation.Rule.DedupeKey {
 		case "filesystem_root_usage":
 			root = evaluation
+		case "backup_remote_replication":
+			remote = evaluation
 		}
 	}
 	if root.Rule.Warning != 80 || root.Rule.Critical != 95 ||
 		!root.Available || root.Value != 80 {
 		t.Fatalf("root=%+v", root)
+	}
+	if remote.Rule.DedupeKey == "" || remote.Available {
+		t.Fatalf("remote unknown threshold=%+v", remote)
 	}
 }
 
@@ -249,14 +254,15 @@ TRUNCATE login_events`); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Items) == 0 {
-		t.Fatal("missing explicit dependency-unavailable alerts")
+	if len(page.Items) != 3 {
+		t.Fatalf("dependency alerts=%d want=3: %+v", len(page.Items), page.Items)
 	}
 	for _, alert := range page.Items {
 		if !strings.HasSuffix(
 			alert.DedupeKey,
 			"_dependency_unavailable",
 		) ||
+			alert.DedupeKey == "backup_remote_replication_dependency_unavailable" ||
 			!strings.Contains(alert.Summary, "unavailable") ||
 			alert.CurrentValue != 1 ||
 			alert.ThresholdValue != 1 {

@@ -9,7 +9,67 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const alertCollectorQueryTimeout = 2 * time.Second
+const (
+	alertCollectorQueryTimeout = 2 * time.Second
+
+	postgresActivityAlertCollectorQuery = `
+SELECT
+  (
+    SELECT count(*)::bigint
+    FROM ai_runs
+    WHERE status='succeeded'
+      AND completed_at >= $2
+      AND completed_at <= $1
+  ),
+  (
+    SELECT count(*)::bigint
+    FROM ai_runs
+    WHERE status IN ('failed','cancelled')
+      AND completed_at >= $2
+      AND completed_at <= $1
+  ),
+  (
+    SELECT count(*)::bigint
+    FROM file_processing_jobs
+    WHERE attempts<4
+      AND available_at <= $1
+      AND created_at <= $1
+      AND (
+        state='queued'
+        OR (state='running' AND lease_until < $1)
+      )
+  ),
+  (
+    SELECT count(*)::bigint
+    FROM file_processing_jobs
+    WHERE (
+      state='failed'
+      AND updated_at >= $2
+      AND updated_at <= $1
+    ) OR (
+      state='running'
+      AND attempts>=4
+      AND lease_until >= $2
+      AND lease_until < $1
+      AND created_at <= $1
+    )
+  ),
+  (
+    SELECT count(*)::bigint
+    FROM login_events
+    WHERE success=false
+      AND occurred_at >= $2
+      AND occurred_at <= $1
+  ),
+  (
+    SELECT count(*)::bigint
+    FROM audit_logs
+    WHERE action LIKE 'authorization.%'
+      AND metadata->>'outcome'='denied'
+      AND occurred_at >= $2
+      AND occurred_at <= $1
+  )`
+)
 
 type AlertCollection struct {
 	Samples                     []Sample
@@ -67,72 +127,18 @@ func (collector *postgresActivityAlertCollector) Collect(
 	queryCtx, cancel := context.WithTimeout(ctx, alertCollectorQueryTimeout)
 	defer cancel()
 	var (
-		aiSucceeded, aiFailed              int64
+		aiSucceeded, aiNonSuccessful       int64
 		processingQueued, processingFailed int64
 		loginFailed, authorizationDenied   int64
 	)
-	err := collector.db.QueryRow(queryCtx, `
-SELECT
-  (
-    SELECT count(*)::bigint
-    FROM ai_runs
-    WHERE status='succeeded'
-      AND completed_at >= $2
-      AND completed_at <= $1
-  ),
-  (
-    SELECT count(*)::bigint
-    FROM ai_runs
-    WHERE status='failed'
-      AND completed_at >= $2
-      AND completed_at <= $1
-  ),
-  (
-    SELECT count(*)::bigint
-    FROM file_processing_jobs
-    WHERE attempts<4
-      AND available_at <= $1
-      AND created_at <= $1
-      AND (
-        state='queued'
-        OR (state='running' AND lease_until < $1)
-      )
-  ),
-  (
-    SELECT count(*)::bigint
-    FROM file_processing_jobs
-    WHERE (
-      state='failed'
-      AND updated_at >= $2
-      AND updated_at <= $1
-    ) OR (
-      state='running'
-      AND attempts>=4
-      AND lease_until >= $2
-      AND lease_until < $1
-      AND created_at <= $1
-    )
-  ),
-  (
-    SELECT count(*)::bigint
-    FROM login_events
-    WHERE success=false
-      AND occurred_at >= $2
-      AND occurred_at <= $1
-  ),
-  (
-    SELECT count(*)::bigint
-    FROM audit_logs
-    WHERE action LIKE 'authorization.%'
-      AND metadata->>'outcome'='denied'
-      AND occurred_at >= $2
-      AND occurred_at <= $1
-  )`,
+	err := collector.db.QueryRow(
+		queryCtx,
+		postgresActivityAlertCollectorQuery,
 		now,
 		windowStart,
 	).Scan(
 		&aiSucceeded,
-		&aiFailed,
+		&aiNonSuccessful,
 		&processingQueued,
 		&processingFailed,
 		&loginFailed,
@@ -143,7 +149,7 @@ SELECT
 	}
 	for _, value := range []int64{
 		aiSucceeded,
-		aiFailed,
+		aiNonSuccessful,
 		processingQueued,
 		processingFailed,
 		loginFailed,
@@ -161,8 +167,10 @@ SELECT
 			Unit: SampleUnitCount, ObservedAt: now, WindowStartedAt: &window,
 		},
 		{
+			// The failed scope is the non-success terminal aggregate
+			// (failed + cancelled), matching dashboard success-rate semantics.
 			Source: SampleSourceApp, Metric: SampleMetricAIRequestsTotal,
-			Scope: SampleScopeFailed, Value: float64(aiFailed),
+			Scope: SampleScopeFailed, Value: float64(aiNonSuccessful),
 			Unit: SampleUnitCount, ObservedAt: now, WindowStartedAt: &window,
 		},
 		{
