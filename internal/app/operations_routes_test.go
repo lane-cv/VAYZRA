@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/operations"
@@ -37,6 +38,17 @@ func (*appAdminOperations) ListAudit(context.Context, operations.Principal, audi
 	return audit.AuditPage{Items: []audit.Record{}}, nil
 }
 
+func (*appAdminOperations) GetDashboard(context.Context, operations.Principal) (operations.Dashboard, error) {
+	now := time.Date(2026, 7, 29, 7, 0, 0, 0, time.UTC)
+	return operations.Dashboard{
+		ObservedAt:       now,
+		Services:         []operations.ServiceHealth{},
+		Queues:           []operations.QueueSummary{},
+		RecentAuditState: operations.DataStateEmpty,
+		RecentAudit:      []operations.AuditSummary{},
+	}, nil
+}
+
 func TestApplicationMountsAdminOperationsWithOriginAndCSRF(t *testing.T) {
 	service := &appAdminOperations{}
 	handler := New(Dependencies{
@@ -44,6 +56,7 @@ func TestApplicationMountsAdminOperationsWithOriginAndCSRF(t *testing.T) {
 		PublicOrigin: "https://learn.example.com",
 	})
 	for _, path := range []string{
+		"/api/v1/admin/operations/dashboard",
 		"/api/v1/admin/operations/settings",
 		"/api/v1/admin/operations/audit",
 	} {

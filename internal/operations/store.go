@@ -61,10 +61,15 @@ type ServiceStore interface {
 	SettingsRejectionAuditor
 }
 
+type DashboardReader interface {
+	Assemble(context.Context) (Dashboard, error)
+}
+
 type HTTPService interface {
 	GetSettings(context.Context, Principal) (Settings, error)
 	UpdateSettings(context.Context, Principal, Settings) (Settings, error)
 	ListAudit(context.Context, Principal, audit.AuditFilter) (audit.AuditPage, error)
+	GetDashboard(context.Context, Principal) (Dashboard, error)
 }
 
 type ModeReader interface {

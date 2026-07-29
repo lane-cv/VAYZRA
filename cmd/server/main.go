@@ -654,11 +654,44 @@ func newProductionAdminOperationsService(
 	pool *pgxpool.Pool,
 	runtime operationsRuntime,
 ) operations.HTTPService {
+	if pool == nil || runtime == nil {
+		return nil
+	}
 	store, ok := runtime.(operations.ServiceStore)
 	if !ok {
 		return nil
 	}
-	return operations.NewService(store, audit.NewPostgresWriter(pool))
+	dashboardStore := operations.NewPostgresDashboardReader(pool)
+	sampleStore, err := operations.NewPostgresSampleDashboardReader(
+		pool,
+		operations.DashboardSampleFreshFor,
+	)
+	if err != nil {
+		return nil
+	}
+	dashboard, err := operations.NewDashboardAssembler(
+		time.Now,
+		operations.DashboardSampleFreshFor,
+		operations.DashboardDependencies{
+			Students: dashboardStore, Questions: dashboardStore,
+			AI: dashboardStore, Storage: sampleStore,
+			Services: sampleStore, Queues: dashboardStore,
+			Backup: dashboardStore, Alerts: dashboardStore,
+			Audit: dashboardStore,
+		},
+	)
+	if err != nil {
+		return nil
+	}
+	service, err := operations.NewServiceWithDashboard(
+		store,
+		audit.NewPostgresWriter(pool),
+		dashboard,
+	)
+	if err != nil {
+		return nil
+	}
+	return service
 }
 
 func newProductionAdminBackupService(pool *pgxpool.Pool) backup.HTTPService {

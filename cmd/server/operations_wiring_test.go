@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,7 +20,9 @@ import (
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
+	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/redisx"
+	"happylearn.local/app/tests/integration"
 )
 
 type serverOperationsRuntime struct {
@@ -80,6 +83,19 @@ func (*serverAdminOperationsService) UpdateSettings(_ context.Context, _ operati
 
 func (*serverAdminOperationsService) ListAudit(context.Context, operations.Principal, audit.AuditFilter) (audit.AuditPage, error) {
 	return audit.AuditPage{Items: []audit.Record{}}, nil
+}
+
+func (*serverAdminOperationsService) GetDashboard(
+	context.Context,
+	operations.Principal,
+) (operations.Dashboard, error) {
+	return operations.Dashboard{
+		ObservedAt:       time.Date(2026, 7, 29, 7, 0, 0, 0, time.UTC),
+		Services:         []operations.ServiceHealth{},
+		Queues:           []operations.QueueSummary{},
+		RecentAuditState: operations.DataStateEmpty,
+		RecentAudit:      []operations.AuditSummary{},
+	}, nil
 }
 
 func (g *serverOperationsRuntime) AcquireShared(context.Context) (func(), error) {
@@ -148,6 +164,53 @@ func TestProductionApplicationWiresAdminOperationsFromSharedRuntime(t *testing.T
 	closeResources()
 	if got := strings.Join(events, ","); got != "operations_close,pool_close" {
 		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	runtime := operations.NewPostgresStore(pool)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := runtime.Close(closeCtx); err != nil {
+			t.Errorf("close operations runtime: %v", err)
+		}
+	})
+	service := newProductionAdminOperationsService(pool, runtime)
+	if service == nil {
+		t.Fatal("production operations service is nil")
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	dashboard, err := service.GetDashboard(readCtx, operations.Principal{
+		User: auth.User{
+			ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive,
+		},
+		RequestID: "server-dashboard-wiring",
+		IP:        net.ParseIP("192.0.2.90"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.ObservedAt.IsZero() ||
+		len(dashboard.Services) != len(operations.DashboardServiceOrder()) ||
+		len(dashboard.Queues) != len(operations.DashboardQueueOrder()) {
+		t.Fatalf("dashboard=%+v", dashboard)
+	}
+
+	nilPoolRuntime := operations.NewPostgresStore(nil)
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		_ = nilPoolRuntime.Close(closeCtx)
+	})
+	if got := newProductionAdminOperationsService(nil, nilPoolRuntime); got != nil {
+		t.Fatalf("nil-pool production service=%T want nil", got)
 	}
 }
 

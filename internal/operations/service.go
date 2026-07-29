@@ -14,6 +14,7 @@ import (
 type service struct {
 	store       ServiceStore
 	auditReader audit.FilteredReader
+	dashboard   DashboardReader
 }
 
 func NewService(store ServiceStore, readers ...audit.FilteredReader) HTTPService {
@@ -22,6 +23,21 @@ func NewService(store ServiceStore, readers ...audit.FilteredReader) HTTPService
 		reader = readers[0]
 	}
 	return &service{store: store, auditReader: reader}
+}
+
+func NewServiceWithDashboard(
+	store ServiceStore,
+	auditReader audit.FilteredReader,
+	dashboard DashboardReader,
+) (HTTPService, error) {
+	if store == nil || auditReader == nil || dashboard == nil {
+		return nil, ErrInvalid
+	}
+	return &service{
+		store:       store,
+		auditReader: auditReader,
+		dashboard:   dashboard,
+	}, nil
 }
 
 func (s *service) GetSettings(ctx context.Context, principal Principal) (Settings, error) {
@@ -56,6 +72,19 @@ func (s *service) ListAudit(ctx context.Context, principal Principal, filter aud
 		return audit.AuditPage{}, errors.New("operations audit reader unavailable")
 	}
 	return s.auditReader.ListFiltered(ctx, filter)
+}
+
+func (s *service) GetDashboard(
+	ctx context.Context,
+	principal Principal,
+) (Dashboard, error) {
+	if err := authorizeSettings(principal); err != nil {
+		return Dashboard{}, err
+	}
+	if s.dashboard == nil {
+		return Dashboard{}, errDashboardDependencyUnavailable
+	}
+	return s.dashboard.Assemble(ctx)
 }
 
 func highRiskSettingsReason(settings Settings) string {

@@ -42,6 +42,7 @@ func (h *AdminHandler) Routes() http.Handler {
 	router.Get("/settings", h.getSettings)
 	router.Put("/settings", h.updateSettings)
 	router.Get("/audit", h.listAudit)
+	router.Get("/dashboard", h.dashboard)
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
 	})
@@ -49,6 +50,25 @@ func (h *AdminHandler) Routes() http.Handler {
 		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不被允许")
 	})
 	return router
+}
+
+func (h *AdminHandler) dashboard(w http.ResponseWriter, r *http.Request) {
+	if !noQuery(r) {
+		operationsInvalid(w, r, "invalid_request")
+		return
+	}
+	principal, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	dashboard, err := h.service.GetDashboard(r.Context(), principal)
+	if err != nil {
+		operationsError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data Dashboard `json:"data"`
+	}{Data: dashboard})
 }
 
 func (h *AdminHandler) getSettings(w http.ResponseWriter, r *http.Request) {

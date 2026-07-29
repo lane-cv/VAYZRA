@@ -17,14 +17,20 @@ import (
 )
 
 type operationsHTTPStub struct {
-	settings Settings
-	page     audit.AuditPage
-	filter   audit.AuditFilter
-	getErr   error
-	putErr   error
-	auditErr error
-	puts     int
-	lastPut  Settings
+	settings     Settings
+	dashboard    Dashboard
+	page         audit.AuditPage
+	filter       audit.AuditFilter
+	getErr       error
+	putErr       error
+	auditErr     error
+	dashboardErr error
+	puts         int
+	lastPut      Settings
+}
+
+func (s *operationsHTTPStub) GetDashboard(context.Context, Principal) (Dashboard, error) {
+	return cloneDashboard(s.dashboard), s.dashboardErr
 }
 
 type operationsAuditReader struct {
