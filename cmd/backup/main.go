@@ -60,11 +60,12 @@ func main() {
 	defer stop()
 	ctx, cancel := context.WithTimeout(signalContext, 45*time.Minute)
 	defer cancel()
-	actions, closeActions, err := newProductionActions(ctx, os.Getenv)
-	if err == nil {
-		defer closeActions()
-		err = runCommand(ctx, os.Args[1:], actions)
-	}
+	err := runProgram(
+		ctx,
+		os.Args[1:],
+		os.Getenv,
+		productionProgramFactories(),
+	)
 	if err != nil {
 		log.Print("backup_error")
 		os.Exit(1)
