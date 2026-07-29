@@ -371,6 +371,33 @@ wait_for_file() {
   [[ -f "$path" ]]
 }
 
+log_count() {
+  local path="$1"
+  local pattern="$2"
+  local count
+  count="$(grep -Fc "$pattern" "$path" 2>/dev/null || true)"
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$count"
+}
+
+wait_for_log_count_greater() {
+  local path="$1"
+  local pattern="$2"
+  local baseline="$3"
+  local attempts=0
+  local count
+  [[ "$baseline" =~ ^[0-9]+$ ]] || return 1
+  while [[ "$attempts" -lt 500 ]]; do
+    count="$(log_count "$path" "$pattern")" || return 1
+    if [[ "$count" -gt "$baseline" ]]; then
+      return 0
+    fi
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 make_fixture() {
   local fixture
   fixture="$(mktemp -d "$CONTRACT_TEMP_ROOT/fixture.XXXXXX")"
@@ -539,6 +566,17 @@ if [[ "$*" == *postgres*psql* ]]; then
         printf '%s\n' 'changed'
         ;;
       *PHASE5_QUERY_LEASE_RENEW*)
+        if [[ -n "${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}" &&
+          -f "$PHASE5_FAKE_RENEW_OWNER_PID_FILE" ]]; then
+          owner_pid="$(<"$PHASE5_FAKE_RENEW_OWNER_PID_FILE")"
+          [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || exit 79
+          if ! kill -0 "$owner_pid" 2>/dev/null; then
+            [[ -n "${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}" ]] || exit 79
+            printf '%s\n' orphan_renew \
+              >"$PHASE5_FAKE_ORPHAN_RENEW_MARKER"
+            exit 79
+          fi
+        fi
         printf '%s\n' 'SQL PHASE5_QUERY_LEASE_RENEW' >>"$PHASE5_FAKE_DOCKER_LOG"
         printf '%s\n' 'renewed'
         ;;
@@ -584,6 +622,18 @@ if [[ "${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}" == true &&
 fi
 FAKE_DOCKER
   chmod 0700 "$fixture/bin/docker"
+  cat >"$fixture/bin/ps" <<'FAKE_PS'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'lstart=' &&
+  "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
+  kill -0 "$4" 2>/dev/null || exit 1
+  printf 'phase5-contract-process-%s\n' "$4"
+  exit 0
+fi
+exec /bin/ps "$@"
+FAKE_PS
+  chmod 0700 "$fixture/bin/ps"
   printf '%s\n' "$fixture"
 }
 
@@ -674,7 +724,7 @@ run_fixture() {
   local remote_result="${3:-success}"
   local run_response="${4:-queued|scheduled|11111111-1111-4111-8111-111111111111}"
   PATH="$fixture/bin:$PATH" \
-  PHASE5_FAKE_DOCKER_LOG="$fixture/docker.log" \
+  PHASE5_FAKE_DOCKER_LOG="${PHASE5_FAKE_DOCKER_LOG:-$fixture/docker.log}" \
   PHASE5_FAKE_CONTAINER_STATE="$fixture/sync-container.state" \
   PHASE5_FAKE_SYNC_TIMEOUT="${PHASE5_FAKE_SYNC_TIMEOUT:-}" \
   PHASE5_FAKE_DEGRADED_RUNS="${PHASE5_FAKE_DEGRADED_RUNS:-}" \
@@ -690,6 +740,8 @@ run_fixture() {
   PHASE5_FAKE_DELAY_RELEASE_FILE="${PHASE5_FAKE_DELAY_RELEASE_FILE:-}" \
   PHASE5_FAKE_BLOCK_LOCK_SECONDS="${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}" \
   PHASE5_FAKE_FAIL_BACKUP_FAIL="${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}" \
+  PHASE5_FAKE_RENEW_OWNER_PID_FILE="${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}" \
+  PHASE5_FAKE_ORPHAN_RENEW_MARKER="${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}" \
   PHASE5_FAKE_RUN_RESPONSE="$run_response" \
   HAPPYLEARN_AISTOR_LICENSE_FILE="$fixture/minio.license" \
   HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$fixture/secrets" \
@@ -1214,6 +1266,94 @@ fi
   fail "recovered run left its host lock"
 [[ ! -e "$stale_lock_owner" ]] ||
   fail "reclaimed stale owner directory remained"
+
+post_heartbeat_fixture="$(make_fixture)"
+post_heartbeat_release="$post_heartbeat_fixture/post-heartbeat.release"
+post_heartbeat_owner_pid_file="$post_heartbeat_fixture/post-heartbeat.owner.pid"
+post_heartbeat_orphan_renew="$post_heartbeat_fixture/orphan-renew.detected"
+post_heartbeat_second_log="$post_heartbeat_fixture/second-run.log"
+: >"$post_heartbeat_second_log"
+PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
+  PHASE5_FAKE_DELAY_RELEASE_FILE="$post_heartbeat_release" \
+  PHASE5_FAKE_RENEW_OWNER_PID_FILE="$post_heartbeat_owner_pid_file" \
+  PHASE5_FAKE_ORPHAN_RENEW_MARKER="$post_heartbeat_orphan_renew" \
+  HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
+  run_fixture "$post_heartbeat_fixture" >/dev/null 2>&1 &
+post_heartbeat_runner="$!"
+if ! wait_for_file "${post_heartbeat_release}.started"; then
+  kill -KILL "$post_heartbeat_runner" 2>/dev/null || true
+  fail "post-heartbeat fixture did not reach the blocked external descendant"
+fi
+post_heartbeat_owner="$(readlink "$post_heartbeat_fixture/host.lock")"
+post_heartbeat_owner_pid="$(
+  sed -n 's/^pid=//p' "$post_heartbeat_owner/owner"
+)"
+[[ "$post_heartbeat_owner_pid" =~ ^[1-9][0-9]*$ ]] ||
+  fail "post-heartbeat owner PID was invalid"
+printf '%s\n' "$post_heartbeat_owner_pid" \
+  >"$post_heartbeat_owner_pid_file"
+post_heartbeat_renew_baseline="$(
+  log_count "$post_heartbeat_fixture/docker.log" \
+    'SQL PHASE5_QUERY_LEASE_RENEW'
+)"
+if ! wait_for_log_count_greater \
+  "$post_heartbeat_fixture/docker.log" \
+  'SQL PHASE5_QUERY_LEASE_RENEW' \
+  "$post_heartbeat_renew_baseline"; then
+  touch "$post_heartbeat_release"
+  wait "$post_heartbeat_runner" 2>/dev/null || true
+  fail "heartbeat did not renew while the external descendant was blocked"
+fi
+kill -KILL "$post_heartbeat_owner_pid"
+attempts=0
+while kill -0 "$post_heartbeat_owner_pid" 2>/dev/null &&
+  [[ "$attempts" -lt 500 ]]; do
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+if kill -0 "$post_heartbeat_owner_pid" 2>/dev/null; then
+  touch "$post_heartbeat_release"
+  wait "$post_heartbeat_runner" 2>/dev/null || true
+  fail "post-heartbeat owner survived SIGKILL"
+fi
+post_heartbeat_second_rejected=true
+if PHASE5_FAKE_DOCKER_LOG="$post_heartbeat_second_log" \
+  run_fixture "$post_heartbeat_fixture"; then
+  post_heartbeat_second_rejected=false
+fi
+post_heartbeat_owner_preserved=true
+if [[ ! -L "$post_heartbeat_fixture/host.lock" ||
+  "$(readlink "$post_heartbeat_fixture/host.lock")" != \
+    "$post_heartbeat_owner" ]]; then
+  post_heartbeat_owner_preserved=false
+fi
+touch "$post_heartbeat_release"
+wait_for_file "${post_heartbeat_release}.finished" ||
+  fail "post-heartbeat external descendant did not finish after release"
+wait "$post_heartbeat_runner" 2>/dev/null || true
+post_heartbeat_reclaimed=false
+attempts=0
+while [[ "$attempts" -lt 100 ]]; do
+  if run_fixture "$post_heartbeat_fixture"; then
+    post_heartbeat_reclaimed=true
+    break
+  fi
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+[[ "$post_heartbeat_second_rejected" == true ]] ||
+  fail "active post-heartbeat descendant lock was stolen"
+test ! -s "$post_heartbeat_second_log" ||
+  fail "post-heartbeat lock rejection accessed Compose"
+[[ "$post_heartbeat_owner_preserved" == true ]] ||
+  fail "post-heartbeat lock rejection replaced the published owner"
+test ! -e "$post_heartbeat_orphan_renew" ||
+  fail "orphan heartbeat renewed after its original owner died"
+[[ "$post_heartbeat_reclaimed" == true ]] ||
+  fail "post-heartbeat host lock was not reclaimable after descendants exited"
+[[ ! -e "$post_heartbeat_fixture/host.lock" &&
+  ! -L "$post_heartbeat_fixture/host.lock" ]] ||
+  fail "post-heartbeat recovery left its host lock"
 
 gnu_identity_fixture="$(make_fixture)"
 install_linux_lock_tools "$gnu_identity_fixture"

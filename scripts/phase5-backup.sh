@@ -325,6 +325,31 @@ portable_file_identity() {
   fi
 }
 
+portable_process_identity() {
+  local pid="$1"
+  local identity
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  command -v ps >/dev/null 2>&1 || return 1
+  identity="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  identity="${identity#"${identity%%[![:space:]]*}"}"
+  identity="${identity%"${identity##*[![:space:]]}"}"
+  [[ -n "$identity" &&
+    "$identity" != *$'\n'* &&
+    "${#identity}" -le 128 &&
+    "$identity" =~ ^[[:print:]]+$ ]] ||
+    return 1
+  printf '%s' "$identity"
+}
+
+process_identity_matches() {
+  local pid="$1"
+  local expected="$2"
+  local actual
+  [[ -n "$expected" ]] || return 1
+  actual="$(portable_process_identity "$pid")" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
 system_holds_liveness_file() {
   local path="$1"
   local identity="$2"
@@ -954,19 +979,33 @@ SQL
 }
 
 start_lease_heartbeat() {
+  local original_owner_pid="$LOCK_OWNER_PID"
+  local original_owner_process_identity
+  original_owner_process_identity="$(
+    portable_process_identity "$original_owner_pid"
+  )" || return 1
   LEASE_HEARTBEAT_FAILED="$LOCK_OWNER_DIRECTORY/heartbeat.failed"
   [[ ! -e "$LEASE_HEARTBEAT_FAILED" ]] || return 1
   set -m
   (
     set +m
+    exec 8<&-
     exec 9>&-
     ALLOW_LOST_LEASE_ACTIONS=true
     SEPARATE_EXTERNAL_GROUP=false
-    while sleep "$HEARTBEAT_INTERVAL_SECONDS"; do
+    while process_identity_matches \
+      "$original_owner_pid" "$original_owner_process_identity"; do
+      sleep "$HEARTBEAT_INTERVAL_SECONDS"
+      process_identity_matches \
+        "$original_owner_pid" "$original_owner_process_identity" ||
+        exit 0
       if ! renew_operational_lease; then
         printf '%s\n' 'lease_lost' >"$LEASE_HEARTBEAT_FAILED"
         exit 1
       fi
+      process_identity_matches \
+        "$original_owner_pid" "$original_owner_process_identity" ||
+        exit 0
     done
   ) &
   LEASE_HEARTBEAT_PID="$!"
