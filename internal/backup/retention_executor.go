@@ -7,7 +7,10 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -38,8 +41,9 @@ func RetentionInventoryFailureStage(err error) string {
 }
 
 type RepositorySnapshot struct {
-	ID        string
-	CreatedAt time.Time
+	ID         string
+	CreatedAt  time.Time
+	BatchRunID string
 }
 
 type RetentionRepositoryState struct {
@@ -52,6 +56,7 @@ type RetentionRepositoryState struct {
 type resticRepositorySnapshot struct {
 	ID   string    `json:"id"`
 	Time time.Time `json:"time"`
+	Tags []string  `json:"tags"`
 }
 
 func decodeResticRepositorySnapshots(value []byte) ([]RepositorySnapshot, error) {
@@ -87,14 +92,38 @@ func decodeResticRepositorySnapshotsAt(
 		}
 		seen[snapshot.ID] = struct{}{}
 		snapshots = append(snapshots, RepositorySnapshot{
-			ID:        snapshot.ID,
-			CreatedAt: snapshot.Time.UTC(),
+			ID:         snapshot.ID,
+			CreatedAt:  snapshot.Time.UTC(),
+			BatchRunID: canonicalBatchRunID(snapshot.Tags),
 		})
 	}
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].ID < snapshots[j].ID
 	})
 	return snapshots, nil
+}
+
+func canonicalBatchRunID(tags []string) string {
+	const prefix = "happylearn-batch:"
+	result := ""
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, prefix) {
+			continue
+		}
+		value := strings.TrimPrefix(tag, prefix)
+		if !validCanonicalBatchRunID(value) || result != "" {
+			return ""
+		}
+		result = value
+	}
+	return result
+}
+
+func validCanonicalBatchRunID(value string) bool {
+	runID, err := uuid.Parse(value)
+	return err == nil &&
+		runID != uuid.Nil &&
+		runID.String() == value
 }
 
 func validResticSnapshotID(value string) bool {
@@ -194,7 +223,8 @@ func PlanRetentionDeletes(
 		if _, committedSnapshot := committedSet[id]; committedSnapshot {
 			continue
 		}
-		if snapshot.CreatedAt.Before(orphanCutoff) {
+		if validCanonicalBatchRunID(snapshot.BatchRunID) &&
+			snapshot.CreatedAt.Before(orphanCutoff) {
 			deleteSet[id] = struct{}{}
 		}
 	}

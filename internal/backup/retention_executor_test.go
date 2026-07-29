@@ -48,6 +48,8 @@ func TestDecodeRepositorySnapshotsAcceptsRandomPathsAndHostsButRejectsUnsafeInve
 	if len(decoded) != 2 ||
 		decoded[0].ID != first ||
 		decoded[1].ID != second ||
+		decoded[0].BatchRunID != "11111111-1111-4111-8111-111111111111" ||
+		decoded[1].BatchRunID != "" ||
 		!decoded[1].CreatedAt.Equal(now.Add(-25*time.Hour)) {
 		t.Fatalf("decoded=%+v", decoded)
 	}
@@ -79,6 +81,36 @@ func TestDecodeRepositorySnapshotsAcceptsRandomPathsAndHostsButRejectsUnsafeInve
 	}
 }
 
+func TestDecodeRepositorySnapshotsRequiresOneCanonicalBatchOwnershipTag(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	snapshotID := retentionSnapshotID(1)
+	for name, tags := range map[string]string{
+		"missing":       `[]`,
+		"invalid":       `["happylearn-batch:not-a-uuid"]`,
+		"noncanonical":  `["happylearn-batch:11111111-1111-4111-8111-11111111111A"]`,
+		"duplicate":     `["happylearn-batch:11111111-1111-4111-8111-111111111111","happylearn-batch:11111111-1111-4111-8111-111111111111"]`,
+		"mixed-invalid": `["happylearn-batch:11111111-1111-4111-8111-111111111111","happylearn-batch:bad"]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			decoded, err := decodeResticRepositorySnapshotsAt(
+				[]byte(fmt.Sprintf(
+					`[{"time":%q,"tags":%s,"id":%q}]`,
+					now.Add(-25*time.Hour).Format(time.RFC3339Nano),
+					tags,
+					snapshotID,
+				)),
+				now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded) != 1 || decoded[0].BatchRunID != "" {
+				t.Fatalf("unsafe ownership accepted: %+v", decoded)
+			}
+		})
+	}
+}
+
 func TestPlanRetentionDeletesOnlyDomainCandidatesAndOldOrphans(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := retentionSnapshotID(1)
@@ -88,8 +120,18 @@ func TestPlanRetentionDeletesOnlyDomainCandidatesAndOldOrphans(t *testing.T) {
 	recentFailure := retentionSnapshotID(5)
 	oldFailure := retentionSnapshotID(6)
 	preRelease := retentionSnapshotID(7)
+	externalOld := retentionSnapshotID(8)
+	maliciousOwnerOld := retentionSnapshotID(9)
 	snapshots := []RepositorySnapshot{
-		{ID: oldFailure, CreatedAt: now.Add(-24*time.Hour - time.Nanosecond)},
+		{
+			ID: oldFailure, CreatedAt: now.Add(-24*time.Hour - time.Nanosecond),
+			BatchRunID: "11111111-1111-4111-8111-111111111111",
+		},
+		{ID: externalOld, CreatedAt: now.Add(-48 * time.Hour)},
+		{
+			ID: maliciousOwnerOld, CreatedAt: now.Add(-48 * time.Hour),
+			BatchRunID: "not-a-canonical-uuid",
+		},
 		{ID: recentFailure, CreatedAt: now.Add(-24 * time.Hour)},
 		{ID: evictedB, CreatedAt: now.Add(-60 * 24 * time.Hour)},
 		{ID: current, CreatedAt: now.Add(-time.Minute)},
@@ -114,6 +156,12 @@ func TestPlanRetentionDeletesOnlyDomainCandidatesAndOldOrphans(t *testing.T) {
 	}
 	if slices.Contains(got, recentFailure) || slices.Contains(got, preRelease) {
 		t.Fatalf("recent/protected snapshot selected: %v", got)
+	}
+	if slices.Contains(got, externalOld) {
+		t.Fatalf("external unowned snapshot selected: %v", got)
+	}
+	if slices.Contains(got, maliciousOwnerOld) {
+		t.Fatalf("malicious ownership selected: %v", got)
 	}
 }
 

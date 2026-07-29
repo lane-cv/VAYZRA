@@ -67,6 +67,7 @@ type retentionArtifactRow struct {
 	Trigger            backup.Trigger
 	State              backup.State
 	RequestedAt        time.Time
+	ArtifactPresent    bool
 	Kind               backup.ArtifactKind
 	Repository         backup.Repository
 	ArtifactSnapshotID string
@@ -243,37 +244,66 @@ func loadRetentionArtifactRows(
 		return nil, backup.ErrRetention
 	}
 	rows, err := pool.Query(ctx, `
-SELECT r.id,r.trigger_kind,r.state,r.requested_at,
-       a.kind,a.repository,a.snapshot_id,
-       CASE
-         WHEN a.repository='local' THEN r.local_snapshot_id
-         WHEN r.id=$2 AND r.state='syncing' THEN a.snapshot_id
-         ELSE r.remote_snapshot_id
-       END
-FROM backup_runs r
-JOIN backup_artifacts a ON a.backup_run_id=r.id
-WHERE a.repository=$1
-  AND (
-    (
-      a.repository='local'
-      AND r.state IN ('succeeded','degraded')
-    )
-    OR (
-      a.repository='remote'
-      AND r.state='succeeded'
-    )
-    OR (
-      r.id=$2
-      AND r.state IN ('verifying','syncing')
+WITH eligible_runs AS (
+  SELECT DISTINCT r.*
+  FROM backup_runs r
+  JOIN backup_artifacts existing
+    ON existing.backup_run_id=r.id
+   AND existing.repository=$1
+  WHERE (
+      $1='local'
       AND (
-        a.repository='local'
+        r.state IN ('succeeded','degraded')
         OR (
-          a.repository='remote'
+          r.id=$2
+          AND r.state IN ('verifying','syncing')
+        )
+      )
+    )
+    OR (
+      $1='remote'
+      AND (
+        r.state='succeeded'
+        OR (
+          r.id=$2
           AND r.state='syncing'
         )
       )
     )
-  )
+  UNION ALL
+  SELECT r.*
+  FROM backup_runs r
+  WHERE NOT EXISTS (
+      SELECT 1 FROM backup_artifacts existing
+      WHERE existing.backup_run_id=r.id
+        AND existing.repository=$1
+    )
+    AND (
+      (
+        $1='local'
+        AND r.state IN ('succeeded','degraded')
+        AND r.local_snapshot_id IS NOT NULL
+      )
+      OR (
+        $1='remote'
+        AND r.state='succeeded'
+        AND r.remote_snapshot_id IS NOT NULL
+      )
+    )
+)
+SELECT r.id,r.trigger_kind,r.state,r.requested_at,
+       a.backup_run_id IS NOT NULL,
+       COALESCE(a.kind,''),$1::text,COALESCE(a.snapshot_id,''),
+       CASE
+         WHEN a.backup_run_id IS NULL THEN ''
+         WHEN $1='local' THEN COALESCE(r.local_snapshot_id,'')
+         WHEN r.id=$2 AND r.state='syncing' THEN a.snapshot_id
+         ELSE COALESCE(r.remote_snapshot_id,'')
+       END
+FROM eligible_runs r
+LEFT JOIN backup_artifacts a
+  ON a.backup_run_id=r.id
+ AND a.repository=$1
 ORDER BY r.requested_at DESC,r.id DESC,a.kind`,
 		repository,
 		runID,
@@ -290,6 +320,7 @@ ORDER BY r.requested_at DESC,r.id DESC,a.kind`,
 			&row.Trigger,
 			&row.State,
 			&row.RequestedAt,
+			&row.ArtifactPresent,
 			&row.Kind,
 			&row.Repository,
 			&row.ArtifactSnapshotID,
@@ -333,6 +364,7 @@ func buildRetentionRepositoryState(
 		if row.RunID == uuid.Nil ||
 			row.Repository != repository ||
 			row.RequestedAt.IsZero() ||
+			!row.ArtifactPresent ||
 			!retentionSnapshotID.MatchString(row.ArtifactSnapshotID) ||
 			row.ArtifactSnapshotID != row.RunSnapshotID ||
 			!validRetentionState(row, currentRunID) {

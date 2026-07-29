@@ -1089,6 +1089,35 @@ func TestPostgresStoreRetentionLocalSevenRemoteThirtyAndTwelveMonthly(t *testing
 		t, pool, now.AddDate(0, 0, -10), TriggerManual,
 		StateDegraded, RepositoryLocal, "local-degraded",
 	)
+	localCandidates, err := store.RetentionCandidates(ctx, RetentionPolicy{
+		Now: now, Location: shanghai, LocalDaily: 7,
+		RemoteDaily: 30, RemoteMonthly: 12,
+		PreReleaseProtectFor: 30 * 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localGot := make(map[uuid.UUID]bool)
+	for _, artifact := range localCandidates {
+		if artifact.Repository == RepositoryLocal {
+			localGot[artifact.BackupRunID] = true
+		}
+	}
+	if !localGot[localIDs[7]] || !localGot[localIDs[8]] {
+		t.Errorf("old local candidates missing")
+	}
+	if localGot[protected] || localGot[localIDs[0]] {
+		t.Errorf("protected local point selected")
+	}
+	if !localGot[degraded] {
+		t.Errorf("degraded local point did not participate in retention")
+	}
+	if _, err := pool.Exec(
+		ctx,
+		`TRUNCATE restore_verifications,backup_artifacts,backup_runs CASCADE`,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	remoteDaily := make([]uuid.UUID, 0, 32)
 	for daysAgo := 0; daysAgo < 32; daysAgo++ {
@@ -1105,7 +1134,7 @@ func TestPostgresStoreRetentionLocalSevenRemoteThirtyAndTwelveMonthly(t *testing
 		))
 	}
 
-	candidates, err := store.RetentionCandidates(ctx, RetentionPolicy{
+	remoteCandidates, err := store.RetentionCandidates(ctx, RetentionPolicy{
 		Now: now, Location: shanghai, LocalDaily: 7,
 		RemoteDaily: 30, RemoteMonthly: 12,
 		PreReleaseProtectFor: 30 * 24 * time.Hour,
@@ -1113,31 +1142,24 @@ func TestPostgresStoreRetentionLocalSevenRemoteThirtyAndTwelveMonthly(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := make(map[uuid.UUID]bool)
-	for _, artifact := range candidates {
-		got[artifact.BackupRunID] = true
+	remoteGot := make(map[uuid.UUID]bool)
+	for _, artifact := range remoteCandidates {
+		if artifact.Repository == RepositoryRemote {
+			remoteGot[artifact.BackupRunID] = true
+		}
 	}
-	if !got[localIDs[7]] || !got[localIDs[8]] {
-		t.Errorf("old local candidates missing: got=%v", sortedUUIDs(got))
-	}
-	if got[protected] || got[localIDs[0]] {
-		t.Errorf("protected local point selected: got=%v", sortedUUIDs(got))
-	}
-	if !got[degraded] {
-		t.Errorf("degraded local point did not participate in retention: got=%v", sortedUUIDs(got))
-	}
-	if !got[remoteDaily[30]] || !got[remoteDaily[31]] {
-		t.Errorf("old remote daily candidates missing: got=%v", sortedUUIDs(got))
+	if !remoteGot[remoteDaily[30]] || !remoteGot[remoteDaily[31]] {
+		t.Errorf("old remote daily candidates missing")
 	}
 	for _, candidate := range []uuid.UUID{
 		remoteMonthly[0], remoteMonthly[11], remoteMonthly[12],
 	} {
-		if !got[candidate] {
+		if !remoteGot[candidate] {
 			t.Errorf("remote point outside 30 daily/12 monthly union not selected: %s", candidate)
 		}
 	}
 	for _, retained := range remoteMonthly[1:11] {
-		if got[retained] {
+		if remoteGot[retained] {
 			t.Errorf("retained remote monthly selected: %s", retained)
 		}
 	}
@@ -1231,15 +1253,21 @@ INSERT INTO backup_runs(
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `
+	repositories := []Repository{repository}
+	if repository == RepositoryRemote {
+		repositories = []Repository{RepositoryLocal, RepositoryRemote}
+	}
+	for _, artifactRepository := range repositories {
+		if _, err := pool.Exec(ctx, `
 INSERT INTO backup_artifacts(
   backup_run_id,kind,repository,snapshot_id,sha256,size_bytes,verified_at,expires_at
 ) VALUES(
   $1,'manifest',$2,$3,decode(repeat('11',32),'hex'),42,$4,$4
 )`,
-		id, repository, snapshot, requestedAt,
-	); err != nil {
-		t.Fatal(err)
+			id, artifactRepository, snapshot, requestedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return id
 }
@@ -1306,6 +1334,92 @@ INSERT INTO backup_artifacts(
 		}
 	}
 	return id
+}
+
+func TestPostgresStoreRetentionCandidatesRejectsEligibleRunWithoutArtifacts(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for _, repository := range []Repository{
+		RepositoryLocal,
+		RepositoryRemote,
+	} {
+		t.Run(string(repository), func(t *testing.T) {
+			pool := backupPool(t)
+			store := NewPostgresStore(pool)
+			ctx := context.Background()
+			currentState := StateVerifying
+			missingState := StateDegraded
+			var remoteSnapshot any
+			if repository == RepositoryRemote {
+				currentState = StateSyncing
+				missingState = StateSucceeded
+				remoteSnapshot = fmt.Sprintf("%064x", 2)
+			}
+			current := insertProspectiveRetentionPoint(
+				t,
+				pool,
+				now,
+				TriggerScheduled,
+				currentState,
+				repository,
+				fmt.Sprintf("%064x", 1),
+			)
+			missingID := uuid.New()
+			if _, err := pool.Exec(ctx, `
+INSERT INTO backup_runs(
+  id,idempotency_key,trigger_kind,state,requested_at,finished_at,
+  database_migration_version,encryption_key_id,local_snapshot_id,
+  remote_snapshot_id,manifest_sha256,local_expires_at,remote_expires_at
+) VALUES(
+  $1,$2,'scheduled',$3,$4::timestamptz,$4::timestamptz,
+  20,'age-key-1',$5,$6,decode(repeat('44',32),'hex'),
+  $4::timestamptz+interval '7 days',
+  CASE WHEN $6::text IS NULL THEN NULL
+       ELSE $4::timestamptz+interval '30 days' END
+)`,
+				missingID,
+				"retention-missing-"+missingID.String(),
+				missingState,
+				now.Add(-24*time.Hour),
+				fmt.Sprintf("%064x", 2),
+				remoteSnapshot,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if repository == RepositoryRemote {
+				for _, kind := range []ArtifactKind{
+					ArtifactDatabaseDump,
+					ArtifactObjectSnapshot,
+					ArtifactManifest,
+				} {
+					if _, err := pool.Exec(ctx, `
+INSERT INTO backup_artifacts(
+  backup_run_id,kind,repository,snapshot_id,sha256,size_bytes,
+  verified_at,expires_at
+) VALUES(
+  $1,$2,'local',$3,decode(repeat('55',32),'hex'),7,
+  $4::timestamptz,$4::timestamptz+interval '7 days'
+)`,
+						missingID,
+						kind,
+						fmt.Sprintf("%064x", 2),
+						now.Add(-24*time.Hour),
+					); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_, err := store.RetentionCandidates(ctx, RetentionPolicy{
+				Now: now, Location: time.UTC, CurrentRunID: current,
+				LocalDaily: 7, RemoteDaily: 30, RemoteMonthly: 12,
+				PreReleaseProtectFor: 30 * 24 * time.Hour,
+			})
+			if err == nil {
+				t.Fatal("eligible terminal run without artifacts was omitted")
+			}
+		})
+	}
 }
 
 func sortedUUIDs(values map[uuid.UUID]bool) []string {

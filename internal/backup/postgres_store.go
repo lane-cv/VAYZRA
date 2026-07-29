@@ -790,29 +790,64 @@ func (s *PostgresStore) RetentionCandidates(
 		return nil, ErrInvalid
 	}
 	rows, err := s.pool.Query(ctx, `
-SELECT r.id,r.trigger_kind,r.state,r.requested_at,
-       a.backup_run_id,a.kind,a.repository,a.snapshot_id,a.sha256,
-       a.size_bytes,a.verified_at,a.expires_at
-FROM backup_runs r
-JOIN backup_artifacts a ON a.backup_run_id=r.id
-WHERE (
-    a.repository='local' AND r.state IN ('succeeded','degraded')
-  )
-  OR (
-    a.repository='remote' AND r.state='succeeded'
-  )
-  OR (
-    r.id=$1
-    AND r.state IN ('verifying','syncing')
-    AND (
+WITH eligible_runs AS (
+  SELECT DISTINCT
+         r.id,r.trigger_kind,r.state,r.requested_at,a.repository::text
+  FROM backup_runs r
+  JOIN backup_artifacts a ON a.backup_run_id=r.id
+  WHERE (
       a.repository='local'
-      OR (
-        a.repository='remote'
-        AND r.state='syncing'
+      AND r.state IN ('succeeded','degraded')
+    )
+    OR (
+      a.repository='remote'
+      AND r.state='succeeded'
+    )
+    OR (
+      r.id=$1
+      AND r.state IN ('verifying','syncing')
+      AND (
+        a.repository='local'
+        OR (
+          a.repository='remote'
+          AND r.state='syncing'
+        )
       )
     )
-  )
-ORDER BY a.repository,r.requested_at DESC,r.id DESC,a.kind`,
+  UNION ALL
+  SELECT r.id,r.trigger_kind,r.state,r.requested_at,'local'::text
+  FROM backup_runs r
+  WHERE r.state IN ('succeeded','degraded')
+    AND r.local_snapshot_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM backup_artifacts a
+      WHERE a.backup_run_id=r.id
+        AND a.repository='local'
+    )
+  UNION ALL
+  SELECT r.id,r.trigger_kind,r.state,r.requested_at,'remote'::text
+  FROM backup_runs r
+  WHERE r.state='succeeded'
+    AND r.remote_snapshot_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM backup_artifacts a
+      WHERE a.backup_run_id=r.id
+        AND a.repository='remote'
+    )
+)
+SELECT r.id,r.trigger_kind,r.state,r.requested_at,
+       a.backup_run_id IS NOT NULL,
+       COALESCE(a.backup_run_id,r.id),COALESCE(a.kind,''),
+       r.repository,COALESCE(a.snapshot_id,''),COALESCE(a.sha256,''::bytea),
+       COALESCE(a.size_bytes,0),COALESCE(a.verified_at,r.requested_at),
+       COALESCE(a.expires_at,r.requested_at)
+FROM eligible_runs r
+LEFT JOIN backup_artifacts a
+  ON a.backup_run_id=r.id
+ AND a.repository=r.repository
+ORDER BY r.repository,r.requested_at DESC,r.id DESC,a.kind`,
 		policy.CurrentRunID,
 	)
 	if err != nil {
@@ -824,6 +859,7 @@ ORDER BY a.repository,r.requested_at DESC,r.id DESC,a.kind`,
 		var point retentionArtifactPoint
 		if err := rows.Scan(
 			&point.runID, &point.trigger, &point.state, &point.requestedAt,
+			&point.artifactPresent,
 			&point.artifact.BackupRunID, &point.artifact.Kind,
 			&point.artifact.Repository, &point.artifact.SnapshotID,
 			&point.artifact.SHA256, &point.artifact.SizeBytes,
@@ -837,7 +873,7 @@ ORDER BY a.repository,r.requested_at DESC,r.id DESC,a.kind`,
 	if err := rows.Err(); err != nil {
 		return nil, ErrUnavailable
 	}
-	return selectRetentionCandidates(points, policy), nil
+	return selectRetentionCandidates(points, policy)
 }
 
 type transitionValues struct {
@@ -927,11 +963,12 @@ func mapPostgresWriteError(err error) error {
 }
 
 type retentionArtifactPoint struct {
-	runID       uuid.UUID
-	trigger     Trigger
-	state       State
-	requestedAt time.Time
-	artifact    Artifact
+	runID           uuid.UUID
+	trigger         Trigger
+	state           State
+	requestedAt     time.Time
+	artifactPresent bool
+	artifact        Artifact
 }
 
 type retentionRun struct {
@@ -945,13 +982,16 @@ type retentionRun struct {
 func selectRetentionCandidates(
 	points []retentionArtifactPoint,
 	policy RetentionPolicy,
-) []Artifact {
+) ([]Artifact, error) {
 	type runKey struct {
 		id         uuid.UUID
 		repository Repository
 	}
 	byRun := make(map[runKey]*retentionRun)
 	for _, point := range points {
+		if !point.artifactPresent {
+			return nil, ErrUnavailable
+		}
 		key := runKey{id: point.runID, repository: point.artifact.Repository}
 		run := byRun[key]
 		if run == nil {
@@ -1034,7 +1074,7 @@ func selectRetentionCandidates(
 		candidates = append(candidates, run.artifacts...)
 	}
 	sortArtifacts(candidates)
-	return candidates
+	return candidates, nil
 }
 
 func retentionDay(at time.Time, location *time.Location) string {
