@@ -986,7 +986,10 @@ case "$kind" in
   aistor-license-init)
     [[ "$*" == *'PHASE5_RESTORE_AISTOR_LICENSE'* &&
       "$*" == *'dst=/license-source/minio.license,readonly'* &&
-      "$*" == *'dst=/license-target'* ]] ||
+      "$*" == *'dst=/license-target'* &&
+      "$*" == *'--cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH'* &&
+      "$*" != *'DAC_OVERRIDE'* &&
+      "$*" != *'FOWNER'* ]] ||
       exit 64
     ;;
   postgres-restore)
@@ -2146,6 +2149,10 @@ if grep -Fq -- '--student-isolation-probe' "$success_fixture/docker.log"; then
 fi
 grep -Fq 'restore-kind=aistor-license-init' "$success_fixture/docker.log" ||
   fail 'AIStor license was not copied through a dedicated init container'
+grep -Fq -- \
+  'cp /license-source/minio.license /license-target/minio.license; chmod 0400 /license-target/minio.license; chown 1000:0 /license-target/minio.license; test "$(stat -c %u:%g:%a /license-target/minio.license)" = 1000:0:400' \
+  "$success_fixture/docker.log" ||
+  fail 'AIStor license initialization did not set mode before handing off ownership'
 grep -Fq 'dst=/minio-license,readonly' "$success_fixture/docker.log" ||
   fail 'AIStor did not consume its owner-only license volume'
 

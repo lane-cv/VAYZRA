@@ -1632,7 +1632,7 @@ initialize_aistor_license() {
     --user 0:0 \
     --cap-drop ALL \
     --cap-add CHOWN \
-    --cap-add DAC_OVERRIDE \
+    --cap-add DAC_READ_SEARCH \
     --security-opt no-new-privileges \
     --mount "type=bind,src=$HAPPYLEARN_AISTOR_LICENSE_FILE,dst=/license-source/minio.license,readonly" \
     --mount "type=volume,src=$AISTOR_LICENSE_VOLUME,dst=/license-target" \
@@ -1640,7 +1640,7 @@ initialize_aistor_license() {
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
     /bin/sh -ceu \
-    'test -z "$(find /license-target -mindepth 1 -maxdepth 1 -print -quit)"; cp /license-source/minio.license /license-target/minio.license; chown 1000:0 /license-target/minio.license; chmod 0400 /license-target/minio.license; test "$(stat -c %u:%g:%a /license-target/minio.license)" = 1000:0:400; printf "%s\n" PHASE5_RESTORE_AISTOR_LICENSE' \
+    'test -z "$(find /license-target -mindepth 1 -maxdepth 1 -print -quit)"; cp /license-source/minio.license /license-target/minio.license; chmod 0400 /license-target/minio.license; chown 1000:0 /license-target/minio.license; test "$(stat -c %u:%g:%a /license-target/minio.license)" = 1000:0:400; printf "%s\n" PHASE5_RESTORE_AISTOR_LICENSE' \
     >/dev/null
 }
 
