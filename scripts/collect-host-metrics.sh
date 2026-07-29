@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/host-metrics-path.sh"
 INTERNAL_ENDPOINT='http://127.0.0.1:9090/internal/host-samples'
 MAX_FILE_BYTES=$((64 * 1024))
-BACKUP_RUNTIME_UID=10003
 monitored_service_allowlist=(caddy app worker postgres redis minio)
 auxiliary_service_allowlist=(postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance)
 
@@ -61,41 +61,7 @@ run_bounded_capture() {
   check_bounded_file "$destination"
 }
 
-path_mode() {
-  local path="$1"
-  if stat -f '%Lp' "$path" >/dev/null 2>&1; then
-    stat -f '%Lp' "$path"
-  else
-    stat -c '%a' "$path"
-  fi
-}
-
-path_owner() {
-  local path="$1"
-  if stat -f '%u' "$path" >/dev/null 2>&1; then
-    stat -f '%u' "$path"
-  else
-    stat -c '%u' "$path"
-  fi
-}
-
-validate_backup_path() {
-  local path="$1"
-  local canonical mode owner mode_value
-  [[ "$path" == /* && "$path" != "/" &&
-    "$path" != *$'\n'* && "$path" != *$'\r'* &&
-    -d "$path" && ! -L "$path" ]] || return 1
-  canonical="$(cd "$path" && pwd -P)" || return 1
-  [[ "$canonical" == "${path%/}" ]] || return 1
-  mode="$(path_mode "$path")" || return 1
-  owner="$(path_owner "$path")" || return 1
-  [[ "$mode" =~ ^[0-7]{3,4}$ && "$owner" =~ ^[0-9]+$ ]] || return 1
-  mode_value=$((8#$mode))
-  ((owner == EUID || owner == 0 || owner == BACKUP_RUNTIME_UID)) || return 1
-  ((mode_value == 8#700))
-}
-
-validate_backup_path "$backup_path" || die
+validate_host_metrics_backup_path "$backup_path" || die
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/happylearn-host-metrics.XXXXXX")" ||
   die

@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target="$repo_root/scripts/collect-host-metrics.sh"
+path_helper="$repo_root/scripts/host-metrics-path.sh"
+uid_target="$repo_root/scripts/host-metrics_uid_contract_test.sh"
 live_target="$repo_root/scripts/host-metrics_live_test.sh"
 makefile="$repo_root/Makefile"
 package_json="$repo_root/package.json"
@@ -14,6 +16,9 @@ fail() {
 
 [[ -f "$target" ]] || fail "collector script is missing"
 [[ -x "$target" ]] || fail "collector script is not executable"
+[[ -f "$path_helper" ]] || fail "backup path validator is missing"
+[[ -f "$uid_target" && -x "$uid_target" ]] ||
+  fail "cross-UID backup path contract is missing or not executable"
 [[ -f "$live_target" && -x "$live_target" ]] ||
   fail "live integration gate is missing or not executable"
 
@@ -43,6 +48,14 @@ require_literal 'caddy app worker postgres redis minio'
 require_literal 'postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance'
 require_literal 'host-sampler'
 require_literal 'head -c "$((MAX_FILE_BYTES + 1))"'
+require_literal 'source "$ROOT/scripts/host-metrics-path.sh"'
+require_literal 'validate_host_metrics_backup_path "$backup_path"'
+
+grep -Fq 'HOST_METRICS_BACKUP_RUNTIME_UID=10003' "$path_helper" ||
+  fail "fixed backup runtime UID changed"
+if grep -Fq 'cd "$path"' "$path_helper"; then
+  fail "backup path validation enters the protected target directory"
+fi
 
 forbid_pattern '(/var/run/docker\.sock|docker[[:space:]]+inspect)'
 forbid_pattern '(^|[[:space:]])(env|printenv)([[:space:]]|$)'
@@ -169,20 +182,6 @@ case "$*" in
 esac
 EOF
 
-cat >"$fake_bin/stat" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ -n "${HOST_METRICS_FAKE_BACKUP_OWNER:-}" &&
-  $# -eq 3 &&
-  "$1" =~ ^-(f|c)$ &&
-  "$2" == "%u" &&
-  "$3" == "$HAPPYLEARN_BACKUP_HOST_PATH" ]]; then
-  printf '%s\n' "$HOST_METRICS_FAKE_BACKUP_OWNER"
-  exit 0
-fi
-exec /usr/bin/stat "$@"
-EOF
-
 cat >"$fake_bin/host-sampler" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -241,7 +240,7 @@ EOF
 
 chmod 0755 \
   "$fake_bin/timeout" "$fake_bin/docker" "$fake_bin/df" "$fake_bin/date" \
-  "$fake_bin/stat" "$fake_bin/host-sampler" "$fake_bin/curl"
+  "$fake_bin/host-sampler" "$fake_bin/curl"
 secret_file="$fixture_root/host-hmac"
 printf '%s\n' 'test-host-secret' >"$secret_file"
 chmod 0600 "$secret_file"
@@ -268,12 +267,6 @@ run_fixture() {
 
 : >"$command_log"
 run_fixture >/dev/null
-if ! HOST_METRICS_FAKE_BACKUP_OWNER=10003 run_fixture >/dev/null 2>&1; then
-  fail "fixed production backup owner UID 10003 was rejected"
-fi
-if HOST_METRICS_FAKE_BACKUP_OWNER=10004 run_fixture >/dev/null 2>&1; then
-  fail "unapproved backup owner UID 10004 was accepted"
-fi
 
 jq -e '
   .schemaVersion == 1 and
@@ -352,4 +345,5 @@ if HOST_METRICS_BACKUP_PATH_OVERRIDE="$backup_link" \
   fail "symlinked backup filesystem path was accepted"
 fi
 
+bash "$uid_target"
 printf '%s\n' 'host metrics contract: PASS'
