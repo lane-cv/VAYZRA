@@ -72,6 +72,11 @@ type HTTPService interface {
 	GetDashboard(context.Context, Principal) (Dashboard, error)
 }
 
+type AlertHTTPService interface {
+	ListAlerts(context.Context, Principal, AlertFilter) (AlertPage, error)
+	AcknowledgeAlert(context.Context, Principal, uuid.UUID) (Alert, error)
+}
+
 type ModeReader interface {
 	GetMode(context.Context) (ModeSnapshot, error)
 }

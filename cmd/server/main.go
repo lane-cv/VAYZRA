@@ -162,6 +162,7 @@ type applicationDependencies struct {
 	newNotifications       func(*pgxpool.Pool) notifications.HTTPService
 	startOutbox            func(*pgxpool.Pool, operations.ClaimGate) func()
 	startAIRunner          func(context.Context, *pgxpool.Pool, config.Config, operations.ClaimGate) (func(), error)
+	startAlertRunner       func(*pgxpool.Pool) func()
 	newOperations          func(*pgxpool.Pool) operationsRuntime
 	newAdminOperations     func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
 	newAdminBackups        func(*pgxpool.Pool) backup.HTTPService
@@ -217,6 +218,7 @@ func buildProductionApplication(
 		newNotifications:   newProductionNotificationService,
 		startOutbox:        newProductionOutboxRunner,
 		startAIRunner:      newProductionAIRunner,
+		startAlertRunner:   newProductionAlertRunner,
 		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
 			return operations.NewPostgresStore(pool)
 		},
@@ -532,6 +534,18 @@ func buildApplicationRuntime(
 			closeOtherResources()
 		}
 	}
+	if deps.startAlertRunner != nil {
+		stopAlertRunner := deps.startAlertRunner(pool)
+		if stopAlertRunner == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize alert evaluator")
+		}
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopAlertRunner()
+			closeOtherResources()
+		}
+	}
 	var internalHandler http.Handler
 	if deps.newInternal != nil {
 		internalHandler, err = deps.newInternal(pool, redisClient, cfg)
@@ -769,15 +783,25 @@ func newProductionAdminOperationsService(
 	if err != nil {
 		return nil
 	}
-	service, err := operations.NewServiceWithDashboard(
+	service, err := operations.NewServiceWithDashboardAndAlerts(
 		store,
 		audit.NewPostgresWriter(pool),
 		dashboard,
+		operations.NewPostgresAlertStore(pool),
 	)
 	if err != nil {
 		return nil
 	}
 	return service
+}
+
+func newProductionAlertRunner(pool *pgxpool.Pool) func() {
+	return operations.StartAlertRunner(operations.AlertRunner{
+		Store:             operations.NewPostgresAlertStore(pool),
+		Clock:             time.Now,
+		PollInterval:      operations.DefaultAlertRunnerInterval,
+		EvaluationTimeout: 30 * time.Second,
+	})
 }
 
 func newProductionInternalHandler(

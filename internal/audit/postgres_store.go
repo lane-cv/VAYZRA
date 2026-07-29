@@ -240,7 +240,8 @@ var allowedMetadata = map[string]map[string]bool{
 	"ai.provider_created": {}, "ai.provider_updated": {"keyChanged": true}, "ai.provider_activated": {}, "ai.provider_tested": {"providerId": true, "protocol": true, "ok": true, "errorCategory": true, "latencyMs": true}, "ai.model_put": {"providerId": true, "modality": true}, "ai.prompt_put": {"subject": true, "version": true}, "ai.limits_global_put": {}, "ai.limits_student_put": {"studentId": true},
 	"ai.file_access_rejected":     {"reason": true},
 	"operations.settings_updated": {}, "operations.settings_rejected": {"category": true, "reason": true}, "operations.lease_taken_over": {},
-	"operations.backup_requested": {},
+	"operations.backup_requested":   {},
+	"operations.alert_acknowledged": {"status": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -254,7 +255,8 @@ var allowedTargetTypes = map[string]string{
 	"ai.provider_created": "ai_provider", "ai.provider_updated": "ai_provider", "ai.provider_activated": "ai_provider", "ai.provider_tested": "ai_provider", "ai.model_put": "ai_model", "ai.prompt_put": "ai_prompt", "ai.limits_global_put": "ai_limits", "ai.limits_student_put": "ai_limits",
 	"ai.file_access_rejected":     "ai_file_request",
 	"operations.settings_updated": "system_settings", "operations.settings_rejected": "system_settings", "operations.lease_taken_over": "operational_mode",
-	"operations.backup_requested": "backup_run",
+	"operations.backup_requested":   "backup_run",
+	"operations.alert_acknowledged": "operational_alert",
 }
 
 type auditOutcomeRule struct {
@@ -291,23 +293,24 @@ var auditOutcomeRules = map[string]auditOutcomeRule{
 	"file.processing_artifact_cleanup_scheduled": {outcome: "succeeded"},
 	"file.processing_artifact_cleanup_completed": {outcome: "succeeded"},
 
-	"qa.thread_created":            {outcome: "succeeded"},
-	"qa.student_followed_up":       {outcome: "succeeded"},
-	"qa.admin_replied":             {outcome: "succeeded"},
-	"qa.status_changed":            {outcome: "succeeded"},
-	"qa.teacher_note_added":        {outcome: "succeeded"},
-	"ai.provider_created":          {outcome: "succeeded"},
-	"ai.provider_updated":          {outcome: "succeeded"},
-	"ai.provider_activated":        {outcome: "succeeded"},
-	"ai.model_put":                 {outcome: "succeeded"},
-	"ai.prompt_put":                {outcome: "succeeded"},
-	"ai.limits_global_put":         {outcome: "succeeded"},
-	"ai.limits_student_put":        {outcome: "succeeded"},
-	"ai.file_access_rejected":      {outcome: "rejected"},
-	"operations.settings_updated":  {outcome: "succeeded"},
-	"operations.settings_rejected": {outcome: "rejected"},
-	"operations.lease_taken_over":  {outcome: "succeeded"},
-	"operations.backup_requested":  {outcome: "succeeded"},
+	"qa.thread_created":             {outcome: "succeeded"},
+	"qa.student_followed_up":        {outcome: "succeeded"},
+	"qa.admin_replied":              {outcome: "succeeded"},
+	"qa.status_changed":             {outcome: "succeeded"},
+	"qa.teacher_note_added":         {outcome: "succeeded"},
+	"ai.provider_created":           {outcome: "succeeded"},
+	"ai.provider_updated":           {outcome: "succeeded"},
+	"ai.provider_activated":         {outcome: "succeeded"},
+	"ai.model_put":                  {outcome: "succeeded"},
+	"ai.prompt_put":                 {outcome: "succeeded"},
+	"ai.limits_global_put":          {outcome: "succeeded"},
+	"ai.limits_student_put":         {outcome: "succeeded"},
+	"ai.file_access_rejected":       {outcome: "rejected"},
+	"operations.settings_updated":   {outcome: "succeeded"},
+	"operations.settings_rejected":  {outcome: "rejected"},
+	"operations.lease_taken_over":   {outcome: "succeeded"},
+	"operations.backup_requested":   {outcome: "succeeded"},
+	"operations.alert_acknowledged": {outcome: "succeeded"},
 	"ai.provider_tested": {
 		metadataKey: "ok",
 		metadataOutcomes: map[string]string{
@@ -408,6 +411,12 @@ func validOperationsEvent(event Event) bool {
 		id, err := uuid.Parse(event.TargetID)
 		return len(event.Metadata) == 0 && err == nil &&
 			id != uuid.Nil && id.String() == event.TargetID
+	case "operations.alert_acknowledged":
+		id, err := uuid.Parse(event.TargetID)
+		status, ok := event.Metadata["status"].(string)
+		return len(event.Metadata) == 1 && err == nil &&
+			id != uuid.Nil && id.String() == event.TargetID &&
+			ok && status == "acknowledged"
 	case "operations.settings_rejected":
 		category, categoryOK := event.Metadata["category"].(string)
 		reason, reasonOK := event.Metadata["reason"].(string)

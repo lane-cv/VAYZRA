@@ -607,11 +607,13 @@ SELECT
   count(*) FILTER (
     WHERE state IN ('open','acknowledged')
       AND severity='warning'
+      AND (consecutive_failures >= 2 OR version >= 2)
       AND last_observed_at <= $1
   )::bigint,
   count(*) FILTER (
     WHERE state IN ('open','acknowledged')
       AND severity='critical'
+      AND (consecutive_failures >= 2 OR version >= 2)
       AND last_observed_at <= $1
   )::bigint,
   count(*) FILTER (

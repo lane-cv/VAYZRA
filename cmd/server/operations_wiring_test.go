@@ -202,6 +202,20 @@ func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
 		len(dashboard.Queues) != len(operations.DashboardQueueOrder()) {
 		t.Fatalf("dashboard=%+v", dashboard)
 	}
+	alertService, ok := service.(operations.AlertHTTPService)
+	if !ok {
+		t.Fatalf("production operations service lacks alert API: %T", service)
+	}
+	alerts, err := alertService.ListAlerts(readCtx, operations.Principal{
+		User: auth.User{
+			ID: uuid.New(), Role: auth.RoleAdmin, Status: auth.StatusActive,
+		},
+		RequestID: "server-alert-wiring",
+		IP:        net.ParseIP("192.0.2.91"),
+	}, operations.AlertFilter{Limit: 50})
+	if err != nil || len(alerts.Items) != 0 {
+		t.Fatalf("alerts=%+v err=%v", alerts, err)
+	}
 
 	nilPoolRuntime := operations.NewPostgresStore(nil)
 	t.Cleanup(func() {
@@ -211,6 +225,85 @@ func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
 	})
 	if got := newProductionAdminOperationsService(nil, nilPoolRuntime); got != nil {
 		t.Fatalf("nil-pool production service=%T want nil", got)
+	}
+}
+
+func TestProductionApplicationStopsAlertRunnerBeforeOperationsAndPool(t *testing.T) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) {
+				return nil, nil
+			},
+			migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+				return serverAdminAuth{}, nil
+			},
+			newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+			newAdminOperations: newServerAdminOperations,
+			startAlertRunner: func(*pgxpool.Pool) func() {
+				events = append(events, "alert_start")
+				return func() { events = append(events, "alert_stop") }
+			},
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) { events = append(events, "pool_close") },
+		},
+	)
+	if err != nil || handler == nil || closeResources == nil {
+		t.Fatalf(
+			"handler=%v cleanup_present=%t err=%v",
+			handler,
+			closeResources != nil,
+			err,
+		)
+	}
+	closeResources()
+	if got := strings.Join(events, ","); got != "alert_start,alert_stop,operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestAlertRunnerInitializationFailureClosesOperationsAndPool(t *testing.T) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) {
+				return nil, nil
+			},
+			migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+				return serverAdminAuth{}, nil
+			},
+			newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+			newAdminOperations: newServerAdminOperations,
+			startAlertRunner:   func(*pgxpool.Pool) func() { return nil },
+			requireOperations:  true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) { events = append(events, "pool_close") },
+		},
+	)
+	if handler != nil || closeResources != nil || err == nil ||
+		err.Error() != "initialize alert evaluator" {
+		t.Fatalf(
+			"handler=%v cleanup_present=%t err=%v",
+			handler,
+			closeResources != nil,
+			err,
+		)
+	}
+	if got := strings.Join(events, ","); got != "operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
 	}
 }
 

@@ -1282,11 +1282,12 @@ FROM (VALUES
 			`INSERT INTO operational_alerts(
   id,dedupe_key,category,severity,state,
   first_observed_at,last_observed_at,acknowledged_by,acknowledged_at,
-  resolved_at,current_value,threshold_value,summary
+  resolved_at,current_value,threshold_value,summary,
+  consecutive_failures,version
 ) VALUES
-  ('54000000-0000-4000-8000-000000000001','dashboard-warning','queue','warning','open',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,NULL,2,1,'Dashboard warning'),
-  ('54000000-0000-4000-8000-000000000002','dashboard-critical','backup','critical','acknowledged',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes','30000000-0000-4000-8000-000000000001',$1::timestamptz-interval '1 minute',NULL,2,1,'Dashboard critical'),
-  ('54000000-0000-4000-8000-000000000003','dashboard-resolved','queue','warning','resolved',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,$1::timestamptz-interval '1 minute',0,1,'Dashboard resolved')`,
+  ('54000000-0000-4000-8000-000000000001','dashboard-warning','queue','warning','open',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,NULL,2,1,'Dashboard warning',2,2),
+  ('54000000-0000-4000-8000-000000000002','dashboard-critical','backup','critical','acknowledged',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes','30000000-0000-4000-8000-000000000001',$1::timestamptz-interval '1 minute',NULL,2,1,'Dashboard critical',2,2),
+  ('54000000-0000-4000-8000-000000000003','dashboard-resolved','queue','warning','resolved',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,$1::timestamptz-interval '1 minute',0,1,'Dashboard resolved',0,2)`,
 			[]any{now},
 		},
 		{

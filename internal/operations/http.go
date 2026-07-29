@@ -2,6 +2,7 @@ package operations
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -43,6 +44,8 @@ func (h *AdminHandler) Routes() http.Handler {
 	router.Put("/settings", h.updateSettings)
 	router.Get("/audit", h.listAudit)
 	router.Get("/dashboard", h.dashboard)
+	router.Get("/alerts", h.listAlerts)
+	router.Post("/alerts/{id}/acknowledge", h.acknowledgeAlert)
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
 	})
@@ -50,6 +53,199 @@ func (h *AdminHandler) Routes() http.Handler {
 		httpx.Error(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不被允许")
 	})
 	return router
+}
+
+func (h *AdminHandler) listAlerts(w http.ResponseWriter, r *http.Request) {
+	filter, ok := alertFilterFromRequest(w, r)
+	if !ok {
+		return
+	}
+	principal, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	service, ok := h.service.(AlertHTTPService)
+	if !ok {
+		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
+		return
+	}
+	page, err := service.ListAlerts(r.Context(), principal, filter)
+	if err != nil {
+		alertOperationsError(w, r, err)
+		return
+	}
+	items := make([]alertDTO, len(page.Items))
+	for index := range page.Items {
+		items[index] = alertView(page.Items[index])
+	}
+	next := ""
+	if page.Next != nil {
+		next = encodeAlertCursor(*page.Next)
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data []alertDTO `json:"data"`
+		Meta struct {
+			Next string `json:"next,omitempty"`
+		} `json:"meta"`
+	}{
+		Data: items,
+		Meta: struct {
+			Next string `json:"next,omitempty"`
+		}{Next: next},
+	})
+}
+
+func (h *AdminHandler) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
+	if !noQuery(r) || !emptyRequestBody(w, r) {
+		operationsInvalid(w, r, "invalid_request")
+		return
+	}
+	rawID := chi.URLParam(r, "id")
+	id, err := uuid.Parse(rawID)
+	if err != nil || id == uuid.Nil || id.String() != rawID {
+		operationsInvalid(w, r, "invalid_request")
+		return
+	}
+	principal, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	service, ok := h.service.(AlertHTTPService)
+	if !ok {
+		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
+		return
+	}
+	alert, err := service.AcknowledgeAlert(r.Context(), principal, id)
+	if err != nil {
+		alertOperationsError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, struct {
+		Data alertDTO `json:"data"`
+	}{Data: alertView(alert)})
+}
+
+func emptyRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.ContentLength > 0 {
+		return false
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1))
+	return err == nil && len(raw) == 0
+}
+
+type alertDTO struct {
+	ID              string        `json:"id"`
+	DedupeKey       string        `json:"dedupeKey"`
+	Category        string        `json:"category"`
+	Severity        AlertSeverity `json:"severity"`
+	State           AlertState    `json:"state"`
+	FirstObservedAt time.Time     `json:"firstObservedAt"`
+	LastObservedAt  time.Time     `json:"lastObservedAt"`
+	AcknowledgedBy  string        `json:"acknowledgedBy,omitempty"`
+	AcknowledgedAt  *time.Time    `json:"acknowledgedAt,omitempty"`
+	ResolvedAt      *time.Time    `json:"resolvedAt,omitempty"`
+	CurrentValue    float64       `json:"currentValue"`
+	ThresholdValue  float64       `json:"thresholdValue"`
+	Summary         string        `json:"summary"`
+}
+
+func alertView(alert Alert) alertDTO {
+	acknowledgedBy := ""
+	if alert.AcknowledgedBy != uuid.Nil {
+		acknowledgedBy = alert.AcknowledgedBy.String()
+	}
+	return alertDTO{
+		ID: alert.ID.String(), DedupeKey: alert.DedupeKey,
+		Category: alert.Category, Severity: alert.Severity, State: alert.State,
+		FirstObservedAt: alert.FirstObservedAt.UTC(),
+		LastObservedAt:  alert.LastObservedAt.UTC(),
+		AcknowledgedBy:  acknowledgedBy,
+		AcknowledgedAt:  utcAlertTime(alert.AcknowledgedAt),
+		ResolvedAt:      utcAlertTime(alert.ResolvedAt),
+		CurrentValue:    alert.CurrentValue,
+		ThresholdValue:  alert.ThresholdValue,
+		Summary:         alert.Summary,
+	}
+}
+
+func alertFilterFromRequest(w http.ResponseWriter, r *http.Request) (AlertFilter, bool) {
+	query, err := exactQuery(r, "state", "severity", "category", "before", "limit")
+	if err != nil {
+		operationsInvalid(w, r, "invalid_request")
+		return AlertFilter{}, false
+	}
+	filter := AlertFilter{
+		State:    AlertState(query.Get("state")),
+		Severity: AlertSeverity(query.Get("severity")),
+		Category: query.Get("category"),
+		Limit:    50,
+	}
+	if raw := query.Get("limit"); raw != "" {
+		value, parseErr := canonicalPositiveInt64(raw)
+		if parseErr != nil || value > 100 {
+			operationsInvalid(w, r, "invalid_request")
+			return AlertFilter{}, false
+		}
+		filter.Limit = int(value)
+	}
+	if raw := query.Get("before"); raw != "" {
+		cursor, parseErr := decodeAlertCursor(raw)
+		if parseErr != nil {
+			operationsInvalid(w, r, "invalid_request")
+			return AlertFilter{}, false
+		}
+		filter.Before = &cursor
+	}
+	if validateAlertFilter(filter) != nil {
+		operationsInvalid(w, r, "invalid_request")
+		return AlertFilter{}, false
+	}
+	return filter, true
+}
+
+func encodeAlertCursor(cursor AlertCursor) string {
+	payload := cursor.LastObservedAt.UTC().Format(time.RFC3339Nano) +
+		"\n" + cursor.ID.String()
+	return base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func decodeAlertCursor(raw string) (AlertCursor, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(decoded) > 128 {
+		return AlertCursor{}, ErrInvalid
+	}
+	parts := strings.Split(string(decoded), "\n")
+	if len(parts) != 2 {
+		return AlertCursor{}, ErrInvalid
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil || observedAt.IsZero() {
+		return AlertCursor{}, ErrInvalid
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil || id == uuid.Nil || id.String() != parts[1] {
+		return AlertCursor{}, ErrInvalid
+	}
+	cursor := AlertCursor{LastObservedAt: observedAt.UTC(), ID: id}
+	if encodeAlertCursor(cursor) != raw {
+		return AlertCursor{}, ErrInvalid
+	}
+	return cursor, nil
+}
+
+func alertOperationsError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, ErrForbidden):
+		httpx.Error(w, r, http.StatusForbidden, "forbidden", "无权访问")
+	case errors.Is(err, ErrInvalid):
+		operationsInvalid(w, r, "invalid_request")
+	case errors.Is(err, ErrAlertNotFound):
+		httpx.Error(w, r, http.StatusNotFound, "alert_not_found", "告警不存在")
+	case errors.Is(err, ErrAlertAlreadyResolved):
+		httpx.Error(w, r, http.StatusConflict, "alert_already_resolved", "告警已解决")
+	default:
+		httpx.Error(w, r, http.StatusInternalServerError, "internal_error", "服务暂不可用")
+	}
 }
 
 func (h *AdminHandler) dashboard(w http.ResponseWriter, r *http.Request) {

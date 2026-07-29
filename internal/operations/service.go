@@ -15,6 +15,28 @@ type service struct {
 	store       ServiceStore
 	auditReader audit.FilteredReader
 	dashboard   DashboardReader
+	alerts      AlertStore
+}
+
+func NewServiceWithDashboardAndAlerts(
+	store ServiceStore,
+	auditReader audit.FilteredReader,
+	dashboard DashboardReader,
+	alerts AlertStore,
+) (HTTPService, error) {
+	if alerts == nil {
+		return nil, ErrInvalid
+	}
+	base, err := NewServiceWithDashboard(store, auditReader, dashboard)
+	if err != nil {
+		return nil, err
+	}
+	concrete, ok := base.(*service)
+	if !ok {
+		return nil, ErrInvalid
+	}
+	concrete.alerts = alerts
+	return concrete, nil
 }
 
 func NewService(store ServiceStore, readers ...audit.FilteredReader) HTTPService {
@@ -85,6 +107,40 @@ func (s *service) GetDashboard(
 		return Dashboard{}, errDashboardDependencyUnavailable
 	}
 	return s.dashboard.Assemble(ctx)
+}
+
+func (s *service) ListAlerts(
+	ctx context.Context,
+	principal Principal,
+	filter AlertFilter,
+) (AlertPage, error) {
+	if err := authorizeSettings(principal); err != nil {
+		return AlertPage{}, err
+	}
+	if s.alerts == nil {
+		return AlertPage{}, errors.New("operations alert store unavailable")
+	}
+	if err := validateAlertFilter(filter); err != nil {
+		return AlertPage{}, err
+	}
+	return s.alerts.ListAlerts(ctx, filter)
+}
+
+func (s *service) AcknowledgeAlert(
+	ctx context.Context,
+	principal Principal,
+	id uuid.UUID,
+) (Alert, error) {
+	if err := authorizeSettings(principal); err != nil {
+		return Alert{}, err
+	}
+	if s.alerts == nil {
+		return Alert{}, errors.New("operations alert store unavailable")
+	}
+	if id == uuid.Nil {
+		return Alert{}, ErrInvalid
+	}
+	return s.alerts.AcknowledgeAlert(ctx, principal, id)
 }
 
 func highRiskSettingsReason(settings Settings) string {
