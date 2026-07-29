@@ -1072,8 +1072,12 @@ inspect_not_found_message() {
     networks) singular=network ;;
     *) return 1 ;;
   esac
-  grep -Fxq "Error: No such $singular: $name" "$path" ||
-    grep -Fxq "Error response from daemon: No such $singular: $name" "$path"
+  if grep -Fxq "Error: No such $singular: $name" "$path" ||
+    grep -Fxq "Error response from daemon: No such $singular: $name" "$path"; then
+    return 0
+  fi
+  [[ "$class" == networks ]] &&
+    grep -Fxq "Error response from daemon: network $name not found" "$path"
 }
 
 inspect_resource_labels() {
