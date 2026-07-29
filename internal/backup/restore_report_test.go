@@ -133,6 +133,137 @@ func TestWriteRestoreVerificationReportUsesExclusivePendingFile(t *testing.T) {
 	}
 }
 
+func TestWriteRestoreVerificationReportRollsBackPostLinkFailures(t *testing.T) {
+	injectedFailure := errors.New("injected filesystem failure")
+	for _, testCase := range []struct {
+		name   string
+		inject func(restoreReportOperations) restoreReportOperations
+	}{
+		{
+			name: "first directory sync",
+			inject: func(operations restoreReportOperations) restoreReportOperations {
+				syncCalls := 0
+				realSync := operations.syncDirectory
+				operations.syncDirectory = func(path string) error {
+					syncCalls++
+					if syncCalls == 1 {
+						return injectedFailure
+					}
+					return realSync(path)
+				}
+				return operations
+			},
+		},
+		{
+			name: "second directory sync",
+			inject: func(operations restoreReportOperations) restoreReportOperations {
+				syncCalls := 0
+				realSync := operations.syncDirectory
+				operations.syncDirectory = func(path string) error {
+					syncCalls++
+					if syncCalls == 2 {
+						return injectedFailure
+					}
+					return realSync(path)
+				}
+				return operations
+			},
+		},
+		{
+			name: "pending remove",
+			inject: func(operations restoreReportOperations) restoreReportOperations {
+				removeCalls := 0
+				realRemove := operations.remove
+				operations.remove = func(path string) error {
+					removeCalls++
+					if removeCalls == 1 {
+						return injectedFailure
+					}
+					return realRemove(path)
+				}
+				return operations
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, "restore-check.report")
+			pending := filepath.Join(directory, ".restore-check.report.pending")
+			operations := testCase.inject(defaultRestoreReportOperations())
+
+			err := writeRestoreVerificationReport(
+				path,
+				fixedRestoreReportResult(),
+				operations,
+			)
+			if !errors.Is(err, ErrRestoreReport) {
+				t.Fatalf("error=%v", err)
+			}
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("failed write left final report: %v", statErr)
+			}
+			if _, statErr := os.Lstat(pending); !os.IsNotExist(statErr) {
+				t.Fatalf("failed write left blocking pending report: %v", statErr)
+			}
+
+			if retryErr := WriteRestoreVerificationReport(
+				path,
+				fixedRestoreReportResult(),
+			); retryErr != nil {
+				t.Fatalf("safe retry failed: %v", retryErr)
+			}
+		})
+	}
+}
+
+func TestWriteRestoreVerificationReportRollbackPreservesReplacement(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "restore-check.report")
+	const replacement = "replacement owned by another writer\n"
+	operations := defaultRestoreReportOperations()
+	realSync := operations.syncDirectory
+	syncCalls := 0
+	operations.syncDirectory = func(directory string) error {
+		syncCalls++
+		if syncCalls != 1 {
+			return realSync(directory)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return errors.New("injected directory sync failure")
+	}
+
+	err := writeRestoreVerificationReport(
+		path,
+		fixedRestoreReportResult(),
+		operations,
+	)
+	if !errors.Is(err, ErrRestoreReport) {
+		t.Fatalf("error=%v", err)
+	}
+	content, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(content) != replacement {
+		t.Fatalf("rollback removed replacement: %q", content)
+	}
+	pending := filepath.Join(directory, ".restore-check.report.pending")
+	if _, statErr := os.Lstat(pending); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback left pending report: %v", statErr)
+	}
+}
+
 func TestWriteRestoreVerificationReportRejectsUnsafeOrIncompleteResult(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
