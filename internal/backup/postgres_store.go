@@ -801,7 +801,20 @@ WHERE (
   OR (
     a.repository='remote' AND r.state='succeeded'
   )
-ORDER BY a.repository,r.requested_at DESC,r.id DESC,a.kind`)
+  OR (
+    r.id=$1
+    AND r.state IN ('verifying','syncing')
+    AND (
+      a.repository='local'
+      OR (
+        a.repository='remote'
+        AND r.state='syncing'
+      )
+    )
+  )
+ORDER BY a.repository,r.requested_at DESC,r.id DESC,a.kind`,
+		policy.CurrentRunID,
+	)
 	if err != nil {
 		return nil, ErrUnavailable
 	}

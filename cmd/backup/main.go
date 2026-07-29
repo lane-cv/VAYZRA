@@ -417,6 +417,10 @@ func (application *commandApplication) Sync(
 		},
 	)
 	if syncErr != nil {
+		log.Printf(
+			"backup_remote_sync_stage_%s",
+			backup.RemoteSyncFailureStage(syncErr),
+		)
 		if errors.Is(syncErr, backup.ErrCancelled) {
 			return errWorkflowUnavailable
 		}
@@ -594,8 +598,7 @@ func (application *commandApplication) Fail(
 	}
 	if category == "remote_unavailable" &&
 		state.State == backup.StateSyncing &&
-		state.RemoteConfigured &&
-		state.RemoteSucceeded {
+		state.RemoteConfigured {
 		completed, completionErr := application.service.Complete(
 			ctx,
 			backup.CompletionInput{

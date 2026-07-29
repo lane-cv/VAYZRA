@@ -837,6 +837,25 @@ func TestCommandApplicationDoesNotConvertCancellationToRemoteDegradation(t *test
 	if states.state.ErrorCategory == "remote_unavailable" {
 		t.Fatalf("cancellation was converted to degradation: %+v", states.state)
 	}
+	if err := application.Fail(
+		context.Background(),
+		runID,
+		"remote_unavailable",
+	); err != nil {
+		t.Fatalf("explicit remote failure completion: %v", err)
+	}
+	if service.state != backup.StateDegraded ||
+		len(service.completions) != 1 ||
+		service.completions[0].RemoteSucceeded ||
+		service.completions[0].ErrorCategory != "remote_unavailable" ||
+		states.state != nil {
+		t.Fatalf(
+			"durable=%s completions=%+v state=%+v",
+			service.state,
+			service.completions,
+			states.state,
+		)
+	}
 }
 
 func TestCommandApplicationRecordsVerifiedRemoteArtifactsAfterSuccessfulSync(t *testing.T) {

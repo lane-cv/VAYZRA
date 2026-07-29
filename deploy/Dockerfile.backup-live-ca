@@ -1,0 +1,8 @@
+ARG HAPPYLEARN_BACKUP_BASE_IMAGE=happylearn-backup:phase5
+FROM ${HAPPYLEARN_BACKUP_BASE_IMAGE}
+
+USER 0:0
+COPY --chown=0:0 ca.crt /usr/local/share/ca-certificates/phase5-live-ca.crt
+RUN chmod 0644 /usr/local/share/ca-certificates/phase5-live-ca.crt \
+    && /usr/sbin/update-ca-certificates
+USER 10003:0

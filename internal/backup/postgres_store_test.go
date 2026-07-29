@@ -1143,6 +1143,54 @@ func TestPostgresStoreRetentionLocalSevenRemoteThirtyAndTwelveMonthly(t *testing
 	}
 }
 
+func TestPostgresStoreRetentionCountsVerifiedCurrentRunProspectively(t *testing.T) {
+	pool := backupPool(t)
+	store := NewPostgresStore(pool)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 28, 3, 0, 0, 0, time.UTC)
+	historical := make([]uuid.UUID, 0, 7)
+	for daysAgo := 1; daysAgo <= 7; daysAgo++ {
+		historical = append(historical, insertRetentionPoint(
+			t,
+			pool,
+			now.AddDate(0, 0, -daysAgo),
+			TriggerScheduled,
+			StateSucceeded,
+			RepositoryLocal,
+			fmt.Sprintf("prospective-local-%02d", daysAgo),
+		))
+	}
+	current := insertProspectiveRetentionPoint(
+		t,
+		pool,
+		now,
+		TriggerScheduled,
+		StateVerifying,
+		RepositoryLocal,
+		fmt.Sprintf("%064x", 999),
+	)
+
+	candidates, err := store.RetentionCandidates(ctx, RetentionPolicy{
+		Now: now, Location: shanghai, LocalDaily: 7,
+		RemoteDaily: 30, RemoteMonthly: 12,
+		PreReleaseProtectFor: 30 * 24 * time.Hour,
+		CurrentRunID:         current,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[uuid.UUID]bool)
+	for _, artifact := range candidates {
+		got[artifact.BackupRunID] = true
+	}
+	if !got[historical[6]] {
+		t.Fatalf("oldest success was not evicted with prospective current: %v", sortedUUIDs(got))
+	}
+	if got[current] {
+		t.Fatalf("prospective current was selected: %v", sortedUUIDs(got))
+	}
+}
+
 func backupPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := integration.StartPostgres(t)
@@ -1192,6 +1240,70 @@ INSERT INTO backup_artifacts(
 		id, repository, snapshot, requestedAt,
 	); err != nil {
 		t.Fatal(err)
+	}
+	return id
+}
+
+func insertProspectiveRetentionPoint(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	requestedAt time.Time,
+	trigger Trigger,
+	state State,
+	repository Repository,
+	snapshot string,
+) uuid.UUID {
+	t.Helper()
+	if state != StateVerifying && state != StateSyncing {
+		t.Fatalf("invalid prospective state=%s", state)
+	}
+	id := uuid.New()
+	ctx := context.Background()
+	remoteSnapshot := any(nil)
+	if repository == RepositoryRemote {
+		remoteSnapshot = snapshot
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO backup_runs(
+  id,idempotency_key,trigger_kind,state,requested_at,finished_at,
+  database_migration_version,encryption_key_id,local_snapshot_id,
+  remote_snapshot_id,manifest_sha256,local_expires_at,remote_expires_at
+) VALUES(
+  $1,$2,$3,$4,$5::timestamptz,NULL,
+  20,'age-key-1',$6,$7,decode(repeat('00',32),'hex'),
+  $5::timestamptz+interval '7 days',
+  CASE WHEN $7::text IS NULL THEN NULL ELSE $5::timestamptz+interval '30 days' END
+)`,
+		id,
+		"retention-"+id.String(),
+		trigger,
+		state,
+		requestedAt,
+		snapshot,
+		remoteSnapshot,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []ArtifactKind{
+		ArtifactDatabaseDump,
+		ArtifactObjectSnapshot,
+		ArtifactManifest,
+	} {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO backup_artifacts(
+  backup_run_id,kind,repository,snapshot_id,sha256,size_bytes,verified_at,expires_at
+) VALUES(
+  $1,$2,$3,$4,decode(repeat('11',32),'hex'),42,
+  $5::timestamptz,$5::timestamptz+interval '30 days'
+)`,
+			id,
+			kind,
+			repository,
+			snapshot,
+			requestedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return id
 }

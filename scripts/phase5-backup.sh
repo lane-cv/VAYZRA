@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 readonly USAGE='Usage: scripts/phase5-backup.sh --project happylearn-dev --trigger scheduled|manual|pre_release'
 readonly OPERATIONS_ADVISORY_KEY='845103120'
 readonly BACKUP_ADVISORY_KEY='845103121'
 
 PROJECT=''
+EFFECTIVE_PROJECT=''
 TRIGGER=''
 ROOT=''
 COMPOSE_FILE=''
+LIVE_COMPOSE_FILE=''
+LIVE_ROOT=''
 LOCK_DIRECTORY=''
 LOCK_HELD=false
 LEASE_FIFO=''
@@ -28,12 +32,12 @@ REMOTE_ENABLED=false
 REMOTE_DEGRADED=false
 RECOVERY_UNSAFE=false
 ALLOW_LOST_LEASE_ACTIONS=false
+SEPARATE_EXTERNAL_GROUP=true
 CLEANING_UP=false
 FAILURE_CATEGORY='internal'
+CURRENT_STAGE='startup'
 LOCAL_SNAPSHOT_ID=''
 REMOTE_SNAPSHOT_ID=''
-declare -a LOCAL_PROTECTED_TAGS=()
-declare -a REMOTE_PROTECTED_TAGS=()
 
 SERVICE_STOP_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_SERVICE_STOP_TIMEOUT_SECONDS:-60}"
 DRAIN_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DRAIN_TIMEOUT_SECONDS:-600}"
@@ -41,6 +45,9 @@ READY_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_READY_TIMEOUT_SECONDS:-180}"
 POLL_INTERVAL_SECONDS="${HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS:-2}"
 HEARTBEAT_INTERVAL_SECONDS="${HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS:-60}"
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}"
+DATABASE_QUERY_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-30}"
+DATABASE_CONNECT_TIMEOUT_SECONDS="${HAPPYLEARN_BACKUP_DATABASE_CONNECT_TIMEOUT_SECONDS:-5}"
+DATABASE_STATEMENT_TIMEOUT_MILLISECONDS="$((DATABASE_QUERY_TIMEOUT_SECONDS * 1000))"
 
 usage_error() {
   printf '%s\n' "$USAGE" >&2
@@ -59,6 +66,7 @@ validate_arguments() {
   [[ "$#" -eq 4 ]] || usage_error
   [[ "$1" == '--project' && "$3" == '--trigger' ]] || usage_error
   PROJECT="$2"
+  EFFECTIVE_PROJECT="$PROJECT"
   TRIGGER="$4"
   [[ "$PROJECT" == "happylearn-dev" ]] || usage_error
   case "$TRIGGER" in
@@ -74,6 +82,11 @@ validate_arguments() {
     usage_error
   valid_uint "$EXTERNAL_TIMEOUT_SECONDS" || usage_error
   [[ "$EXTERNAL_TIMEOUT_SECONDS" -lt 7200 ]] || usage_error
+  valid_uint "$DATABASE_QUERY_TIMEOUT_SECONDS" || usage_error
+  [[ "$DATABASE_QUERY_TIMEOUT_SECONDS" -le 300 ]] || usage_error
+  valid_uint "$DATABASE_CONNECT_TIMEOUT_SECONDS" || usage_error
+  [[ "$DATABASE_CONNECT_TIMEOUT_SECONDS" -le "$DATABASE_QUERY_TIMEOUT_SECONDS" ]] ||
+    usage_error
 }
 
 resolve_root() {
@@ -81,6 +94,7 @@ resolve_root() {
   script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
   ROOT="$(cd "$script_directory/.." && pwd -P)"
   COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"
+  LIVE_COMPOSE_FILE="$ROOT/deploy/compose.backup-live.yml"
   [[ -f "$COMPOSE_FILE" && -f "$ROOT/Dockerfile.backup" ]] ||
     usage_error
 }
@@ -112,6 +126,60 @@ owner_only_secret() {
   [[ "$size" -ge 1 && "$size" -le 4096 ]]
 }
 
+single_line_secret_value() {
+  local path="$1"
+  local value
+  local size
+  owner_only_secret "$path" || return 1
+  value="$(<"$path")"
+  if stat -f '%z' "$path" >/dev/null 2>&1; then
+    size="$(stat -f '%z' "$path")"
+  else
+    size="$(stat -c '%s' "$path")"
+  fi
+  [[ -n "$value" &&
+    "$value" != *$'\n'* &&
+    "$value" != *$'\r'* &&
+    "$value" == "${value#"${value%%[![:space:]]*}"}" &&
+    "$value" == "${value%"${value##*[![:space:]]}"}" ]] ||
+    return 1
+  [[ "$size" -eq "${#value}" || "$size" -eq $((${#value} + 1)) ]] ||
+    return 1
+  printf '%s' "$value"
+}
+
+valid_remote_repository() {
+  local repository="$1"
+  local location authority bucket lower_bucket percent_suffix
+  [[ "$repository" == s3:https://* &&
+    ! "$repository" =~ [[:space:][:cntrl:]] &&
+    "$repository" != *'?'* &&
+    "$repository" != *'#'* &&
+    "$repository" != *'\'* ]] ||
+    return 1
+  location="${repository#s3:https://}"
+  [[ "$location" == */* ]] || return 1
+  authority="${location%%/*}"
+  bucket="${location#*/}"
+  [[ -n "$authority" && "$authority" != *'@'* ]] || return 1
+  while [[ "$bucket" == /* ]]; do
+    bucket="${bucket#/}"
+  done
+  while [[ "$bucket" == */ ]]; do
+    bucket="${bucket%/}"
+  done
+  lower_bucket="$(printf '%s' "$bucket" | tr '[:upper:]' '[:lower:]')"
+  [[ -n "$bucket" &&
+    "$lower_bucket" != *insecure-tls* ]] ||
+    return 1
+  percent_suffix="$repository"
+  while [[ "$percent_suffix" == *'%'* ]]; do
+    percent_suffix="${percent_suffix#*%}"
+    [[ "$percent_suffix" =~ ^[0-9A-Fa-f]{2} ]] || return 1
+    percent_suffix="${percent_suffix:2}"
+  done
+}
+
 validate_paths_and_secrets() {
   : "${HAPPYLEARN_AISTOR_LICENSE_FILE:?missing AIStor license file}"
   : "${HAPPYLEARN_BACKUP_SECRET_DIRECTORY:?missing backup secret directory}"
@@ -127,13 +195,14 @@ validate_paths_and_secrets() {
   owner_only_directory "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_BACKUP_STATE_DIRECTORY" || return 1
-  owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/database_password" ||
+  single_line_secret_value \
+    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/database_password" >/dev/null ||
     return 1
-  owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_repository" ||
+  [[ "$(single_line_secret_value \
+    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_repository")" == '/repository' ]] ||
     return 1
-  owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password" ||
-    return 1
-  [[ "$(<"$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_repository")" == '/repository' ]] ||
+  single_line_secret_value \
+    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password" >/dev/null ||
     return 1
   [[ "$HAPPYLEARN_BACKUP_AGE_RECIPIENT" =~ ^age1[023456789ac-hj-np-z]{20,100}$ ]] ||
     return 1
@@ -153,7 +222,8 @@ remote_configuration_complete() {
   local name
   for name in "${names[@]}"; do
     if [[ -e "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/$name" ]]; then
-      owner_only_secret "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/$name" ||
+      single_line_secret_value \
+        "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/$name" >/dev/null ||
         return 1
       present=$((present + 1))
     fi
@@ -164,9 +234,45 @@ remote_configuration_complete() {
   fi
   [[ "$present" -eq 4 ]] || return 1
   local repository
-  repository="$(<"$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/remote_repository")"
-  [[ "$repository" =~ ^s3:https://[^/?#]+/[^?#]+$ ]] || return 1
+  repository="$(single_line_secret_value \
+    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/remote_repository")"
+  valid_remote_repository "$repository" || return 1
   REMOTE_ENABLED=true
+}
+
+configure_live_context() {
+  local enabled="${HAPPYLEARN_BACKUP_LIVE_TEST:-}"
+  local live_project="${HAPPYLEARN_BACKUP_LIVE_PROJECT:-}"
+  local live_root="${HAPPYLEARN_BACKUP_LIVE_ROOT:-}"
+  local secret_root
+  local repository_root
+  local state_root
+  local lock_path
+  if [[ -z "$enabled" ]]; then
+    [[ -z "$live_project" && -z "$live_root" ]] || return 1
+    return 0
+  fi
+  [[ "$enabled" == '1' &&
+    "$live_project" =~ ^happylearn-phase5-live-[a-f0-9]{12}$ &&
+    "$live_root" == /* &&
+    -f "$LIVE_COMPOSE_FILE" ]] ||
+    return 1
+  owner_only_directory "$live_root" || return 1
+  LIVE_ROOT="$(cd "$live_root" && pwd -P)"
+  secret_root="$(cd "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" && pwd -P)"
+  repository_root="$(cd "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" && pwd -P)"
+  state_root="$(cd "$HAPPYLEARN_BACKUP_STATE_DIRECTORY" && pwd -P)"
+  lock_path="$(
+    cd "$(dirname "${HAPPYLEARN_BACKUP_LOCK_DIRECTORY:-/}")" &&
+      printf '%s/%s' "$(pwd -P)" \
+        "$(basename "${HAPPYLEARN_BACKUP_LOCK_DIRECTORY:-/}")"
+  )"
+  [[ "$secret_root" == "$LIVE_ROOT/secrets" &&
+    "$repository_root" == "$LIVE_ROOT/repository" &&
+    "$state_root" == "$LIVE_ROOT/state" &&
+    "$lock_path" == "$LIVE_ROOT/host.lock" ]] ||
+    return 1
+  EFFECTIVE_PROJECT="$live_project"
 }
 
 acquire_host_lock() {
@@ -180,7 +286,14 @@ acquire_host_lock() {
 }
 
 compose() {
-  docker compose --project-name "$PROJECT" --file "$COMPOSE_FILE" "$@"
+  local -a arguments=(
+    --project-name "$EFFECTIVE_PROJECT"
+    --file "$COMPOSE_FILE"
+  )
+  if [[ -n "$LIVE_ROOT" ]]; then
+    arguments+=(--file "$LIVE_COMPOSE_FILE")
+  fi
+  docker compose "${arguments[@]}" "$@"
 }
 
 initialize_backup_mounts() {
@@ -193,23 +306,55 @@ initialize_backup_mounts() {
 verify_backup_mount_ownership() {
   run_guarded_external 120 \
     compose run --rm --no-deps --entrypoint /bin/sh backup -eu -c '
-      test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700"
-      test "$(stat -c "%u:%g:%a" /state)" = "10003:0:700"
-      test "$(stat -c "%u:%g:%a" /run/secrets)" = "10003:0:700"
+      test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700" ||
+        { printf "%s\n" repository_ownership >&2; exit 1; }
+      test "$(stat -c "%u:%g:%a" /state)" = "10003:0:700" ||
+        { printf "%s\n" state_ownership >&2; exit 1; }
+      test "$(stat -c "%u:%g:%a" /run/secrets)" = "10003:0:700" ||
+        { printf "%s\n" secret_directory_ownership >&2; exit 1; }
       for name in database_password local_repository local_password; do
-        test "$(stat -c "%u:%g:%a" "/run/secrets/${name}")" = "10003:0:400"
+        test "$(stat -c "%u:%g:%a" "/run/secrets/${name}")" = "10003:0:400" ||
+          { printf "%s\n" required_secret_ownership >&2; exit 1; }
       done
       for name in remote_repository remote_password remote_access_key_id \
         remote_secret_access_key; do
         if test -e "/run/secrets/${name}"; then
-          test "$(stat -c "%u:%g:%a" "/run/secrets/${name}")" = "10003:0:400"
+          test "$(stat -c "%u:%g:%a" "/run/secrets/${name}")" = "10003:0:400" ||
+            { printf "%s\n" optional_secret_ownership >&2; exit 1; }
         fi
       done
     '
 }
 
 database_query() {
-  compose exec -T postgres psql \
+  local query
+  query="$(cat)"
+  [[ -n "$query" ]] || return 1
+  run_guarded_external "$DATABASE_QUERY_TIMEOUT_SECONDS" \
+    database_query_text "$query"
+}
+
+database_query_text() {
+  local query="$1"
+  [[ -n "$query" ]] || return 1
+  compose exec -T \
+    -e "PGCONNECTTIMEOUT=${DATABASE_CONNECT_TIMEOUT_SECONDS}" \
+    -e "PGOPTIONS=-c statement_timeout=${DATABASE_STATEMENT_TIMEOUT_MILLISECONDS} -c lock_timeout=${DATABASE_STATEMENT_TIMEOUT_MILLISECONDS}" \
+    postgres psql \
+    --username happylearn \
+    --dbname happylearn \
+    --no-psqlrc \
+    --quiet \
+    --tuples-only \
+    --no-align \
+    --set ON_ERROR_STOP=1 <<<"$query"
+}
+
+database_session() {
+  compose exec -T \
+    -e "PGCONNECTTIMEOUT=${DATABASE_CONNECT_TIMEOUT_SECONDS}" \
+    -e "PGOPTIONS=-c statement_timeout=0" \
+    postgres psql \
     --username happylearn \
     --dbname happylearn \
     --no-psqlrc \
@@ -266,11 +411,41 @@ LIMIT 1;
 COMMIT;
 SQL
   )"
-  local state selected_trigger selected_id extra
-  IFS='|' read -r state selected_trigger selected_id extra <<<"$selected"
-  [[ -z "${extra:-}" &&
-    "$selected_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
-    "$selected_trigger" == "$TRIGGER" ]] || return 1
+  local state selected_trigger selected_id extra line
+  local selected_result=''
+  local selected_count=0
+  while IFS= read -r line; do
+    case "$line" in
+      ''|BEGIN|COMMIT) ;;
+      queued\|*|draining\|*|snapshotting\|*|encrypting\|*|verifying\|*|syncing\|*|succeeded\|*|degraded\|*)
+        if [[ "$line" =~ ^(queued|draining|snapshotting|encrypting|verifying|syncing|succeeded|degraded)\|(scheduled|manual|pre_release)\|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+          selected_result="$line"
+          selected_count=$((selected_count + 1))
+        else
+          safe_log 'queue_result_invalid_record'
+          return 1
+        fi
+        ;;
+      *)
+        safe_log 'queue_result_unexpected_line'
+        return 1
+        ;;
+    esac
+  done <<<"$selected"
+  if [[ "$selected_count" -ne 1 ]]; then
+    safe_log "queue_result_count_${selected_count}"
+    return 1
+  fi
+  IFS='|' read -r state selected_trigger selected_id extra <<<"$selected_result"
+  [[ -z "${extra:-}" ]] || return 1
+  if [[ "$selected_trigger" != "$TRIGGER" ]]; then
+    safe_log 'queue_result_trigger_mismatch'
+    return 1
+  fi
+  if [[ ! "$selected_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    safe_log "queue_result_id_shape_${#selected_id}"
+    return 1
+  fi
   case "$state" in
     queued|draining|snapshotting|encrypting|verifying|syncing)
       RUN_ID="$selected_id"
@@ -279,7 +454,10 @@ SQL
       TERMINAL_RECORDED=true
       return 2
       ;;
-    *) return 1 ;;
+    *)
+      safe_log "queue_result_state_shape_${#state}"
+      return 1
+      ;;
   esac
 }
 
@@ -304,7 +482,9 @@ start_operational_lock_session() {
   : >"$LEASE_OUTPUT"
   chmod 0600 "$LEASE_OUTPUT"
   set -m
-  database_query <"$LEASE_FIFO" >"$LEASE_OUTPUT" 2>/dev/null &
+  (
+    database_session <"$LEASE_FIFO" >"$LEASE_OUTPUT" 2>/dev/null
+  ) &
   LEASE_PID="$!"
   set +m
   exec 9>"$LEASE_FIFO"
@@ -432,7 +612,12 @@ SQL
 start_lease_heartbeat() {
   LEASE_HEARTBEAT_FAILED="$LOCK_DIRECTORY/heartbeat.failed"
   [[ ! -e "$LEASE_HEARTBEAT_FAILED" ]] || return 1
+  set -m
   (
+    set +m
+    exec 9>&-
+    ALLOW_LOST_LEASE_ACTIONS=true
+    SEPARATE_EXTERNAL_GROUP=false
     while sleep "$HEARTBEAT_INTERVAL_SECONDS"; do
       if ! renew_operational_lease; then
         printf '%s\n' 'lease_lost' >"$LEASE_HEARTBEAT_FAILED"
@@ -441,6 +626,7 @@ start_lease_heartbeat() {
     done
   ) &
   LEASE_HEARTBEAT_PID="$!"
+  set +m
 }
 
 assert_lease_heartbeat() {
@@ -459,6 +645,19 @@ terminate_external_group() {
   sleep "$POLL_INTERVAL_SECONDS"
   kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+wait_for_lease_session_exit() {
+  local pid="$1"
+  local deadline=$((SECONDS + DATABASE_QUERY_TIMEOUT_SECONDS))
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      return 1
+    fi
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+  wait "$pid"
 }
 
 run_guarded_external() {
@@ -467,10 +666,15 @@ run_guarded_external() {
   valid_uint "$timeout_seconds" || return 1
   local deadline=$((SECONDS + timeout_seconds))
   local pid
-  set -m
-  ( "$@" ) &
-  pid="$!"
-  set +m
+  if [[ "$SEPARATE_EXTERNAL_GROUP" == true ]]; then
+    set -m
+    ( "$@" ) &
+    pid="$!"
+    set +m
+  else
+    ( "$@" ) &
+    pid="$!"
+  fi
   while kill -0 "$pid" 2>/dev/null; do
     if [[ "$ALLOW_LOST_LEASE_ACTIONS" == false &&
       "$LEASE_DURABLE" == true ]] &&
@@ -497,8 +701,7 @@ run_guarded_external() {
 
 stop_lease_heartbeat() {
   if [[ -n "$LEASE_HEARTBEAT_PID" ]]; then
-    kill "$LEASE_HEARTBEAT_PID" 2>/dev/null || true
-    wait "$LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    terminate_external_group "$LEASE_HEARTBEAT_PID"
     LEASE_HEARTBEAT_PID=''
   fi
 }
@@ -534,7 +737,7 @@ wait_for_durable_drain() {
 }
 
 backup_command() {
-  run_guarded_external "$EXTERNAL_TIMEOUT_SECONDS" \
+  run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
     bounded_backup_compose "$@"
 }
 
@@ -567,7 +770,7 @@ wait_for_authenticated_aistor() {
   return 1
 }
 
-restart_stopped_services() {
+restart_aistor_service() {
   if [[ "$AISTOR_STOPPED" == true ]]; then
     FAILURE_CATEGORY='object_store_restart'
     if ! run_guarded_external "$READY_TIMEOUT_SECONDS" \
@@ -581,6 +784,10 @@ restart_stopped_services() {
     fi
     AISTOR_STOPPED=false
   fi
+}
+
+restart_stopped_services() {
+  restart_aistor_service || return 1
   if [[ "$WORKER_STOPPED" == true ]]; then
     if ! run_guarded_external 60 compose start worker; then
       RECOVERY_UNSAFE=true
@@ -604,16 +811,23 @@ SQL
 remote_snapshot_id() {
   database_query <<SQL
 -- PHASE5_QUERY_REMOTE_RESULT
-SELECT remote_snapshot_id
-FROM backup_runs
-WHERE id='${RUN_ID}'::uuid
-  AND state='syncing'
-  AND remote_snapshot_id ~ '^[0-9a-f]{64}$';
+SELECT min(artifacts.snapshot_id)
+FROM backup_artifacts AS artifacts
+JOIN backup_runs AS runs ON runs.id=artifacts.backup_run_id
+WHERE artifacts.backup_run_id='${RUN_ID}'::uuid
+  AND runs.state='syncing'
+  AND artifacts.repository='remote'
+  AND artifacts.kind IN ('database_dump','object_snapshot','manifest')
+  AND artifacts.snapshot_id ~ '^[0-9a-f]{64}$'
+GROUP BY artifacts.backup_run_id
+HAVING count(*)=3
+   AND count(DISTINCT artifacts.kind)=3
+   AND count(DISTINCT artifacts.snapshot_id)=1;
 SQL
 }
 
 local_restic() {
-  run_guarded_external "$EXTERNAL_TIMEOUT_SECONDS" \
+  run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
     compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" restic \
     --no-cache \
@@ -623,7 +837,7 @@ local_restic() {
 }
 
 remote_restic() {
-  run_guarded_external "$EXTERNAL_TIMEOUT_SECONDS" \
+  run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
     compose run --rm --no-deps --entrypoint /bin/sh backup \
     -eu -c '
       deadline="$1"
@@ -675,133 +889,24 @@ ensure_repository() {
   esac
 }
 
-protected_batch_tags() {
+run_retention() {
   local repository="$1"
-  local days="$2"
-  local snapshot_column
-  local terminal_states
   case "$repository" in
-    local)
-      snapshot_column='local_snapshot_id'
-      terminal_states="'succeeded','degraded'"
-      ;;
-    remote)
-      snapshot_column='remote_snapshot_id'
-      terminal_states="'succeeded'"
-      ;;
+    local|remote) ;;
     *) return 1 ;;
   esac
-  [[ "$days" == '30' ]] || return 1
-  database_query <<SQL
--- PHASE5_QUERY_PROTECTED_TAGS
-WITH candidates AS (
-  SELECT id,0 AS priority
-  FROM backup_runs
-  WHERE id='${RUN_ID}'::uuid
-    AND ${snapshot_column} ~ '^[0-9a-f]{64}$'
-  UNION ALL
-  SELECT id,1
-  FROM backup_runs
-  WHERE trigger_kind='pre_release'
-    AND state IN (${terminal_states})
-    AND ${snapshot_column} ~ '^[0-9a-f]{64}$'
-    AND finished_at>=clock_timestamp()-interval '${days} days'
-    AND finished_at<=clock_timestamp()
-  UNION ALL
-  SELECT id,2
-  FROM (
-    SELECT id
-    FROM backup_runs
-    WHERE state IN (${terminal_states})
-      AND ${snapshot_column} ~ '^[0-9a-f]{64}$'
-    ORDER BY finished_at DESC,id DESC
-    LIMIT 1
-  ) AS latest_good
-)
-SELECT 'happylearn-batch:' || id::text
-FROM candidates
-GROUP BY id
-ORDER BY min(priority),id
-LIMIT 513;
-SQL
-}
-
-load_protected_tags() {
-  local repository="$1"
-  local output
-  output="$(protected_batch_tags "$repository" 30)" || return 1
-  [[ -n "$output" ]] || return 1
-  local tag
-  local -a parsed=()
-  while IFS= read -r tag; do
-    [[ "$tag" =~ ^happylearn-batch:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
-      return 1
-    parsed+=("$tag")
-    [[ "${#parsed[@]}" -le 512 ]] || return 1
-  done <<<"$output"
-  if [[ "$repository" == 'local' ]]; then
-    LOCAL_PROTECTED_TAGS=("${parsed[@]}")
-  else
-    REMOTE_PROTECTED_TAGS=("${parsed[@]}")
-  fi
-}
-
-protect_pre_release() {
-  local days="$1"
-  [[ "$days" == '30' ]] || return 1
-  load_protected_tags local
-  if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == false ]]; then
-    load_protected_tags remote
-  fi
-}
-
-protect_last_good() {
-  local current="happylearn-batch:${RUN_ID}"
-  local tag
-  local found=false
-  for tag in "${LOCAL_PROTECTED_TAGS[@]}"; do
-    if [[ "$tag" == "$current" ]]; then
-      found=true
-    fi
-  done
-  [[ "$found" == true ]] || return 1
-  if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == false ]]; then
-    found=false
-    for tag in "${REMOTE_PROTECTED_TAGS[@]}"; do
-      if [[ "$tag" == "$current" ]]; then
-        found=true
-      fi
-    done
-    [[ "$found" == true ]] || return 1
-  fi
-}
-
-apply_retention() {
-  local repository="$1"
-  shift
-  local -a arguments=(--group-by paths "$@")
-  local tag
-  case "$repository" in
-    local)
-      for tag in "${LOCAL_PROTECTED_TAGS[@]}"; do
-        arguments+=(--keep-tag "$tag")
-      done
-      local_restic forget "${arguments[@]}" --prune
-      ;;
-    remote)
-      for tag in "${REMOTE_PROTECTED_TAGS[@]}"; do
-        arguments+=(--keep-tag "$tag")
-      done
-      remote_restic forget "${arguments[@]}" --prune
-      ;;
-    *) return 1 ;;
-  esac
+  run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
+    compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
+    /app/happylearn-backup-retention \
+    --repository "$repository" --run-id "$RUN_ID"
 }
 
 complete_remote_degraded() {
   if [[ "$FAILURE_CATEGORY" == 'lease_lost' ]]; then
     return 1
   fi
+  restart_stopped_services || return 1
   FAILURE_CATEGORY='remote_unavailable'
   backup_command fail --run-id "$RUN_ID" --category "$FAILURE_CATEGORY"
   TERMINAL_RECORDED=true
@@ -810,33 +915,79 @@ complete_remote_degraded() {
 
 record_failure() {
   [[ -n "$RUN_ID" && "$TERMINAL_RECORDED" == false ]] || return 0
-  if run_guarded_external "$EXTERNAL_TIMEOUT_SECONDS" bounded_backup_compose \
+  if run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
+    bounded_backup_compose \
     fail --run-id "$RUN_ID" --category "$FAILURE_CATEGORY"; then
+    TERMINAL_RECORDED=true
+    return 0
+  fi
+  if record_unprepared_failure; then
     TERMINAL_RECORDED=true
     return 0
   fi
   return 1
 }
 
+record_unprepared_failure() {
+  [[ "$FAILURE_CATEGORY" =~ ^(drain_timeout|database_dump|object_store_stop|snapshot|object_store_restart|integrity|remote_sync|remote_unavailable|retention|lease_lost|timeout|internal)$ ]] ||
+    return 1
+  local recorded
+  recorded="$(
+    database_query <<SQL
+-- PHASE5_QUERY_UNPREPARED_FAIL
+UPDATE backup_runs
+SET state='failed',
+    finished_at=clock_timestamp(),
+    error_category='${FAILURE_CATEGORY}',
+    error_trace_id='',
+    owner_id=NULL,
+    lease_expires_at=NULL
+WHERE id='${RUN_ID}'::uuid
+  AND state='queued'
+  AND owner_id IS NULL
+  AND lease_expires_at IS NULL
+RETURNING 'recorded';
+SQL
+  )"
+  [[ "$recorded" == 'recorded' ]]
+}
+
 stop_operational_lock_session() {
   [[ "$LEASE_FD_OPEN" == true ]] || return 0
   printf '%s\n' \
     "SELECT pg_advisory_unlock(${OPERATIONS_ADVISORY_KEY}); -- PHASE5_RELEASE_LOCK" \
+    "SELECT 'PHASE5_LEASE_RELEASED';" \
     "\\q" >&9 || true
   exec 9>&-
   LEASE_FD_OPEN=false
   if [[ -n "$LEASE_PID" ]]; then
-    wait "$LEASE_PID" 2>/dev/null || true
+    if ! wait_for_marker \
+      'PHASE5_LEASE_RELEASED' \
+      "$DATABASE_QUERY_TIMEOUT_SECONDS"; then
+      safe_log 'lease_release_marker_timeout'
+      abort_operational_lock_session
+      return 1
+    fi
+    local released_pid="$LEASE_PID"
+    if ! wait_for_lease_session_exit "$released_pid"; then
+      safe_log 'lease_session_exit_timeout'
+      abort_operational_lock_session
+      return 1
+    fi
+    LEASE_PID=''
   fi
   LEASE_PID=''
+  return 0
 }
 
 release_operational_lease() {
   local released
-  stop_lease_heartbeat
   if [[ "$LEASE_DURABLE" == true ]]; then
     if [[ "$RECOVERY_UNSAFE" == true ]]; then
-      transition_operational_mode release || return 1
+      if ! transition_operational_mode release; then
+        stop_lease_heartbeat
+        return 1
+      fi
     else
       released="$(
         database_query <<SQL
@@ -855,10 +1006,15 @@ WHERE singleton_id=true
 RETURNING 'released';
 SQL
       )"
-      [[ "$released" == 'released' ]] || return 1
+      if [[ "$released" != 'released' ]]; then
+        safe_log 'durable_lease_release_failed'
+        stop_lease_heartbeat
+        return 1
+      fi
     fi
     LEASE_DURABLE=false
   fi
+  stop_lease_heartbeat
   stop_operational_lock_session
 }
 
@@ -897,34 +1053,43 @@ cleanup() {
   if restart_stopped_services; then
     FAILURE_CATEGORY="$failed_stage"
   else
+    safe_log 'cleanup_restart_failed'
     status=1
   fi
   if [[ "$status" -ne 0 ]] && ! record_failure; then
+    safe_log 'cleanup_record_failure_failed'
     status=1
   fi
   if ! release_operational_lease; then
+    safe_log 'cleanup_release_failed'
     RECOVERY_UNSAFE=true
     status=1
     stop_operational_lock_session
   fi
   if ! remove_host_lock; then
+    safe_log 'cleanup_host_lock_failed'
     status=1
   fi
   if [[ "$status" -ne 0 ]]; then
-    safe_log 'failed'
+    safe_log "failed_${CURRENT_STAGE}_${failed_stage}"
   fi
   exit "$status"
 }
 
 main() {
   validate_arguments "$@"
+  CURRENT_STAGE='paths'
   resolve_root
   validate_paths_and_secrets
+  configure_live_context
   trap cleanup EXIT HUP INT TERM
   acquire_host_lock
+  CURRENT_STAGE='mount_init'
   initialize_backup_mounts
+  CURRENT_STAGE='mount_verify'
   verify_backup_mount_ownership
 
+  CURRENT_STAGE='queue'
   local result
   if queue_or_select_run; then
     :
@@ -936,30 +1101,42 @@ main() {
     FAILURE_CATEGORY='internal'
     return 1
   fi
+  CURRENT_STAGE='lease_values'
   prepare_lease_values
+  CURRENT_STAGE='lock_session'
   start_operational_lock_session
+  CURRENT_STAGE='durable_lease'
   acquire_durable_lease
+  CURRENT_STAGE='heartbeat'
   start_lease_heartbeat
 
   FAILURE_CATEGORY='internal'
+  CURRENT_STAGE='prepare'
   backup_command prepare --run-id "$RUN_ID"
   assert_lease_heartbeat
   FAILURE_CATEGORY='integrity'
+  CURRENT_STAGE='local_repository'
   ensure_repository local
   assert_lease_heartbeat
+  FAILURE_CATEGORY='drain_timeout'
+  CURRENT_STAGE='drain'
   wait_for_durable_drain
   transition_operational_mode backup
   assert_lease_heartbeat
+  CURRENT_STAGE='stop_services'
   stop_snapshot_services
   assert_lease_heartbeat
 
   FAILURE_CATEGORY='snapshot'
+  CURRENT_STAGE='snapshot'
   backup_command snapshot --run-id "$RUN_ID"
   assert_lease_heartbeat
-  restart_stopped_services
+  CURRENT_STAGE='aistor_restart'
+  restart_aistor_service
   assert_lease_heartbeat
 
   FAILURE_CATEGORY='integrity'
+  CURRENT_STAGE='verify'
   backup_command verify --run-id "$RUN_ID"
   assert_lease_heartbeat
   LOCAL_SNAPSHOT_ID="$(local_snapshot_id)"
@@ -970,43 +1147,65 @@ main() {
   if [[ "$REMOTE_ENABLED" == true ]]; then
     FAILURE_CATEGORY='remote_sync'
     if ! ensure_repository remote; then
+      safe_log 'remote_repository_unavailable'
       REMOTE_DEGRADED=true
     fi
     assert_lease_heartbeat
+    FAILURE_CATEGORY='remote_sync'
     if ! backup_command sync --run-id "$RUN_ID"; then
+      safe_log 'remote_sync_command_failed'
       REMOTE_DEGRADED=true
-    fi
-    assert_lease_heartbeat
-    REMOTE_SNAPSHOT_ID="$(remote_snapshot_id)"
-    if [[ ! "$REMOTE_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]]; then
+      REMOTE_SNAPSHOT_ID=''
+      FAILURE_CATEGORY='integrity'
+      local_restic unlock --remove-all
+    elif REMOTE_SNAPSHOT_ID="$(remote_snapshot_id)" &&
+      [[ "$REMOTE_SNAPSHOT_ID" =~ ^[0-9a-f]{64}$ ]]; then
+      REMOTE_DEGRADED=false
+    else
+      safe_log 'remote_sync_evidence_missing'
       REMOTE_DEGRADED=true
       REMOTE_SNAPSHOT_ID=''
     fi
+    assert_lease_heartbeat
   fi
 
   FAILURE_CATEGORY='retention'
-  protect_pre_release 30
-  protect_last_good
-  apply_retention local --keep-daily 7
+  CURRENT_STAGE='local_retention'
+  run_retention local
   assert_lease_heartbeat
+
+  if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == true ]]; then
+    complete_remote_degraded
+    return
+  fi
 
   if [[ "$REMOTE_ENABLED" == true && "$REMOTE_DEGRADED" == false ]]; then
     if ! restic_check remote; then
+      safe_log 'remote_repository_check_failed'
       complete_remote_degraded
       return
     fi
     assert_lease_heartbeat
-    if ! apply_retention remote --keep-daily 30 --keep-monthly 12; then
+    if ! run_retention remote; then
+      safe_log 'remote_retention_failed'
       complete_remote_degraded
       return
     fi
     assert_lease_heartbeat
   fi
 
+  FAILURE_CATEGORY='object_store_restart'
+  CURRENT_STAGE='service_restart'
+  restart_stopped_services
+  assert_lease_heartbeat
   FAILURE_CATEGORY='internal'
+  CURRENT_STAGE='finish'
   backup_command finish --run-id "$RUN_ID"
   TERMINAL_RECORDED=true
-  release_operational_lease
+  if ! release_operational_lease; then
+    safe_log 'main_release_failed'
+    return 1
+  fi
 }
 
 main "$@"

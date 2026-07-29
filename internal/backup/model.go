@@ -242,6 +242,7 @@ type RetentionPolicy struct {
 	RemoteDaily          int
 	RemoteMonthly        int
 	PreReleaseProtectFor time.Duration
+	CurrentRunID         uuid.UUID
 }
 
 var safeOpaqueValue = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)

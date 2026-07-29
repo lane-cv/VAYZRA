@@ -15,7 +15,9 @@ COPY db db
 COPY internal internal
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' \
-      -o /out/happylearn-backup ./cmd/backup
+      -o /out/happylearn-backup ./cmd/backup \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' \
+      -o /out/happylearn-backup-retention ./cmd/backup-retention
 
 FROM debian:12.12-slim AS runtime
 ARG POSTGRESQL_CLIENT_VERSION=18.4-1.pgdg12+1
@@ -53,7 +55,9 @@ COPY --from=tools --chown=10003:0 /out/age /usr/local/bin/age
 COPY --from=tools --chown=10003:0 /out/age-keygen /usr/local/bin/age-keygen
 COPY --from=backup-build --chown=10003:0 \
   /out/happylearn-backup /app/happylearn-backup
-RUN chmod 0555 /app/happylearn-backup \
+COPY --from=backup-build --chown=10003:0 \
+  /out/happylearn-backup-retention /app/happylearn-backup-retention
+RUN chmod 0555 /app/happylearn-backup /app/happylearn-backup-retention \
       /usr/local/bin/restic /usr/local/bin/age /usr/local/bin/age-keygen \
     && restic version | grep -Eq '^restic 0\.19\.1 ' \
     && age --version | grep -Eq '^v?1\.3\.1$' \

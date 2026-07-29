@@ -753,6 +753,98 @@ func TestExecutorSyncVerifiesDistinctAuthenticatedRemoteSnapshot(t *testing.T) {
 	}
 }
 
+func TestExecutorSyncReportsSafeSpecificRemoteFailureStages(t *testing.T) {
+	manifest := validManifest()
+	manifest.BatchID = commandRunIDForExecutor
+	manifestBytes, err := MarshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestHash := sha256.Sum256(manifestBytes)
+	destinationID := strings.Repeat("3", sha256.Size*2)
+	for _, tc := range []struct {
+		command string
+		stage   string
+	}{
+		{command: "copy", stage: "copy"},
+		{command: "snapshots", stage: "snapshot_lookup"},
+		{command: "check", stage: "repository_check"},
+		{command: "stats", stage: "snapshot_stats"},
+		{command: "dump", stage: "manifest_check"},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			runner := &recordingRunner{run: func(
+				_ context.Context,
+				command Command,
+				_ int,
+			) (CommandResult, error) {
+				if len(command.Args) < 2 {
+					t.Fatalf("args=%q", command.Args)
+				}
+				name := command.Args[1]
+				if name == tc.command {
+					return CommandResult{ExitCode: 17}, nil
+				}
+				switch name {
+				case "copy", "check":
+					return CommandResult{ExitCode: 0}, nil
+				case "snapshots":
+					return CommandResult{
+						ExitCode: 0,
+						Stdout: []byte(fmt.Sprintf(
+							`[{"id":%q,"short_id":"33333333","original":%q,"tags":%s}]`,
+							destinationID,
+							executorRecoverySnapshotID,
+							mustJSON(t, []string{
+								"happylearn-batch:" + commandRunIDForExecutor,
+								"happylearn-manifest-sha256:" +
+									hex.EncodeToString(manifestHash[:]),
+							}),
+						)),
+					}, nil
+				case "stats":
+					return CommandResult{
+						ExitCode: 0,
+						Stdout: []byte(
+							`{"total_size":558,"total_uncompressed_size":1837,"compression_ratio":3.292114695340502,"compression_progress":100,"compression_space_saving":69.62438758845944,"total_blob_count":3,"snapshots_count":1}`,
+						),
+					}, nil
+				case "dump":
+					return CommandResult{
+						ExitCode: 0,
+						Stdout:   append([]byte(nil), manifestBytes...),
+					}, nil
+				default:
+					t.Fatalf("unexpected remote command: %q", command.Args)
+					return CommandResult{}, nil
+				}
+			}}
+			executor, _ := executorFixture(t, runner)
+			executor.config.Secrets = mapSecrets{
+				SecretLocalRepository:  "/private/local/repository",
+				SecretLocalPassword:    "local-password-secret",
+				SecretRemoteRepository: "s3:https://objects.example.test/backups",
+				SecretRemotePassword:   "remote-password-secret",
+				SecretRemoteAccessKey:  "remote-access-key-secret",
+				SecretRemoteSecretKey:  "remote-secret-key-secret",
+			}
+			_, syncErr := executor.Sync(context.Background(), SyncInput{
+				RunID:            commandRunIDForExecutor,
+				SourceSnapshotID: executorRecoverySnapshotID,
+				ManifestSHA256:   manifestHash,
+			})
+			if !errors.Is(syncErr, ErrRemoteSync) ||
+				RemoteSyncFailureStage(syncErr) != tc.stage {
+				t.Fatalf(
+					"stage=%q err=%v",
+					RemoteSyncFailureStage(syncErr),
+					syncErr,
+				)
+			}
+		})
+	}
+}
+
 func TestDecodeResticCopiedSnapshotRequiresUniqueFullDestinationBinding(t *testing.T) {
 	manifestHash := sha256.Sum256([]byte("manifest"))
 	destinationID := strings.Repeat("3", sha256.Size*2)
@@ -794,6 +886,45 @@ func TestDecodeResticCopiedSnapshotRequiresUniqueFullDestinationBinding(t *testi
 				manifestHash,
 			); err == nil || got != "" {
 				t.Fatalf("destination=%q err=%v encoded=%s", got, err, encoded)
+			}
+		})
+	}
+}
+
+func TestDecodeResticSummaryAcceptsPinnedVersionTimestampsButRejectsPartialOrUnknownShape(
+	t *testing.T,
+) {
+	const valid = `{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":0,"dirs_new":1,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":2,"data_added":746,"data_added_packed":712,"total_files_processed":1,"total_bytes_processed":18,"total_duration":0.678038834,"backup_start":"2026-07-28T22:22:07.82399555Z","backup_end":"2026-07-28T22:22:08.502034342Z","snapshot_id":"440a142e2fcba4090626b7b08cee86f10e32841b0a29d9373f87d2c2149b126c"}`
+	summary, err := decodeResticSummary([]byte(valid))
+	if err != nil ||
+		summary.SnapshotID != "440a142e2fcba4090626b7b08cee86f10e32841b0a29d9373f87d2c2149b126c" ||
+		summary.BackupStart.IsZero() ||
+		!summary.BackupEnd.After(summary.BackupStart) {
+		t.Fatalf("summary=%+v err=%v", summary, err)
+	}
+	for name, encoded := range map[string]string{
+		"start-only": strings.Replace(
+			valid,
+			`,"backup_end":"2026-07-28T22:22:08.502034342Z"`,
+			"",
+			1,
+		),
+		"end-before-start": strings.Replace(
+			valid,
+			"2026-07-28T22:22:08.502034342Z",
+			"2026-07-28T22:22:06Z",
+			1,
+		),
+		"unknown": strings.Replace(
+			valid,
+			`,"snapshot_id"`,
+			`,"future":true,"snapshot_id"`,
+			1,
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeResticSummary([]byte(encoded)); err == nil {
+				t.Fatalf("unsafe summary accepted: %s", encoded)
 			}
 		})
 	}

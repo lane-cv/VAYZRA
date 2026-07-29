@@ -15,6 +15,7 @@
     "e2e-contracts": "make e2e-contracts",
     "e2e-phase4": "make e2e-phase4",
     "backup:contract": "bash scripts/phase5-backup_contract_test.sh",
+    "backup:live": "bash scripts/phase5-backup_live_test.sh",
     "backup:run": "make phase5-backup"
   },
   "devDependencies": {

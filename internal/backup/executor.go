@@ -384,6 +384,34 @@ type SyncInput struct {
 	ManifestSHA256   [sha256.Size]byte
 }
 
+type remoteSyncFailure struct {
+	stage string
+	cause error
+}
+
+func (failure *remoteSyncFailure) Error() string {
+	return ErrRemoteSync.Error()
+}
+
+func (failure *remoteSyncFailure) Unwrap() []error {
+	return []error{ErrRemoteSync, failure.cause}
+}
+
+func remoteSyncFailureAt(stage string, cause error) error {
+	if cause == nil {
+		cause = ErrRemoteSync
+	}
+	return &remoteSyncFailure{stage: stage, cause: cause}
+}
+
+func RemoteSyncFailureStage(err error) string {
+	var failure *remoteSyncFailure
+	if errors.As(err, &failure) {
+		return failure.stage
+	}
+	return "unknown"
+}
+
 func (executor Executor) Snapshot(
 	ctx context.Context,
 	input SnapshotInput,
@@ -776,42 +804,42 @@ func (executor Executor) Sync(
 		!resticSnapshotID.MatchString(input.SourceSnapshotID) ||
 		len(input.SourceSnapshotID) != sha256.Size*2 ||
 		input.ManifestSHA256 == [sha256.Size]byte{} {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("input", ErrRemoteSync)
 	}
 	remote, configured, err := executor.remoteConfiguration()
 	if err != nil || !configured {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("configuration", err)
 	}
 	localRepository, err := executor.config.Secrets.Read(SecretLocalRepository)
 	if err != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("configuration", err)
 	}
 	localPassword, err := executor.config.Secrets.Read(SecretLocalPassword)
 	if err != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("configuration", err)
 	}
 	if err := secureDirectory(executor.config.WorkRoot); err != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("work_setup", err)
 	}
 	workDirectory, err := os.MkdirTemp(executor.config.WorkRoot, ".backup-sync-")
 	if err != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("work_setup", err)
 	}
 	if err := os.Chmod(workDirectory, 0o700); err != nil {
 		_ = os.RemoveAll(workDirectory)
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("work_setup", err)
 	}
 	defer func() {
 		if err := cleanupWorkDirectory(executor.config.WorkRoot, workDirectory); err != nil {
 			remoteSnapshotID = ""
-			resultErr = ErrCleanup
+			resultErr = remoteSyncFailureAt("cleanup", ErrCleanup)
 		}
 	}()
 	localRepositoryFile := filepath.Join(workDirectory, "source-repository")
 	localPasswordFile := filepath.Join(workDirectory, "source-password")
 	if writeOwnerOnlyFile(localRepositoryFile, []byte(localRepository)) != nil ||
 		writeOwnerOnlyFile(localPasswordFile, []byte(localPassword)) != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("work_setup", ErrRemoteSync)
 	}
 	remoteEnv := []string{
 		"LC_ALL=C",
@@ -838,10 +866,13 @@ func (executor Executor) Sync(
 		StderrLimit: CommandOutputLimit,
 	})
 	if err != nil {
-		return "", mapExecutorRunError(ctx, err, ErrRemoteSync)
+		return "", remoteSyncFailureAt(
+			"copy",
+			mapExecutorRunError(ctx, err, ErrRemoteSync),
+		)
 	}
 	if copyResult.ExitCode != 0 {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("copy", ErrRemoteSync)
 	}
 	batchTag := "happylearn-batch:" + input.RunID
 	manifestTag := "happylearn-manifest-sha256:" +
@@ -859,7 +890,7 @@ func (executor Executor) Sync(
 		manifestTag,
 	)
 	if err != nil {
-		return "", err
+		return "", remoteSyncFailureAt("snapshot_lookup", err)
 	}
 	destinationID, err := decodeResticCopiedSnapshot(
 		lookupResult,
@@ -868,7 +899,7 @@ func (executor Executor) Sync(
 		input.ManifestSHA256,
 	)
 	if err != nil {
-		return "", ErrRemoteSync
+		return "", remoteSyncFailureAt("snapshot_lookup", err)
 	}
 	for _, verification := range []struct {
 		limit int
@@ -886,12 +917,19 @@ func (executor Executor) Sync(
 			verification.args...,
 		)
 		if runErr != nil {
-			return "", runErr
+			switch verification.args[0] {
+			case "check":
+				return "", remoteSyncFailureAt("repository_check", runErr)
+			case "stats":
+				return "", remoteSyncFailureAt("snapshot_stats", runErr)
+			default:
+				return "", remoteSyncFailureAt("manifest_check", runErr)
+			}
 		}
 		switch verification.args[0] {
 		case "stats":
 			if decodeResticStats(result) != nil {
-				return "", ErrRemoteSync
+				return "", remoteSyncFailureAt("snapshot_stats", ErrRemoteSync)
 			}
 		case "dump":
 			manifest, decodeErr := DecodeManifest(bytes.NewReader(result))
@@ -899,7 +937,7 @@ func (executor Executor) Sync(
 			if decodeErr != nil ||
 				manifest.BatchID != input.RunID ||
 				!bytes.Equal(actualHash[:], input.ManifestSHA256[:]) {
-				return "", ErrRemoteSync
+				return "", remoteSyncFailureAt("manifest_check", ErrRemoteSync)
 			}
 		}
 	}
@@ -980,21 +1018,23 @@ func exactSnapshotTags(
 }
 
 type resticSummary struct {
-	MessageType         string  `json:"message_type"`
-	FilesNew            int64   `json:"files_new"`
-	FilesChanged        int64   `json:"files_changed"`
-	FilesUnmodified     int64   `json:"files_unmodified"`
-	DirsNew             int64   `json:"dirs_new"`
-	DirsChanged         int64   `json:"dirs_changed"`
-	DirsUnmodified      int64   `json:"dirs_unmodified"`
-	DataBlobs           int64   `json:"data_blobs"`
-	TreeBlobs           int64   `json:"tree_blobs"`
-	DataAdded           int64   `json:"data_added"`
-	DataAddedPacked     int64   `json:"data_added_packed"`
-	TotalFilesProcessed int64   `json:"total_files_processed"`
-	TotalBytesProcessed int64   `json:"total_bytes_processed"`
-	TotalDuration       float64 `json:"total_duration"`
-	SnapshotID          string  `json:"snapshot_id"`
+	MessageType         string    `json:"message_type"`
+	FilesNew            int64     `json:"files_new"`
+	FilesChanged        int64     `json:"files_changed"`
+	FilesUnmodified     int64     `json:"files_unmodified"`
+	DirsNew             int64     `json:"dirs_new"`
+	DirsChanged         int64     `json:"dirs_changed"`
+	DirsUnmodified      int64     `json:"dirs_unmodified"`
+	DataBlobs           int64     `json:"data_blobs"`
+	TreeBlobs           int64     `json:"tree_blobs"`
+	DataAdded           int64     `json:"data_added"`
+	DataAddedPacked     int64     `json:"data_added_packed"`
+	TotalFilesProcessed int64     `json:"total_files_processed"`
+	TotalBytesProcessed int64     `json:"total_bytes_processed"`
+	TotalDuration       float64   `json:"total_duration"`
+	BackupStart         time.Time `json:"backup_start"`
+	BackupEnd           time.Time `json:"backup_end"`
+	SnapshotID          string    `json:"snapshot_id"`
 }
 
 func decodeResticSummary(encoded []byte) (resticSummary, error) {
@@ -1020,7 +1060,10 @@ func decodeResticSummary(encoded []byte) (resticSummary, error) {
 		summary.DataAddedPacked < 0 ||
 		summary.TotalFilesProcessed < 0 ||
 		summary.TotalBytesProcessed < 0 ||
-		summary.TotalDuration < 0 {
+		summary.TotalDuration < 0 ||
+		summary.BackupStart.IsZero() != summary.BackupEnd.IsZero() ||
+		(!summary.BackupStart.IsZero() &&
+			summary.BackupEnd.Before(summary.BackupStart)) {
 		return resticSummary{}, ErrSnapshot
 	}
 	return summary, nil
