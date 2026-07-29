@@ -60,6 +60,16 @@ ORDER BY indexname`,
 			t.Fatalf("index %s definition=%q missing %q", name, found[name], fragment)
 		}
 	}
+	aiDailyDefinition := found["ai_runs_dashboard_daily_idx"]
+	if strings.Contains(strings.ToUpper(aiDailyDefinition), " INCLUDE ") ||
+		strings.Contains(aiDailyDefinition, "updated_at") ||
+		strings.Contains(aiDailyDefinition, "started_at") ||
+		strings.Contains(aiDailyDefinition, "completed_at") {
+		t.Fatalf(
+			"AI daily index must preserve HOT updates, definition=%q",
+			aiDailyDefinition,
+		)
+	}
 
 	var applied bool
 	if err := pool.QueryRow(ctx, `

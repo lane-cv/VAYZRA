@@ -3,17 +3,7 @@ CREATE INDEX audit_logs_dashboard_latest_idx
   ON audit_logs(occurred_at DESC,id DESC);
 
 CREATE INDEX ai_runs_dashboard_daily_idx
-  ON ai_runs(created_at)
-  INCLUDE (
-    status,
-    usage_source,
-    first_byte_ms,
-    total_ms,
-    cost_micro_usd,
-    updated_at,
-    started_at,
-    completed_at
-  );
+  ON ai_runs(created_at);
 
 CREATE INDEX ai_runs_dashboard_failed_idx
   ON ai_runs(completed_at)
