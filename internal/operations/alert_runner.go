@@ -58,8 +58,8 @@ func (runner AlertRunner) RunOnce(ctx context.Context) (runErr error) {
 			defaultAlertReleaseTimeout,
 		)
 		defer releaseCancel()
-		if err := lease.Release(releaseCtx); err != nil && runErr == nil {
-			runErr = err
+		if err := lease.Release(releaseCtx); err != nil {
+			runErr = errors.Join(runErr, err)
 		}
 	}()
 	now := runner.Clock().UTC()
@@ -67,18 +67,23 @@ func (runner AlertRunner) RunOnce(ctx context.Context) (runErr error) {
 		return ErrInvalid
 	}
 	evaluations, err := runner.Store.LoadAlertEvaluations(runCtx, now)
-	if err != nil {
+	if err != nil && len(evaluations) == 0 {
 		return err
+	}
+	evaluationErrors := make([]error, 0, 1)
+	if err != nil {
+		evaluationErrors = append(evaluationErrors, err)
 	}
 	for _, evaluation := range evaluations {
 		if runCtx.Err() != nil {
-			return runCtx.Err()
+			evaluationErrors = append(evaluationErrors, runCtx.Err())
+			break
 		}
 		if _, err := runner.Store.EvaluateAlert(runCtx, evaluation); err != nil {
-			return err
+			evaluationErrors = append(evaluationErrors, err)
 		}
 	}
-	return nil
+	return errors.Join(evaluationErrors...)
 }
 
 func StartAlertRunner(runner AlertRunner) func() {

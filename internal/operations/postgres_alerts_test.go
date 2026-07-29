@@ -137,19 +137,23 @@ WHERE action='operations.alert_acknowledged'
 	}
 }
 
-func TestPostgresAlertUnavailableHysteresisAndUnresolvedDedupe(t *testing.T) {
+func TestPostgresAlertDependencyUnavailableHysteresisAndUnresolvedDedupe(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedAlertPool(t)
 	store := NewPostgresAlertStore(pool)
 	now := alertPostgresClock(t, pool)
-	rule := Rule{
+	thresholdRule := Rule{
 		DedupeKey: "filesystem_root_usage", Category: "storage",
 		Summary: "Root filesystem usage is high",
 		Warning: 75, Critical: 90, Direction: DirectionAbove, MinimumSamples: 1,
 	}
-	if _, err := store.EvaluateAlert(ctx, Evaluation{
-		Rule: rule, ObservedAt: now, Available: false,
-	}); err != nil {
+	first, err := alertDependencyEvaluation(Evaluation{
+		Rule: thresholdRule, ObservedAt: now, Available: false,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EvaluateAlert(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	const parallel = 12
@@ -159,8 +163,12 @@ func TestPostgresAlertUnavailableHysteresisAndUnresolvedDedupe(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
+			evaluation := first
+			evaluation.ObservedAt = now.Add(time.Minute)
 			_, err := store.EvaluateAlert(ctx, Evaluation{
-				Rule: rule, ObservedAt: now.Add(time.Minute), Available: false,
+				Rule: evaluation.Rule, Value: evaluation.Value,
+				ObservedAt: evaluation.ObservedAt,
+				Available:  true, SampleCount: 1,
 			})
 			errs <- err
 		}()
@@ -176,7 +184,7 @@ func TestPostgresAlertUnavailableHysteresisAndUnresolvedDedupe(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 SELECT count(*),coalesce(max(consecutive_failures),0)
 FROM operational_alerts
-WHERE dedupe_key=$1 AND state<>'resolved'`, rule.DedupeKey).
+WHERE dedupe_key=$1 AND state<>'resolved'`, first.Rule.DedupeKey).
 		Scan(&rows, &failures); err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +195,130 @@ WHERE dedupe_key=$1 AND state<>'resolved'`, rule.DedupeKey).
 	if err != nil || len(page.Items) != 1 ||
 		page.Items[0].Severity != AlertSeverityWarning {
 		t.Fatalf("page=%+v err=%v", page, err)
+	}
+}
+
+func TestPostgresAlertInsufficientSamplesDoNotAdvanceOrResolveExistingAlert(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	store := NewPostgresAlertStore(pool)
+	now := alertPostgresClock(t, pool)
+	rule := Rule{
+		DedupeKey: "ai_error_rate", Category: "ai",
+		Summary: "AI error rate is high",
+		Warning: 10, Critical: 25, Direction: DirectionAbove, MinimumSamples: 20,
+	}
+	for index := 0; index < 2; index++ {
+		if _, err := store.EvaluateAlert(ctx, Evaluation{
+			Rule: rule, Value: 30,
+			ObservedAt: now.Add(time.Duration(index) * time.Minute),
+			Available:  true, SampleCount: 20,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := scanAlert(pool.QueryRow(ctx, `
+SELECT `+alertSelectColumns+`
+FROM operational_alerts
+WHERE dedupe_key=$1 AND state<>'resolved'`, rule.DedupeKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 2; index < 5; index++ {
+		transition, err := store.EvaluateAlert(ctx, Evaluation{
+			Rule: rule, Value: 100,
+			ObservedAt: now.Add(time.Duration(index) * time.Minute),
+			Available:  true, SampleCount: 19,
+		})
+		if err != nil || transition.Kind != AlertTransitionNone ||
+			transition.Alert != nil {
+			t.Fatalf("index=%d transition=%+v err=%v", index, transition, err)
+		}
+	}
+	after, err := scanAlert(pool.QueryRow(ctx, `
+SELECT `+alertSelectColumns+`
+FROM operational_alerts
+WHERE dedupe_key=$1 AND state<>'resolved'`, rule.DedupeKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != AlertStateOpen ||
+		after.ConsecutiveFailures != before.ConsecutiveFailures ||
+		after.ConsecutiveSuccesses != before.ConsecutiveSuccesses ||
+		after.Version != before.Version ||
+		!after.LastObservedAt.Equal(before.LastObservedAt) {
+		t.Fatalf("before=%+v after=%+v", before, after)
+	}
+}
+
+func TestPostgresDependencyRecoveryResolvesOnlyUnavailableAlert(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	store := NewPostgresAlertStore(pool)
+	now := alertPostgresClock(t, pool)
+	thresholdRule := Rule{
+		DedupeKey: "processing_queue_depth", Category: "processing",
+		Summary: "Processing queue depth is high",
+		Warning: 20, Critical: 100, Direction: DirectionAbove, MinimumSamples: 1,
+	}
+	for index := 0; index < 2; index++ {
+		at := now.Add(time.Duration(index) * time.Minute)
+		if _, err := store.EvaluateAlert(ctx, Evaluation{
+			Rule: thresholdRule, Value: 21, ObservedAt: at,
+			Available: true, SampleCount: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		dependency, err := alertDependencyEvaluation(Evaluation{
+			Rule: thresholdRule, ObservedAt: at, Available: false,
+		}, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EvaluateAlert(ctx, dependency); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := scanAlert(pool.QueryRow(ctx, `
+SELECT `+alertSelectColumns+`
+FROM operational_alerts
+WHERE dedupe_key=$1 AND state<>'resolved'`, thresholdRule.DedupeKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 2; index < 5; index++ {
+		at := now.Add(time.Duration(index) * time.Minute)
+		dependency, err := alertDependencyEvaluation(Evaluation{
+			Rule: thresholdRule, ObservedAt: at, Available: true,
+		}, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transition, err := store.EvaluateAlert(ctx, dependency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index == 4 &&
+			(transition.Kind != AlertTransitionResolved ||
+				transition.Alert == nil ||
+				transition.Alert.State != AlertStateResolved) {
+			t.Fatalf("dependency transition=%+v", transition)
+		}
+	}
+	after, err := scanAlert(pool.QueryRow(ctx, `
+SELECT `+alertSelectColumns+`
+FROM operational_alerts
+WHERE dedupe_key=$1 AND state<>'resolved'`, thresholdRule.DedupeKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ID != before.ID ||
+		after.State != before.State ||
+		after.ConsecutiveFailures != before.ConsecutiveFailures ||
+		after.ConsecutiveSuccesses != before.ConsecutiveSuccesses ||
+		after.Version != before.Version ||
+		!after.LastObservedAt.Equal(before.LastObservedAt) {
+		t.Fatalf("threshold before=%+v after=%+v", before, after)
 	}
 }
 

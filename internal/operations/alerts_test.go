@@ -2,6 +2,7 @@ package operations
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,20 +105,20 @@ func TestClassifyAlertEvaluationHandlesAvailabilityMinimumsAndDirections(t *test
 		want       alertCondition
 	}{
 		{
-			name: "unavailable",
+			name: "unavailable is neutral",
 			evaluation: Evaluation{
 				Rule: above, Value: 0, ObservedAt: now,
 				Available: false, SampleCount: 0,
 			},
-			want: alertConditionUnavailable,
+			want: alertConditionNeutral,
 		},
 		{
-			name: "below minimum is healthy",
+			name: "below minimum is neutral",
 			evaluation: Evaluation{
 				Rule: above, Value: 100, ObservedAt: now,
 				Available: true, SampleCount: 19,
 			},
-			want: alertConditionHealthy,
+			want: alertConditionNeutral,
 		},
 		{
 			name: "above healthy",
@@ -245,12 +246,22 @@ func TestBuildAlertEvaluationsMapsEveryDefaultSeries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evaluations) != len(rules) {
+	if len(evaluations) != 2*len(rules) {
 		t.Fatalf("evaluations=%d rules=%d", len(evaluations), len(rules))
 	}
 	byKey := make(map[string]Evaluation, len(evaluations))
 	for _, evaluation := range evaluations {
 		byKey[evaluation.Rule.DedupeKey] = evaluation
+		if strings.HasSuffix(
+			evaluation.Rule.DedupeKey,
+			"_dependency_unavailable",
+		) {
+			if !evaluation.Available || evaluation.Value != 0 ||
+				!evaluation.ObservedAt.Equal(now) {
+				t.Fatalf("dependency evaluation=%+v", evaluation)
+			}
+			continue
+		}
 		if !evaluation.Available || !evaluation.ObservedAt.Equal(now) {
 			t.Fatalf("evaluation=%+v", evaluation)
 		}
@@ -292,12 +303,25 @@ func TestBuildAlertEvaluationsTreatsMissingAndStaleAsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evaluations) != len(rules)-1 {
-		t.Fatalf("evaluations=%d want=%d", len(evaluations), len(rules)-1)
+	if len(evaluations) != 2*(len(rules)-1) {
+		t.Fatalf("evaluations=%d want=%d", len(evaluations), 2*(len(rules)-1))
 	}
 	for _, evaluation := range evaluations {
-		if evaluation.Rule.DedupeKey == "backup_remote_replication" {
+		if strings.HasPrefix(
+			evaluation.Rule.DedupeKey,
+			"backup_remote_replication",
+		) {
 			t.Fatal("remote rule evaluated when replication is not configured")
+		}
+		if strings.HasSuffix(
+			evaluation.Rule.DedupeKey,
+			"_dependency_unavailable",
+		) {
+			if !evaluation.Available || evaluation.Value != 1 ||
+				!evaluation.ObservedAt.Equal(now) {
+				t.Fatalf("dependency evaluation=%+v", evaluation)
+			}
+			continue
 		}
 		if evaluation.Available {
 			t.Fatalf("unexpected available evaluation=%+v", evaluation)
@@ -305,6 +329,55 @@ func TestBuildAlertEvaluationsTreatsMissingAndStaleAsUnavailable(t *testing.T) {
 		if !evaluation.ObservedAt.Equal(now) {
 			t.Fatalf("unavailable observedAt=%s want=%s", evaluation.ObservedAt, now)
 		}
+	}
+}
+
+func TestBuildAlertEvaluationsSeparatesDependencyAvailabilityFromThresholds(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	rules, err := DefaultAlertRules(validSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluations, err := BuildAlertEvaluations(
+		rules,
+		[]Sample{alertSample(
+			SampleSourceHost,
+			SampleMetricFilesystemUsedPercent,
+			SampleScopeRoot,
+			10,
+			now,
+			nil,
+		)},
+		now,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := make(map[string]Evaluation, len(evaluations))
+	for _, evaluation := range evaluations {
+		byKey[evaluation.Rule.DedupeKey] = evaluation
+	}
+	root := byKey["filesystem_root_usage"]
+	rootDependency := byKey["filesystem_root_usage_dependency_unavailable"]
+	if !root.Available || root.Value != 10 ||
+		!rootDependency.Available || rootDependency.Value != 0 ||
+		rootDependency.Rule.Category != "storage" ||
+		rootDependency.Rule.Summary != "Root filesystem metrics are unavailable" {
+		t.Fatalf("root=%+v dependency=%+v", root, rootDependency)
+	}
+	missing := byKey["processing_queue_depth"]
+	missingDependency := byKey["processing_queue_depth_dependency_unavailable"]
+	if missing.Available ||
+		!missingDependency.Available || missingDependency.Value != 1 ||
+		missingDependency.Rule.Warning != 1 ||
+		missingDependency.Rule.Category != "processing" ||
+		missingDependency.Rule.Summary != "Processing queue metrics are unavailable" {
+		t.Fatalf("threshold=%+v dependency=%+v", missing, missingDependency)
+	}
+	condition, err := classifyAlertEvaluation(missingDependency)
+	if err != nil || condition != alertConditionWarning {
+		t.Fatalf("dependency condition=%q err=%v", condition, err)
 	}
 }
 
@@ -352,6 +425,94 @@ func TestBuildAlertEvaluationsRejectsDuplicateOrMismatchedSeries(t *testing.T) {
 	if _, err := BuildAlertEvaluations(rules, oversizedTotal, now, false); err == nil {
 		t.Fatal("inexact AI terminal total accepted")
 	}
+}
+
+func TestBuildAlertEvaluationsRequiresMatchingExactFifteenMinuteWindows(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	rules, err := DefaultAlertRules(validSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactStart := now.Add(-15 * time.Minute)
+	tests := map[string][]Sample{
+		"AI end mismatch": {
+			alertSample(
+				SampleSourceApp,
+				SampleMetricAIRequestsTotal,
+				SampleScopeSucceeded,
+				20,
+				now,
+				&exactStart,
+			),
+			alertSample(
+				SampleSourceApp,
+				SampleMetricAIRequestsTotal,
+				SampleScopeFailed,
+				1,
+				now.Add(-time.Second),
+				&exactStart,
+			),
+		},
+		"AI non exact duration": {
+			alertSample(
+				SampleSourceApp,
+				SampleMetricAIRequestsTotal,
+				SampleScopeSucceeded,
+				20,
+				now,
+				timePointerForAlertTest(now.Add(-14*time.Minute)),
+			),
+			alertSample(
+				SampleSourceApp,
+				SampleMetricAIRequestsTotal,
+				SampleScopeFailed,
+				1,
+				now,
+				timePointerForAlertTest(now.Add(-14*time.Minute)),
+			),
+		},
+		"processing accepts no twenty four hour window": {
+			alertSample(
+				SampleSourceWorker,
+				SampleMetricQueueFailuresTotal,
+				SampleScopeProcessing,
+				5,
+				now,
+				timePointerForAlertTest(now.Add(-24*time.Hour)),
+			),
+		},
+		"login requires exact window": {
+			alertSample(
+				SampleSourceApp,
+				SampleMetricSecurityEventsTotal,
+				SampleScopeLoginFailure,
+				20,
+				now,
+				timePointerForAlertTest(now.Add(-16*time.Minute)),
+			),
+		},
+		"authorization requires exact window": {
+			alertSample(
+				SampleSourceApp,
+				SampleMetricSecurityEventsTotal,
+				SampleScopeAuthorizationDenial,
+				50,
+				now,
+				timePointerForAlertTest(now.Add(-14*time.Minute)),
+			),
+		},
+	}
+	for name, samples := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildAlertEvaluations(rules, samples, now, false); err == nil {
+				t.Fatal("non-exact alert window accepted")
+			}
+		})
+	}
+}
+
+func timePointerForAlertTest(value time.Time) *time.Time {
+	return &value
 }
 
 func alertSample(

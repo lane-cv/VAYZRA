@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -90,6 +91,59 @@ func TestAlertRunnerReturnsLoadAndEvaluationErrorsAfterLeaseRelease(t *testing.T
 	}
 }
 
+func TestAlertRunnerContinuesAfterRuleErrorsAndReturnsAllFailures(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	firstErr := errors.New("first evaluation failed")
+	thirdErr := errors.New("third evaluation failed")
+	store := &alertRunnerStoreStub{
+		lease:    &alertRunnerLeaseStub{},
+		acquired: true,
+		evaluations: []Evaluation{
+			alertRunnerEvaluation("filesystem_root_usage", now),
+			alertRunnerEvaluation("processing_queue_depth", now),
+			alertRunnerEvaluation("filesystem_backup_usage", now),
+		},
+		evaluateErrors: map[string]error{
+			"filesystem_root_usage":   firstErr,
+			"filesystem_backup_usage": thirdErr,
+		},
+	}
+	runner := AlertRunner{
+		Store: store, Clock: func() time.Time { return now },
+		EvaluationTimeout: time.Second,
+	}
+	err := runner.RunOnce(context.Background())
+	if !errors.Is(err, firstErr) || !errors.Is(err, thirdErr) {
+		t.Fatalf("aggregate error=%v", err)
+	}
+	if got := store.evaluateCalls(); got != 3 {
+		t.Fatalf("evaluate calls=%d want=3", got)
+	}
+}
+
+func TestAlertRunnerEvaluatesUsableRulesWhenCollectionIsPartiallyUnavailable(t *testing.T) {
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	store := &alertRunnerStoreStub{
+		lease:    &alertRunnerLeaseStub{},
+		acquired: true,
+		evaluations: []Evaluation{
+			alertRunnerEvaluation("filesystem_root_usage", now),
+			alertRunnerEvaluation("processing_queue_depth", now),
+		},
+		loadErr: ErrAlertCollectorUnavailable,
+	}
+	err := (AlertRunner{
+		Store: store, Clock: func() time.Time { return now },
+		EvaluationTimeout: time.Second,
+	}).RunOnce(context.Background())
+	if !errors.Is(err, ErrAlertCollectorUnavailable) {
+		t.Fatalf("error=%v", err)
+	}
+	if got := store.evaluateCalls(); got != 2 {
+		t.Fatalf("evaluate calls=%d want=2", got)
+	}
+}
+
 func TestStartAlertRunnerRunsImmediatelyAndStopsIdempotently(t *testing.T) {
 	evaluated := make(chan struct{}, 1)
 	store := &alertRunnerStoreStub{
@@ -134,18 +188,9 @@ func TestPostgresLoadAlertEvaluationsUsesLatestSettingsAndSamples(t *testing.T) 
 	pool := migratedAlertPool(t)
 	store := NewPostgresAlertStore(pool)
 	now := alertPostgresClock(t, pool)
-	window := now.Add(-15 * time.Minute)
 	samples := []Sample{
 		alertSample(SampleSourceHost, SampleMetricFilesystemUsedPercent, SampleScopeRoot, 80, now, nil),
 		alertSample(SampleSourceHost, SampleMetricFilesystemUsedPercent, SampleScopeBackup, 81, now, nil),
-		alertSample(SampleSourceApp, SampleMetricBackupAgeSeconds, SampleScopeLocal, 26*60*60, now, nil),
-		alertSample(SampleSourceApp, SampleMetricBackupRemoteUp, SampleScopeRemote, 0, now, nil),
-		alertSample(SampleSourceApp, SampleMetricAIRequestsTotal, SampleScopeSucceeded, 75, now, &window),
-		alertSample(SampleSourceApp, SampleMetricAIRequestsTotal, SampleScopeFailed, 25, now, &window),
-		alertSample(SampleSourceWorker, SampleMetricQueueItems, SampleScopeProcessing, 21, now, nil),
-		alertSample(SampleSourceWorker, SampleMetricQueueFailuresTotal, SampleScopeProcessing, 5, now, &window),
-		alertSample(SampleSourceApp, SampleMetricSecurityEventsTotal, SampleScopeLoginFailure, 20, now, &window),
-		alertSample(SampleSourceApp, SampleMetricSecurityEventsTotal, SampleScopeAuthorizationDenial, 50, now, &window),
 	}
 	if err := NewPostgresSampleStore(pool).InsertSamples(ctx, now, samples); err != nil {
 		t.Fatal(err)
@@ -160,24 +205,63 @@ SET disk_warning_percent=80,disk_critical_percent=95,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evaluations) != 9 {
+	if len(evaluations) != 16 {
 		t.Fatalf("evaluations=%d", len(evaluations))
 	}
-	var root, remote Evaluation
+	var root Evaluation
 	for _, evaluation := range evaluations {
 		switch evaluation.Rule.DedupeKey {
 		case "filesystem_root_usage":
 			root = evaluation
-		case "backup_remote_replication":
-			remote = evaluation
 		}
 	}
 	if root.Rule.Warning != 80 || root.Rule.Critical != 95 ||
 		!root.Available || root.Value != 80 {
 		t.Fatalf("root=%+v", root)
 	}
-	if !remote.Available || remote.Value != 0 {
-		t.Fatalf("remote=%+v", remote)
+}
+
+func TestPostgresAlertRunnerEmptyDatabaseNeverOpensBusinessThresholdAlerts(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedAlertPool(t)
+	if _, err := pool.Exec(ctx, `
+TRUNCATE operational_samples;
+TRUNCATE operational_alerts CASCADE;
+TRUNCATE backup_runs CASCADE;
+TRUNCATE login_events`); err != nil {
+		t.Fatal(err)
+	}
+	store := NewPostgresAlertStore(pool)
+	now := alertPostgresClock(t, pool)
+	clock := now
+	runner := AlertRunner{
+		Store: store, Clock: func() time.Time { return clock },
+		EvaluationTimeout: 10 * time.Second,
+	}
+	if err := runner.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(time.Minute)
+	if err := runner.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.ListAlerts(ctx, AlertFilter{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) == 0 {
+		t.Fatal("missing explicit dependency-unavailable alerts")
+	}
+	for _, alert := range page.Items {
+		if !strings.HasSuffix(
+			alert.DedupeKey,
+			"_dependency_unavailable",
+		) ||
+			!strings.Contains(alert.Summary, "unavailable") ||
+			alert.CurrentValue != 1 ||
+			alert.ThresholdValue != 1 {
+			t.Fatalf("non-dependency or contradictory alert=%+v", alert)
+		}
 	}
 }
 
@@ -192,18 +276,19 @@ func (lease *alertRunnerLeaseStub) Release(context.Context) error {
 }
 
 type alertRunnerStoreStub struct {
-	mu           sync.Mutex
-	lease        AlertLease
-	leaseFactory func() AlertLease
-	acquired     bool
-	acquireErr   error
-	evaluations  []Evaluation
-	loadErr      error
-	evaluateErr  error
-	onEvaluate   func()
-	acquireCalls int
-	loadCalls    int
-	evaluated    []Evaluation
+	mu             sync.Mutex
+	lease          AlertLease
+	leaseFactory   func() AlertLease
+	acquired       bool
+	acquireErr     error
+	evaluations    []Evaluation
+	loadErr        error
+	evaluateErr    error
+	evaluateErrors map[string]error
+	onEvaluate     func()
+	acquireCalls   int
+	loadCalls      int
+	evaluated      []Evaluation
 }
 
 func (store *alertRunnerStoreStub) TryAcquireAlertRunnerLease(
@@ -240,6 +325,9 @@ func (store *alertRunnerStoreStub) EvaluateAlert(
 	store.evaluated = append(store.evaluated, evaluation)
 	hook := store.onEvaluate
 	err := store.evaluateErr
+	if evaluationErr := store.evaluateErrors[evaluation.Rule.DedupeKey]; evaluationErr != nil {
+		err = evaluationErr
+	}
 	store.mu.Unlock()
 	if hook != nil {
 		hook()

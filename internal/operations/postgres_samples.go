@@ -35,6 +35,55 @@ func (store *PostgresSampleStore) InsertSamples(
 	if len(samples) == 0 || len(samples) > MaxSampleInsertBatch {
 		return ErrInvalid
 	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := copySamples(ctx, tx, now, samples); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (store *PostgresSampleStore) insertAndLatestMetrics(
+	ctx context.Context,
+	now time.Time,
+	samples []Sample,
+) ([]Sample, error) {
+	if store == nil || store.pool == nil {
+		return nil, errStoreClosed
+	}
+	if ctx == nil || !validSampleTime(now) ||
+		len(samples) > MaxSampleInsertBatch {
+		return nil, ErrInvalid
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if len(samples) > 0 {
+		if err := copySamples(ctx, tx, now, samples); err != nil {
+			return nil, err
+		}
+	}
+	latest, err := latestMetrics(ctx, tx, now.UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return latest, nil
+}
+
+func copySamples(
+	ctx context.Context,
+	tx pgx.Tx,
+	now time.Time,
+	samples []Sample,
+) error {
 	rows := make([][]any, len(samples))
 	for index, sample := range samples {
 		if err := ValidateSample(sample, now); err != nil {
@@ -54,12 +103,6 @@ func (store *PostgresSampleStore) InsertSamples(
 			windowStartedAt,
 		}
 	}
-
-	tx, err := store.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
 	copied, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"operational_samples"},
@@ -80,7 +123,7 @@ func (store *PostgresSampleStore) InsertSamples(
 	if copied != int64(len(samples)) {
 		return errSampleBatchShortWrite
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (store *PostgresSampleStore) ReadLatestSamples(
@@ -187,13 +230,25 @@ func (store *PostgresSampleStore) LatestMetrics(
 	if ctx == nil || !validSampleTime(now) {
 		return nil, ErrInvalid
 	}
-	rows, err := store.pool.Query(ctx, `
+	return latestMetrics(ctx, store.pool, now.UTC())
+}
+
+type latestMetricsQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func latestMetrics(
+	ctx context.Context,
+	querier latestMetricsQuerier,
+	now time.Time,
+) ([]Sample, error) {
+	rows, err := querier.Query(ctx, `
 SELECT DISTINCT ON(metric_name,scope)
   source,metric_name,scope,value,unit,observed_at,window_started_at
 FROM operational_samples
 WHERE observed_at >= $1
 ORDER BY metric_name,scope,observed_at DESC,id DESC`,
-		now.UTC().Add(-DashboardSampleFreshFor),
+		now.Add(-DashboardSampleFreshFor),
 	)
 	if err != nil {
 		return nil, err

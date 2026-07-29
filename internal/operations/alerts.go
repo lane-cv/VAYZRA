@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	ErrAlertNotFound        = errors.New("alert not found")
-	ErrAlertAlreadyResolved = errors.New("alert already resolved")
+	ErrAlertNotFound             = errors.New("alert not found")
+	ErrAlertAlreadyResolved      = errors.New("alert already resolved")
+	ErrAlertCollectorUnavailable = errors.New("alert collector unavailable")
 )
 
 type Direction string
@@ -131,10 +132,10 @@ type AlertStore interface {
 type alertCondition string
 
 const (
-	alertConditionHealthy     alertCondition = "healthy"
-	alertConditionWarning     alertCondition = "warning"
-	alertConditionCritical    alertCondition = "critical"
-	alertConditionUnavailable alertCondition = "unavailable"
+	alertConditionHealthy  alertCondition = "healthy"
+	alertConditionWarning  alertCondition = "warning"
+	alertConditionCritical alertCondition = "critical"
+	alertConditionNeutral  alertCondition = "neutral"
 )
 
 var alertIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]{0,127}$`)
@@ -145,6 +146,18 @@ var alertCategories = map[string]struct{}{
 	"ai":         {},
 	"processing": {},
 	"security":   {},
+}
+
+var alertDependencySummaries = map[string]string{
+	"filesystem_root_usage":     "Root filesystem metrics are unavailable",
+	"filesystem_backup_usage":   "Backup filesystem metrics are unavailable",
+	"backup_local_age":          "Local backup status is unavailable",
+	"backup_remote_replication": "Remote backup status is unavailable",
+	"ai_error_rate":             "AI request metrics are unavailable",
+	"processing_queue_depth":    "Processing queue metrics are unavailable",
+	"processing_failures":       "Processing failure metrics are unavailable",
+	"login_failures":            "Login failure metrics are unavailable",
+	"authorization_denials":     "Authorization denial metrics are unavailable",
 }
 
 func DefaultAlertRules(settings Settings) ([]Rule, error) {
@@ -258,8 +271,43 @@ func BuildAlertEvaluations(
 			return nil, err
 		}
 		evaluations = append(evaluations, evaluation)
+		dependency, err := alertDependencyEvaluation(evaluation, now)
+		if err != nil {
+			return nil, err
+		}
+		evaluations = append(evaluations, dependency)
 	}
 	return evaluations, nil
+}
+
+func alertDependencyEvaluation(
+	evaluation Evaluation,
+	now time.Time,
+) (Evaluation, error) {
+	summary, ok := alertDependencySummaries[evaluation.Rule.DedupeKey]
+	if !ok {
+		return Evaluation{}, ErrInvalid
+	}
+	rule := Rule{
+		DedupeKey:      evaluation.Rule.DedupeKey + "_dependency_unavailable",
+		Category:       evaluation.Rule.Category,
+		Summary:        summary,
+		Warning:        1,
+		Critical:       2,
+		Direction:      DirectionAbove,
+		MinimumSamples: 1,
+	}
+	if err := validateAlertRule(rule); err != nil {
+		return Evaluation{}, err
+	}
+	value := float64(0)
+	if !evaluation.Available {
+		value = 1
+	}
+	return Evaluation{
+		Rule: rule, Value: value, ObservedAt: now.UTC(),
+		Available: true, SampleCount: 1,
+	}, nil
 }
 
 func alertEvaluationForRule(
@@ -280,6 +328,12 @@ func alertEvaluationForRule(
 	sample, ok := samples[series]
 	if !ok || !alertSampleFresh(sample, now) {
 		return evaluation, nil
+	}
+	switch rule.DedupeKey {
+	case "processing_failures", "login_failures", "authorization_denials":
+		if !alertSampleHasExactWindow(sample, 15*time.Minute) {
+			return Evaluation{}, ErrInvalid
+		}
 	}
 	evaluation.Value = sample.Value
 	evaluation.ObservedAt = sample.ObservedAt.UTC()
@@ -310,7 +364,10 @@ func aiErrorRateEvaluation(
 		return evaluation, nil
 	}
 	if succeeded.WindowStartedAt == nil || failed.WindowStartedAt == nil ||
-		!succeeded.WindowStartedAt.Equal(*failed.WindowStartedAt) {
+		!succeeded.ObservedAt.Equal(failed.ObservedAt) ||
+		!succeeded.WindowStartedAt.Equal(*failed.WindowStartedAt) ||
+		!alertSampleHasExactWindow(succeeded, 15*time.Minute) ||
+		!alertSampleHasExactWindow(failed, 15*time.Minute) {
 		return Evaluation{}, ErrInvalid
 	}
 	total := succeeded.Value + failed.Value
@@ -331,6 +388,11 @@ func aiErrorRateEvaluation(
 		return Evaluation{}, ErrInvalid
 	}
 	return evaluation, nil
+}
+
+func alertSampleHasExactWindow(sample Sample, duration time.Duration) bool {
+	return sample.WindowStartedAt != nil &&
+		sample.ObservedAt.Sub(*sample.WindowStartedAt) == duration
 }
 
 func alertSampleFresh(sample Sample, now time.Time) bool {
@@ -389,10 +451,10 @@ func classifyAlertEvaluation(evaluation Evaluation) (alertCondition, error) {
 		return "", err
 	}
 	if !evaluation.Available {
-		return alertConditionUnavailable, nil
+		return alertConditionNeutral, nil
 	}
 	if evaluation.SampleCount < evaluation.Rule.MinimumSamples {
-		return alertConditionHealthy, nil
+		return alertConditionNeutral, nil
 	}
 	switch evaluation.Rule.Direction {
 	case DirectionAbove:

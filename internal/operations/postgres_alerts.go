@@ -20,13 +20,26 @@ const (
 )
 
 type PostgresAlertStore struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	collectors []AlertSampleCollector
 }
 
 var _ AlertStore = (*PostgresAlertStore)(nil)
 
 func NewPostgresAlertStore(pool *pgxpool.Pool) *PostgresAlertStore {
-	return &PostgresAlertStore{pool: pool}
+	return newPostgresAlertStoreWithCollectors(
+		pool,
+		NewPostgresAlertCollectors(pool),
+	)
+}
+
+func newPostgresAlertStoreWithCollectors(
+	pool *pgxpool.Pool,
+	collectors []AlertSampleCollector,
+) *PostgresAlertStore {
+	return &PostgresAlertStore{
+		pool: pool, collectors: append([]AlertSampleCollector(nil), collectors...),
+	}
 }
 
 func (store *PostgresAlertStore) EvaluateAlert(
@@ -39,6 +52,9 @@ func (store *PostgresAlertStore) EvaluateAlert(
 			return AlertTransition{}, err
 		}
 		return AlertTransition{}, ErrInvalid
+	}
+	if condition == alertConditionNeutral {
+		return AlertTransition{Kind: AlertTransitionNone}, nil
 	}
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {
@@ -553,20 +569,74 @@ func (store *PostgresAlertStore) LoadAlertEvaluations(
 	if err != nil {
 		return nil, err
 	}
-	samples, err := NewPostgresSampleStore(store.pool).LatestMetrics(ctx, now.UTC())
+	now = now.UTC()
+	collected := make([]Sample, 0, 8)
+	collectorErrors := make([]error, 0)
+	remoteConfigured := false
+	remoteConfigurationKnown := false
+	for _, collector := range store.collectors {
+		if collector == nil {
+			collectorErrors = append(
+				collectorErrors,
+				ErrAlertCollectorUnavailable,
+			)
+			continue
+		}
+		collection, collectErr := collector.Collect(ctx, now)
+		if collectErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			collectorErrors = append(
+				collectorErrors,
+				ErrAlertCollectorUnavailable,
+			)
+			continue
+		}
+		collected = append(collected, collection.Samples...)
+		if collection.RemoteReplicationConfigured != nil {
+			if remoteConfigurationKnown &&
+				remoteConfigured != *collection.RemoteReplicationConfigured {
+				return nil, ErrInvalid
+			}
+			remoteConfigured = *collection.RemoteReplicationConfigured
+			remoteConfigurationKnown = true
+		}
+	}
+	indexed := make(map[sampleSeries]struct{}, len(collected))
+	for _, sample := range collected {
+		if err := ValidateSample(sample, now); err != nil {
+			return nil, err
+		}
+		key := sampleSeries{
+			source: sample.Source, metric: sample.Metric, scope: sample.Scope,
+		}
+		if _, duplicate := indexed[key]; duplicate {
+			return nil, ErrInvalid
+		}
+		indexed[key] = struct{}{}
+	}
+	latest, err := NewPostgresSampleStore(store.pool).
+		insertAndLatestMetrics(ctx, now, collected)
 	if err != nil {
 		return nil, err
 	}
-	remoteConfigured := false
-	for _, sample := range samples {
-		if sample.Source == SampleSourceApp &&
-			sample.Metric == SampleMetricBackupRemoteUp &&
-			sample.Scope == SampleScopeRemote {
-			remoteConfigured = true
-			break
+	samples := append([]Sample(nil), collected...)
+	for _, sample := range latest {
+		if sample.Source == SampleSourceHost {
+			samples = append(samples, sample)
 		}
 	}
-	return BuildAlertEvaluations(rules, samples, now.UTC(), remoteConfigured)
+	evaluations, err := BuildAlertEvaluations(
+		rules,
+		samples,
+		now,
+		remoteConfigurationKnown && remoteConfigured,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return evaluations, errors.Join(collectorErrors...)
 }
 
 func (lease *AlertRunnerLease) Release(ctx context.Context) error {

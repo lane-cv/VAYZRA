@@ -269,6 +269,45 @@ func TestProductionApplicationStopsAlertRunnerBeforeOperationsAndPool(t *testing
 	}
 }
 
+func TestProductionAlertRunnerCollectsApplicationAggregates(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE operational_samples;
+TRUNCATE operational_alerts CASCADE;
+TRUNCATE backup_runs CASCADE;
+TRUNCATE login_events;
+INSERT INTO system_settings(singleton_id) VALUES(true)
+ON CONFLICT(singleton_id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	stop := newProductionAlertRunner(pool)
+	if stop == nil {
+		t.Fatal("production alert runner returned nil stop")
+	}
+	defer stop()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM operational_samples
+WHERE source IN ('app','worker')`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 6 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("production runner aggregate samples=%d want=6", count)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+}
+
 func TestAlertRunnerInitializationFailureClosesOperationsAndPool(t *testing.T) {
 	var events []string
 	gate := &serverOperationsRuntime{events: &events}
