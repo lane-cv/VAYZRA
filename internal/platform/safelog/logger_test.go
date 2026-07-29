@@ -122,10 +122,10 @@ func TestJSONLoggerRedactsSecretLikeValues(t *testing.T) {
 		}
 	}
 	record := decodeSingleRecord(t, output.Bytes())
-	if got := record["stage"].(string); got != "prefix-redacted-middle-redacted-redacted" {
+	if got := record["stage"].(string); got != "prefix-hidden-middle-hidden-hidden" {
 		t.Fatalf("stage = %q", got)
 	}
-	if got := record["category"].(string); got != "redactedredacted" {
+	if got := record["category"].(string); got != "hiddenhidden" {
 		t.Fatalf("category = %q", got)
 	}
 }
@@ -142,6 +142,73 @@ func TestJSONLoggerRedactorCopiesMarkers(t *testing.T) {
 	logger.Info("secret.copy", Field{Name: "stage", Value: "copy-me-secret"})
 	if strings.Contains(output.String(), "copy-me-secret") {
 		t.Fatalf("output contains original marker: %q", output.String())
+	}
+}
+
+func TestJSONLoggerNeverWritesConfiguredMarkerBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		markers []string
+		emit    func(Logger)
+	}{
+		{
+			name:    "replacement is itself a marker",
+			markers: []string{"redacted"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final", Field{Name: "stage", Value: "redacted"})
+			},
+		},
+		{
+			name:    "structural key is a marker",
+			markers: []string{"timestamp"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final")
+			},
+		},
+		{
+			name:    "integer rendering is a marker",
+			markers: []string{"12345678"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final", Field{Name: "count", Value: 12345678})
+			},
+		},
+		{
+			name:    "line terminator completes a marker",
+			markers: []string{"+08:00\"}\n"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final")
+			},
+		},
+		{
+			name:    "replacement concatenation reconstructs another marker",
+			markers: []string{"abcdefgh", "redactedredacted", "hiddenhidden"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final", Field{Name: "stage", Value: "abcdefghabcdefgh"})
+			},
+		},
+		{
+			name:    "multiple distinct markers",
+			markers: []string{"abcdefgh", "ijklmnop"},
+			emit: func(logger Logger) {
+				logger.Info("secret.final", Field{Name: "stage", Value: "abcdefghijklmnopabcdefgh"})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger, err := New(&output, func() time.Time { return fixedTime }, test.markers...)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			test.emit(logger)
+
+			for _, marker := range test.markers {
+				if bytes.Contains(output.Bytes(), []byte(marker)) {
+					t.Fatalf("final JSON contains configured marker %q: %q", marker, output.Bytes())
+				}
+			}
+		})
 	}
 }
 
@@ -193,6 +260,85 @@ func TestJSONLoggerOmitsURLQueryCookiesAndAuthorization(t *testing.T) {
 		logger.Info("request.received", Field{Name: "path", Value: "/files/a%3Fb"})
 		record := decodeSingleRecord(t, output.Bytes())
 		if got := record["path"]; got != "/files/a%3Fb" {
+			t.Fatalf("path = %#v", got)
+		}
+	})
+}
+
+func TestJSONLoggerRejectsNetworkPathsAndAllowsEscapedAbsolutePaths(t *testing.T) {
+	rejected := []string{
+		"//example.test/private",
+		"//user@example.test/private",
+		"/%2Fexample.test/private",
+		"/%2Fuser@example.test/private",
+	}
+	for _, path := range rejected {
+		t.Run(path, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := newTestLogger(t, &output)
+			logger.Info("path.rejected", Field{Name: "path", Value: path})
+			if output.Len() != 0 {
+				t.Fatalf("network path produced %q", output.String())
+			}
+		})
+	}
+
+	accepted := []string{
+		"/",
+		"/admin/alerts",
+		"/files/a%2Fb/%40student/%E4%B8%AD%E6%96%87",
+		"/files/%e4%b8%ad",
+	}
+	for _, path := range accepted {
+		t.Run(path, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := newTestLogger(t, &output)
+			logger.Info("path.accepted", Field{Name: "path", Value: path})
+			record := decodeSingleRecord(t, output.Bytes())
+			if got := record["path"]; got != path {
+				t.Fatalf("path = %#v, want %q", got, path)
+			}
+		})
+	}
+}
+
+func TestJSONLoggerRevalidatesPathAfterRedaction(t *testing.T) {
+	t.Run("short invalid escape is dropped", func(t *testing.T) {
+		var output bytes.Buffer
+		logger, err := New(&output, func() time.Time { return fixedTime }, "41secret")
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		logger.Info("path.redacted", Field{Name: "path", Value: "/%41secret"})
+		if output.Len() != 0 {
+			t.Fatalf("invalid redacted path produced %q", output.String())
+		}
+	})
+
+	t.Run("long invalid escape is not hidden by truncation", func(t *testing.T) {
+		var output bytes.Buffer
+		logger, err := New(&output, func() time.Time { return fixedTime }, "41secret")
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		logger.Info("path.redacted", Field{
+			Name:  "path",
+			Value: "/" + strings.Repeat("a", 238) + "%41secret",
+		})
+		if output.Len() != 0 {
+			t.Fatalf("invalid redacted path produced %q", output.String())
+		}
+	})
+
+	t.Run("valid redacted path remains usable", func(t *testing.T) {
+		var output bytes.Buffer
+		logger, err := New(&output, func() time.Time { return fixedTime }, "secret12")
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		logger.Info("path.redacted", Field{Name: "path", Value: "/files/secret12"})
+		record := decodeSingleRecord(t, output.Bytes())
+		if got := record["path"]; got != "/files/hidden" {
 			t.Fatalf("path = %#v", got)
 		}
 	})
@@ -252,6 +398,40 @@ func TestJSONLoggerBoundsStringsAndNestedValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJSONLoggerRejectsSemanticScalarValuesBeforeReflection(t *testing.T) {
+	pointerError := pointerErrorString("pointer-error-value")
+	pointerStringer := pointerStringerInt(17)
+	rejected := []any{
+		errorString("named-error-value"),
+		pointerErrorString("pointer-method-on-value"),
+		&pointerError,
+		stringerString("named-stringer-value"),
+		pointerStringerInt(13),
+		&pointerStringer,
+	}
+	for _, value := range rejected {
+		t.Run(typeName(value), func(t *testing.T) {
+			var output bytes.Buffer
+			logger := newTestLogger(t, &output)
+			logger.Info("semantic.rejected", Field{Name: "stage", Value: value})
+			if output.Len() != 0 {
+				t.Fatalf("semantic scalar %T produced %q", value, output.String())
+			}
+		})
+	}
+
+	t.Run("harmless named scalars remain accepted", func(t *testing.T) {
+		var output bytes.Buffer
+		logger := newTestLogger(t, &output)
+		logger.Info("semantic.accepted",
+			Field{Name: "stage", Value: harmlessString("named-scalar")},
+			Field{Name: "count", Value: harmlessInt(3)},
+			Field{Name: "state", Value: harmlessBool(true)},
+		)
+		decodeSingleRecord(t, output.Bytes())
+	})
 }
 
 func TestJSONLoggerRepairsInvalidUTF8BeforeBounding(t *testing.T) {
@@ -507,3 +687,31 @@ func (writer *slowByteWriter) Bytes() []byte {
 	defer writer.mu.Unlock()
 	return bytes.Clone(writer.buffer.Bytes())
 }
+
+type errorString string
+
+func (value errorString) Error() string {
+	return string(value)
+}
+
+type pointerErrorString string
+
+func (value *pointerErrorString) Error() string {
+	return string(*value)
+}
+
+type stringerString string
+
+func (value stringerString) String() string {
+	return string(value)
+}
+
+type pointerStringerInt int
+
+func (value *pointerStringerInt) String() string {
+	return fmt.Sprintf("%d", *value)
+}
+
+type harmlessString string
+type harmlessInt int64
+type harmlessBool bool

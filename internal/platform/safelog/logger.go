@@ -7,8 +7,10 @@
 package safelog
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/url"
@@ -24,7 +26,7 @@ import (
 const (
 	maxEventBytes  = 64
 	maxStringBytes = 240
-	redactedValue  = "redacted"
+	redactedValue  = "hidden"
 )
 
 var (
@@ -55,6 +57,8 @@ var (
 		"body",
 		"content",
 	}
+	errorType    = reflect.TypeFor[error]()
+	stringerType = reflect.TypeFor[fmt.Stringer]()
 )
 
 // Field is a single allowlisted structured log field.
@@ -84,6 +88,9 @@ type redactor struct {
 
 // New constructs a structured logger. Secret markers must each contain at
 // least eight bytes. The logger owns an independent copy of the marker slice.
+//
+// Output.Write runs while the logger's serialization lock is held. The writer
+// must not synchronously call Info or Error on this Logger.
 func New(output io.Writer, clock func() time.Time, secretValues ...string) (Logger, error) {
 	if nilInterface(output) {
 		return Logger{}, errors.New("safelog: output is required")
@@ -164,6 +171,9 @@ func (logger Logger) write(level, event string, fields []Field) {
 		return
 	}
 	encoded = append(encoded, '\n')
+	if logger.state.redactor.containsMarker(encoded) {
+		return
+	}
 	written, err := logger.state.output.Write(encoded)
 	if err != nil || written != len(encoded) {
 		return
@@ -213,8 +223,15 @@ func (redactor redactor) normalizeField(name string, value any) (any, bool) {
 	if value == nil {
 		return nil, false
 	}
+	valueType := reflect.TypeOf(value)
+	if typeOrPointerImplements(valueType, errorType) {
+		return nil, false
+	}
 	if duration, ok := value.(time.Duration); ok {
 		return duration.Milliseconds(), true
+	}
+	if typeOrPointerImplements(valueType, stringerType) {
+		return nil, false
 	}
 
 	reflected := reflect.ValueOf(value)
@@ -225,7 +242,7 @@ func (redactor redactor) normalizeField(name string, value any) (any, bool) {
 			if !validEscapedPath(raw) {
 				return nil, false
 			}
-			return redactor.renderPath(raw), true
+			return redactor.renderPath(raw)
 		}
 		rendered := redactor.render(raw)
 		if !validSafeString(rendered) {
@@ -247,12 +264,22 @@ func (redactor redactor) normalizeField(name string, value any) (any, bool) {
 	}
 }
 
+func typeOrPointerImplements(concrete, contract reflect.Type) bool {
+	if concrete.Implements(contract) {
+		return true
+	}
+	return concrete.Kind() != reflect.Pointer && reflect.PointerTo(concrete).Implements(contract)
+}
+
 func validEscapedPath(value string) bool {
-	if value == "" || value[0] != '/' || strings.ContainsAny(value, "?#") {
+	if value == "" ||
+		value[0] != '/' ||
+		strings.HasPrefix(value, "//") ||
+		strings.ContainsAny(value, "?#") {
 		return false
 	}
 	decoded, err := url.PathUnescape(value)
-	if err != nil {
+	if err != nil || strings.HasPrefix(decoded, "//") {
 		return false
 	}
 	parsed := &url.URL{Path: decoded, RawPath: value}
@@ -282,19 +309,22 @@ func (redactor redactor) render(value string) string {
 	return boundUTF8(value)
 }
 
-func (redactor redactor) renderPath(value string) string {
+func (redactor redactor) renderPath(value string) (string, bool) {
 	value = redactor.redactAndRepair(value)
+	if !validEscapedPath(value) {
+		return "", false
+	}
 	if len(value) <= maxStringBytes {
-		return value
+		return value, true
 	}
 
 	for end := maxStringBytes; end > 0; end-- {
 		candidate := value[:end]
 		if utf8.ValidString(candidate) && validEscapedPath(candidate) {
-			return candidate
+			return candidate, true
 		}
 	}
-	return "/"
+	return "", false
 }
 
 func (redactor redactor) redactAndRepair(value string) string {
@@ -302,6 +332,15 @@ func (redactor redactor) redactAndRepair(value string) string {
 		value = strings.ReplaceAll(value, marker, redactedValue)
 	}
 	return strings.ToValidUTF8(value, "\uFFFD")
+}
+
+func (redactor redactor) containsMarker(value []byte) bool {
+	for _, marker := range redactor.markers {
+		if bytes.Contains(value, []byte(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func boundUTF8(value string) string {
