@@ -486,6 +486,16 @@ func TestPostgresSampleStoreMetricsSelectsOneLatestFixedSeries(t *testing.T) {
 			Scope: SampleScopeProcessing, Value: 7, Unit: SampleUnitCount,
 			ObservedAt: now,
 		},
+		{
+			Source: SampleSourceHost, Metric: SampleMetricFilesystemUsedPercent,
+			Scope: SampleScopeRoot, Value: 99, Unit: SampleUnitPercent,
+			ObservedAt: now.Add(-DashboardSampleFreshFor - time.Nanosecond),
+		},
+		{
+			Source: SampleSourceHost, Metric: SampleMetricFilesystemUsedPercent,
+			Scope: SampleScopeBackup, Value: 75, Unit: SampleUnitPercent,
+			ObservedAt: now.Add(-DashboardSampleFreshFor),
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -494,6 +504,11 @@ func TestPostgresSampleStoreMetricsSelectsOneLatestFixedSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []Sample{
+		{
+			Source: SampleSourceHost, Metric: SampleMetricFilesystemUsedPercent,
+			Scope: SampleScopeBackup, Value: 75, Unit: SampleUnitPercent,
+			ObservedAt: now.Add(-DashboardSampleFreshFor),
+		},
 		{
 			Source: SampleSourceWorker, Metric: SampleMetricQueueItems,
 			Scope: SampleScopeProcessing, Value: 7, Unit: SampleUnitCount,

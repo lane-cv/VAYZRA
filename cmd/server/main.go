@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -108,20 +109,36 @@ func runServerLifecycles(
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	type shutdownResult struct {
+		shutdownErr error
+		closeErr    error
+	}
+	results := make(chan shutdownResult, len(servers))
+	var shutdowns sync.WaitGroup
+	shutdowns.Add(len(servers))
+	for _, server := range servers {
+		go func(server serverLifecycle) {
+			defer shutdowns.Done()
+			outcome := shutdownResult{}
+			outcome.shutdownErr = server.Shutdown(shutdownCtx)
+			if outcome.shutdownErr != nil {
+				outcome.closeErr = server.Close()
+			}
+			results <- outcome
+		}(server)
+	}
+	shutdowns.Wait()
+	close(results)
 	shutdownFailed := false
 	forceCloseFailed := false
-	for _, server := range servers {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			shutdownFailed = true
-			if closeErr := server.Close(); closeErr != nil {
-				forceCloseFailed = true
-			}
-		}
+	for outcome := range results {
+		shutdownFailed = shutdownFailed || outcome.shutdownErr != nil
+		forceCloseFailed = forceCloseFailed || outcome.closeErr != nil
 	}
-	closeResources()
 	if forceCloseFailed {
 		return errors.New("server force close")
 	}
+	closeResources()
 	if shutdownFailed {
 		return errors.New("server shutdown")
 	}

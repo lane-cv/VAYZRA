@@ -19,6 +19,7 @@ type fakeServerLifecycle struct {
 	shutdownOne  sync.Once
 	closeOnce    sync.Once
 	listenOnce   sync.Once
+	shutdownWait <-chan struct{}
 	mu           sync.Mutex
 	stopped      bool
 }
@@ -31,6 +32,9 @@ func (s *fakeServerLifecycle) ListenAndServe() error {
 func (s *fakeServerLifecycle) Shutdown(context.Context) error {
 	s.shutdownOne.Do(func() {
 		close(s.shutdown)
+		if s.shutdownWait != nil {
+			<-s.shutdownWait
+		}
 		if s.shutdownErr == nil {
 			s.markStopped()
 			select {
@@ -100,10 +104,10 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 			wantErr:     "server shutdown", wantClose: true, wantCleanup: 1,
 		},
 		{
-			name: "failed force close still cleans resources", signal: true,
+			name: "failed force close keeps shared resources alive", signal: true,
 			shutdownErr: errors.New("secret shutdown detail"),
 			closeErr:    errors.New("secret close detail"),
-			wantErr:     "server force close", wantClose: true, wantCleanup: 1,
+			wantErr:     "server force close", wantClose: true, wantCleanup: 0,
 		},
 	}
 	for _, tc := range tests {
@@ -125,7 +129,7 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 				if returned {
 					t.Fatal("cleanup ran after lifecycle returned")
 				}
-				if tc.closeErr == nil && !server.isStopped() {
+				if !server.isStopped() {
 					t.Fatal("cleanup ran while server runtime was active")
 				}
 				cleanupCalls++
@@ -161,6 +165,42 @@ func TestServerRuntimeLifecycleCleansOnlyAfterRuntimeStops(t *testing.T) {
 				t.Fatalf("err=%v want=%q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestInternalServerRuntimeLifecycleStartsShutdownConcurrently(t *testing.T) {
+	signals, cancel := context.WithCancel(context.Background())
+	public := newFakeServerLifecycle()
+	internal := newFakeServerLifecycle()
+	releasePublic := make(chan struct{})
+	public.shutdownWait = releasePublic
+	cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- runServerLifecycles(
+			signals,
+			[]serverLifecycle{public, internal},
+			func() {},
+		)
+	}()
+	select {
+	case <-public.shutdown:
+	case <-time.After(time.Second):
+		t.Fatal("public shutdown did not start")
+	}
+	internalStarted := false
+	select {
+	case <-internal.shutdown:
+		internalStarted = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releasePublic)
+	if err := <-result; err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !internalStarted {
+		t.Fatal("internal shutdown waited for the public listener")
 	}
 }
 

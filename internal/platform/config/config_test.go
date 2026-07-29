@@ -423,17 +423,17 @@ func TestLoadInternalListenAndSecretsFromOwnerOnlyFiles(t *testing.T) {
 }
 
 func TestLoadInternalSecretsAcceptsOnlyDocumentedFileVariables(t *testing.T) {
-	for _, variable := range []string{
-		"HAPPYLEARN_METRICS_BEARER_SECRET",
-		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET",
-		"HAPPYLEARN_WEBHOOK_URL",
-		"HAPPYLEARN_WEBHOOK_AUTHORIZATION",
+	for variable, fileVariable := range map[string]string{
+		"HAPPYLEARN_METRICS_BEARER_SECRET":    "HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET": "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+		"HAPPYLEARN_WEBHOOK_URL":              "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION":    "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
 	} {
 		t.Run(variable, func(t *testing.T) {
 			env := productionConfigEnv(t)
 			env[variable] = "direct-secret-must-not-be-accepted"
 			_, err := Load(mapEnv(env))
-			if err == nil || !strings.Contains(err.Error(), variable+"_FILE") ||
+			if err == nil || !strings.Contains(err.Error(), fileVariable) ||
 				strings.Contains(err.Error(), "direct-secret-must-not-be-accepted") {
 				t.Fatalf("error=%v", err)
 			}

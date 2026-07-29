@@ -191,7 +191,10 @@ func (store *PostgresSampleStore) LatestMetrics(
 SELECT DISTINCT ON(metric_name,scope)
   source,metric_name,scope,value,unit,observed_at,window_started_at
 FROM operational_samples
-ORDER BY metric_name,scope,observed_at DESC,id DESC`)
+WHERE observed_at >= $1
+ORDER BY metric_name,scope,observed_at DESC,id DESC`,
+		now.UTC().Add(-DashboardSampleFreshFor),
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -223,14 +223,21 @@ func Load(getenv func(string) string) (Config, error) {
 	if len(c.LoginThrottleSecret) < 32 {
 		return Config{}, fmt.Errorf("HAPPYLEARN_LOGIN_THROTTLE_SECRET must be at least 32 bytes")
 	}
-	for _, direct := range []string{
-		"HAPPYLEARN_METRICS_BEARER_SECRET",
-		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET",
-		"HAPPYLEARN_WEBHOOK_URL",
-		"HAPPYLEARN_WEBHOOK_AUTHORIZATION",
+	for _, variable := range []struct {
+		direct string
+		file   string
+	}{
+		{"HAPPYLEARN_METRICS_BEARER_SECRET", "HAPPYLEARN_METRICS_BEARER_SECRET_FILE"},
+		{"HAPPYLEARN_HOST_METRICS_HMAC_SECRET", "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE"},
+		{"HAPPYLEARN_WEBHOOK_URL", "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE"},
+		{"HAPPYLEARN_WEBHOOK_AUTHORIZATION", "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE"},
 	} {
-		if getenv(direct) != "" {
-			return Config{}, fmt.Errorf("%s_FILE must be used instead of %s", direct, direct)
+		if getenv(variable.direct) != "" {
+			return Config{}, fmt.Errorf(
+				"%s must be used instead of %s",
+				variable.file,
+				variable.direct,
+			)
 		}
 	}
 	var err error
