@@ -10,6 +10,7 @@ readonly TEACHER_DISPLAY_NAME='Phase 5 Restore Teacher'
 readonly CONTROLLER_SOCKET_GID='0'
 readonly CONTROLLER_SOCKET_MODE='660'
 readonly CONTROLLER_STOP_TIMEOUT_SECONDS=30
+readonly CONTROLLER_WAIT_TERM_GRACE_SECONDS=5
 
 CONTROLLER_WAIT_LIMIT_SECONDS="${HAPPYLEARN_PHASE5_RESTORE_LIVE_CONTROLLER_TIMEOUT_SECONDS:-1200}"
 
@@ -471,6 +472,28 @@ inspect_image_reference_id() {
   return 1
 }
 
+docker_container_name_absent() {
+  local name="$1"
+  local matches
+  [[ "$name" =~ ^[a-z0-9][a-z0-9_.-]{0,127}$ ]] || return 1
+  matches="$(
+    docker container ls --all --quiet \
+      --filter "name=^/${name}$"
+  )" || return 1
+  [[ -z "$matches" ]]
+}
+
+docker_container_id_absent() {
+  local container_id="$1"
+  local matches
+  [[ "$container_id" =~ ^[a-f0-9]{64}$ ]] || return 1
+  matches="$(
+    docker container ls --all --quiet --no-trunc \
+      --filter "id=$container_id"
+  )" || return 1
+  [[ -z "$matches" ]]
+}
+
 pre_register_image_references() {
   local reference baseline_id inspect_status
   [[ -f "$CREATED_IMAGE_RECORD" &&
@@ -500,6 +523,7 @@ pre_register_image_references() {
 create_fixture() {
   local fixture_uuid compact_uuid
   local repository_password teacher_password
+  local existing_containers existing_volumes existing_networks
   fixture_uuid="$(new_uuid)"
   compact_uuid="${fixture_uuid//-/}"
   FIXTURE_SUFFIX="${compact_uuid:0:12}"
@@ -553,14 +577,23 @@ create_fixture() {
   chmod 0600 "$CREATED_IMAGE_RECORD"
   pre_register_image_references ||
     fail 'could not pre-register randomized live fixture images'
-  if [[ -n "$(docker ps -aq \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    [[ -n "$(docker volume ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
-    [[ -n "$(docker network ls --quiet \
-      --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
+  existing_containers="$(
+    docker ps -aq \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || fail 'container collision scan failed'
+  existing_volumes="$(
+    docker volume ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || fail 'volume collision scan failed'
+  existing_networks="$(
+    docker network ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}"
+  )" || fail 'network collision scan failed'
+  if [[ -n "$existing_containers" ||
+    -n "$existing_volumes" ||
+    -n "$existing_networks" ]] ||
     grep -Evq '\|absent\|pending$' "$CREATED_IMAGE_RECORD" ||
-    docker container inspect "$CONTROLLER_NAME" >/dev/null 2>&1; then
+    ! docker_container_name_absent "$CONTROLLER_NAME"; then
     fail 'randomized live fixture collided with an existing resource'
   fi
   install -m 0400 "$LICENSE_SOURCE" "$LICENSE_COPY"
@@ -637,7 +670,9 @@ record_image() {
   local record_reference baseline_id expected_id extra
   local updated=0
   image_reference_is_expected "$reference" || return 1
-  image_id="$(docker image inspect --format '{{.Id}}' "$reference")"
+  image_id="$(
+    docker image inspect --format '{{.Id}}' "$reference"
+  )" || fail 'built image ID is unavailable'
   [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
     fail 'built image ID is invalid'
   record_tmp="$FIXTURE_ROOT/control/.created-images.new"
@@ -707,6 +742,7 @@ build_images() {
 
 generate_age_identity() {
   local identity_file="$FIXTURE_ROOT/offline/age.identity"
+  local recipient
   docker run --rm \
     --network none \
     --read-only \
@@ -717,7 +753,7 @@ generate_age_identity() {
     --entrypoint /usr/local/bin/age-keygen \
     "$BACKUP_IMAGE" >"$identity_file" 2>/dev/null
   chmod 0400 "$identity_file"
-  export HAPPYLEARN_BACKUP_AGE_RECIPIENT="$(
+  recipient="$(
     docker run --rm \
       --interactive \
       --network none \
@@ -727,7 +763,8 @@ generate_age_identity() {
       --security-opt no-new-privileges:true \
       --entrypoint /usr/local/bin/age-keygen \
       "$BACKUP_IMAGE" -y <"$identity_file"
-  )"
+  )" || fail 'Age recipient generation failed'
+  export HAPPYLEARN_BACKUP_AGE_RECIPIENT="$recipient"
   [[ "$HAPPYLEARN_BACKUP_AGE_RECIPIENT" =~ ^age1[0-9a-z]+$ ]] ||
     fail 'Age recipient generation failed'
 }
@@ -758,7 +795,8 @@ wait_for_source_stack() {
     all_healthy=true
     statuses=''
     for service in postgres redis minio app worker; do
-      container_id="$(compose ps --quiet "$service")"
+      container_id="$(compose ps --quiet "$service")" ||
+        return 1
       if [[ -z "$container_id" || "$container_id" == *$'\n'* ]]; then
         all_healthy=false
         statuses="${statuses}${service}=missing "
@@ -768,7 +806,7 @@ wait_for_source_stack() {
         docker container inspect --format \
           '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
           "$container_id"
-      )"
+      )" || return 1
       statuses="${statuses}${service}=${state} "
       [[ "$state" == healthy ]] || all_healthy=false
     done
@@ -957,15 +995,18 @@ WHERE id='${BACKUP_ID}'::uuid
 }
 
 assert_repository_handoff_safe() {
+  local oneoff_containers
   [[ "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" == "$FIXTURE_ROOT/repository" ]] ||
     return 1
   [[ ! -e "$FIXTURE_ROOT/host.lock" &&
     ! -L "$FIXTURE_ROOT/host.lock" ]] ||
     return 1
-  [[ -z "$(docker ps --quiet \
-    --filter "label=com.docker.compose.project=${PROJECT}" \
-    --filter 'label=com.docker.compose.oneoff=True')" ]] ||
-    return 1
+  oneoff_containers="$(
+    docker ps --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}" \
+      --filter 'label=com.docker.compose.oneoff=True'
+  )" || return 1
+  [[ -z "$oneoff_containers" ]]
 }
 
 prepare_restore_repository_access() {
@@ -1074,21 +1115,35 @@ discover_restore_controller() {
   CONTROLLER_CREATED=true
 }
 
-reap_controller_wait_client() {
+terminate_process_bounded() {
+  local pid="$1"
+  local term_grace_seconds="$2"
   local deadline
-  [[ -n "$CONTROLLER_WAIT_PID" ]] || return 0
-  [[ "$CONTROLLER_WAIT_PID" =~ ^[1-9][0-9]*$ ]] || return 1
-  deadline=$((SECONDS + 5))
-  while kill -0 "$CONTROLLER_WAIT_PID" 2>/dev/null; do
+  [[ "$pid" =~ ^[1-9][0-9]*$ &&
+    "$pid" != "$$" &&
+    "$term_grace_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    return 1
+  kill -TERM "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + term_grace_seconds))
+  while kill -0 "$pid" 2>/dev/null; do
     if ((SECONDS >= deadline)); then
-      kill -TERM "$CONTROLLER_WAIT_PID" 2>/dev/null || true
-      sleep 0.1
-      kill -KILL "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
       break
     fi
     sleep 0.1
   done
-  wait "$CONTROLLER_WAIT_PID" 2>/dev/null || true
+  # pid is the direct child created below. After SIGKILL, wait cannot depend
+  # on the child cooperating and reaps its status immediately.
+  wait "$pid" 2>/dev/null || true
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+reap_controller_wait_client() {
+  [[ -n "$CONTROLLER_WAIT_PID" ]] || return 0
+  terminate_process_bounded \
+    "$CONTROLLER_WAIT_PID" \
+    "$CONTROLLER_WAIT_TERM_GRACE_SECONDS" ||
+    return 1
   CONTROLLER_WAIT_PID=''
   if [[ -n "$CONTROLLER_WAIT_STATUS_FILE" ]]; then
     rm -f "$CONTROLLER_WAIT_STATUS_FILE"
@@ -1139,10 +1194,8 @@ remove_restore_controller() {
       return 1
     reap_controller_wait_client || return 1
   fi
-  if docker container inspect "$CONTROLLER_ID" >/dev/null 2>&1 ||
-    docker container inspect "$CONTROLLER_NAME" >/dev/null 2>&1; then
-    return 1
-  fi
+  docker_container_id_absent "$CONTROLLER_ID" || return 1
+  docker_container_name_absent "$CONTROLLER_NAME" || return 1
   CONTROLLER_CREATED=false
   CONTROLLER_ID=''
 }
@@ -1159,18 +1212,14 @@ wait_restore_controller_bounded() {
     ! -e "$CONTROLLER_WAIT_STATUS_FILE" &&
     ! -L "$CONTROLLER_WAIT_STATUS_FILE" ]] ||
     return 1
-  (
-    umask 077
-    docker container wait "$container_id" >"$CONTROLLER_WAIT_STATUS_FILE"
-  ) &
+  (umask 077 && : >"$CONTROLLER_WAIT_STATUS_FILE") || return 1
+  docker container wait "$container_id" \
+    >"$CONTROLLER_WAIT_STATUS_FILE" 2>/dev/null &
   CONTROLLER_WAIT_PID=$!
   deadline=$((SECONDS + timeout_seconds))
   while kill -0 "$CONTROLLER_WAIT_PID" 2>/dev/null; do
     if ((SECONDS >= deadline)); then
-      kill -TERM "$CONTROLLER_WAIT_PID" 2>/dev/null || true
-      wait "$CONTROLLER_WAIT_PID" 2>/dev/null || true
-      CONTROLLER_WAIT_PID=''
-      rm -f "$CONTROLLER_WAIT_STATUS_FILE"
+      reap_controller_wait_client >/dev/null 2>&1 || return 1
       return 124
     fi
     sleep 0.1
@@ -1573,7 +1622,7 @@ validate_owned_restore_resource() {
 remove_owned_restore_resource() {
   local class="$1"
   local name="$2"
-  local observation confirmation identity owner dual_names
+  local observation confirmation identity owner dual_names remaining_names
   observation="$(inspect_owned_restore_resource "$class" "$name")" ||
     return 1
   validate_owned_restore_resource "$class" "$name" "$observation" ||
@@ -1626,10 +1675,8 @@ remove_owned_restore_resource() {
       docker network rm "$identity" >/dev/null || return 1
       ;;
   esac
-  if inspect_owned_restore_resource "$class" "$identity" \
-    >/dev/null 2>&1; then
-    return 1
-  fi
+  remaining_names="$(list_owned_restore_resources "$class")" || return 1
+  [[ "$(printf '%s\n' "$remaining_names" | grep -Fxc "$name")" == 0 ]]
 }
 
 cleanup_owned_restore_resources() {
@@ -1870,7 +1917,7 @@ volume_identity_matches() {
 }
 
 remove_labeled_project_volumes() {
-  local volume listed
+  local volume listed attachments
   listed="$(
     docker volume ls --quiet \
       --filter "label=com.docker.compose.project=${PROJECT}"
@@ -1878,8 +1925,10 @@ remove_labeled_project_volumes() {
   while IFS= read -r volume; do
     [[ -n "$volume" ]] || continue
     volume_identity_matches "$volume" || return 1
-    [[ -z "$(docker ps -aq --filter "volume=${volume}")" ]] ||
-      return 1
+    attachments="$(
+      docker ps -aq --filter "volume=${volume}"
+    )" || return 1
+    [[ -z "$attachments" ]] || return 1
     docker volume rm "$volume" >/dev/null || return 1
   done <<<"$listed"
 }

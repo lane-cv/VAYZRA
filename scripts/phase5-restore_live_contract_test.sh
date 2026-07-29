@@ -193,6 +193,8 @@ forbid_pattern 'phase5-backup_live_test\.sh'
 forbid_pattern 'docker[[:space:]]+system[[:space:]]+prune'
 forbid_pattern 'docker[[:space:]]+(container[[:space:]]+|volume[[:space:]]+|network[[:space:]]+)?prune'
 forbid_pattern 'HAPPYLEARN_[A-Z0-9_]*(PASSWORD|SECRET_KEY|ACCESS_KEY)[[:space:]]*='
+forbid_pattern '\[\[[[:space:]]+(-n|-z)[[:space:]]+"\$\(docker'
+forbid_pattern 'export[[:space:]]+HAPPYLEARN_BACKUP_AGE_RECIPIENT="\$\('
 forbid_pattern 'create-teacher[^[:cntrl:]]*--password[=[:space:]]'
 forbid_pattern 'restore-http-probe'
 forbid_pattern 'student-isolation-probe'
@@ -505,7 +507,8 @@ review_report_semantics() {
 }
 
 review_bounded_controller_wait() (
-  local status started
+  local status started scenario_pid stub_pid
+  local resistant_root="$CONTRACT_ROOT/controller-wait-resistant"
   FIXTURE_ROOT="$CONTRACT_ROOT/controller-wait"
   mkdir -m 0700 "$FIXTURE_ROOT" "$FIXTURE_ROOT/control"
   CONTROLLER_WAIT_STATUS_FILE="$FIXTURE_ROOT/control/controller.wait"
@@ -525,6 +528,58 @@ review_bounded_controller_wait() (
     $((SECONDS - started)) -le 2 &&
     -z "$CONTROLLER_WAIT_PID" ]] ||
     return 1
+
+  mkdir -m 0700 "$resistant_root" "$resistant_root/control"
+  (
+    FIXTURE_ROOT="$resistant_root"
+    CONTROLLER_WAIT_STATUS_FILE="$resistant_root/control/controller.wait"
+    CONTROLLER_WAIT_PID=''
+    docker() {
+      [[ "$1 $2" == 'container wait' ]] || return 1
+      exec /bin/sh -c '
+        trap "" TERM
+        printf "%s\n" "$$" >"$1"
+        while :; do sleep 1; done
+      ' resistant "$resistant_root/stub.pid"
+    }
+    started=$SECONDS
+    status=0
+    wait_restore_controller_bounded \
+      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 ||
+      status=$?
+    printf '%s|%s|%s\n' \
+      "$status" "$((SECONDS - started))" "$CONTROLLER_WAIT_PID" \
+      >"$resistant_root/result"
+  ) &
+  scenario_pid=$!
+  started=$SECONDS
+  while kill -0 "$scenario_pid" 2>/dev/null; do
+    if ((SECONDS - started >= 9)); then
+      kill -KILL "$scenario_pid" 2>/dev/null || true
+      wait "$scenario_pid" 2>/dev/null || true
+      if [[ -f "$resistant_root/stub.pid" ]]; then
+        stub_pid="$(<"$resistant_root/stub.pid")"
+        kill -KILL "$stub_pid" 2>/dev/null || true
+        wait "$stub_pid" 2>/dev/null || true
+      fi
+      return 1
+    fi
+    sleep 0.1
+  done
+  wait "$scenario_pid" || return 1
+  IFS='|' read -r status started CONTROLLER_WAIT_PID \
+    <"$resistant_root/result"
+  stub_pid="$(<"$resistant_root/stub.pid")"
+  [[ "$status" == 124 &&
+    "$started" -le 7 &&
+    -z "$CONTROLLER_WAIT_PID" &&
+    "$stub_pid" =~ ^[1-9][0-9]*$ &&
+    ! -e "$resistant_root/control/controller.wait" ]] ||
+    return 1
+  if kill -0 "$stub_pid" 2>/dev/null; then
+    kill -KILL "$stub_pid" 2>/dev/null || true
+    return 1
+  fi
 
   CONTROLLER_WAIT_STATUS_FILE="$FIXTURE_ROOT/control/controller.wait"
   docker() {
@@ -638,6 +693,10 @@ review_graceful_restore_cleanup() (
       fi
       return 0
     fi
+    if [[ "$1 $2" == 'container ls' ]]; then
+      [[ "$exists" == false ]] || printf '%s\n' "$controller_id"
+      return 0
+    fi
     if [[ "$1 $2" == 'container stop' ]]; then
       [[ "$stop_fails" == false ]] || return 1
       running=false
@@ -650,7 +709,7 @@ review_graceful_restore_cleanup() (
     fi
     return 1
   }
-  remove_restore_controller
+  remove_restore_controller || return 1
   grep -Fq \
     "container stop --signal TERM --timeout 30 $controller_id" "$calls" &&
     grep -Fq "container rm $controller_id" "$calls" &&
@@ -663,7 +722,7 @@ review_graceful_restore_cleanup() (
   stop_fails=true
   CONTROLLER_ID=''
   CONTROLLER_CREATED=false
-  remove_restore_controller
+  remove_restore_controller || return 1
   grep -Fq \
     "container stop --signal TERM --timeout 30 $controller_id" "$calls" &&
     grep -Fq "container rm --force $controller_id" "$calls" ||
@@ -944,6 +1003,138 @@ review_controller_socket_groups() (
   ! controller_supplementary_groups_match 20 0
 )
 
+review_create_fixture_daemon_error() (
+  local calls="$CONTRACT_ROOT/create-fixture-daemon.calls"
+  local license="$CONTRACT_ROOT/create-fixture-daemon.license"
+  local fixture_tmp fail_class expected_error
+  printf 'license\n' >"$license"
+  chmod 0400 "$license"
+  LICENSE_SOURCE="$license"
+  new_uuid() {
+    printf '11111111-1111-4111-8111-111111111111\n'
+  }
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    case "$1 $2" in
+      'image inspect') return 1 ;;
+      'image ls') return 0 ;;
+      'ps -aq')
+        [[ "$fail_class" != containers ]] || return 70
+        return 0
+        ;;
+      'volume ls')
+        [[ "$fail_class" != volumes ]] || return 70
+        return 0
+        ;;
+      'network ls')
+        [[ "$fail_class" != networks ]] || return 70
+        return 0
+        ;;
+      'container inspect') return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  for fail_class in containers volumes networks; do
+    fixture_tmp="$CONTRACT_ROOT/create-fixture-daemon-$fail_class"
+    mkdir -m 0700 "$fixture_tmp"
+    : >"$calls"
+    export TMPDIR="$fixture_tmp"
+    if (create_fixture) \
+      >"$fixture_tmp/create.output" 2>&1; then
+      return 1
+    fi
+    case "$fail_class" in
+      containers) expected_error='container collision scan failed' ;;
+      volumes) expected_error='volume collision scan failed' ;;
+      networks) expected_error='network collision scan failed' ;;
+    esac
+    grep -Fxq \
+      "phase5 restore live: $expected_error" \
+      "$fixture_tmp/create.output" ||
+      return 1
+    ! grep -Eq \
+      '(container|image|network|volume) rm|compose down' "$calls" ||
+      return 1
+  done
+)
+
+review_repository_handoff_daemon_error() (
+  local calls="$CONTRACT_ROOT/repository-handoff-daemon.calls"
+  local output="$CONTRACT_ROOT/repository-handoff-daemon.output"
+  local cleanup_root image_id
+  FIXTURE_ROOT="$CONTRACT_ROOT/repository-handoff-daemon"
+  mkdir -m 0700 "$FIXTURE_ROOT" "$FIXTURE_ROOT/repository"
+  PROJECT='happylearn-phase5-live-111111111111'
+  HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$FIXTURE_ROOT/repository"
+  HOST_UID="$(id -u)"
+  HOST_GID="$(id -g)"
+  : >"$calls"
+  docker() {
+    printf '%s\n' "$*" >>"$calls"
+    [[ "$1 $2" == 'ps --quiet' ]] && return 70
+    return 1
+  }
+  compose() {
+    printf 'compose %s\n' "$*" >>"$calls"
+    return 0
+  }
+  if (prepare_restore_repository_access) >"$output" 2>&1; then
+    return 1
+  fi
+  grep -Fxq \
+    'phase5 restore live: repository ownership handoff was not quiescent' \
+    "$output" &&
+    ! grep -Eq \
+      '^compose |(container|image|network|volume) rm' "$calls" ||
+    return 1
+
+  cleanup_root="$(mktemp -d \
+    "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
+  trap 'chmod -R u+rwX "$cleanup_root" 2>/dev/null || true
+    rm -rf "$cleanup_root"' EXIT
+  FIXTURE_ROOT="$cleanup_root"
+  mkdir -m 0700 "$FIXTURE_ROOT/repository"
+  printf 'repository data\n' >"$FIXTURE_ROOT/repository/data"
+  BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+  CREATED_IMAGE_RECORD="$FIXTURE_ROOT/created-images"
+  image_id="sha256:$(printf '5%.0s' {1..64})"
+  printf '%s|absent|%s\n' \
+    "$BACKUP_IMAGE" "$image_id" >"$CREATED_IMAGE_RECORD"
+  chmod 0600 "$CREATED_IMAGE_RECORD"
+  : >"$calls"
+  REPOSITORY_HOST_HANDOFF=false
+  ! handoff_repository_to_host_for_cleanup &&
+    [[ "$REPOSITORY_HOST_HANDOFF" == false ]] &&
+    ! grep -Eq \
+      '^run |(container|image|network|volume) rm' "$calls"
+)
+
+review_absence_checks_fail_closed() (
+  local status=0
+  PROJECT='happylearn-phase5-live-111111111111'
+  FIXTURE_SUFFIX='111111111111'
+  BACKUP_ID='11111111-1111-4111-8111-111111111111'
+  CONTROLLER_NAME="${PROJECT}-restore-controller"
+  BACKUP_IMAGE='happylearn-backup:phase5-restore-live-111111111111'
+  APP_IMAGE="${PROJECT}-app"
+  WORKER_IMAGE="${PROJECT}-worker"
+  CONTROLLER_IMAGE='happylearn-restore-controller:phase5-live-111111111111'
+  FIXTURE_IMAGE='happylearn-restore-live-fixture:phase5-live-111111111111'
+  docker() {
+    return 70
+  }
+  ! assert_restore_resources_absent "$BACKUP_ID" &&
+    ! project_resources_absent &&
+    ! docker_container_name_absent "$CONTROLLER_NAME" &&
+    ! docker_container_id_absent \
+      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa &&
+    {
+      inspect_image_reference_id "$BACKUP_IMAGE" >/dev/null ||
+        status=$?
+      [[ "$status" == 1 ]]
+    }
+)
+
 review_project_fallback_cleanup() (
   local fixture_container_id fixture_container_name fixture_volume_name
   local fixture_network_id fixture_network_name
@@ -955,7 +1146,11 @@ review_project_fallback_cleanup() (
   fixture_volume_name="${PROJECT}_minio_data"
   fixture_network_name="${PROJECT}_happylearn"
   local container_exists=true volume_exists=true network_exists=true
+  local volume_attachment_list_fails=false
+  local calls="$CONTRACT_ROOT/project-fallback.calls"
+  : >"$calls"
   docker() {
+    printf '%s\n' "$*" >>"$calls"
     case "$1 $2" in
       'container ls')
         [[ "$container_exists" == false ]] ||
@@ -984,7 +1179,8 @@ review_project_fallback_cleanup() (
         volume_exists=false
         ;;
       'ps -aq')
-        return 0
+        [[ "$volume_attachment_list_fails" == false ]]
+        return
         ;;
       'network ls')
         [[ "$network_exists" == false ]] ||
@@ -1007,12 +1203,23 @@ review_project_fallback_cleanup() (
     remove_labeled_project_networks &&
     [[ "$container_exists" == false &&
       "$volume_exists" == false &&
-      "$network_exists" == false ]]
+      "$network_exists" == false ]] ||
+    return 1
+
+  : >"$calls"
+  volume_exists=true
+  volume_attachment_list_fails=true
+  ! remove_labeled_project_volumes &&
+    [[ "$volume_exists" == true ]] &&
+    ! grep -Fq "volume rm $fixture_volume_name" "$calls"
 )
 
 review_dynamic_fault_windows() (
   local root calls cleanup_status=0
   review_controller_socket_groups || return 1
+  review_create_fixture_daemon_error || return 1
+  review_repository_handoff_daemon_error || return 1
+  review_absence_checks_fail_closed || return 1
   review_project_fallback_cleanup || return 1
   root="$(mktemp -d \
     "${TMPDIR:-/tmp}/phase5-restore-live.XXXXXX")"
