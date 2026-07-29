@@ -9,12 +9,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"happylearn.local/app/internal/queuepolicy"
 )
 
 const (
 	OutboxBatchLimit    = 50
 	OutboxLeaseDuration = 30 * time.Second
-	OutboxMaxAttempts   = 10
+	OutboxMaxAttempts   = queuepolicy.OutboxMaxAttempts
 )
 
 var (

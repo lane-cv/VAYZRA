@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"happylearn.local/app/internal/queuepolicy"
 )
 
 const dashboardQueueFailureWindow = 15 * time.Minute
@@ -204,12 +205,10 @@ SELECT
   count(*) FILTER (
     WHERE status NOT IN ('queued','streaming','succeeded','failed','cancelled')
   )::bigint,
-  (
-    SELECT count(*)::bigint
-    FROM ai_runs AS lifecycle
-    WHERE lifecycle.created_at > $1 OR lifecycle.updated_at > $1
-      OR lifecycle.started_at > $1 OR lifecycle.completed_at > $1
-  )
+  count(*) FILTER (
+    WHERE created_at > $1 OR updated_at > $1
+      OR started_at > $1 OR completed_at > $1
+  )::bigint
 FROM ai_runs
 WHERE created_at >= $2`,
 		now, dayStart,
@@ -312,7 +311,6 @@ WITH queue_rows AS (
   WHERE state IN ('queued','running')
     OR (state='failed' AND updated_at >= $2)
     OR state NOT IN ('queued','running','completed','failed')
-    OR created_at>$1 OR updated_at>$1
 
   UNION ALL
 
@@ -345,8 +343,6 @@ WITH queue_rows AS (
   WHERE status IN ('queued','streaming')
     OR (status='failed' AND completed_at >= $2)
     OR status NOT IN ('queued','streaming','succeeded','failed','cancelled')
-    OR created_at>$1 OR updated_at>$1
-    OR started_at>$1 OR completed_at>$1
 
   UNION ALL
 
@@ -356,7 +352,7 @@ WITH queue_rows AS (
     count(*) FILTER (
       WHERE published_at IS NULL
         AND next_attempt_at <= $1
-        AND attempts<4
+        AND attempts<$3
         AND (lease_until IS NULL OR lease_until <= $1)
         AND created_at <= $1
     )::bigint,
@@ -372,7 +368,7 @@ WITH queue_rows AS (
           AND last_error_category<>''
       ) OR (
         published_at IS NULL
-          AND attempts>=4
+          AND attempts>=$3
           AND (lease_until IS NULL OR lease_until <= $1)
       )
     )::bigint,
@@ -387,12 +383,11 @@ WITH queue_rows AS (
   FROM outbox_events
   WHERE published_at IS NULL
     OR (published_at >= $2 AND last_error_category IS NOT NULL)
-    OR created_at>$1 OR published_at>$1
 )
 SELECT queue,queued,streaming,failed,expired,unknown,future
 FROM queue_rows
 ORDER BY queue_order`,
-		now, windowStart,
+		now, windowStart, queuepolicy.OutboxMaxAttempts,
 	)
 	if err != nil {
 		return nil, err

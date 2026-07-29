@@ -211,6 +211,9 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 	if strings.Contains(db.lastQuery, "$1 + interval") {
 		t.Fatalf("AI query hides far-future rows: %s", db.lastQuery)
 	}
+	if strings.Contains(db.lastQuery, "FROM ai_runs AS lifecycle") {
+		t.Fatalf("AI query scans lifecycle outside daily source: %s", db.lastQuery)
+	}
 
 	db.row = dashboardRowStub{values: []any{
 		int64(0), int64(0), int64(0), int64(0), int64(0),
@@ -372,6 +375,9 @@ func TestPostgresDashboardReaderQueuesMatchClaimLeaseSemantics(t *testing.T) {
 		ReadQueueSummaries(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
+	if len(db.lastArgs) != 3 || db.lastArgs[2] != 10 {
+		t.Fatalf("queue args=%#v want shared outbox max attempts", db.lastArgs)
+	}
 	assertDashboardQuery(
 		t,
 		db.lastQuery,
@@ -384,11 +390,41 @@ func TestPostgresDashboardReaderQueuesMatchClaimLeaseSemantics(t *testing.T) {
 		"status='streaming' AND lease_expires_at < $1",
 		"next_attempt_at <= $1",
 		"lease_until > $1",
-		"attempts>=4",
+		"attempts<$3",
+		"attempts>=$3",
 		"FROM file_processing_jobs\n  WHERE state IN ('queued','running')",
 		"FROM ai_runs\n  WHERE status IN ('queued','streaming')",
 		"FROM outbox_events\n  WHERE published_at IS NULL",
 	)
+	processingSource := dashboardQuerySource(
+		t,
+		db.lastQuery,
+		"FROM file_processing_jobs",
+		"\n\n  UNION ALL",
+	)
+	if strings.Contains(processingSource, "OR created_at>$1") {
+		t.Fatalf("processing source scans irrelevant historical rows: %s", processingSource)
+	}
+	aiSource := dashboardQuerySource(
+		t,
+		db.lastQuery,
+		"FROM ai_runs",
+		"\n\n  UNION ALL",
+	)
+	if strings.Contains(aiSource, "OR created_at>$1") ||
+		strings.Contains(aiSource, "OR started_at>$1") {
+		t.Fatalf("AI queue source scans irrelevant historical rows: %s", aiSource)
+	}
+	outboxSource := dashboardQuerySource(
+		t,
+		db.lastQuery,
+		"FROM outbox_events",
+		"\n)",
+	)
+	if strings.Contains(outboxSource, "OR created_at>$1") ||
+		strings.Contains(outboxSource, "OR published_at>$1") {
+		t.Fatalf("outbox source scans irrelevant historical rows: %s", outboxSource)
+	}
 }
 
 func TestPostgresDashboardReaderBackupMapsLocalRemoteAndRestoreEvidence(t *testing.T) {
@@ -752,7 +788,7 @@ WHERE id=$1`,
 		t.Fatalf("fixture AI queue=%+v", queues[1])
 	}
 	if queues[2].Queue != QueueOutbox ||
-		queues[2].Queued != 2 || queues[2].Streaming != 1 ||
+		queues[2].Queued != 4 || queues[2].Streaming != 1 ||
 		queues[2].Failed != 2 || queues[2].Expired != 0 ||
 		queues[2].State != DataStateDegraded {
 		t.Fatalf("fixture outbox queue=%+v", queues[2])
@@ -786,6 +822,257 @@ WHERE id=$1`,
 	if _, err := reader.ReadAISummary(ctx, now); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("future AI lifecycle error=%v want ErrInvalid", err)
 	}
+}
+
+func TestPostgresDashboardReaderNaturalPlansStayBounded(t *testing.T) {
+	ctx := context.Background()
+	pool := integration.StartPostgres(t)
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	now := dashboardPostgresClock()
+	seedDashboardPlannerHistory(t, ctx, tx, now)
+
+	aiDB := &dashboardDBStub{row: dashboardRowStub{values: []any{
+		int64(0), int64(0), int64(0), int64(0), int64(0),
+		int64(0), int64(0), int64(0), int64(0),
+	}}}
+	if _, err := newPostgresDashboardReaderDB(aiDB).
+		ReadAISummary(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	queueDB := &dashboardDBStub{rows: &dashboardRowsStub{values: [][]any{
+		{"processing", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+		{"ai", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+		{"outbox", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+	}}}
+	if _, err := newPostgresDashboardReaderDB(queueDB).
+		ReadQueueSummaries(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	backupDB := &dashboardDBStub{row: dashboardRowStub{values: []any{
+		nil, nil, nil, nil, nil, nil, int64(0), int64(0), int64(0),
+	}}}
+	if _, err := newPostgresDashboardReaderDB(backupDB).
+		ReadBackupSummary(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	auditDB := &dashboardDBStub{rows: &dashboardRowsStub{}}
+	if _, err := newPostgresDashboardReaderDB(auditDB).
+		ReadRecentAudit(ctx, now, MaxRecentAudit); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name        string
+		query       string
+		args        []any
+		indexes     []string
+		largeTables []string
+	}{
+		{
+			name:        "AI daily",
+			query:       aiDB.lastQuery,
+			args:        aiDB.lastArgs,
+			indexes:     []string{"ai_runs_dashboard_daily_idx"},
+			largeTables: []string{"ai_runs"},
+		},
+		{
+			name:  "queues",
+			query: queueDB.lastQuery,
+			args:  queueDB.lastArgs,
+			indexes: []string{
+				"file_processing_jobs_claim_idx",
+				"file_processing_jobs_dashboard_failed_idx",
+				"ai_runs_one_active_student_idx",
+				"ai_runs_dashboard_failed_idx",
+				"outbox_events_dashboard_pending_idx",
+				"outbox_events_dashboard_terminal_failure_idx",
+			},
+			largeTables: []string{"file_processing_jobs", "ai_runs", "outbox_events"},
+		},
+		{
+			name:  "backup",
+			query: backupDB.lastQuery,
+			args:  backupDB.lastArgs,
+			indexes: []string{
+				"backup_runs_dashboard_finished_idx",
+				"backup_runs_dashboard_remote_finished_idx",
+				"restore_verifications_dashboard_finished_idx",
+				"restore_verifications_dashboard_unknown_idx",
+			},
+			largeTables: []string{"backup_runs", "restore_verifications"},
+		},
+		{
+			name:        "audit",
+			query:       auditDB.lastQuery,
+			args:        auditDB.lastArgs,
+			indexes:     []string{"audit_logs_dashboard_latest_idx"},
+			largeTables: []string{"audit_logs"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := dashboardExplainPlan(t, ctx, tx, test.query, test.args...)
+			t.Logf("history_rows=50000 plan:\n%s", plan)
+			for _, index := range test.indexes {
+				if !strings.Contains(plan, index) {
+					t.Fatalf("natural plan missing %s:\n%s", index, plan)
+				}
+			}
+			for _, table := range test.largeTables {
+				if strings.Contains(plan, "Seq Scan on "+table) {
+					t.Fatalf("natural plan scans historical %s:\n%s", table, plan)
+				}
+			}
+		})
+	}
+}
+
+func seedDashboardPlannerHistory(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	now time.Time,
+) {
+	t.Helper()
+	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`TRUNCATE audit_logs,ai_runs,file_processing_jobs,outbox_events,
+		  restore_verifications,backup_runs CASCADE`,
+		`INSERT INTO audit_logs(
+		   action,target_type,target_id,metadata,request_id,occurred_at
+		 )
+		 SELECT 'operations.history','operations','dashboard','{}',
+		   'dashboard-plan-'||value,
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second')
+		 FROM generate_series(1,50000) AS value`,
+		`INSERT INTO ai_runs(
+		   id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,
+		   status,provider_id,provider_key_version,provider_base_url,protocol_mode,
+		   model_id,upstream_model_id,modality,context_window_tokens,
+		   max_output_tokens,image_quota_tokens,
+		   input_price_micro_usd_per_million_tokens,
+		   output_price_micro_usd_per_million_tokens,
+		   prompt_id,prompt_subject,prompt_version,prompt_sha256,
+		   connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,
+		   total_timeout_ms,reserved_request_count,reserved_token_count,
+		   quota_day_key,quota_month_key,estimator_version,
+		   input_tokens,output_tokens,cost_micro_usd,usage_source,
+		   first_byte_ms,total_ms,created_at,updated_at,started_at,completed_at
+		 )
+		 SELECT
+		   md5('dashboard-ai-id-'||value)::uuid,
+		   md5('dashboard-ai-thread-'||value)::uuid,
+		   '61000000-0000-4000-8000-000000000001'::uuid,
+		   md5('dashboard-ai-trigger-'||value)::uuid,
+		   1,'dashboard-plan-'||lpad(value::text,10,'0'),
+		   'succeeded','62000000-0000-4000-8000-000000000001'::uuid,1,
+		   'https://dashboard.invalid/v1','chat_completions',
+		   '63000000-0000-4000-8000-000000000001'::uuid,
+		   'dashboard-model','text',8192,1024,1024,0,0,
+		   '64000000-0000-4000-8000-000000000001'::uuid,
+		   'math',1,repeat('a',64),1000,30000,30000,120000,
+		   1,1024,'2026-07-30','2026-07',1,
+		   1,1,0,'upstream',1,1,
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second')
+		 FROM generate_series(1,50000) AS value`,
+		`INSERT INTO file_processing_jobs(
+		   id,file_version_id,kind,state,attempts,available_at,created_at,updated_at
+		 )
+		 SELECT md5('dashboard-job-id-'||value)::uuid,
+		   md5('dashboard-version-id-'||value)::uuid,
+		   'process_file','completed',1,
+		   $1::timestamptz-interval '90 days',
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second')
+		 FROM generate_series(1,50000) AS value`,
+		`INSERT INTO outbox_events(
+		   id,kind,payload,created_at,published_at,attempts,next_attempt_at
+		 )
+		 SELECT md5('dashboard-outbox-id-'||value)::uuid,
+		   'dashboard.history','{}',
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   1,$1::timestamptz-interval '90 days'
+		 FROM generate_series(1,50000) AS value`,
+		`INSERT INTO backup_runs(
+		   id,idempotency_key,trigger_kind,state,requested_at,started_at,finished_at
+		 )
+		 SELECT md5('dashboard-backup-id-'||value)::uuid,
+		   'dashboard-plan-'||lpad(value::text,10,'0'),
+		   'manual','failed',
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second')
+		 FROM generate_series(1,50000) AS value`,
+		`INSERT INTO restore_verifications(
+		   id,backup_run_id,state,started_at,finished_at
+		 )
+		 SELECT md5('dashboard-restore-id-'||value)::uuid,
+		   md5('dashboard-backup-id-'||value)::uuid,
+		   'failed',
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second'),
+		   $1::timestamptz-interval '90 days'-(value*interval '1 second')
+		 FROM generate_series(1,50000) AS value`,
+		`ANALYZE audit_logs`,
+		`ANALYZE ai_runs`,
+		`ANALYZE file_processing_jobs`,
+		`ANALYZE outbox_events`,
+		`ANALYZE backup_runs`,
+		`ANALYZE restore_verifications`,
+	} {
+		var err error
+		if strings.Contains(statement, "$1") {
+			_, err = tx.Exec(ctx, statement, now)
+		} else {
+			_, err = tx.Exec(ctx, statement)
+		}
+		if err != nil {
+			t.Fatalf("planner fixture: %v", err)
+		}
+	}
+}
+
+func dashboardExplainPlan(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	query string,
+	args ...any,
+) string {
+	t.Helper()
+	rows, err := tx.Query(
+		ctx,
+		"EXPLAIN (ANALYZE,BUFFERS,COSTS OFF,TIMING OFF,SUMMARY OFF) "+query,
+		args...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return plan.String()
 }
 
 func seedDashboardPostgresFixture(
@@ -957,8 +1244,10 @@ FROM (VALUES
   ('52000000-0000-4000-8000-000000000001','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-1',NULL,NULL,0,$1::timestamptz-interval '20 minutes',NULL),
   ('52000000-0000-4000-8000-000000000002','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-2','dashboard-expired',$1::timestamptz-interval '1 minute',1,$1::timestamptz-interval '20 minutes',NULL),
   ('52000000-0000-4000-8000-000000000003','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-3','dashboard-active',$1::timestamptz+interval '5 minutes',1,$1::timestamptz-interval '20 minutes',NULL),
-  ('52000000-0000-4000-8000-000000000004','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-4',NULL,NULL,4,$1::timestamptz-interval '20 minutes','attempts_exhausted'),
-  ('52000000-0000-4000-8000-000000000005','dashboard.test','{}',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '5 minutes','dashboard-outbox-5',NULL,NULL,1,$1::timestamptz-interval '20 minutes','delivery_failed')`,
+  ('52000000-0000-4000-8000-000000000004','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-4',NULL,NULL,10,$1::timestamptz-interval '20 minutes','attempts_exhausted'),
+  ('52000000-0000-4000-8000-000000000005','dashboard.test','{}',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '5 minutes','dashboard-outbox-5',NULL,NULL,1,$1::timestamptz-interval '20 minutes','delivery_failed'),
+  ('52000000-0000-4000-8000-000000000006','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-6',NULL,NULL,4,$1::timestamptz-interval '20 minutes',NULL),
+  ('52000000-0000-4000-8000-000000000007','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-7','dashboard-expired-9',$1::timestamptz-interval '1 minute',9,$1::timestamptz-interval '20 minutes',NULL)`,
 			[]any{now},
 		},
 		{
@@ -1048,8 +1337,8 @@ INSERT INTO ai_runs(
   'math',1,encode(digest('Dashboard prompt','sha256'),'hex'),
   1000,30000,30000,120000,1,1024,'2026-07-30','2026-07',1,
   'unknown','upstream_error',
-  $1::timestamptz-interval '48 hours',$1::timestamptz-interval '47 hours',
-  $1::timestamptz-interval '47 hours 30 minutes',$1::timestamptz+interval '1 minute'
+  $1::timestamptz-interval '40 minutes',$1::timestamptz-interval '10 minutes',
+  $1::timestamptz-interval '30 minutes',$1::timestamptz+interval '1 minute'
 )`, now); err != nil {
 		t.Fatal(err)
 	}
@@ -1075,6 +1364,25 @@ func assertDashboardQuery(
 	if len(args) == 0 || args[0] != now {
 		t.Fatalf("query does not use supplied UTC clock first: %#v", args)
 	}
+}
+
+func dashboardQuerySource(
+	t *testing.T,
+	query string,
+	start string,
+	end string,
+) string {
+	t.Helper()
+	startIndex := strings.Index(query, start)
+	if startIndex < 0 {
+		t.Fatalf("query missing source %q: %s", start, query)
+	}
+	source := query[startIndex:]
+	endIndex := strings.Index(source, end)
+	if endIndex < 0 {
+		t.Fatalf("query source %q missing terminator %q: %s", start, end, query)
+	}
+	return source[:endIndex]
 }
 
 func stringPointer(value string) *string {
