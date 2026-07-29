@@ -33,13 +33,6 @@ const second: BackupRun = {
   trigger: 'scheduled',
   state: 'succeeded',
   requestedAt: '2026-07-27T01:02:03Z',
-  logicalBytes: null,
-  storedBytes: null,
-  startedAt: null,
-  finishedAt: null,
-  localExpiresAt: null,
-  remoteExpiresAt: null,
-  errorCategory: '',
 }
 const detail: BackupRunDetail = {
   ...first,
@@ -71,7 +64,6 @@ const detail: BackupRunDetail = {
     unexpectedObjectCount: 0,
     sessionRevocationVerified: true,
     rtoSeconds: 120,
-    errorCategory: '',
   }],
 }
 const wrappers: Array<{ unmount(): void }> = []
@@ -143,7 +135,32 @@ describe('BackupsView', () => {
     expect(panel.text()).toContain('恢复演练成功')
     expect(panel.text()).toContain('120 秒')
     expect(panel.text()).toContain('会话已撤销')
+    expect(panel.text()).toContain('数据库迁移版本：20')
+    expect(panel.text()).toContain('固定表行数合计：3')
     expect(panel.text()).not.toMatch(/hash|路径|凭据|password/i)
+  })
+
+  it('uses a native modal with explicit focus, Escape close, and opener return', async () => {
+    const wrapper = mountBackups()
+    await flushPromises()
+    const opener = wrapper.get('[data-testid="queue-open"]')
+    await opener.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('dialog[open]')
+    const cancel = wrapper.get('[data-testid="queue-cancel"]')
+    expect(document.activeElement).toBe(cancel.element)
+
+    await dialog.trigger('keydown', { key: 'Escape' })
+    await flushPromises()
+    expect(wrapper.find('dialog').exists()).toBe(false)
+    expect(document.activeElement).toBe(opener.element)
+
+    await opener.trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="queue-cancel"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('dialog').exists()).toBe(false)
+    expect(document.activeElement).toBe(opener.element)
   })
 
   it('uses one idempotency key through a failed manual request retry', async () => {
@@ -156,14 +173,18 @@ describe('BackupsView', () => {
     expect(wrapper.get('[role="dialog"]').text()).toContain('短暂维护窗口')
     await wrapper.get('[data-testid="queue-confirm"]').trigger('click')
     await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('req-queue')
+    const queueAlert = wrapper.get('[role="alert"]')
+    expect(queueAlert.text()).toContain('req-queue')
+    expect(document.activeElement).toBe(queueAlert.element)
     await wrapper.get('[data-testid="queue-retry"]').trigger('click')
     await flushPromises()
     expect(queueBackup).toHaveBeenCalledTimes(2)
     expect(queueBackup).toHaveBeenNthCalledWith(1, '44444444-4444-4444-8444-444444444444')
     expect(queueBackup).toHaveBeenNthCalledWith(2, '44444444-4444-4444-8444-444444444444')
     expect(crypto.randomUUID).toHaveBeenCalledOnce()
-    expect(wrapper.get('[role="status"]').text()).toContain('已加入队列')
+    const notice = wrapper.get('[data-testid="queue-notice"]')
+    expect(notice.text()).toContain('已加入队列')
+    expect(document.activeElement).toBe(notice.element)
   })
 
   it('renders an explicit empty state and retryable focused load errors', async () => {
@@ -186,7 +207,7 @@ describe('BackupsView', () => {
     expect(failed.find('[role="alert"]').exists()).toBe(false)
   })
 
-  it('aborts list and detail reads on unmount and denies students', async () => {
+  it('aborts an initial list read on unmount and denies students', async () => {
     let listSignal: AbortSignal | undefined
     vi.mocked(listBackups).mockImplementationOnce((_filter, signal) => {
       listSignal = signal
@@ -200,5 +221,34 @@ describe('BackupsView', () => {
     expect(student.text()).toContain('无权访问备份历史')
     expect(student.find('[data-testid="queue-open"]').exists()).toBe(false)
     expect(listBackups).not.toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts a pending detail read on unmount', async () => {
+    let detailSignal: AbortSignal | undefined
+    vi.mocked(readBackup).mockImplementationOnce((_id, signal) => {
+      detailSignal = signal
+      return new Promise(() => {})
+    })
+    const wrapper = mountBackups()
+    await flushPromises()
+    await wrapper.get('[data-testid="open-detail"]').trigger('click')
+    expect(detailSignal?.aborted).toBe(false)
+    wrapper.unmount()
+    expect(detailSignal?.aborted).toBe(true)
+  })
+
+  it('keeps responsive backup records as semantic cards for the browser viewport gate', async () => {
+    vi.mocked(listBackups).mockResolvedValueOnce({
+      items: [first, second],
+      next: null,
+    })
+    const wrapper = mountBackups()
+    await flushPromises()
+    const grid = wrapper.get('[aria-label="备份记录"]')
+    expect(grid.classes()).toContain('backup-grid')
+    const cards = wrapper.findAll('[data-testid="backup-card"]')
+    expect(cards).toHaveLength(2)
+    expect(cards.every((card) => card.element.tagName === 'ARTICLE')).toBe(true)
+    expect(cards.every((card) => card.get('button').text() === '查看恢复证据')).toBe(true)
   })
 })

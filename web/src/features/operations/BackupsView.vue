@@ -40,9 +40,14 @@ const queueRequestId = ref('')
 const notice = ref('')
 const feedback = ref<HTMLElement>()
 const queueFeedback = ref<HTMLElement>()
+const noticeFeedback = ref<HTMLElement>()
+const queueOpenButton = ref<HTMLButtonElement>()
+const queueDialogElement = ref<HTMLDialogElement>()
+const queueCancelButton = ref<HTMLButtonElement>()
 let alive = true
 let generation = 0
 let queueKey = ''
+let queueCloseFocus: 'trigger' | 'notice' = 'trigger'
 let listController: AbortController | undefined
 let detailController: AbortController | undefined
 
@@ -154,20 +159,59 @@ async function openDetail(run: BackupRun) {
   }
 }
 
-function openQueueDialog() {
+function supportsNativeDialog(element: HTMLDialogElement): boolean {
+  return typeof element.showModal === 'function' && typeof element.close === 'function'
+}
+
+async function openQueueDialog() {
   queueKey = ''
   queueError.value = ''
   queueRequestId.value = ''
   notice.value = ''
+  queueCloseFocus = 'trigger'
   queueDialog.value = true
+  await nextTick()
+  const element = queueDialogElement.value
+  if (!element) return
+  if (!element.open) {
+    if (supportsNativeDialog(element)) element.showModal()
+    else element.setAttribute('open', '')
+  }
+  await nextTick()
+  queueCancelButton.value?.focus()
 }
 
-function closeQueueDialog() {
-  if (queueing.value) return
+async function handleQueueDialogClosed() {
+  const focusTarget = queueCloseFocus
   queueDialog.value = false
   queueKey = ''
   queueError.value = ''
   queueRequestId.value = ''
+  queueCloseFocus = 'trigger'
+  await nextTick()
+  if (!alive) return
+  if (focusTarget === 'notice') noticeFeedback.value?.focus()
+  else queueOpenButton.value?.focus()
+}
+
+function closeQueueDialogElement(focusTarget: 'trigger' | 'notice') {
+  queueCloseFocus = focusTarget
+  const element = queueDialogElement.value
+  if (!element) {
+    void handleQueueDialogClosed()
+    return
+  }
+  if (supportsNativeDialog(element)) {
+    element.close()
+    return
+  }
+  element.removeAttribute('open')
+  void handleQueueDialogClosed()
+}
+
+function closeQueueDialog() {
+  if (queueing.value) return
+  closeQueueDialogElement('trigger')
 }
 
 async function submitQueue() {
@@ -183,9 +227,8 @@ async function submitQueue() {
     const index = items.value.findIndex((run) => run.id === queued.id)
     if (index >= 0) items.value[index] = queued
     else items.value.unshift(queued)
-    queueDialog.value = false
-    queueKey = ''
     notice.value = '手动备份已加入队列'
+    closeQueueDialogElement('notice')
   } catch (reason) {
     if (!alive) return
     const details = failure(reason, '手动备份创建失败，请稍后重试')
@@ -197,7 +240,7 @@ async function submitQueue() {
   }
 }
 
-function formatTime(value?: string | null): string {
+function formatTime(value?: string): string {
   if (!value) return '—'
   return new Intl.DateTimeFormat('zh-CN', {
     dateStyle: 'medium',
@@ -206,8 +249,8 @@ function formatTime(value?: string | null): string {
   }).format(new Date(value))
 }
 
-function formatBytes(value?: number | null): string {
-  if (value === undefined || value === null) return '—'
+function formatBytes(value?: number): string {
+  if (value === undefined) return '—'
   if (value < 1024) return `${value} B`
   const units = ['KB', 'MB', 'GB', 'TB']
   let amount = value / 1024
@@ -233,6 +276,10 @@ function restoreLabel(value: RestoreVerification): string {
   }
 }
 
+function restoredRowCountTotal(value: RestoreVerification): number {
+  return Object.values(value.databaseRowCounts).reduce((total, count) => total + count, 0)
+}
+
 onBeforeMount(() => { void loadInitial() })
 onBeforeUnmount(() => {
   alive = false
@@ -254,12 +301,28 @@ onBeforeUnmount(() => {
         <h1 id="backups-title">备份与恢复记录</h1>
         <p>查看加密恢复点、远端副本状态与最近一次恢复演练结果。</p>
       </div>
-      <button data-testid="queue-open" class="primary" type="button" @click="openQueueDialog">
+      <button
+        ref="queueOpenButton"
+        data-testid="queue-open"
+        class="primary"
+        type="button"
+        @click="openQueueDialog"
+      >
         创建手动备份
       </button>
     </header>
 
-    <p v-if="notice" class="feedback success" role="status" aria-live="polite">{{ notice }}</p>
+    <p
+      v-if="notice"
+      ref="noticeFeedback"
+      data-testid="queue-notice"
+      class="feedback success"
+      role="status"
+      aria-live="polite"
+      tabindex="-1"
+    >
+      {{ notice }}
+    </p>
     <p v-if="loading && items.length === 0" role="status" aria-live="polite">
       正在加载备份历史…
     </p>
@@ -348,6 +411,10 @@ onBeforeUnmount(() => {
         </div>
         <article v-if="latestRestore(selected)" class="restore-result">
           <h3>{{ restoreLabel(latestRestore(selected)!) }}</h3>
+          <p v-if="latestRestore(selected)!.restoredMigrationVersion !== undefined">
+            数据库迁移版本：{{ latestRestore(selected)!.restoredMigrationVersion }}
+          </p>
+          <p>固定表行数合计：{{ restoredRowCountTotal(latestRestore(selected)!) }}</p>
           <p v-if="latestRestore(selected)!.rtoSeconds !== undefined">
             恢复目标耗时：{{ latestRestore(selected)!.rtoSeconds }} 秒
           </p>
@@ -364,48 +431,63 @@ onBeforeUnmount(() => {
       </template>
     </section>
 
-    <div v-if="queueDialog" class="dialog-backdrop">
-      <section role="dialog" aria-modal="true" aria-labelledby="queue-title" class="dialog">
-        <h2 id="queue-title">创建手动备份</h2>
-        <p>备份会进入一个短暂维护窗口；进行中的任务将先安全排空。</p>
-        <p>此操作只创建恢复点，不会恢复或覆盖当前数据。</p>
-        <div
-          v-if="queueError"
-          ref="queueFeedback"
-          class="feedback error"
-          role="alert"
-          tabindex="-1"
+    <dialog
+      v-if="queueDialog"
+      ref="queueDialogElement"
+      role="dialog"
+      aria-labelledby="queue-title"
+      class="dialog"
+      @cancel.prevent="closeQueueDialog"
+      @close="handleQueueDialogClosed"
+      @keydown.esc.prevent.stop="closeQueueDialog"
+    >
+      <h2 id="queue-title">创建手动备份</h2>
+      <p>备份会进入一个短暂维护窗口；进行中的任务将先安全排空。</p>
+      <p>此操作只创建恢复点，不会恢复或覆盖当前数据。</p>
+      <div
+        v-if="queueError"
+        ref="queueFeedback"
+        class="feedback error"
+        role="alert"
+        tabindex="-1"
+      >
+        {{ queueError }}<span v-if="queueRequestId">（支持编号：{{ queueRequestId }}）</span>
+      </div>
+      <div class="dialog-actions">
+        <button
+          ref="queueCancelButton"
+          data-testid="queue-cancel"
+          type="button"
+          :disabled="queueing"
+          @click="closeQueueDialog"
         >
-          {{ queueError }}<span v-if="queueRequestId">（支持编号：{{ queueRequestId }}）</span>
-        </div>
-        <div class="dialog-actions">
-          <button type="button" :disabled="queueing" @click="closeQueueDialog">取消</button>
-          <button
-            v-if="queueError"
-            data-testid="queue-retry"
-            class="primary"
-            type="button"
-            :disabled="queueing"
-            @click="submitQueue"
-          >
-            {{ queueing ? '正在重试…' : '重试创建' }}
-          </button>
-          <button
-            v-else
-            data-testid="queue-confirm"
-            class="primary"
-            type="button"
-            :disabled="queueing"
-            @click="submitQueue"
-          >
-            {{ queueing ? '正在创建…' : '确认创建' }}
-          </button>
-        </div>
-      </section>
-    </div>
+          取消
+        </button>
+        <button
+          v-if="queueError"
+          data-testid="queue-retry"
+          class="primary"
+          type="button"
+          :disabled="queueing"
+          @click="submitQueue"
+        >
+          {{ queueing ? '正在重试…' : '重试创建' }}
+        </button>
+        <button
+          v-else
+          data-testid="queue-confirm"
+          class="primary"
+          type="button"
+          :disabled="queueing"
+          @click="submitQueue"
+        >
+          {{ queueing ? '正在创建…' : '确认创建' }}
+        </button>
+      </div>
+    </dialog>
   </section>
 </template>
 
 <style scoped>
-.page{max-width:1120px}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{margin:0;color:#1673b9;font-weight:800;letter-spacing:.06em}.page-heading h1{margin:.45rem 0;font-size:clamp(1.8rem,4vw,2.7rem)}.page-heading p{color:#58667c}.primary,.backup-card button,.load-more,.dialog button{border:1px solid #b9cce0;border-radius:9px;background:#fff;color:#234766;padding:10px 14px;font:inherit;font-weight:700;cursor:pointer}.primary{border-color:#176eb5;background:#176eb5;color:#fff}.primary:disabled,.backup-card button:disabled,.load-more:disabled,.dialog button:disabled{cursor:wait;opacity:.65}.backup-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.backup-card{padding:22px;border:1px solid #dbe4f0;border-radius:14px;background:#fff;box-shadow:0 10px 28px #173a5d0a}.backup-card.state-degraded{border-color:#efc16e}.backup-card.state-failed{border-color:#e3aaa5}.card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.trigger{color:#6a788c;font-size:.85rem}.card-top h2{margin:.35rem 0;font-size:1.25rem}.state-pill{border-radius:999px;background:#e9f3fb;color:#1766a4;padding:5px 9px;font-size:.78rem;font-weight:800}.state-degraded .state-pill{background:#fff2d6;color:#8a5b00}.state-failed .state-pill{background:#fde9e7;color:#a23c35}.warning{padding:10px 12px;border-radius:9px;background:#fff8e8;color:#78530d;line-height:1.55}.backup-card dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:18px 0}.backup-card dl div{min-width:0}.backup-card dt{color:#748297;font-size:.78rem}.backup-card dd{margin:4px 0 0;color:#213e60;font-weight:700}.feedback{margin:16px 0;padding:14px;border-radius:10px}.feedback.error{background:#fff0ef;color:#8e302b}.feedback.success{background:#eaf8ef;color:#176b37}.empty,.detail{margin-top:18px;padding:28px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}.load-more{display:block;margin:22px auto}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.artifact-grid article,.restore-result{padding:16px;border-radius:11px;background:#f3f7fb}.artifact-grid span{display:block;color:#5b7189;font-size:.78rem}.artifact-grid strong{display:block;margin:5px 0}.artifact-grid p,.restore-result p{color:#52667b}.restore-result{margin-top:14px}.restore-result h3{margin-top:0}.dialog-backdrop{position:fixed;z-index:20;inset:0;display:grid;place-items:center;padding:18px;background:#0b223a99}.dialog{width:min(480px,100%);padding:24px;border-radius:14px;background:#fff;box-shadow:0 24px 70px #08172666}.dialog h2{margin-top:0}.dialog p{color:#52667b;line-height:1.6}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}.denied{max-width:680px}@media(max-width:760px){.page-heading{align-items:stretch;flex-direction:column}.backup-grid,.artifact-grid{grid-template-columns:1fr}.backup-card dl{grid-template-columns:1fr 1fr}.page-heading .primary{width:100%}}@media(max-width:420px){.backup-card dl{grid-template-columns:1fr}.dialog-actions{align-items:stretch;flex-direction:column-reverse}.dialog-actions button{width:100%}}
+.page{max-width:1120px}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{margin:0;color:#1673b9;font-weight:800;letter-spacing:.06em}.page-heading h1{margin:.45rem 0;font-size:clamp(1.8rem,4vw,2.7rem)}.page-heading p{color:#58667c}.primary,.backup-card button,.load-more,.dialog button{border:1px solid #b9cce0;border-radius:9px;background:#fff;color:#234766;padding:10px 14px;font:inherit;font-weight:700;cursor:pointer}.primary{border-color:#176eb5;background:#176eb5;color:#fff}.primary:disabled,.backup-card button:disabled,.load-more:disabled,.dialog button:disabled{cursor:wait;opacity:.65}.backup-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.backup-card{padding:22px;border:1px solid #dbe4f0;border-radius:14px;background:#fff;box-shadow:0 10px 28px #173a5d0a}.backup-card.state-degraded{border-color:#efc16e}.backup-card.state-failed{border-color:#e3aaa5}.card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.trigger{color:#6a788c;font-size:.85rem}.card-top h2{margin:.35rem 0;font-size:1.25rem}.state-pill{border-radius:999px;background:#e9f3fb;color:#1766a4;padding:5px 9px;font-size:.78rem;font-weight:800}.state-degraded .state-pill{background:#fff2d6;color:#8a5b00}.state-failed .state-pill{background:#fde9e7;color:#a23c35}.warning{padding:10px 12px;border-radius:9px;background:#fff8e8;color:#78530d;line-height:1.55}.backup-card dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:18px 0}.backup-card dl div{min-width:0}.backup-card dt{color:#748297;font-size:.78rem}.backup-card dd{margin:4px 0 0;color:#213e60;font-weight:700}.feedback{margin:16px 0;padding:14px;border-radius:10px}.feedback.error{background:#fff0ef;color:#8e302b}.feedback.success{background:#eaf8ef;color:#176b37}.empty,.detail{margin-top:18px;padding:28px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}.load-more{display:block;margin:22px auto}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.artifact-grid article,.restore-result{padding:16px;border-radius:11px;background:#f3f7fb}.artifact-grid span{display:block;color:#5b7189;font-size:.78rem}.artifact-grid strong{display:block;margin:5px 0}.artifact-grid p,.restore-result p{color:#52667b}.restore-result{margin-top:14px}.restore-result h3{margin-top:0}.dialog{width:min(480px,calc(100% - 36px));padding:24px;border:0;border-radius:14px;background:#fff;box-shadow:0 24px 70px #08172666}.dialog::backdrop{background:#0b223a99}.dialog h2{margin-top:0}.dialog p{color:#52667b;line-height:1.6}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}.denied{max-width:680px}@media(max-width:760px){.page-heading{align-items:stretch;flex-direction:column}.backup-grid,.artifact-grid{grid-template-columns:1fr}.backup-card dl{grid-template-columns:1fr 1fr}.page-heading .primary{width:100%}}@media(max-width:420px){.backup-card dl{grid-template-columns:1fr}.dialog-actions{align-items:stretch;flex-direction:column-reverse}.dialog-actions button{width:100%}}
 </style>

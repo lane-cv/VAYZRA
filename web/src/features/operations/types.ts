@@ -79,12 +79,12 @@ export type BackupRun = {
   trigger: BackupTrigger
   state: BackupState
   requestedAt: string
-  startedAt?: string | null
-  finishedAt?: string | null
-  logicalBytes?: number | null
-  storedBytes?: number | null
-  localExpiresAt?: string | null
-  remoteExpiresAt?: string | null
+  startedAt?: string
+  finishedAt?: string
+  logicalBytes?: number
+  storedBytes?: number
+  localExpiresAt?: string
+  remoteExpiresAt?: string
   errorCategory?: string
 }
 
@@ -109,15 +109,15 @@ export type BackupArtifact = {
 export type RestoreVerification = {
   id: string
   state: RestoreVerificationState
-  startedAt?: string | null
-  finishedAt?: string | null
-  restoredMigrationVersion?: number | null
+  startedAt?: string
+  finishedAt?: string
+  restoredMigrationVersion?: number
   databaseRowCounts: Record<string, number>
   checkedObjectCount: number
   missingObjectCount: number
   unexpectedObjectCount: number
   sessionRevocationVerified: boolean
-  rtoSeconds?: number | null
+  rtoSeconds?: number
   errorCategory?: string
 }
 

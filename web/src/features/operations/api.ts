@@ -321,6 +321,28 @@ const restoreStates = new Set([
   'succeeded',
   'failed',
 ])
+const backupErrorCategories = new Set([
+  'drain_timeout',
+  'database_dump',
+  'object_store_stop',
+  'snapshot',
+  'object_store_restart',
+  'integrity',
+  'remote_sync',
+  'remote_unavailable',
+  'retention',
+  'lease_lost',
+  'cancelled',
+  'internal',
+  'repository_integrity',
+  'restore_database',
+  'restore_object_store',
+  'session_revocation',
+  'readiness',
+  'reference_check',
+  'authorization_check',
+  'timeout',
+])
 const restoreRowCountTables = new Set([
   'users',
   'sessions',
@@ -354,13 +376,10 @@ function safeInteger(value: unknown, minimum = 0): number {
   return value
 }
 
-function safeOptionalInteger(value: unknown): number | null {
-  return value === null ? null : safeInteger(value)
-}
-
-function safeOptionalTimestamp(value: unknown): string | null {
-  if (value === null) return null
-  if (typeof value !== 'string' || !validTimestamp(value)) throw invalidResponse()
+function safeBackupTimestamp(value: unknown): string {
+  if (typeof value !== 'string' || !validCanonicalBackupTimestamp(value)) {
+    throw invalidResponse()
+  }
   return value
 }
 
@@ -370,12 +389,14 @@ function safeEnum<T extends string>(value: unknown, values: Set<string>): T {
 }
 
 function safeErrorCategory(value: unknown): string {
-  if (
-    typeof value !== 'string'
-    || !/^[a-z][a-z0-9_]{0,63}$/.test(value)
-    || !wellFormedUnicode(value)
-  ) throw invalidResponse()
-  return value
+  return safeEnum(value, backupErrorCategories)
+}
+
+function validCanonicalBackupTimestamp(value: string): boolean {
+  const match = rfc3339Nano.exec(value)
+  if (!match || match[8] !== 'Z' || !validTimestamp(value)) return false
+  const fraction = match[7]
+  return fraction === undefined || !fraction.endsWith('0')
 }
 
 function parseBackupRunWithKeys(
@@ -388,7 +409,7 @@ function parseBackupRunWithKeys(
     typeof source.id !== 'string'
     || !canonicalUUID(source.id)
     || typeof source.requestedAt !== 'string'
-    || !validTimestamp(source.requestedAt)
+    || !validCanonicalBackupTimestamp(source.requestedAt)
   ) throw invalidResponse()
   const result: BackupRun = {
     id: source.id,
@@ -397,14 +418,13 @@ function parseBackupRunWithKeys(
     requestedAt: source.requestedAt,
   }
   for (const field of ['startedAt', 'finishedAt', 'localExpiresAt', 'remoteExpiresAt'] as const) {
-    if (field in source) result[field] = safeOptionalTimestamp(source[field])
+    if (field in source) result[field] = safeBackupTimestamp(source[field])
   }
   for (const field of ['logicalBytes', 'storedBytes'] as const) {
-    if (field in source) result[field] = safeOptionalInteger(source[field])
+    if (field in source) result[field] = safeInteger(source[field])
   }
   if ('errorCategory' in source) {
-    if (source.errorCategory === '') result.errorCategory = ''
-    else result.errorCategory = safeErrorCategory(source.errorCategory)
+    result.errorCategory = safeErrorCategory(source.errorCategory)
   }
   return result
 }
@@ -418,9 +438,9 @@ function parseBackupArtifact(value: unknown): BackupArtifact {
   exactKeys(source, artifactKeys)
   if (
     typeof source.verifiedAt !== 'string'
-    || !validTimestamp(source.verifiedAt)
+    || !validCanonicalBackupTimestamp(source.verifiedAt)
     || typeof source.expiresAt !== 'string'
-    || !validTimestamp(source.expiresAt)
+    || !validCanonicalBackupTimestamp(source.expiresAt)
   ) throw invalidResponse()
   return {
     kind: safeEnum(source.kind, artifactKinds),
@@ -434,9 +454,13 @@ function parseBackupArtifact(value: unknown): BackupArtifact {
 function parseRestoreRowCounts(value: unknown): Record<string, number> {
   const source = record(value)
   const result: Record<string, number> = {}
+  let total = 0
   for (const [table, count] of Object.entries(source)) {
     if (!restoreRowCountTables.has(table)) throw invalidResponse()
-    result[table] = safeInteger(count)
+    const safeCount = safeInteger(count)
+    if (total > Number.MAX_SAFE_INTEGER - safeCount) throw invalidResponse()
+    total += safeCount
+    result[table] = safeCount
   }
   return result
 }
@@ -459,14 +483,13 @@ function parseRestoreVerification(value: unknown): RestoreVerification {
     sessionRevocationVerified: source.sessionRevocationVerified,
   }
   for (const field of ['startedAt', 'finishedAt'] as const) {
-    if (field in source) result[field] = safeOptionalTimestamp(source[field])
+    if (field in source) result[field] = safeBackupTimestamp(source[field])
   }
   for (const field of ['restoredMigrationVersion', 'rtoSeconds'] as const) {
-    if (field in source) result[field] = safeOptionalInteger(source[field])
+    if (field in source) result[field] = safeInteger(source[field])
   }
   if ('errorCategory' in source) {
-    if (source.errorCategory === '') result.errorCategory = ''
-    else result.errorCategory = safeErrorCategory(source.errorCategory)
+    result.errorCategory = safeErrorCategory(source.errorCategory)
   }
   return result
 }
@@ -485,7 +508,7 @@ function parseBackupDetail(value: unknown): BackupRunDetail {
 }
 
 function validBackupCursor(cursor: BackupCursor): boolean {
-  return canonicalUUID(cursor.id) && validTimestamp(cursor.requestedAt)
+  return canonicalUUID(cursor.id) && validCanonicalBackupTimestamp(cursor.requestedAt)
 }
 
 export async function listBackups(
@@ -510,7 +533,7 @@ export async function listBackups(
     { signal },
   )
   if (!Array.isArray(response.data)) throw invalidResponse()
-  const meta = response.meta ?? {}
+  const meta = response.meta === undefined ? {} : record(response.meta)
   exactKeys(meta, new Set(['nextBeforeRequestedAt', 'nextBeforeId']))
   const rawAt = meta.nextBeforeRequestedAt
   const rawID = meta.nextBeforeId
@@ -519,7 +542,7 @@ export async function listBackups(
   if (rawAt !== undefined && rawID !== undefined) {
     if (
       typeof rawAt !== 'string'
-      || !validTimestamp(rawAt)
+      || !validCanonicalBackupTimestamp(rawAt)
       || typeof rawID !== 'string'
       || !canonicalUUID(rawID)
     ) throw invalidResponse()
