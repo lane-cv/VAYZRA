@@ -32,6 +32,7 @@ type SampleMetric string
 
 const (
 	SampleMetricServiceUp                   SampleMetric = "service_up"
+	SampleMetricServiceReady                SampleMetric = "service_ready"
 	SampleMetricServiceLatencyMilliseconds  SampleMetric = "service_latency_milliseconds"
 	SampleMetricPostgresPoolInUse           SampleMetric = "postgres_pool_in_use"
 	SampleMetricPostgresFailuresTotal       SampleMetric = "postgres_transaction_failures_total"
@@ -43,7 +44,9 @@ const (
 	SampleMetricQueueItems                  SampleMetric = "queue_items"
 	SampleMetricQueueFailuresTotal          SampleMetric = "queue_failures_total"
 	SampleMetricBackupAgeSeconds            SampleMetric = "backup_age_seconds"
+	SampleMetricBackupRemoteUp              SampleMetric = "backup_remote_up"
 	SampleMetricRestoreAgeSeconds           SampleMetric = "restore_age_seconds"
+	SampleMetricAIRuns                      SampleMetric = "ai_runs"
 	SampleMetricAIRequestsTotal             SampleMetric = "ai_requests_total"
 	SampleMetricAILatencyMilliseconds       SampleMetric = "ai_latency_milliseconds"
 	SampleMetricAITokensTotal               SampleMetric = "ai_tokens_total"
@@ -74,6 +77,9 @@ const (
 	SampleScopeBackup              SampleScope = "backup"
 	SampleScopeSucceeded           SampleScope = "succeeded"
 	SampleScopeFailed              SampleScope = "failed"
+	SampleScopeQueued              SampleScope = "queued"
+	SampleScopeStreaming           SampleScope = "streaming"
+	SampleScopeExpired             SampleScope = "expired"
 	SampleScopeFirstByte           SampleScope = "first_byte"
 	SampleScopeTotal               SampleScope = "total"
 	SampleScopeInput               SampleScope = "input"
@@ -190,6 +196,25 @@ func ValidateSample(sample Sample, now time.Time) error {
 	return nil
 }
 
+func NormalizeHostServiceScope(service string) (SampleScope, error) {
+	switch service {
+	case "app":
+		return SampleScopeApp, nil
+	case "caddy":
+		return SampleScopeCaddy, nil
+	case "postgres":
+		return SampleScopePostgres, nil
+	case "redis":
+		return SampleScopeRedis, nil
+	case "minio":
+		return SampleScopeObjectStore, nil
+	case "worker":
+		return SampleScopeWorker, nil
+	default:
+		return "", ErrInvalid
+	}
+}
+
 func validSampleValue(value float64, unit SampleUnit) bool {
 	if math.IsNaN(value) || math.IsInf(value, 0) ||
 		value < 0 || (value == 0 && math.Signbit(value)) ||
@@ -239,6 +264,7 @@ func buildSampleRules() map[sampleSeries]sampleRule {
 	}
 
 	add(SampleSourceApp, SampleMetricServiceUp, SampleScopeApp, SampleUnitBoolean, sampleWindowForbidden)
+	add(SampleSourceApp, SampleMetricServiceReady, SampleScopeApp, SampleUnitBoolean, sampleWindowForbidden)
 	add(SampleSourcePostgres, SampleMetricServiceUp, SampleScopePostgres, SampleUnitBoolean, sampleWindowForbidden)
 	add(SampleSourceRedis, SampleMetricServiceUp, SampleScopeRedis, SampleUnitBoolean, sampleWindowForbidden)
 	add(SampleSourceObjectStore, SampleMetricServiceUp, SampleScopeObjectStore, SampleUnitBoolean, sampleWindowForbidden)
@@ -282,14 +308,18 @@ func buildSampleRules() map[sampleSeries]sampleRule {
 	add(SampleSourceObjectStore, SampleMetricObjectUsedBytes, SampleScopeObjectStore, SampleUnitBytes, sampleWindowForbidden)
 	add(SampleSourceObjectStore, SampleMetricObjectFailuresTotal, SampleScopeObjectStore, SampleUnitCount, sampleWindowRequired)
 
-	for _, scope := range []SampleScope{SampleScopeProcessing, SampleScopeAI, SampleScopeOutbox} {
+	for _, scope := range []SampleScope{SampleScopeProcessing, SampleScopeOutbox} {
 		add(SampleSourceWorker, SampleMetricQueueItems, scope, SampleUnitCount, sampleWindowForbidden)
 		add(SampleSourceWorker, SampleMetricQueueFailuresTotal, scope, SampleUnitCount, sampleWindowRequired)
 	}
 	for _, scope := range []SampleScope{SampleScopeLocal, SampleScopeRemote} {
 		add(SampleSourceApp, SampleMetricBackupAgeSeconds, scope, SampleUnitSeconds, sampleWindowForbidden)
 	}
+	add(SampleSourceApp, SampleMetricBackupRemoteUp, SampleScopeRemote, SampleUnitBoolean, sampleWindowForbidden)
 	add(SampleSourceApp, SampleMetricRestoreAgeSeconds, SampleScopeLocal, SampleUnitSeconds, sampleWindowForbidden)
+	for _, scope := range []SampleScope{SampleScopeQueued, SampleScopeStreaming, SampleScopeExpired} {
+		add(SampleSourceApp, SampleMetricAIRuns, scope, SampleUnitCount, sampleWindowForbidden)
+	}
 
 	for _, scope := range []SampleScope{SampleScopeSucceeded, SampleScopeFailed} {
 		add(SampleSourceApp, SampleMetricAIRequestsTotal, scope, SampleUnitCount, sampleWindowRequired)

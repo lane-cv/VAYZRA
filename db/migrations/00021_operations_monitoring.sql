@@ -1,5 +1,6 @@
 -- +goose Up
 CREATE TABLE operational_samples (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   source text NOT NULL,
   metric_name text NOT NULL,
   scope text NOT NULL,
@@ -24,7 +25,7 @@ CREATE TABLE operational_samples (
 );
 
 CREATE INDEX operational_samples_metric_time_idx
-  ON operational_samples(metric_name, scope, observed_at DESC);
+  ON operational_samples(metric_name, scope, observed_at DESC, id DESC);
 
 CREATE TABLE operational_alerts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

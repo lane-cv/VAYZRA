@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,8 @@ type PostgresSampleStore struct {
 
 var _ SampleStore = (*PostgresSampleStore)(nil)
 
+var errSampleBatchShortWrite = errors.New("sample batch was not fully stored")
+
 func NewPostgresSampleStore(pool *pgxpool.Pool) *PostgresSampleStore {
 	return &PostgresSampleStore{pool: pool}
 }
@@ -25,6 +28,9 @@ func (store *PostgresSampleStore) InsertSamples(
 ) error {
 	if store == nil || store.pool == nil {
 		return errStoreClosed
+	}
+	if ctx == nil {
+		return ErrInvalid
 	}
 	if len(samples) == 0 || len(samples) > MaxSampleInsertBatch {
 		return ErrInvalid
@@ -54,7 +60,7 @@ func (store *PostgresSampleStore) InsertSamples(
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.CopyFrom(
+	copied, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"operational_samples"},
 		[]string{
@@ -67,8 +73,12 @@ func (store *PostgresSampleStore) InsertSamples(
 			"window_started_at",
 		},
 		pgx.CopyFromRows(rows),
-	); err != nil {
+	)
+	if err != nil {
 		return err
+	}
+	if copied != int64(len(samples)) {
+		return errSampleBatchShortWrite
 	}
 	return tx.Commit(ctx)
 }
@@ -87,6 +97,9 @@ func (store *PostgresSampleStore) ReadLatestSamples(
 	if store == nil || store.pool == nil {
 		return result, errStoreClosed
 	}
+	if ctx == nil {
+		return result, ErrInvalid
+	}
 	if !validSampleTime(request.Now) ||
 		request.Limit < 1 || request.Limit > MaxSampleReadLimit ||
 		request.FreshFor <= 0 || request.FreshFor > MaxSampleFreshFor {
@@ -101,19 +114,19 @@ func (store *PostgresSampleStore) ReadLatestSamples(
 	rows, err := store.pool.Query(ctx, `
 SELECT source,metric_name,scope,value,unit,observed_at,window_started_at
 FROM operational_samples
-WHERE source=$1 AND metric_name=$2 AND scope=$3 AND unit=$4
-ORDER BY observed_at DESC,ctid DESC
-LIMIT $5`,
+WHERE source=$1 AND metric_name=$2 AND scope=$3
+ORDER BY observed_at DESC,id DESC
+LIMIT $4`,
 		string(request.Source),
 		string(request.Metric),
 		string(request.Scope),
-		string(rule.unit),
 		request.Limit,
 	)
 	if err != nil {
 		return result, err
 	}
 	defer rows.Close()
+	samples := make([]Sample, 0, request.Limit)
 	for rows.Next() {
 		var (
 			source          string
@@ -147,15 +160,16 @@ LIMIT $5`,
 		if err := ValidateSample(sample, request.Now); err != nil {
 			return result, err
 		}
-		result.Samples = append(result.Samples, sample)
+		samples = append(samples, sample)
 	}
 	if err := rows.Err(); err != nil {
 		return result, err
 	}
-	if len(result.Samples) == 0 {
+	if len(samples) == 0 {
 		return result, nil
 	}
-	if result.Samples[0].ObservedAt.Before(request.Now.Add(-request.FreshFor)) {
+	result.Samples = samples
+	if samples[0].ObservedAt.Before(request.Now.Add(-request.FreshFor)) {
 		result.Freshness = SampleFreshnessStale
 	} else {
 		result.Freshness = SampleFreshnessFresh
@@ -171,6 +185,9 @@ func (store *PostgresSampleStore) DeleteExpiredSamples(
 	if store == nil || store.pool == nil {
 		return 0, errStoreClosed
 	}
+	if ctx == nil {
+		return 0, ErrInvalid
+	}
 	if !validSampleTime(now) || retentionDays < 1 || retentionDays > 30 {
 		return 0, ErrInvalid
 	}
@@ -182,16 +199,16 @@ func (store *PostgresSampleStore) DeleteExpiredSamples(
 	defer tx.Rollback(ctx)
 	tag, err := tx.Exec(ctx, `
 WITH expired AS (
-  SELECT ctid
+  SELECT id
   FROM operational_samples
   WHERE observed_at < $1
-  ORDER BY observed_at,source,metric_name,scope,unit,ctid
+  ORDER BY observed_at,source,metric_name,scope,unit,id
   LIMIT $2
   FOR UPDATE SKIP LOCKED
 )
 DELETE FROM operational_samples AS samples
 USING expired
-WHERE samples.ctid=expired.ctid`,
+WHERE samples.id=expired.id`,
 		cutoff,
 		MaxSampleRetentionBatch,
 	)

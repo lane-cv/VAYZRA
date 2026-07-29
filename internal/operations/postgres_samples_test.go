@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/tests/integration"
@@ -92,6 +94,44 @@ DROP FUNCTION IF EXISTS operations_test_reject_sample()`)
 	assertOperationalSampleCount(t, pool, 0)
 }
 
+func TestPostgresSampleStoreRollsBackWhenCopyFromSkipsARow(t *testing.T) {
+	ctx := context.Background()
+	pool, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	if _, err := pool.Exec(ctx, `
+CREATE FUNCTION operations_test_skip_sample() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.value=2 THEN
+    RETURN NULL;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER operations_test_skip_sample
+BEFORE INSERT ON operational_samples
+FOR EACH ROW EXECUTE FUNCTION operations_test_skip_sample()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(cleanupCtx, `
+DROP TRIGGER IF EXISTS operations_test_skip_sample ON operational_samples;
+DROP FUNCTION IF EXISTS operations_test_skip_sample()`)
+	})
+
+	err := store.InsertSamples(ctx, now, []Sample{
+		sampleQueueDepth(now, 1),
+		sampleQueueDepth(now, 2),
+		sampleQueueDepth(now, 3),
+	})
+	if err == nil {
+		t.Fatal("InsertSamples() error=nil want short CopyFrom rejection")
+	}
+	assertOperationalSampleCount(t, pool, 0)
+}
+
 func TestPostgresSampleStoreReadsOnlyFixedSeriesWithExplicitFreshness(t *testing.T) {
 	ctx := context.Background()
 	pool, store := migratedSampleStore(t)
@@ -102,7 +142,7 @@ func TestPostgresSampleStoreReadsOnlyFixedSeriesWithExplicitFreshness(t *testing
 		{
 			Source:     SampleSourceWorker,
 			Metric:     SampleMetricQueueItems,
-			Scope:      SampleScopeAI,
+			Scope:      SampleScopeOutbox,
 			Value:      11,
 			Unit:       SampleUnitCount,
 			ObservedAt: now.Add(-2 * time.Hour),
@@ -116,8 +156,7 @@ func TestPostgresSampleStoreReadsOnlyFixedSeriesWithExplicitFreshness(t *testing
 INSERT INTO operational_samples(
   source,metric_name,scope,value,unit,observed_at,window_started_at
 ) VALUES
-  ('worker','private_metric','student_private',1,'count',$1,NULL),
-  ('worker','queue_items','processing',99,'private_unit',$1,NULL)`,
+  ('worker','private_metric','student_private',1,'count',$1,NULL)`,
 		now.Add(-time.Second),
 	); err != nil {
 		t.Fatal(err)
@@ -157,7 +196,7 @@ INSERT INTO operational_samples(
 	stale, err := store.ReadLatestSamples(ctx, SampleReadRequest{
 		Source:   SampleSourceWorker,
 		Metric:   SampleMetricQueueItems,
-		Scope:    SampleScopeAI,
+		Scope:    SampleScopeOutbox,
 		Limit:    1,
 		Now:      now,
 		FreshFor: time.Hour,
@@ -170,9 +209,9 @@ INSERT INTO operational_samples(
 	}
 
 	empty, err := store.ReadLatestSamples(ctx, SampleReadRequest{
-		Source:   SampleSourceWorker,
-		Metric:   SampleMetricQueueItems,
-		Scope:    SampleScopeOutbox,
+		Source:   SampleSourceApp,
+		Metric:   SampleMetricAIRuns,
+		Scope:    SampleScopeQueued,
 		Limit:    1,
 		Now:      now,
 		FreshFor: time.Minute,
@@ -182,6 +221,111 @@ INSERT INTO operational_samples(
 	}
 	if empty.Freshness != SampleFreshnessEmpty || len(empty.Samples) != 0 {
 		t.Fatalf("empty result=%+v", empty)
+	}
+}
+
+func TestPostgresSampleStoreFailsClosedOnAnyPollutedSeriesRow(t *testing.T) {
+	ctx := context.Background()
+	pool, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	for _, test := range []struct {
+		name            string
+		validObservedAt time.Time
+		badObservedAt   time.Time
+	}{
+		{
+			name:            "polluted newest row cannot expose older fresh value",
+			validObservedAt: now.Add(-2 * time.Second),
+			badObservedAt:   now.Add(-time.Second),
+		},
+		{
+			name:            "polluted older row clears a partially scanned result",
+			validObservedAt: now.Add(-time.Second),
+			badObservedAt:   now.Add(-2 * time.Second),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := pool.Exec(ctx, `TRUNCATE operational_samples`); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.InsertSamples(
+				ctx,
+				now,
+				[]Sample{sampleQueueDepth(test.validObservedAt, 7)},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `
+INSERT INTO operational_samples(
+  source,metric_name,scope,value,unit,observed_at,window_started_at
+) VALUES ('worker','queue_items','processing',99,'private_unit',$1,NULL)`,
+				test.badObservedAt,
+			); err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.ReadLatestSamples(ctx, SampleReadRequest{
+				Source:   SampleSourceWorker,
+				Metric:   SampleMetricQueueItems,
+				Scope:    SampleScopeProcessing,
+				Limit:    2,
+				Now:      now,
+				FreshFor: time.Minute,
+			})
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("ReadLatestSamples() error=%v want ErrInvalid", err)
+			}
+			if len(result.Samples) != 0 || result.Freshness != SampleFreshnessEmpty {
+				t.Fatalf("polluted result=%+v want empty", result)
+			}
+		})
+	}
+}
+
+func TestPostgresSampleStoreStableLatestOrderSurvivesRewriteAndReindex(t *testing.T) {
+	ctx := context.Background()
+	pool, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	if err := store.InsertSamples(ctx, now, []Sample{
+		sampleQueueDepth(now, 30),
+		sampleQueueDepth(now, 10),
+		sampleQueueDepth(now, 20),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+CREATE INDEX operations_test_samples_rewrite_idx
+  ON operational_samples(value DESC);
+CLUSTER operational_samples USING operations_test_samples_rewrite_idx;
+REINDEX INDEX operational_samples_metric_time_idx`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DROP INDEX IF EXISTS operations_test_samples_rewrite_idx`,
+		)
+	})
+
+	result, err := store.ReadLatestSamples(ctx, SampleReadRequest{
+		Source:   SampleSourceWorker,
+		Metric:   SampleMetricQueueItems,
+		Scope:    SampleScopeProcessing,
+		Limit:    3,
+		Now:      now,
+		FreshFor: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]float64, len(result.Samples))
+	for index, sample := range result.Samples {
+		got[index] = sample.Value
+	}
+	want := []float64{20, 10, 30}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stable values=%v want=%v", got, want)
 	}
 }
 
@@ -235,6 +379,66 @@ func TestPostgresSampleStoreReadBoundariesFailClosed(t *testing.T) {
 	}
 }
 
+func TestPostgresSampleStoreRejectsNilContextAndHandlesCanceledOrClosedStores(t *testing.T) {
+	ctx := context.Background()
+	pool, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	request := SampleReadRequest{
+		Source:   SampleSourceWorker,
+		Metric:   SampleMetricQueueItems,
+		Scope:    SampleScopeProcessing,
+		Limit:    1,
+		Now:      now,
+		FreshFor: time.Minute,
+	}
+	t.Run("nil contexts", func(t *testing.T) {
+		if err := store.InsertSamples(nil, now, []Sample{sampleQueueDepth(now, 1)}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("InsertSamples(nil) error=%v want ErrInvalid", err)
+		}
+		if result, err := store.ReadLatestSamples(nil, request); !errors.Is(err, ErrInvalid) || len(result.Samples) != 0 {
+			t.Fatalf("ReadLatestSamples(nil) result=%+v error=%v", result, err)
+		}
+		if deleted, err := store.DeleteExpiredSamples(nil, now, 7); !errors.Is(err, ErrInvalid) || deleted != 0 {
+			t.Fatalf("DeleteExpiredSamples(nil) deleted=%d error=%v", deleted, err)
+		}
+		assertOperationalSampleCount(t, pool, 0)
+	})
+
+	t.Run("canceled contexts", func(t *testing.T) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := store.InsertSamples(canceled, now, []Sample{sampleQueueDepth(now, 1)}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("InsertSamples(canceled) error=%v want context.Canceled", err)
+		}
+		if result, err := store.ReadLatestSamples(canceled, request); !errors.Is(err, context.Canceled) || len(result.Samples) != 0 {
+			t.Fatalf("ReadLatestSamples(canceled) result=%+v error=%v", result, err)
+		}
+		if deleted, err := store.DeleteExpiredSamples(canceled, now, 7); !errors.Is(err, context.Canceled) || deleted != 0 {
+			t.Fatalf("DeleteExpiredSamples(canceled) deleted=%d error=%v", deleted, err)
+		}
+		assertOperationalSampleCount(t, pool, 0)
+	})
+
+	t.Run("closed pool", func(t *testing.T) {
+		closedPool, err := pgxpool.New(ctx, pool.Config().ConnString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedPool.Close()
+		closedStore := NewPostgresSampleStore(closedPool)
+		if err := closedStore.InsertSamples(ctx, now, []Sample{sampleQueueDepth(now, 1)}); err == nil {
+			t.Fatal("InsertSamples(closed) error=nil")
+		}
+		if result, err := closedStore.ReadLatestSamples(ctx, request); err == nil || len(result.Samples) != 0 {
+			t.Fatalf("ReadLatestSamples(closed) result=%+v error=%v", result, err)
+		}
+		if deleted, err := closedStore.DeleteExpiredSamples(ctx, now, 7); err == nil || deleted != 0 {
+			t.Fatalf("DeleteExpiredSamples(closed) deleted=%d error=%v", deleted, err)
+		}
+		assertOperationalSampleCount(t, pool, 0)
+	})
+}
+
 func TestPostgresSampleStoreFreshnessIncludesExactBoundary(t *testing.T) {
 	ctx := context.Background()
 	_, store := migratedSampleStore(t)
@@ -260,6 +464,80 @@ func TestPostgresSampleStoreFreshnessIncludesExactBoundary(t *testing.T) {
 	if result.Freshness != SampleFreshnessFresh {
 		t.Fatalf("freshness=%q want %q", result.Freshness, SampleFreshnessFresh)
 	}
+}
+
+func TestPostgresSampleRetentionSkipsLockedRowsWithoutBlockingAndKeepsExactBatches(t *testing.T) {
+	ctx := context.Background()
+	pool, store := migratedSampleStore(t)
+	now := sampleTestClock()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO operational_samples(
+  source,metric_name,scope,value,unit,observed_at,window_started_at
+)
+SELECT 'app','backup_age_seconds','local',value,'seconds',$1,NULL
+FROM generate_series(1,1010) AS value`,
+		now.AddDate(0, 0, -8),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback(ctx)
+	rows, err := lockTx.Query(ctx, `
+SELECT id
+FROM operational_samples
+ORDER BY observed_at,id
+LIMIT 10
+FOR UPDATE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockedIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		lockedIDs = append(lockedIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(lockedIDs) != 10 {
+		t.Fatalf("locked ids=%d want=10", len(lockedIDs))
+	}
+
+	type retentionResult struct {
+		deleted int64
+		err     error
+	}
+	result := make(chan retentionResult, 1)
+	go func() {
+		deleted, deleteErr := store.DeleteExpiredSamples(ctx, now, 7)
+		result <- retentionResult{deleted: deleted, err: deleteErr}
+	}()
+	select {
+	case got := <-result:
+		if got.err != nil || got.deleted != MaxSampleRetentionBatch {
+			t.Fatalf("concurrent retention=(%d,%v)", got.deleted, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retention blocked behind locked rows instead of using SKIP LOCKED")
+	}
+	assertOperationalSampleCount(t, pool, 10)
+	if err := lockTx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		t.Fatal(err)
+	}
+	deleted, err := store.DeleteExpiredSamples(ctx, now, 7)
+	if err != nil || deleted != 10 {
+		t.Fatalf("second retention=(%d,%v) want=(10,nil)", deleted, err)
+	}
+	assertOperationalSampleCount(t, pool, 0)
 }
 
 func TestPostgresSampleRetentionUsesConfiguredDayBoundaries(t *testing.T) {

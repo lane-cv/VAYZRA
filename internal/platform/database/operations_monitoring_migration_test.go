@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -64,6 +65,51 @@ WHERE schemaname='public'
 	if unresolvedDefinition !=
 		"CREATE UNIQUE INDEX operational_alerts_open_dedupe_key ON public.operational_alerts USING btree (dedupe_key) WHERE (state <> 'resolved'::text)" {
 		t.Fatalf("unexpected unresolved dedupe index: %s", unresolvedDefinition)
+	}
+
+	var (
+		isIdentity, identityGeneration string
+		primaryKeyDefinition           string
+		sampleIndexDefinition          string
+	)
+	if err := pool.QueryRow(ctx, `
+SELECT is_identity,identity_generation
+FROM information_schema.columns
+WHERE table_schema='public'
+  AND table_name='operational_samples'
+  AND column_name='id'`).
+		Scan(&isIdentity, &identityGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if isIdentity != "YES" || identityGeneration != "ALWAYS" {
+		t.Fatalf(
+			"sample id identity=(%s,%s) want=(YES,ALWAYS)",
+			isIdentity,
+			identityGeneration,
+		)
+	}
+	if err := pool.QueryRow(ctx, `
+SELECT pg_get_constraintdef(oid)
+FROM pg_constraint
+WHERE conrelid='public.operational_samples'::regclass
+  AND contype='p'`).
+		Scan(&primaryKeyDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if primaryKeyDefinition != "PRIMARY KEY (id)" {
+		t.Fatalf("sample primary key=%q", primaryKeyDefinition)
+	}
+	if err := pool.QueryRow(ctx, `
+SELECT indexdef
+FROM pg_indexes
+WHERE schemaname='public'
+  AND indexname='operational_samples_metric_time_idx'`).
+		Scan(&sampleIndexDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if sampleIndexDefinition !=
+		"CREATE INDEX operational_samples_metric_time_idx ON public.operational_samples USING btree (metric_name, scope, observed_at DESC, id DESC)" {
+		t.Fatalf("unexpected sample time index: %s", sampleIndexDefinition)
 	}
 }
 
@@ -268,6 +314,39 @@ INSERT INTO alert_deliveries(
 )
 SELECT id,1,'webhook','succeeded',2,now(),now() FROM alert`); err != nil {
 			t.Fatalf("insert valid delivery: %v", err)
+		}
+	})
+}
+
+func TestOperationsMonitoringSampleIdentityIsMonotonicAtTimestampTies(t *testing.T) {
+	pool, ctx := migratedOperationsMonitoring(t)
+	operationsMonitoringTx(t, ctx, pool, func(tx pgx.Tx) {
+		rows, err := tx.Query(ctx, `
+INSERT INTO operational_samples(
+  source,metric_name,scope,value,unit,observed_at,window_started_at
+) VALUES
+  ('app','service_up','app',1,'boolean',$1,NULL),
+  ('app','service_ready','app',1,'boolean',$1,NULL)
+RETURNING id`,
+			time.Date(2026, 7, 29, 7, 0, 0, 0, time.UTC),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if len(ids) != 2 || ids[0] < 1 || ids[1] <= ids[0] {
+			t.Fatalf("sample identity ids=%v", ids)
 		}
 	})
 }
