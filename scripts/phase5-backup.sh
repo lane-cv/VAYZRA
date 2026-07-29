@@ -22,6 +22,7 @@ LOCK_OWNER_TOKEN=''
 LOCK_OWNER_PID=''
 LOCK_OWNER_IDENTITY=''
 LOCK_OWNER_FD_OPEN=false
+HOST_LOCK_PLATFORM=''
 OBSERVED_LOCK_OWNER_PID=''
 OBSERVED_LOCK_OWNER_IDENTITY=''
 OBSERVED_LOCK_OWNER_TOKEN=''
@@ -317,55 +318,65 @@ configure_live_context() {
 
 portable_file_identity() {
   local path="$1"
-  if stat -f '%d:%i' "$path" >/dev/null 2>&1; then
-    stat -f '%d:%i' "$path"
-  else
+  if stat -c '%d:%i' "$path" >/dev/null 2>&1; then
     stat -c '%d:%i' "$path"
+  else
+    stat -f '%d:%i' "$path"
   fi
 }
 
 system_holds_liveness_file() {
   local path="$1"
   local identity="$2"
-  local process_directory descriptor process_owner output
+  local descriptor_path flock_status output
   local current_pid="$$"
   [[ -f "$path" && ! -L "$path" &&
     "$(portable_file_identity "$path")" == "$identity" ]] ||
     return 2
-  if [[ -d /proc ]]; then
-    [[ -r /proc && -x /proc ]] || return 2
-    for process_directory in /proc/[1-9]*; do
-      [[ -d "$process_directory" ]] || continue
-      if ! process_owner="$(portable_owner "$process_directory" 2>/dev/null)"; then
-        [[ ! -e "$process_directory" ]] && continue
+  case "$HOST_LOCK_PLATFORM" in
+    Linux)
+      command -v flock >/dev/null 2>&1 || return 2
+      if ! exec 7<"$path"; then
         return 2
       fi
-      [[ "$process_owner" == "$(id -u)" ]] || continue
-      if [[ ! -d "$process_directory/fd" ]]; then
-        [[ ! -e "$process_directory" ]] && continue
+      if [[ -e /proc/self/fd/7 ]]; then
+        descriptor_path=/proc/self/fd/7
+      elif [[ -e /dev/fd/7 ]]; then
+        descriptor_path=/dev/fd/7
+      else
+        exec 7<&-
         return 2
       fi
-      [[ -r "$process_directory/fd" && -x "$process_directory/fd" ]] ||
+      if flock --exclusive --nonblock --conflict-exit-code 75 \
+        "$descriptor_path" true; then
+        flock_status=1
+      else
+        case "$?" in
+          75) flock_status=0 ;;
+          *) flock_status=2 ;;
+        esac
+      fi
+      if [[ ! -f "$path" || -L "$path" ||
+        "$(portable_file_identity "$path")" != "$identity" ]]; then
+        flock_status=2
+      fi
+      exec 7<&-
+      return "$flock_status"
+      ;;
+    Darwin)
+      command -v lsof >/dev/null 2>&1 || return 2
+      if output="$(lsof -Fn -- "$path" 2>/dev/null)"; then
+        grep -Fxq "n$path" <<<"$output" && return 0
         return 2
-      for descriptor in "$process_directory/fd/"*; do
-        [[ -e "$descriptor" ]] || continue
-        if [[ "$descriptor" -ef "$path" ]]; then
-          return 0
-        fi
-      done
-    done
-    return 1
-  fi
-  command -v lsof >/dev/null 2>&1 || return 2
-  if output="$(lsof -Fn -- "$path" 2>/dev/null)"; then
-    grep -Fxq "n$path" <<<"$output" && return 0
-    return 2
-  fi
-  if lsof -a -p "$current_pid" -Fp -d cwd 2>/dev/null |
-    grep -Eq "^p${current_pid}$"; then
-    return 1
-  fi
-  return 2
+      fi
+      if lsof -a -p "$current_pid" -Fp -d cwd 2>/dev/null |
+        grep -Eq "^p${current_pid}$"; then
+        return 1
+      fi
+      return 2
+      ;;
+    *) return 2 ;;
+  esac
 }
 
 load_host_lock_owner() {
@@ -536,6 +547,12 @@ acquire_host_lock() {
   local lock_basename
   local liveness_file
   local owner_file
+  HOST_LOCK_PLATFORM="$(uname -s)" || return 1
+  case "$HOST_LOCK_PLATFORM" in
+    Linux) command -v flock >/dev/null 2>&1 || return 1 ;;
+    Darwin) command -v lsof >/dev/null 2>&1 || return 1 ;;
+    *) return 1 ;;
+  esac
   LOCK_DIRECTORY="${HAPPYLEARN_BACKUP_LOCK_DIRECTORY:-${TMPDIR:-/tmp}/happylearn-phase5-backup-${PROJECT}.lock}"
   [[ "$LOCK_DIRECTORY" == /* ]] || return 1
   lock_parent="$(dirname "$LOCK_DIRECTORY")"
@@ -571,6 +588,15 @@ acquire_host_lock() {
     return 1
   fi
   LOCK_OWNER_FD_OPEN=true
+  if [[ "$HOST_LOCK_PLATFORM" == Linux ]] &&
+    ! flock --exclusive --nonblock --conflict-exit-code 75 8; then
+    exec 8<&-
+    LOCK_OWNER_FD_OPEN=false
+    discard_host_lock_staging "$LOCK_OWNER_DIRECTORY" || true
+    LOCK_OWNER_DIRECTORY=''
+    LOCK_OWNER_TOKEN=''
+    return 1
+  fi
   owner_file="$LOCK_OWNER_DIRECTORY/owner"
   if ! printf 'version=1\npid=%s\nidentity=%s\ntoken=%s\n' \
     "$LOCK_OWNER_PID" "$LOCK_OWNER_IDENTITY" "$LOCK_OWNER_TOKEN" >"$owner_file" ||

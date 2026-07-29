@@ -87,6 +87,8 @@ require_literal "$TARGET" 'LIMIT 32'
 require_literal "$TARGET" 'restic unlock'
 require_literal "$TARGET" 'LOCK_OWNER_TOKEN'
 require_literal "$TARGET" 'system_holds_liveness_file'
+require_literal "$TARGET" 'command -v flock'
+require_literal "$TARGET" '--conflict-exit-code 75'
 require_literal "$TARGET" 'host_lock_owner_matches'
 require_literal "$TARGET" 'publish_host_lock'
 
@@ -481,10 +483,10 @@ if [[ -n "${PHASE5_FAKE_DELAY_MATCH:-}" &&
       "$*" == *"$PHASE5_FAKE_DELAY_MATCH"* ]]; then
   if [[ -n "${PHASE5_FAKE_DELAY_RELEASE_FILE:-}" ]]; then
     printf '%s\n' started >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.started"
+    trap 'printf "%s\n" finished >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.finished"' EXIT
     while [[ ! -e "$PHASE5_FAKE_DELAY_RELEASE_FILE" ]]; do
       sleep 0.01
     done
-    printf '%s\n' finished >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.finished"
   else
     sleep "${PHASE5_FAKE_DELAY_SECONDS:-3}"
   fi
@@ -583,6 +585,87 @@ fi
 FAKE_DOCKER
   chmod 0700 "$fixture/bin/docker"
   printf '%s\n' "$fixture"
+}
+
+install_linux_lock_tools() {
+  local fixture="$1"
+  cat >"$fixture/bin/uname" <<'FAKE_UNAME'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == '-s' || "$#" -eq 0 ]]; then
+  printf '%s\n' Linux
+  exit 0
+fi
+exec /usr/bin/uname "$@"
+FAKE_UNAME
+  cat >"$fixture/bin/flock" <<'FAKE_FLOCK'
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl qw(LOCK_EX LOCK_NB);
+
+my $conflict = 1;
+my @operands;
+while (@ARGV) {
+  my $argument = shift @ARGV;
+  if ($argument eq '--conflict-exit-code' || $argument eq '-E') {
+    @ARGV or exit 64;
+    $conflict = shift @ARGV;
+    next;
+  }
+  next if $argument eq '--exclusive' || $argument eq '-x';
+  next if $argument eq '--nonblock' || $argument eq '--nb' ||
+    $argument eq '-n';
+  push @operands, $argument;
+}
+@operands or exit 64;
+my $handle;
+if (@operands == 1 && $operands[0] =~ /^[0-9]+$/) {
+  open($handle, '<&=', $operands[0]) or exit 70;
+} else {
+  open($handle, '<', $operands[0]) or exit 70;
+}
+flock($handle, LOCK_EX | LOCK_NB) or exit $conflict;
+exit 0;
+FAKE_FLOCK
+  chmod 0700 "$fixture/bin/uname" "$fixture/bin/flock"
+}
+
+install_gnu_stat_shim() {
+  local fixture="$1"
+  cat >"$fixture/bin/stat" <<'FAKE_GNU_STAT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == '-f' && "${2:-}" == '%d:%i' && "$#" -eq 3 ]]; then
+  directory="$(dirname "$3")"
+  entries="$(
+    find "$directory" -mindepth 1 -maxdepth 1 -print | wc -l |
+      tr -d '[:space:]'
+  )"
+  printf '%s:%s\n' "$((1000000 - entries))" 77
+  exit 0
+fi
+if [[ "${1:-}" == '-f' ]]; then
+  exit 1
+fi
+if [[ "${1:-}" == '-c' && "$#" -eq 3 ]]; then
+  case "$(/usr/bin/uname -s)" in
+    Darwin)
+      case "$2" in
+        '%d:%i') exec /usr/bin/stat -f '%d:%i' "$3" ;;
+        '%a') exec /usr/bin/stat -f '%Lp' "$3" ;;
+        '%u') exec /usr/bin/stat -f '%u' "$3" ;;
+        '%s') exec /usr/bin/stat -f '%z' "$3" ;;
+        *) exit 64 ;;
+      esac
+      ;;
+    Linux) exec /usr/bin/stat "$@" ;;
+    *) exit 64 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+FAKE_GNU_STAT
+  chmod 0700 "$fixture/bin/stat"
 }
 
 run_fixture() {
@@ -1131,6 +1214,137 @@ fi
   fail "recovered run left its host lock"
 [[ ! -e "$stale_lock_owner" ]] ||
   fail "reclaimed stale owner directory remained"
+
+gnu_identity_fixture="$(make_fixture)"
+install_linux_lock_tools "$gnu_identity_fixture"
+install_gnu_stat_shim "$gnu_identity_fixture"
+printf '%s\n' first >"$gnu_identity_fixture/identity-first"
+printf '%s\n' second >"$gnu_identity_fixture/identity-second"
+sed -e '$d' "$TARGET" >"$gnu_identity_fixture/identity-source.sh"
+gnu_identity_result="$(
+  PATH="$gnu_identity_fixture/bin:$PATH" \
+  PHASE5_IDENTITY_TARGET="$gnu_identity_fixture/identity-source.sh" \
+  PHASE5_IDENTITY_FIRST="$gnu_identity_fixture/identity-first" \
+  PHASE5_IDENTITY_SECOND="$gnu_identity_fixture/identity-second" \
+    bash -c '
+      source "$PHASE5_IDENTITY_TARGET"
+      first_before="$(portable_file_identity "$PHASE5_IDENTITY_FIRST")"
+      second="$(portable_file_identity "$PHASE5_IDENTITY_SECOND")"
+      printf "%s\n" third >"${PHASE5_IDENTITY_FIRST}.third"
+      first_after="$(portable_file_identity "$PHASE5_IDENTITY_FIRST")"
+      printf "%s|%s|%s\n" "$first_before" "$second" "$first_after"
+    '
+)" || fail "GNU stat identity probe failed to execute"
+IFS='|' read -r gnu_first_before gnu_second gnu_first_after \
+  <<<"$gnu_identity_result"
+gnu_identity_failed=false
+[[ "$gnu_first_before" != "$gnu_second" ]] ||
+  gnu_identity_failed=true
+[[ "$gnu_first_before" == "$gnu_first_after" ]] ||
+  gnu_identity_failed=true
+gnu_cleanup_failed=false
+if ! run_fixture "$gnu_identity_fixture"; then
+  gnu_cleanup_failed=true
+fi
+[[ ! -e "$gnu_identity_fixture/host.lock" &&
+  ! -L "$gnu_identity_fixture/host.lock" ]] ||
+  gnu_cleanup_failed=true
+
+linux_flock_failure_fixture="$(make_fixture)"
+install_linux_lock_tools "$linux_flock_failure_fixture"
+cat >"$linux_flock_failure_fixture/bin/flock" <<'FAKE_FAILED_FLOCK'
+#!/usr/bin/env bash
+exit 69
+FAKE_FAILED_FLOCK
+chmod 0700 "$linux_flock_failure_fixture/bin/flock"
+if run_fixture "$linux_flock_failure_fixture"; then
+  fail "Linux flock preflight failure was accepted"
+fi
+test ! -s "$linux_flock_failure_fixture/docker.log" ||
+  fail "Linux flock failure reached Compose"
+[[ ! -e "$linux_flock_failure_fixture/host.lock" &&
+  ! -L "$linux_flock_failure_fixture/host.lock" ]] ||
+  fail "Linux flock failure left a published host lock"
+
+linux_holder_fixture="$(make_fixture)"
+install_linux_lock_tools "$linux_holder_fixture"
+cat >"$linux_holder_fixture/bin/lsof" <<'FAKE_INVISIBLE_LSOF'
+#!/usr/bin/env bash
+set -euo pipefail
+pid=''
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == '-p' && "$#" -gt 1 ]]; then
+    pid="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+if [[ -n "$pid" ]]; then
+  printf 'p%s\n' "$pid"
+  exit 0
+fi
+exit 1
+FAKE_INVISIBLE_LSOF
+chmod 0700 "$linux_holder_fixture/bin/lsof"
+linux_holder_release="$linux_holder_fixture/linux-holder.release"
+PHASE5_FAKE_DELAY_MATCH='backup-storage-init' \
+  PHASE5_FAKE_DELAY_RELEASE_FILE="$linux_holder_release" \
+  run_fixture "$linux_holder_fixture" >/dev/null 2>&1 &
+linux_holder_runner="$!"
+if ! wait_for_file "${linux_holder_release}.started"; then
+  kill -KILL "$linux_holder_runner" 2>/dev/null || true
+  fail "Linux holder fixture did not reach the blocked descendant"
+fi
+linux_holder_owner="$(readlink "$linux_holder_fixture/host.lock")"
+linux_holder_pid="$(
+  sed -n 's/^pid=//p' "$linux_holder_owner/owner"
+)"
+kill -KILL "$linux_holder_pid"
+attempts=0
+while kill -0 "$linux_holder_pid" 2>/dev/null &&
+  [[ "$attempts" -lt 500 ]]; do
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+if kill -0 "$linux_holder_pid" 2>/dev/null; then
+  fail "Linux holder owner survived SIGKILL"
+fi
+linux_holder_log_before="$(
+  wc -l <"$linux_holder_fixture/docker.log" | tr -d '[:space:]'
+)"
+linux_holder_rejected=true
+if run_fixture "$linux_holder_fixture"; then
+  linux_holder_rejected=false
+fi
+linux_holder_log_after="$(
+  wc -l <"$linux_holder_fixture/docker.log" | tr -d '[:space:]'
+)"
+touch "$linux_holder_release"
+wait_for_file "${linux_holder_release}.finished" ||
+  fail "Linux inherited holder did not finish after release"
+wait "$linux_holder_runner" 2>/dev/null || true
+linux_holder_failed=false
+if [[ "$linux_holder_rejected" != true ||
+  "$linux_holder_log_before" -ne "$linux_holder_log_after" ||
+  ! -L "$linux_holder_fixture/host.lock" ||
+  "$(readlink "$linux_holder_fixture/host.lock")" != "$linux_holder_owner" ]]; then
+  linux_holder_failed=true
+fi
+attempts=0
+while ! run_fixture "$linux_holder_fixture" &&
+  [[ "$attempts" -lt 100 ]]; do
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+if [[ "$attempts" -ge 100 ]]; then
+  fail "Linux lock was not reclaimable after its inherited holder exited"
+fi
+if [[ "$gnu_identity_failed" == true ||
+  "$gnu_cleanup_failed" == true ||
+  "$linux_holder_failed" == true ]]; then
+  fail "GNU identity=${gnu_identity_failed} cleanup=${gnu_cleanup_failed}; Linux inherited holder=${linux_holder_failed}"
+fi
 
 locked_fixture="$(make_fixture)"
 mkdir -m 0700 "$locked_fixture/host.lock"
