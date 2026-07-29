@@ -8,10 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	dashboardQueueFailureWindow = 15 * time.Minute
-	dashboardAuditWindow        = 30 * 24 * time.Hour
-)
+const dashboardQueueFailureWindow = 15 * time.Minute
 
 type dashboardRow interface {
 	Scan(...any) error
@@ -177,7 +174,8 @@ func (reader *PostgresDashboardReader) ReadAISummary(
 	var (
 		requests, succeeded, terminal            int64
 		firstByteMilliseconds, totalMilliseconds int64
-		costMicroUSD, unknown, future            int64
+		costMicroUSD, unknownUsage               int64
+		unknown, future                          int64
 	)
 	err = reader.db.QueryRow(ctx, `
 SELECT
@@ -199,9 +197,19 @@ SELECT
     WHERE created_at <= $1
   ),0)::bigint,
   count(*) FILTER (
+    WHERE created_at <= $1
+      AND status IN ('succeeded','failed','cancelled')
+      AND usage_source='unknown'
+  )::bigint,
+  count(*) FILTER (
     WHERE status NOT IN ('queued','streaming','succeeded','failed','cancelled')
   )::bigint,
-  count(*) FILTER (WHERE created_at > $1 OR updated_at > $1)::bigint
+  (
+    SELECT count(*)::bigint
+    FROM ai_runs AS lifecycle
+    WHERE lifecycle.created_at > $1 OR lifecycle.updated_at > $1
+      OR lifecycle.started_at > $1 OR lifecycle.completed_at > $1
+  )
 FROM ai_runs
 WHERE created_at >= $2`,
 		now, dayStart,
@@ -212,6 +220,7 @@ WHERE created_at >= $2`,
 		&firstByteMilliseconds,
 		&totalMilliseconds,
 		&costMicroUSD,
+		&unknownUsage,
 		&unknown,
 		&future,
 	)
@@ -222,6 +231,8 @@ WHERE created_at >= $2`,
 		!validDashboardCount(succeeded) ||
 		!validDashboardCount(terminal) ||
 		succeeded > terminal || terminal > requests ||
+		!validDashboardCount(unknownUsage) ||
+		unknownUsage > terminal ||
 		!validDashboardDurationMilliseconds(firstByteMilliseconds) ||
 		!validDashboardDurationMilliseconds(totalMilliseconds) ||
 		!validDashboardCount(costMicroUSD) ||
@@ -242,6 +253,8 @@ WHERE created_at >= $2`,
 	state := DataStateHealthy
 	if requests == 0 {
 		state = DataStateEmpty
+	} else if unknownUsage > 0 {
+		state = DataStateDegraded
 	}
 	return AISummary{
 		State:                        state,
@@ -269,13 +282,24 @@ WITH queue_rows AS (
     1 AS queue_order,
     'processing'::text AS queue,
     count(*) FILTER (
-      WHERE state='queued' AND created_at <= $1
+      WHERE attempts<4
+        AND available_at <= $1
+        AND created_at <= $1
+        AND (
+          state='queued'
+          OR (state='running' AND lease_until < $1)
+        )
     )::bigint AS queued,
     count(*) FILTER (
-      WHERE state='running' AND created_at <= $1
+      WHERE state='running' AND lease_until >= $1
+        AND created_at <= $1
     )::bigint AS streaming,
     count(*) FILTER (
-      WHERE state='failed' AND updated_at >= $2 AND updated_at <= $1
+      WHERE (
+        state='failed' AND updated_at >= $2 AND updated_at <= $1
+      ) OR (
+        state='running' AND lease_until < $1 AND attempts>=4
+      )
     )::bigint AS failed,
     0::bigint AS expired,
     count(*) FILTER (
@@ -285,6 +309,10 @@ WITH queue_rows AS (
       WHERE created_at>$1 OR updated_at>$1
     )::bigint AS future
   FROM file_processing_jobs
+  WHERE state IN ('queued','running')
+    OR (state='failed' AND updated_at >= $2)
+    OR state NOT IN ('queued','running','completed','failed')
+    OR created_at>$1 OR updated_at>$1
 
   UNION ALL
 
@@ -295,17 +323,16 @@ WITH queue_rows AS (
       WHERE status='queued' AND created_at <= $1
     )::bigint,
     count(*) FILTER (
-      WHERE status='streaming' AND created_at <= $1
+      WHERE status='streaming' AND lease_expires_at >= $1
+        AND created_at <= $1
     )::bigint,
     count(*) FILTER (
       WHERE status='failed'
-        AND error_code IS DISTINCT FROM 'runner_lost'
         AND completed_at >= $2 AND completed_at <= $1
     )::bigint,
     count(*) FILTER (
-      WHERE status='failed'
-        AND error_code='runner_lost'
-        AND completed_at >= $2 AND completed_at <= $1
+      WHERE status='streaming' AND lease_expires_at < $1
+        AND created_at <= $1
     )::bigint,
     count(*) FILTER (
       WHERE status NOT IN ('queued','streaming','succeeded','failed','cancelled')
@@ -315,6 +342,11 @@ WITH queue_rows AS (
         OR started_at>$1 OR completed_at>$1
     )::bigint
   FROM ai_runs
+  WHERE status IN ('queued','streaming')
+    OR (status='failed' AND completed_at >= $2)
+    OR status NOT IN ('queued','streaming','succeeded','failed','cancelled')
+    OR created_at>$1 OR updated_at>$1
+    OR started_at>$1 OR completed_at>$1
 
   UNION ALL
 
@@ -322,14 +354,27 @@ WITH queue_rows AS (
     3,
     'outbox',
     count(*) FILTER (
-      WHERE published_at IS NULL AND lease_owner IS NULL AND created_at <= $1
+      WHERE published_at IS NULL
+        AND next_attempt_at <= $1
+        AND attempts<4
+        AND (lease_until IS NULL OR lease_until <= $1)
+        AND created_at <= $1
     )::bigint,
     count(*) FILTER (
-      WHERE published_at IS NULL AND lease_owner IS NOT NULL AND created_at <= $1
+      WHERE published_at IS NULL
+        AND lease_owner IS NOT NULL AND lease_until > $1
+        AND created_at <= $1
     )::bigint,
     count(*) FILTER (
-      WHERE published_at >= $2 AND published_at <= $1
-        AND COALESCE(last_error_category,'')<>''
+      WHERE (
+        published_at >= $2 AND published_at <= $1
+          AND last_error_category IS NOT NULL
+          AND last_error_category<>''
+      ) OR (
+        published_at IS NULL
+          AND attempts>=4
+          AND (lease_until IS NULL OR lease_until <= $1)
+      )
     )::bigint,
     0::bigint,
     count(*) FILTER (
@@ -340,6 +385,9 @@ WITH queue_rows AS (
       WHERE created_at>$1 OR published_at>$1
     )::bigint
   FROM outbox_events
+  WHERE published_at IS NULL
+    OR (published_at >= $2 AND last_error_category IS NOT NULL)
+    OR created_at>$1 OR published_at>$1
 )
 SELECT queue,queued,streaming,failed,expired,unknown,future
 FROM queue_rows
@@ -610,7 +658,6 @@ func (reader *PostgresDashboardReader) ReadRecentAudit(
 	if limit < 1 || limit > MaxRecentAudit {
 		return nil, ErrInvalid
 	}
-	windowStart := now.Add(-dashboardAuditWindow)
 	rows, err := reader.db.Query(ctx, `
 SELECT
   CASE
@@ -642,10 +689,9 @@ SELECT
   occurred_at,
   occurred_at > $1 AS future
 FROM audit_logs
-WHERE occurred_at >= $2
 ORDER BY occurred_at DESC,id DESC
-LIMIT $3`,
-		now, windowStart, limit,
+LIMIT $2`,
+		now, limit,
 	)
 	if err != nil {
 		return nil, err

@@ -181,7 +181,7 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 	db := &dashboardDBStub{
 		row: dashboardRowStub{values: []any{
 			int64(5), int64(3), int64(4), int64(125), int64(900),
-			int64(1234), int64(0), int64(0),
+			int64(1234), int64(0), int64(0), int64(0),
 		}},
 	}
 	got, err := newPostgresDashboardReaderDB(db).
@@ -214,7 +214,7 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 
 	db.row = dashboardRowStub{values: []any{
 		int64(0), int64(0), int64(0), int64(0), int64(0),
-		int64(0), int64(0), int64(0),
+		int64(0), int64(0), int64(0), int64(0),
 	}}
 	empty, err := newPostgresDashboardReaderDB(db).
 		ReadAISummary(context.Background(), now)
@@ -224,7 +224,7 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 
 	db.row = dashboardRowStub{values: []any{
 		int64(2), int64(0), int64(0), int64(0), int64(0),
-		int64(0), int64(0), int64(0),
+		int64(0), int64(0), int64(0), int64(0),
 	}}
 	activeOnly, err := newPostgresDashboardReaderDB(db).
 		ReadAISummary(context.Background(), now)
@@ -234,13 +234,14 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 	}
 
 	for _, values := range [][]any{
-		{int64(1), int64(2), int64(1), int64(1), int64(1), int64(1), int64(0), int64(0)},
-		{int64(1), int64(1), int64(2), int64(1), int64(1), int64(1), int64(0), int64(0)},
-		{int64(1), int64(1), int64(1), int64(-1), int64(1), int64(1), int64(0), int64(0)},
-		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(-1), int64(0), int64(0)},
-		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(1), int64(1), int64(0)},
-		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(1), int64(0), int64(1)},
-		{maxDashboardInteger + 1, int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+		{int64(1), int64(2), int64(1), int64(1), int64(1), int64(1), int64(0), int64(0), int64(0)},
+		{int64(1), int64(1), int64(2), int64(1), int64(1), int64(1), int64(0), int64(0), int64(0)},
+		{int64(1), int64(1), int64(1), int64(-1), int64(1), int64(1), int64(0), int64(0), int64(0)},
+		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(-1), int64(0), int64(0), int64(0)},
+		{int64(1), int64(0), int64(0), int64(1), int64(1), int64(1), int64(1), int64(0), int64(0)},
+		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(1), int64(0), int64(1), int64(0)},
+		{int64(1), int64(1), int64(1), int64(1), int64(1), int64(1), int64(0), int64(0), int64(1)},
+		{maxDashboardInteger + 1, int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
 	} {
 		db.row = dashboardRowStub{values: values}
 		if _, err := newPostgresDashboardReaderDB(db).
@@ -248,6 +249,53 @@ func TestPostgresDashboardReaderAIDailyWindowAndSafeAggregates(t *testing.T) {
 			t.Fatalf("values=%v error=%v want ErrInvalid", values, err)
 		}
 	}
+}
+
+func TestPostgresDashboardReaderAIUnknownUsageIsDegraded(t *testing.T) {
+	now := dashboardPostgresClock()
+	db := &dashboardDBStub{
+		row: dashboardRowStub{values: []any{
+			int64(5), int64(3), int64(4), int64(125), int64(900),
+			int64(1234), int64(1), int64(0), int64(0),
+		}},
+	}
+
+	got, err := newPostgresDashboardReaderDB(db).
+		ReadAISummary(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != DataStateDegraded ||
+		got.Requests != 5 ||
+		got.SuccessRatePercent != 75 ||
+		got.FirstByteLatencyMilliseconds != 125 ||
+		got.TotalLatencyMilliseconds != 900 ||
+		got.DailyCostMicroUSD != 1234 {
+		t.Fatalf("ai=%+v", got)
+	}
+}
+
+func TestPostgresDashboardReaderAIChecksLifecycleFuturePollution(t *testing.T) {
+	now := dashboardPostgresClock()
+	db := &dashboardDBStub{
+		row: dashboardRowStub{values: []any{
+			int64(1), int64(1), int64(1), int64(1), int64(1),
+			int64(1), int64(0), int64(0), int64(0),
+		}},
+	}
+
+	if _, err := newPostgresDashboardReaderDB(db).
+		ReadAISummary(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	assertDashboardQuery(
+		t,
+		db.lastQuery,
+		db.lastArgs,
+		now,
+		"started_at > $1",
+		"completed_at > $1",
+	)
 }
 
 func TestPostgresDashboardReaderQueuesHaveFixedOrderAndStates(t *testing.T) {
@@ -308,6 +356,39 @@ func TestPostgresDashboardReaderQueuesHaveFixedOrderAndStates(t *testing.T) {
 			t.Fatalf("values=%v error=%v want ErrInvalid", values, err)
 		}
 	}
+}
+
+func TestPostgresDashboardReaderQueuesMatchClaimLeaseSemantics(t *testing.T) {
+	now := dashboardPostgresClock()
+	db := &dashboardDBStub{
+		rows: &dashboardRowsStub{values: [][]any{
+			{"processing", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+			{"ai", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+			{"outbox", int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)},
+		}},
+	}
+
+	if _, err := newPostgresDashboardReaderDB(db).
+		ReadQueueSummaries(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	assertDashboardQuery(
+		t,
+		db.lastQuery,
+		db.lastArgs,
+		now,
+		"available_at <= $1",
+		"state='running' AND lease_until < $1",
+		"state='running' AND lease_until >= $1",
+		"status='streaming' AND lease_expires_at >= $1",
+		"status='streaming' AND lease_expires_at < $1",
+		"next_attempt_at <= $1",
+		"lease_until > $1",
+		"attempts>=4",
+		"FROM file_processing_jobs\n  WHERE state IN ('queued','running')",
+		"FROM ai_runs\n  WHERE status IN ('queued','streaming')",
+		"FROM outbox_events\n  WHERE published_at IS NULL",
+	)
 }
 
 func TestPostgresDashboardReaderBackupMapsLocalRemoteAndRestoreEvidence(t *testing.T) {
@@ -446,12 +527,12 @@ func TestPostgresDashboardReaderRecentAuditReturnsOnlyBroadSafeFields(t *testing
 		got[2].Outcome != AuditOutcomeDenied {
 		t.Fatalf("audit=%+v", got)
 	}
-	if len(db.lastArgs) != 3 || db.lastArgs[2] != 3 {
+	if len(db.lastArgs) != 2 || db.lastArgs[1] != 3 {
 		t.Fatalf("audit args=%#v", db.lastArgs)
 	}
 	assertDashboardQuery(t, db.lastQuery, db.lastArgs, now,
 		"CASE", "metadata->>'outcome'",
-		"ORDER BY occurred_at DESC,id DESC", "LIMIT $3")
+		"ORDER BY occurred_at DESC,id DESC", "LIMIT $2")
 	for _, forbidden := range []string{
 		"actor_user_id", "target_id", "request_id", " ip", "username",
 		"display_name", "path", "object_key", "prompt", "url", "trace",
@@ -475,6 +556,31 @@ func TestPostgresDashboardReaderRecentAuditReturnsOnlyBroadSafeFields(t *testing
 			ReadRecentAudit(context.Background(), now, 1); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("values=%v error=%v want ErrInvalid", values, err)
 		}
+	}
+}
+
+func TestPostgresDashboardReaderRecentAuditHasNoArbitraryAgeCutoff(t *testing.T) {
+	now := dashboardPostgresClock()
+	old := now.Add(-180 * 24 * time.Hour)
+	db := &dashboardDBStub{
+		rows: &dashboardRowsStub{values: [][]any{
+			{"operations", "succeeded", old, false},
+		}},
+	}
+
+	got, err := newPostgresDashboardReaderDB(db).
+		ReadRecentAudit(context.Background(), now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].OccurredAt.Equal(old) {
+		t.Fatalf("recent=%+v", got)
+	}
+	if len(db.lastArgs) != 2 || db.lastArgs[0] != now || db.lastArgs[1] != 1 {
+		t.Fatalf("audit args=%#v", db.lastArgs)
+	}
+	if strings.Contains(db.lastQuery, "occurred_at >=") {
+		t.Fatalf("audit query contains arbitrary age cutoff: %s", db.lastQuery)
 	}
 }
 
@@ -529,6 +635,7 @@ func TestPostgresDashboardReaderSQLSmoke(t *testing.T) {
 	defer tx.Rollback(context.Background())
 	for _, statement := range []string{
 		"TRUNCATE users CASCADE",
+		"TRUNCATE outbox_events",
 		"TRUNCATE operational_samples",
 		"TRUNCATE operational_alerts CASCADE",
 	} {
@@ -611,6 +718,340 @@ WHERE id=$1`,
 	recent, err := reader.ReadRecentAudit(ctx, now, MaxRecentAudit)
 	if err != nil || len(recent) != 0 {
 		t.Fatalf("recent=%+v err=%v", recent, err)
+	}
+
+	seedDashboardPostgresFixture(t, ctx, tx, now)
+
+	students, err = reader.ReadStudentSummary(ctx, now)
+	if err != nil || students.State != DataStateHealthy ||
+		students.Active != 4 || students.Disabled != 0 {
+		t.Fatalf("fixture students=%+v err=%v", students, err)
+	}
+	ai, err = reader.ReadAISummary(ctx, now)
+	if err != nil || ai.State != DataStateDegraded ||
+		ai.Requests != 5 || ai.SuccessRatePercent != 50 ||
+		ai.FirstByteLatencyMilliseconds != 100 ||
+		ai.TotalLatencyMilliseconds != 500 ||
+		ai.DailyCostMicroUSD != 300 {
+		t.Fatalf("fixture ai=%+v err=%v", ai, err)
+	}
+	queues, err = reader.ReadQueueSummaries(ctx, now)
+	if err != nil || len(queues) != 3 {
+		t.Fatalf("fixture queues=%+v err=%v", queues, err)
+	}
+	if queues[0].Queue != QueueProcessing ||
+		queues[0].Queued != 2 || queues[0].Streaming != 1 ||
+		queues[0].Failed != 1 || queues[0].Expired != 0 ||
+		queues[0].State != DataStateDegraded {
+		t.Fatalf("fixture processing queue=%+v", queues[0])
+	}
+	if queues[1].Queue != QueueAI ||
+		queues[1].Queued != 1 || queues[1].Streaming != 1 ||
+		queues[1].Failed != 1 || queues[1].Expired != 1 ||
+		queues[1].State != DataStateDegraded {
+		t.Fatalf("fixture AI queue=%+v", queues[1])
+	}
+	if queues[2].Queue != QueueOutbox ||
+		queues[2].Queued != 2 || queues[2].Streaming != 1 ||
+		queues[2].Failed != 2 || queues[2].Expired != 0 ||
+		queues[2].State != DataStateDegraded {
+		t.Fatalf("fixture outbox queue=%+v", queues[2])
+	}
+	backup, err = reader.ReadBackupSummary(ctx, now)
+	if err != nil || backup.State != DataStateHealthy ||
+		backup.Local.State != RecoveryStateSucceeded ||
+		backup.Remote.State != RecoveryStateSucceeded ||
+		backup.Restore.State != RecoveryStateSucceeded ||
+		backup.Restore.RTOSeconds != 73 {
+		t.Fatalf("fixture backup=%+v err=%v", backup, err)
+	}
+	alerts, err = reader.ReadAlertSummary(ctx, now)
+	if err != nil || alerts.State != DataStateHealthy ||
+		alerts.OpenWarning != 1 || alerts.OpenCritical != 1 {
+		t.Fatalf("fixture alerts=%+v err=%v", alerts, err)
+	}
+	recent, err = reader.ReadRecentAudit(ctx, now, MaxRecentAudit)
+	if err != nil || len(recent) != 3 ||
+		recent[0].Category != AuditCategoryAI ||
+		recent[0].Outcome != AuditOutcomeFailed ||
+		recent[1].Category != AuditCategoryFiles ||
+		recent[1].Outcome != AuditOutcomeDenied ||
+		recent[2].Category != AuditCategoryOperations ||
+		recent[2].Outcome != AuditOutcomeSucceeded ||
+		!recent[2].OccurredAt.Equal(now.Add(-180*24*time.Hour)) {
+		t.Fatalf("fixture recent=%+v err=%v", recent, err)
+	}
+
+	insertDashboardFutureAIRun(t, ctx, tx, now)
+	if _, err := reader.ReadAISummary(ctx, now); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("future AI lifecycle error=%v want ErrInvalid", err)
+	}
+}
+
+func seedDashboardPostgresFixture(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	now time.Time,
+) {
+	t.Helper()
+	for index, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{
+			`INSERT INTO users(
+  id,username,display_name,role,status,password_hash,must_change_password,
+  created_at,updated_at
+) VALUES
+  ('30000000-0000-4000-8000-000000000001','dashboard-admin','Dashboard Admin','admin','active','hash',false,$1,$1),
+  ('30000000-0000-4000-8000-000000000101','dashboard-ai-1','Dashboard AI 1','student','active','hash',false,$1,$1),
+  ('30000000-0000-4000-8000-000000000102','dashboard-ai-2','Dashboard AI 2','student','active','hash',false,$1,$1),
+  ('30000000-0000-4000-8000-000000000103','dashboard-ai-3','Dashboard AI 3','student','active','hash',false,$1,$1),
+  ('30000000-0000-4000-8000-000000000104','dashboard-ai-4','Dashboard AI 4','student','active','hash',false,$1,$1)`,
+			[]any{now.Add(-2 * time.Hour)},
+		},
+		{
+			`INSERT INTO ai_providers(
+  id,name,base_url,protocol_mode,encrypted_api_key,key_version,
+  key_updated_at,active,created_by,created_at,updated_at
+) VALUES(
+  '40000000-0000-4000-8000-000000000001',
+  'Dashboard Provider','https://dashboard.invalid/v1','chat_completions',
+  decode(repeat('aa',29),'hex'),1,$1,true,
+  '30000000-0000-4000-8000-000000000001',$1,$1
+)`,
+			[]any{now.Add(-2 * time.Hour)},
+		},
+		{
+			`INSERT INTO ai_models(
+  id,provider_id,upstream_model_id,modality,
+  context_window_tokens,max_output_tokens,
+  connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,
+  image_quota_tokens,input_price_micro_usd_per_million_tokens,
+  output_price_micro_usd_per_million_tokens,
+  created_by,updated_by,created_at,updated_at
+) VALUES(
+  '41000000-0000-4000-8000-000000000001',
+  '40000000-0000-4000-8000-000000000001',
+  'dashboard-model','text',8192,1024,1000,30000,30000,120000,
+  1024,1000000,2000000,
+  '30000000-0000-4000-8000-000000000001',
+  '30000000-0000-4000-8000-000000000001',$1,$1
+)`,
+			[]any{now.Add(-2 * time.Hour)},
+		},
+		{
+			`INSERT INTO prompt_templates(
+  id,subject,version,system_prompt,active,created_by,created_at
+) VALUES(
+  '42000000-0000-4000-8000-000000000001',
+  'math',1,'Dashboard prompt',true,
+  '30000000-0000-4000-8000-000000000001',$1
+)`,
+			[]any{now.Add(-2 * time.Hour)},
+		},
+		{
+			`INSERT INTO ai_threads(
+  id,student_id,title,subject,last_message_at,created_at
+) VALUES
+  ('43000000-0000-4000-8000-000000000001','30000000-0000-4000-8000-000000000101','Dashboard 1','math',$1,$1),
+  ('43000000-0000-4000-8000-000000000002','30000000-0000-4000-8000-000000000101','Dashboard 2','math',$1,$1),
+  ('43000000-0000-4000-8000-000000000003','30000000-0000-4000-8000-000000000102','Dashboard 3','math',$1,$1),
+  ('43000000-0000-4000-8000-000000000004','30000000-0000-4000-8000-000000000103','Dashboard 4','math',$1,$1),
+  ('43000000-0000-4000-8000-000000000005','30000000-0000-4000-8000-000000000104','Dashboard 5','math',$1,$1),
+  ('43000000-0000-4000-8000-000000000006','30000000-0000-4000-8000-000000000101','Dashboard future','math',$1,$1)`,
+			[]any{now.Add(-time.Minute)},
+		},
+		{
+			`INSERT INTO ai_messages(
+  id,thread_id,role,sender_user_id,body_text,idempotency_key,created_at
+) VALUES
+  ('44000000-0000-4000-8000-000000000001','43000000-0000-4000-8000-000000000001','student','30000000-0000-4000-8000-000000000101','Dashboard request 1','dashboard-msg-0001',$1),
+  ('44000000-0000-4000-8000-000000000002','43000000-0000-4000-8000-000000000002','student','30000000-0000-4000-8000-000000000101','Dashboard request 2','dashboard-msg-0002',$1),
+  ('44000000-0000-4000-8000-000000000003','43000000-0000-4000-8000-000000000003','student','30000000-0000-4000-8000-000000000102','Dashboard request 3','dashboard-msg-0003',$1),
+  ('44000000-0000-4000-8000-000000000004','43000000-0000-4000-8000-000000000004','student','30000000-0000-4000-8000-000000000103','Dashboard request 4','dashboard-msg-0004',$1),
+  ('44000000-0000-4000-8000-000000000005','43000000-0000-4000-8000-000000000005','student','30000000-0000-4000-8000-000000000104','Dashboard request 5','dashboard-msg-0005',$1),
+  ('44000000-0000-4000-8000-000000000006','43000000-0000-4000-8000-000000000006','student','30000000-0000-4000-8000-000000000101','Dashboard future request','dashboard-msg-0006',$1)`,
+			[]any{now.Add(-time.Hour)},
+		},
+		{
+			`INSERT INTO ai_runs(
+  id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,status,
+  provider_id,provider_key_version,provider_base_url,protocol_mode,
+  model_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,
+  image_quota_tokens,input_price_micro_usd_per_million_tokens,
+  output_price_micro_usd_per_million_tokens,
+  prompt_id,prompt_subject,prompt_version,prompt_sha256,
+  connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,
+  reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,estimator_version,
+  lease_owner,lease_expires_at,heartbeat_at,
+  input_tokens,output_tokens,cost_micro_usd,usage_source,
+  first_byte_ms,total_ms,error_code,
+  created_at,updated_at,started_at,completed_at
+)
+SELECT
+  fixture.id::uuid,fixture.thread_id::uuid,fixture.student_id::uuid,
+  fixture.message_id::uuid,1,fixture.idempotency_key,fixture.status,
+  '40000000-0000-4000-8000-000000000001'::uuid,1,
+  'https://dashboard.invalid/v1','chat_completions',
+  '41000000-0000-4000-8000-000000000001'::uuid,
+  'dashboard-model','text',8192,1024,1024,1000000,2000000,
+  '42000000-0000-4000-8000-000000000001'::uuid,
+  'math',1,encode(digest('Dashboard prompt','sha256'),'hex'),
+  1000,30000,30000,120000,1,1024,'2026-07-30','2026-07',1,
+  fixture.lease_owner,fixture.lease_expires_at,fixture.heartbeat_at,
+  fixture.input_tokens,fixture.output_tokens,fixture.cost_micro_usd,
+  fixture.usage_source,fixture.first_byte_ms,fixture.total_ms,fixture.error_code,
+  fixture.created_at,fixture.updated_at,fixture.started_at,fixture.completed_at
+FROM (VALUES
+  ('45000000-0000-4000-8000-000000000001','43000000-0000-4000-8000-000000000001','30000000-0000-4000-8000-000000000101','44000000-0000-4000-8000-000000000001','dashboard-run-0001','succeeded',NULL::text,NULL::timestamptz,NULL::timestamptz,10::bigint,20::bigint,300::bigint,'upstream',100::bigint,500::bigint,NULL::text,$1::timestamptz-interval '40 minutes',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '35 minutes',$1::timestamptz-interval '30 minutes'),
+  ('45000000-0000-4000-8000-000000000002','43000000-0000-4000-8000-000000000002','30000000-0000-4000-8000-000000000101','44000000-0000-4000-8000-000000000002','dashboard-run-0002','failed',NULL,NULL,NULL,NULL,NULL,NULL,'unknown',NULL,NULL,'upstream_error',$1::timestamptz-interval '10 minutes',$1::timestamptz-interval '5 minutes',$1::timestamptz-interval '7 minutes',$1::timestamptz-interval '5 minutes'),
+  ('45000000-0000-4000-8000-000000000003','43000000-0000-4000-8000-000000000003','30000000-0000-4000-8000-000000000102','44000000-0000-4000-8000-000000000003','dashboard-run-0003','queued',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '20 minutes',NULL,NULL),
+  ('45000000-0000-4000-8000-000000000004','43000000-0000-4000-8000-000000000004','30000000-0000-4000-8000-000000000103','44000000-0000-4000-8000-000000000004','dashboard-run-0004','streaming','dashboard-active',$1::timestamptz+interval '5 minutes',$1::timestamptz-interval '1 minute',NULL,NULL,NULL,NULL,NULL,NULL,NULL,$1::timestamptz-interval '15 minutes',$1::timestamptz-interval '1 minute',$1::timestamptz-interval '10 minutes',NULL),
+  ('45000000-0000-4000-8000-000000000005','43000000-0000-4000-8000-000000000005','30000000-0000-4000-8000-000000000104','44000000-0000-4000-8000-000000000005','dashboard-run-0005','streaming','dashboard-expired',$1::timestamptz-interval '1 minute',$1::timestamptz-interval '2 minutes',NULL,NULL,NULL,NULL,NULL,NULL,NULL,$1::timestamptz-interval '10 minutes',$1::timestamptz-interval '2 minutes',$1::timestamptz-interval '8 minutes',NULL)
+) AS fixture(
+  id,thread_id,student_id,message_id,idempotency_key,status,
+  lease_owner,lease_expires_at,heartbeat_at,
+  input_tokens,output_tokens,cost_micro_usd,usage_source,
+  first_byte_ms,total_ms,error_code,
+  created_at,updated_at,started_at,completed_at
+)`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO files(id,created_by,created_at) VALUES
+  ('50000000-0000-4000-8000-000000000001','30000000-0000-4000-8000-000000000001',$1),
+  ('50000000-0000-4000-8000-000000000002','30000000-0000-4000-8000-000000000001',$1),
+  ('50000000-0000-4000-8000-000000000003','30000000-0000-4000-8000-000000000001',$1),
+  ('50000000-0000-4000-8000-000000000004','30000000-0000-4000-8000-000000000001',$1)`,
+			[]any{now.Add(-time.Hour)},
+		},
+		{
+			`INSERT INTO file_versions(
+  id,file_id,version,purpose,object_key,display_name,declared_mime,
+  size_bytes,sha256,processing_state,created_by,created_at
+) VALUES
+  ('50100000-0000-4000-8000-000000000001','50000000-0000-4000-8000-000000000001',1,'teaching','dashboard/file-1','file-1.pdf','application/pdf',10,repeat('a',64),'processing','30000000-0000-4000-8000-000000000001',$1),
+  ('50100000-0000-4000-8000-000000000002','50000000-0000-4000-8000-000000000002',1,'teaching','dashboard/file-2','file-2.pdf','application/pdf',10,repeat('b',64),'processing','30000000-0000-4000-8000-000000000001',$1),
+  ('50100000-0000-4000-8000-000000000003','50000000-0000-4000-8000-000000000003',1,'teaching','dashboard/file-3','file-3.pdf','application/pdf',10,repeat('c',64),'processing','30000000-0000-4000-8000-000000000001',$1),
+  ('50100000-0000-4000-8000-000000000004','50000000-0000-4000-8000-000000000004',1,'teaching','dashboard/file-4','file-4.pdf','application/pdf',10,repeat('d',64),'processing','30000000-0000-4000-8000-000000000001',$1)`,
+			[]any{now.Add(-time.Hour)},
+		},
+		{
+			`INSERT INTO file_processing_jobs(
+  id,file_version_id,kind,state,attempts,available_at,
+  lease_owner,lease_until,created_at,updated_at
+) VALUES
+  ('51000000-0000-4000-8000-000000000001','50100000-0000-4000-8000-000000000001','process_file','queued',0,$1::timestamptz-interval '20 minutes',NULL,NULL,$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '20 minutes'),
+  ('51000000-0000-4000-8000-000000000002','50100000-0000-4000-8000-000000000002','process_file','running',1,$1::timestamptz-interval '20 minutes','dashboard-active',$1::timestamptz+interval '5 minutes',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '1 minute'),
+  ('51000000-0000-4000-8000-000000000003','50100000-0000-4000-8000-000000000003','process_file','running',1,$1::timestamptz-interval '20 minutes','dashboard-expired',$1::timestamptz-interval '1 minute',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '2 minutes'),
+  ('51000000-0000-4000-8000-000000000004','50100000-0000-4000-8000-000000000004','process_file','running',4,$1::timestamptz-interval '20 minutes','dashboard-exhausted',$1::timestamptz-interval '1 minute',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '2 minutes')`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO outbox_events(
+  id,kind,payload,created_at,published_at,dedupe_key,
+  lease_owner,lease_until,attempts,next_attempt_at,last_error_category
+) VALUES
+  ('52000000-0000-4000-8000-000000000001','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-1',NULL,NULL,0,$1::timestamptz-interval '20 minutes',NULL),
+  ('52000000-0000-4000-8000-000000000002','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-2','dashboard-expired',$1::timestamptz-interval '1 minute',1,$1::timestamptz-interval '20 minutes',NULL),
+  ('52000000-0000-4000-8000-000000000003','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-3','dashboard-active',$1::timestamptz+interval '5 minutes',1,$1::timestamptz-interval '20 minutes',NULL),
+  ('52000000-0000-4000-8000-000000000004','dashboard.test','{}',$1::timestamptz-interval '30 minutes',NULL,'dashboard-outbox-4',NULL,NULL,4,$1::timestamptz-interval '20 minutes','attempts_exhausted'),
+  ('52000000-0000-4000-8000-000000000005','dashboard.test','{}',$1::timestamptz-interval '30 minutes',$1::timestamptz-interval '5 minutes','dashboard-outbox-5',NULL,NULL,1,$1::timestamptz-interval '20 minutes','delivery_failed')`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO backup_runs(
+  id,idempotency_key,trigger_kind,state,requested_by,
+  requested_at,started_at,finished_at,database_migration_version,
+  encryption_key_id,local_snapshot_id,remote_snapshot_id,manifest_sha256,
+  local_expires_at,remote_expires_at
+) VALUES(
+  '53000000-0000-4000-8000-000000000001','dashboard-backup','manual','succeeded',
+  '30000000-0000-4000-8000-000000000001',
+  $1::timestamptz-interval '30 minutes',$1::timestamptz-interval '25 minutes',$1::timestamptz-interval '20 minutes',
+  22,'dashboard-key','dashboard-local','dashboard-remote',
+  decode(repeat('ab',32),'hex'),$1::timestamptz+interval '7 days',$1::timestamptz+interval '30 days'
+)`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO restore_verifications(
+  id,backup_run_id,state,started_at,finished_at,restored_migration_version,
+  database_row_counts,checked_object_count,missing_object_count,
+  unexpected_object_count,session_revocation_verified,rto_seconds,report_sha256
+) VALUES(
+  '53100000-0000-4000-8000-000000000001',
+  '53000000-0000-4000-8000-000000000001','succeeded',
+  $1::timestamptz-interval '10 minutes',$1::timestamptz-interval '5 minutes',22,
+  '{"users":4}',4,0,0,true,73,decode(repeat('cd',32),'hex')
+)`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO operational_alerts(
+  id,dedupe_key,category,severity,state,
+  first_observed_at,last_observed_at,acknowledged_by,acknowledged_at,
+  resolved_at,current_value,threshold_value,summary
+) VALUES
+  ('54000000-0000-4000-8000-000000000001','dashboard-warning','queue','warning','open',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,NULL,2,1,'Dashboard warning'),
+  ('54000000-0000-4000-8000-000000000002','dashboard-critical','backup','critical','acknowledged',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes','30000000-0000-4000-8000-000000000001',$1::timestamptz-interval '1 minute',NULL,2,1,'Dashboard critical'),
+  ('54000000-0000-4000-8000-000000000003','dashboard-resolved','queue','warning','resolved',$1::timestamptz-interval '20 minutes',$1::timestamptz-interval '2 minutes',NULL,NULL,$1::timestamptz-interval '1 minute',0,1,'Dashboard resolved')`,
+			[]any{now},
+		},
+		{
+			`INSERT INTO audit_logs(
+  actor_user_id,action,target_type,target_id,metadata,request_id,occurred_at
+) VALUES
+  ('30000000-0000-4000-8000-000000000001','operations.dashboard_checked','operations','dashboard','{"outcome":"succeeded"}','dashboard-audit-old',$1::timestamptz-interval '180 days'),
+  ('30000000-0000-4000-8000-000000000001','file.download','file','fixture','{"outcome":"denied"}','dashboard-audit-file',$1::timestamptz-interval '1 minute'),
+  ('30000000-0000-4000-8000-000000000001','ai.run','ai_run','fixture','{"outcome":"failed"}','dashboard-audit-ai',$1::timestamptz-interval '1 minute')`,
+			[]any{now},
+		},
+	} {
+		if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("fixture statement %d: %v", index, err)
+		}
+	}
+}
+
+func insertDashboardFutureAIRun(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	now time.Time,
+) {
+	t.Helper()
+	if _, err := tx.Exec(ctx, `
+INSERT INTO ai_runs(
+  id,thread_id,student_id,trigger_message_id,attempt_no,idempotency_key,status,
+  provider_id,provider_key_version,provider_base_url,protocol_mode,
+  model_id,upstream_model_id,modality,context_window_tokens,max_output_tokens,
+  image_quota_tokens,input_price_micro_usd_per_million_tokens,
+  output_price_micro_usd_per_million_tokens,
+  prompt_id,prompt_subject,prompt_version,prompt_sha256,
+  connect_timeout_ms,response_header_timeout_ms,idle_stream_timeout_ms,total_timeout_ms,
+  reserved_request_count,reserved_token_count,quota_day_key,quota_month_key,estimator_version,
+  usage_source,error_code,created_at,updated_at,started_at,completed_at
+) VALUES(
+  '45000000-0000-4000-8000-000000000006',
+  '43000000-0000-4000-8000-000000000006',
+  '30000000-0000-4000-8000-000000000101',
+  '44000000-0000-4000-8000-000000000006',
+  1,'dashboard-run-0006','failed',
+  '40000000-0000-4000-8000-000000000001',1,
+  'https://dashboard.invalid/v1','chat_completions',
+  '41000000-0000-4000-8000-000000000001',
+  'dashboard-model','text',8192,1024,1024,1000000,2000000,
+  '42000000-0000-4000-8000-000000000001',
+  'math',1,encode(digest('Dashboard prompt','sha256'),'hex'),
+  1000,30000,30000,120000,1,1024,'2026-07-30','2026-07',1,
+  'unknown','upstream_error',
+  $1::timestamptz-interval '48 hours',$1::timestamptz-interval '47 hours',
+  $1::timestamptz-interval '47 hours 30 minutes',$1::timestamptz+interval '1 minute'
+)`, now); err != nil {
+		t.Fatal(err)
 	}
 }
 
