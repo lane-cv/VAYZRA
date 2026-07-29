@@ -21,10 +21,15 @@ OWNER_TOKEN=''
 WORK_DIRECTORY=''
 CONTROL_DIRECTORY=''
 RESTORE_DIRECTORY=''
+CHECK_OUTPUT_DIRECTORY=''
+RESTORED_MANIFEST=''
+EXPECTED_MANIFEST_SHA256=''
 REPORT_FILE=''
 REPORT_TEMPORARY=''
 RESTORE_LOCK_FILE=''
 RESTORE_LOCK_FD_OPEN=false
+REPORT_LOCK_FILE=''
+REPORT_LOCK_FD_OPEN=false
 NETWORK_NAME=''
 POSTGRES_VOLUME=''
 AISTOR_VOLUME=''
@@ -47,6 +52,10 @@ AISTOR_VOLUME_CREATED=false
 AISTOR_LICENSE_VOLUME_CREATED=false
 HOST_UID=''
 HOST_GID=''
+ACTIVE_EXTERNAL_PID=''
+ACTIVE_EXTERNAL_PGID=''
+PENDING_SIGNAL_STATUS=''
+WORKSPACE_INITIALIZED=false
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -223,15 +232,13 @@ validate_paths() {
   owner_only_secret "$HAPPYLEARN_AISTOR_LICENSE_FILE" || return 1
   REPORT_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/restore-${BACKUP_ID}.json"
   REPORT_TEMPORARY="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new"
-  RESTORE_LOCK_FILE="$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY/restore-${BACKUP_ID}.lock"
-  [[ ! -e "$REPORT_FILE" && ! -L "$REPORT_FILE" &&
-    ! -e "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" ]] ||
-    return 1
+  RESTORE_LOCK_FILE="$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY/.phase5-restore-${BACKUP_ID}.lock"
+  REPORT_LOCK_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.lock"
 }
 
 acquire_restore_lock() {
   [[ "$RESTORE_LOCK_FILE" == \
-    "$HAPPYLEARN_RESTORE_CONTROL_DIRECTORY/restore-${BACKUP_ID}.lock" &&
+    "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY/.phase5-restore-${BACKUP_ID}.lock" &&
     ! -L "$RESTORE_LOCK_FILE" ]] ||
     return 1
   if [[ ! -e "$RESTORE_LOCK_FILE" ]]; then
@@ -249,6 +256,30 @@ acquire_restore_lock() {
     return 1
   fi
   RESTORE_LOCK_FD_OPEN=true
+}
+
+acquire_report_lock() {
+  [[ "$REPORT_LOCK_FILE" == \
+    "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.lock" &&
+    ! -L "$REPORT_LOCK_FILE" ]] ||
+    return 1
+  if [[ ! -e "$REPORT_LOCK_FILE" ]]; then
+    (umask 077 && : >"$REPORT_LOCK_FILE") || return 1
+    chmod 0600 "$REPORT_LOCK_FILE" || return 1
+  fi
+  [[ -f "$REPORT_LOCK_FILE" && ! -L "$REPORT_LOCK_FILE" &&
+    "$(portable_mode "$REPORT_LOCK_FILE")" == 600 &&
+    "$(portable_owner "$REPORT_LOCK_FILE")" == "$(id -u)" ]] ||
+    return 1
+  exec 11<>"$REPORT_LOCK_FILE" || return 1
+  if ! flock --exclusive --nonblock 11; then
+    exec 11>&-
+    return 1
+  fi
+  REPORT_LOCK_FD_OPEN=true
+  [[ ! -e "$REPORT_FILE" && ! -L "$REPORT_FILE" &&
+    ! -e "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" ]] ||
+    return 1
 }
 
 random_token() {
@@ -291,6 +322,9 @@ initialize_workspace() {
   RESTORE_DIRECTORY="$WORK_DIRECTORY/restored"
   mkdir "$RESTORE_DIRECTORY" || return 1
   chmod 0700 "$RESTORE_DIRECTORY" || return 1
+  CHECK_OUTPUT_DIRECTORY="$WORK_DIRECTORY/check-output"
+  mkdir "$CHECK_OUTPUT_DIRECTORY" || return 1
+  chmod 0700 "$CHECK_OUTPUT_DIRECTORY" || return 1
   CONTAINER_RECORD="$CONTROL_DIRECTORY/containers"
   : >"$CONTAINER_RECORD" || return 1
   chmod 0600 "$CONTAINER_RECORD" || return 1
@@ -334,6 +368,7 @@ initialize_workspace() {
     'HAPPYLEARN_DATABASE_SSLMODE=disable' \
     'PGPASSFILE=/run/secrets/pgpass' \
     'HAPPYLEARN_MINIO_ENDPOINT=minio:9000' \
+    'HAPPYLEARN_MINIO_USE_TLS=false' \
     "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
     "HAPPYLEARN_MINIO_SECRET_KEY=$MINIO_SECRET_KEY" \
     >"$CONTROL_DIRECTORY/restore-check.env" ||
@@ -348,15 +383,70 @@ initialize_workspace() {
     owner_only_secret "$CONTROL_DIRECTORY/postgres.env" &&
     owner_only_secret "$CONTROL_DIRECTORY/aistor.env" &&
     owner_only_secret "$CONTROL_DIRECTORY/app.env" &&
-    owner_only_secret "$CONTROL_DIRECTORY/restore-check.env"
+    owner_only_secret "$CONTROL_DIRECTORY/restore-check.env" &&
+    owner_only_directory "$CHECK_OUTPUT_DIRECTORY" ||
+    return 1
+  WORKSPACE_INITIALIZED=true
+}
+
+direct_running_job() {
+  local wanted_pid="$1"
+  local job_pid
+  [[ "$wanted_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  while IFS= read -r job_pid; do
+    [[ "$job_pid" == "$wanted_pid" ]] && return 0
+  done < <(jobs -pr)
+  return 1
 }
 
 terminate_external_group() {
   local pid="$1"
-  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  sleep "$POLL_INTERVAL_SECONDS"
-  kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  local pgid="$2"
+  [[ "$pid" =~ ^[1-9][0-9]*$ &&
+    "$pgid" =~ ^[1-9][0-9]*$ ]] ||
+    return 1
+  if direct_running_job "$pid"; then
+    kill -TERM -- "-$pgid" 2>/dev/null ||
+      kill -TERM "$pid" 2>/dev/null ||
+      true
+    sleep "$POLL_INTERVAL_SECONDS"
+  fi
+  kill -KILL -- "-$pgid" 2>/dev/null ||
+    {
+      direct_running_job "$pid" &&
+        kill -KILL "$pid" 2>/dev/null
+    } ||
+    true
   wait "$pid" 2>/dev/null || true
+}
+
+terminate_active_external() {
+  local pid="$ACTIVE_EXTERNAL_PID"
+  local pgid="$ACTIVE_EXTERNAL_PGID"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ &&
+    "$pgid" =~ ^[1-9][0-9]*$ ]]; then
+    terminate_external_group "$pid" "$pgid" || true
+  fi
+  ACTIVE_EXTERNAL_PID=''
+  ACTIVE_EXTERNAL_PGID=''
+}
+
+handle_restore_signal() {
+  local status="$1"
+  [[ "$status" =~ ^(129|130|143)$ ]] || status=1
+  trap '' HUP INT TERM
+  terminate_active_external
+  exit "$status"
+}
+
+install_restore_signal_traps() {
+  if [[ "$CLEANING_UP" == true ]]; then
+    trap '' HUP INT TERM
+  else
+    trap 'handle_restore_signal 129' HUP
+    trap 'handle_restore_signal 130' INT
+    trap 'handle_restore_signal 143' TERM
+  fi
 }
 
 run_bounded() {
@@ -364,23 +454,45 @@ run_bounded() {
   shift
   valid_uint "$timeout_seconds" || return 1
   local deadline=$((SECONDS + timeout_seconds))
-  local pid
+  local pid result=0
+  PENDING_SIGNAL_STATUS=''
+  if [[ "$CLEANING_UP" == true ]]; then
+    trap '' HUP INT TERM
+  else
+    trap 'PENDING_SIGNAL_STATUS=129' HUP
+    trap 'PENDING_SIGNAL_STATUS=130' INT
+    trap 'PENDING_SIGNAL_STATUS=143' TERM
+  fi
   set -m
-  ( "$@" ) &
+  (
+    trap - HUP INT TERM
+    "$@"
+  ) &
   pid="$!"
+  ACTIVE_EXTERNAL_PID="$pid"
+  ACTIVE_EXTERNAL_PGID="$pid"
   set +m
-  while kill -0 "$pid" 2>/dev/null; do
+  install_restore_signal_traps
+  if [[ -n "$PENDING_SIGNAL_STATUS" ]]; then
+    handle_restore_signal "$PENDING_SIGNAL_STATUS"
+  fi
+  while direct_running_job "$pid"; do
     if ((SECONDS >= deadline)); then
-      terminate_external_group "$pid"
+      terminate_external_group "$pid" "$pid"
+      ACTIVE_EXTERNAL_PID=''
+      ACTIVE_EXTERNAL_PGID=''
       return 124
     fi
     sleep "$POLL_INTERVAL_SECONDS"
   done
   if wait "$pid"; then
-    return 0
+    result=0
   else
-    return $?
+    result=$?
   fi
+  ACTIVE_EXTERNAL_PID=''
+  ACTIVE_EXTERNAL_PGID=''
+  return "$result"
 }
 
 poll_until() {
@@ -473,19 +585,30 @@ inspect_resource_labels() {
 inspect_container_labels() {
   local name="$1"
   inspect_resource_labels containers "$name" \
-    '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}|{{index .Config.Labels "io.happylearn.phase5.restore-backup-id"}}'
+    '{{.Id}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.restore-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-kind"}}|{{index .Config.Labels "io.happylearn.phase5.restore-backup-id"}}'
 }
 
 inspect_volume_labels() {
   local name="$1"
   inspect_resource_labels volumes "$name" \
-    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
+    '{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
 }
 
 inspect_network_labels() {
   local name="$1"
   inspect_resource_labels networks "$name" \
-    '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
+    '{{.Id}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "io.happylearn.phase5.restore-owner"}}|{{index .Labels "io.happylearn.phase5.restore-kind"}}|{{index .Labels "io.happylearn.phase5.restore-backup-id"}}'
+}
+
+inspect_class_labels() {
+  local class="$1"
+  local identifier="$2"
+  case "$class" in
+    containers) inspect_container_labels "$identifier" ;;
+    volumes) inspect_volume_labels "$identifier" ;;
+    networks) inspect_network_labels "$identifier" ;;
+    *) return 4 ;;
+  esac
 }
 
 list_owned_resource_names() {
@@ -493,9 +616,9 @@ list_owned_resource_names() {
   local value line
   local -a command
   case "$class" in
-    containers) command=(docker container ls --all --quiet) ;;
-    volumes) command=(docker volume ls --quiet) ;;
-    networks) command=(docker network ls --quiet) ;;
+    containers) command=(docker container ls --all --format '{{.Names}}') ;;
+    volumes) command=(docker volume ls --format '{{.Name}}') ;;
+    networks) command=(docker network ls --format '{{.Name}}') ;;
     *) return 1 ;;
   esac
   value="$(
@@ -512,17 +635,55 @@ list_owned_resource_names() {
   printf '%s' "$value"
 }
 
+expected_resource_name() {
+  local project="$1"
+  local class="$2"
+  local kind="$3"
+  case "$class:$kind" in
+    volumes:postgres) printf '%s-postgres' "$project" ;;
+    volumes:aistor) printf '%s-aistor' "$project" ;;
+    volumes:aistor-license) printf '%s-aistor-license' "$project" ;;
+    networks:network) printf '%s-network' "$project" ;;
+    containers:volume-probe-postgres)
+      printf '%s-volume-probe-postgres' "$project"
+      ;;
+    containers:volume-probe-aistor)
+      printf '%s-volume-probe-aistor' "$project"
+      ;;
+    containers:volume-probe-aistor-license)
+      printf '%s-volume-probe-aistor-license' "$project"
+      ;;
+    containers:restic-check) printf '%s-restic-check' "$project" ;;
+    containers:restic-select) printf '%s-restic-select' "$project" ;;
+    containers:restic-restore) printf '%s-restic-restore' "$project" ;;
+    containers:object-restore) printf '%s-object-restore' "$project" ;;
+    containers:aistor-license-init)
+      printf '%s-aistor-license-init' "$project"
+      ;;
+    containers:postgres) printf '%s-postgres' "$project" ;;
+    containers:postgres-restore) printf '%s-postgres-restore' "$project" ;;
+    containers:aistor) printf '%s-aistor' "$project" ;;
+    containers:redis) printf '%s-redis' "$project" ;;
+    containers:revoke-sessions) printf '%s-revoke-sessions' "$project" ;;
+    containers:app) printf '%s-app' "$project" ;;
+    containers:restore-check) printf '%s-restore-check' "$project" ;;
+    containers:student-one) printf '%s-student-1' "$project" ;;
+    containers:student-two) printf '%s-student-2' "$project" ;;
+    *) return 1 ;;
+  esac
+}
+
 valid_observed_resource() {
   local class="$1"
   local name="$2"
-  local labels="$3"
-  local project owner kind backup extra
-  IFS='|' read -r project owner kind backup extra <<<"$labels"
-  [[ -z "$extra" &&
-    "$project" =~ ^happylearn-phase5-restore-[a-f0-9]{12}$ &&
-    "$owner" =~ ^[a-f0-9]{64}$ &&
-    "$backup" == "$BACKUP_ID" &&
-    "$name" == "$project-"* ]] ||
+  local observation="$3"
+  local identity project owner kind backup extra expected_name
+  IFS='|' read -r identity project owner kind backup extra <<<"$observation"
+  [[ -z "$extra" ]] || return 1
+  valid_project "$project" || return 1
+  valid_owner_token "$owner" || return 1
+  [[ "$project" == "${PROJECT_PREFIX}${owner:0:12}" &&
+    "$backup" == "$BACKUP_ID" ]] ||
     return 1
   case "$class:$kind" in
     volumes:postgres | volumes:aistor | volumes:aistor-license | \
@@ -539,55 +700,82 @@ valid_observed_resource() {
       containers:student-two) ;;
     *) return 1 ;;
   esac
+  expected_name="$(expected_resource_name "$project" "$class" "$kind")" ||
+    return 1
+  [[ "$name" == "$expected_name" ]] || return 1
+  case "$class" in
+    containers | networks) [[ "$identity" =~ ^[a-f0-9]{64}$ ]] ;;
+    volumes) [[ "$identity" == "$name" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+current_resource_matches() {
+  local class="$1"
+  local name="$2"
+  local kind="$3"
+  local observation
+  observation="$(inspect_class_labels "$class" "$name")" || return 1
+  valid_observed_resource "$class" "$name" "$observation" || return 1
+  [[ "${observation#*|}" == "$(resource_labels "$kind")" ]]
+}
+
+remove_verified_resource() {
+  local class="$1"
+  local name="$2"
+  local expected_labels="${3:-}"
+  local observation confirmation identity labels status remove_target
+  if observation="$(inspect_class_labels "$class" "$name")"; then
+    :
+  else
+    status=$?
+    [[ "$status" -eq 3 ]] && return 0
+    return 1
+  fi
+  valid_observed_resource "$class" "$name" "$observation" || return 1
+  identity="${observation%%|*}"
+  labels="${observation#*|}"
+  [[ -z "$expected_labels" || "$labels" == "$expected_labels" ]] || return 1
+  confirmation="$(inspect_class_labels "$class" "$identity")" || return 1
+  [[ "$confirmation" == "$observation" ]] || return 1
+  case "$class" in
+    containers)
+      remove_target="$identity"
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker rm --force "$remove_target" >/dev/null ||
+        return 1
+      ;;
+    volumes)
+      remove_target="$name"
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker volume rm "$remove_target" >/dev/null ||
+        return 1
+      ;;
+    networks)
+      remove_target="$identity"
+      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
+        docker network rm "$remove_target" >/dev/null ||
+        return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if inspect_class_labels "$class" "$identity" >/dev/null; then
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 3 ]]
 }
 
 remove_owned_orphan() {
   local class="$1"
   local name="$2"
-  local labels status
-  case "$class" in
-    containers)
-      if labels="$(inspect_container_labels "$name")"; then
-        :
-      else
-        status=$?
-        [[ "$status" -eq 3 ]] && return 0
-        return 1
-      fi
-      valid_observed_resource "$class" "$name" "$labels" || return 1
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-        docker rm --force "$name" >/dev/null
-      ;;
-    volumes)
-      if labels="$(inspect_volume_labels "$name")"; then
-        :
-      else
-        status=$?
-        [[ "$status" -eq 3 ]] && return 0
-        return 1
-      fi
-      valid_observed_resource "$class" "$name" "$labels" || return 1
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-        docker volume rm "$name" >/dev/null
-      ;;
-    networks)
-      if labels="$(inspect_network_labels "$name")"; then
-        :
-      else
-        status=$?
-        [[ "$status" -eq 3 ]] && return 0
-        return 1
-      fi
-      valid_observed_resource "$class" "$name" "$labels" || return 1
-      run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-        docker network rm "$name" >/dev/null
-      ;;
-    *) return 1 ;;
-  esac
+  remove_verified_resource "$class" "$name"
 }
 
 reap_orphan_resources() {
   local class names name
+  [[ "$RESTORE_LOCK_FD_OPEN" == true ]] || return 1
   for class in containers volumes networks; do
     names="$(list_owned_resource_names "$class")" || return 1
     while IFS= read -r name; do
@@ -598,6 +786,7 @@ reap_orphan_resources() {
 
 owned_resources_absent() {
   local class names
+  [[ "$RESTORE_LOCK_FD_OPEN" == true ]] || return 1
   for class in containers volumes networks; do
     names="$(list_owned_resource_names "$class")" || return 1
     [[ -z "$names" ]] || return 1
@@ -628,8 +817,7 @@ create_volume() {
     aistor-license) AISTOR_LICENSE_VOLUME_CREATED=true ;;
     *) return 1 ;;
   esac
-  [[ "$(inspect_volume_labels "$name")" == "$(resource_labels "$kind")" ]] ||
-    return 1
+  current_resource_matches volumes "$name" "$kind"
 }
 
 create_network() {
@@ -649,9 +837,7 @@ create_network() {
     --label "$BACKUP_LABEL=$BACKUP_ID" \
     "$NETWORK_NAME" >/dev/null
   NETWORK_CREATED=true
-  [[ "$(inspect_network_labels "$NETWORK_NAME")" == \
-    "$(resource_labels network)" ]] ||
-    return 1
+  current_resource_matches networks "$NETWORK_NAME" network
 }
 
 run_named_container() {
@@ -704,7 +890,7 @@ restic_container() {
     --network none \
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
-    --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository,readonly" \
+    --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password,dst=/run/secrets/local_password,readonly" \
     --env RESTIC_REPOSITORY=/repository \
     --env RESTIC_PASSWORD_FILE=/run/secrets/local_password \
@@ -724,7 +910,7 @@ restic_restore_container() {
     --network none \
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
-    --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository,readonly" \
+    --mount "type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository" \
     --mount "type=bind,src=$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password,dst=/run/secrets/local_password,readonly" \
     --mount "type=bind,src=$RESTORE_DIRECTORY,dst=/restore" \
     --env RESTIC_REPOSITORY=/repository \
@@ -743,7 +929,8 @@ repository_check() {
 
 select_snapshot() {
   local inventory="$WORK_DIRECTORY/snapshots.json"
-  local inventory_value ids id_count tags tag_count
+  local inventory_value ids id_count tag_array tags tag_count
+  local batch_tag_count manifest_tags manifest_tag_count manifest_sha256
   restic_container \
     "$PROJECT-restic-select" restic-select \
     snapshots --json --tag "happylearn-batch:$BACKUP_ID" \
@@ -762,17 +949,40 @@ select_snapshot() {
   id_count="$(printf '%s\n' "$ids" | grep -Ec '^[a-f0-9]{64}$')" ||
     return 1
   [[ "$id_count" == '1' && "$ids" != *$'\n'* ]] || return 1
-  tags="$(
-    grep -Eo 'happylearn-batch:[^"[:space:]]+' "$inventory"
+  tag_array="$(
+    grep -Eo '"tags"[[:space:]]*:[[:space:]]*\[[^][]*\]' "$inventory"
   )" || return 1
-  tag_count="$(printf '%s\n' "$tags" |
-    grep -Fxc "happylearn-batch:$BACKUP_ID")" || return 1
-  [[ "$tag_count" == '1' && "$tags" != *$'\n'* ]] || return 1
-  printf '%s' "$ids"
+  [[ -n "$tag_array" && "$tag_array" != *$'\n'* ]] || return 1
+  tags="$(
+    printf '%s\n' "$tag_array" |
+      grep -Eo '"[^"]*"' |
+      sed -n '2,$s/^"//;2,$s/"$//;2,$p'
+  )" || return 1
+  tag_count="$(printf '%s\n' "$tags" | grep -Ec '^.+$')" || return 1
+  [[ "$tag_count" == 2 ]] || return 1
+  batch_tag_count="$(
+    printf '%s\n' "$tags" |
+      grep -Fxc "happylearn-batch:$BACKUP_ID"
+  )" || return 1
+  [[ "$batch_tag_count" == 1 ]] || return 1
+  manifest_tags="$(
+    printf '%s\n' "$tags" |
+      grep -E '^happylearn-manifest-sha256:[a-f0-9]{64}$'
+  )" || return 1
+  manifest_tag_count="$(
+    printf '%s\n' "$manifest_tags" |
+      grep -Ec '^happylearn-manifest-sha256:[a-f0-9]{64}$'
+  )" || return 1
+  [[ "$manifest_tag_count" == 1 &&
+    "$manifest_tags" != *$'\n'* ]] ||
+    return 1
+  manifest_sha256="${manifest_tags#happylearn-manifest-sha256:}"
+  printf '%s|%s' "$ids" "$manifest_sha256"
 }
 
 restore_snapshot() {
   local snapshot_id="$1"
+  local manifest_path mode size actual_sha256
   [[ "$snapshot_id" =~ ^[a-f0-9]{64}$ ]] || return 1
   restic_restore_container \
     "$PROJECT-restic-restore" restic-restore \
@@ -780,7 +990,21 @@ restore_snapshot() {
   [[ -f "$RESTORE_DIRECTORY/database.dump" &&
     ! -L "$RESTORE_DIRECTORY/database.dump" &&
     -d "$RESTORE_DIRECTORY/source/aistor" &&
-    ! -L "$RESTORE_DIRECTORY/source/aistor" ]]
+    ! -L "$RESTORE_DIRECTORY/source/aistor" ]] ||
+    return 1
+  manifest_path="$RESTORE_DIRECTORY/manifest.json"
+  [[ -f "$manifest_path" &&
+    ! -L "$manifest_path" &&
+    "$(portable_owner "$manifest_path")" == "$HOST_UID" ]] ||
+    return 1
+  mode="$(portable_mode "$manifest_path")" || return 1
+  [[ "$mode" =~ ^[0-7]?([0-7])[0-7][0-7]$ ]] || return 1
+  ((8#${BASH_REMATCH[1]} & 4)) || return 1
+  size="$(portable_size "$manifest_path")" || return 1
+  [[ "$size" -ge 1 && "$size" -le 65536 ]] || return 1
+  actual_sha256="$(portable_sha256 "$manifest_path")" || return 1
+  [[ "$actual_sha256" == "$EXPECTED_MANIFEST_SHA256" ]] || return 1
+  RESTORED_MANIFEST="$manifest_path"
 }
 
 restore_object_data() {
@@ -925,13 +1149,23 @@ wait_for_restored_app() {
 }
 
 run_restore_check() {
+  local actual_manifest_sha256
+  [[ "$RESTORED_MANIFEST" == "$RESTORE_DIRECTORY/manifest.json" &&
+    -f "$RESTORED_MANIFEST" &&
+    ! -L "$RESTORED_MANIFEST" ]] ||
+    return 1
+  actual_manifest_sha256="$(portable_sha256 "$RESTORED_MANIFEST")" ||
+    return 1
+  [[ "$actual_manifest_sha256" == "$EXPECTED_MANIFEST_SHA256" ]] ||
+    return 1
   run_named_container \
     "$PROJECT-restore-check" restore-check \
     --network "$NETWORK_NAME" \
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
-    --mount "type=bind,src=$CONTROL_DIRECTORY,dst=/work" \
+    --mount "type=bind,src=$CHECK_OUTPUT_DIRECTORY,dst=/work" \
     --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --mount "type=bind,src=$RESTORED_MANIFEST,dst=/run/restore/manifest.json,readonly" \
     --env-file "$CONTROL_DIRECTORY/restore-check.env" \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
@@ -969,16 +1203,80 @@ run_student_isolation_probe() {
     >/dev/null
 }
 
+valid_int64_decimal() {
+  local value="$1"
+  [[ "$value" =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 1
+  [[ "${#value}" -lt 19 ||
+    "$value" < 9223372036854775808 ]]
+}
+
+hex_to_bytes() {
+  local value="$1"
+  [[ -n "$value" &&
+    "$value" =~ ^[a-f0-9]+$ &&
+    $((${#value} % 2)) -eq 0 ]] ||
+    return 1
+  while [[ -n "$value" ]]; do
+    printf '%b' "\\x${value:0:2}" || return 1
+    value="${value:2}"
+  done
+}
+
+verify_bound_evidence_sha256() {
+  local verification_sha256="$1"
+  local evidence_sha256="$2"
+  local evidence_input="$WORK_DIRECTORY/evidence.input"
+  local backup_hex="${BACKUP_ID//-/}"
+  local actual_evidence_sha256
+  [[ "$backup_hex" =~ ^[a-f0-9]{32}$ &&
+    "$EXPECTED_MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ &&
+    "$verification_sha256" =~ ^[a-f0-9]{64}$ &&
+    "$evidence_sha256" =~ ^[a-f0-9]{64}$ ]] ||
+    return 1
+  : >"$evidence_input" || return 1
+  chmod 0600 "$evidence_input" || return 1
+  hex_to_bytes "$backup_hex" >>"$evidence_input" || return 1
+  hex_to_bytes "$EXPECTED_MANIFEST_SHA256" >>"$evidence_input" || return 1
+  hex_to_bytes "$verification_sha256" >>"$evidence_input" || return 1
+  actual_evidence_sha256="$(portable_sha256 "$evidence_input")" || return 1
+  [[ "$actual_evidence_sha256" == "$evidence_sha256" ]]
+}
+
 load_safe_restore_counts() {
-  local path="$CONTROL_DIRECTORY/restore-check.report"
-  local line key value
-  local seen_schema=false
-  local seen_migration=false
-  local seen_rows=false
-  local seen_checked=false
-  local seen_missing=false
-  local seen_unexpected=false
-  local seen_sessions=false
+  local path="$CHECK_OUTPUT_DIRECTORY/restore-check.report"
+  local line key value numeric_value
+  local index=0
+  local row_sum=0
+  local mode size
+  local -a expected_keys=(
+    schema_version
+    backup_id
+    manifest_sha256
+    migration_version
+    table_users_count
+    table_sessions_count
+    table_subjects_count
+    table_grades_count
+    table_terms_count
+    table_chapters_count
+    table_lessons_count
+    table_lesson_revisions_count
+    table_files_count
+    table_file_versions_count
+    table_file_previews_count
+    table_qa_threads_count
+    table_qa_messages_count
+    table_ai_threads_count
+    table_ai_messages_count
+    table_ai_runs_count
+    row_count_total
+    checked_object_count
+    missing_object_count
+    unexpected_object_count
+    active_session_count
+    verification_report_sha256
+    evidence_sha256
+  )
   SCHEMA_VERSION=''
   MIGRATION_VERSION=''
   ROW_COUNT_TOTAL=''
@@ -986,64 +1284,85 @@ load_safe_restore_counts() {
   MISSING_OBJECT_COUNT=''
   UNEXPECTED_OBJECT_COUNT=''
   ACTIVE_SESSION_COUNT=''
-  [[ -f "$path" && ! -L "$path" ]] || return 1
-  while IFS= read -r line; do
-    [[ "$line" =~ ^[a-z_]+=[0-9]+$ ]] || return 1
+  VERIFICATION_REPORT_SHA256=''
+  EVIDENCE_SHA256=''
+  [[ -f "$path" &&
+    ! -L "$path" &&
+    "$(portable_owner "$path")" == "$HOST_UID" ]] ||
+    return 1
+  mode="$(portable_mode "$path")" || return 1
+  size="$(portable_size "$path")" || return 1
+  [[ "$mode" == 600 && "$size" -ge 1 && "$size" -le 16384 ]] ||
+    return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$index" -lt "${#expected_keys[@]}" &&
+      "$line" =~ ^[a-z0-9_]+=[^=]+$ ]] ||
+      return 1
     key="${line%%=*}"
     value="${line#*=}"
+    [[ "$key" == "${expected_keys[$index]}" ]] || return 1
     case "$key" in
       schema_version)
-        [[ "$seen_schema" == false ]] || return 1
-        seen_schema=true
+        [[ "$value" == 1 ]] || return 1
         SCHEMA_VERSION="$value"
         ;;
+      backup_id)
+        [[ "$value" == "$BACKUP_ID" ]] || return 1
+        ;;
+      manifest_sha256)
+        [[ "$value" == "$EXPECTED_MANIFEST_SHA256" ]] || return 1
+        ;;
       migration_version)
-        [[ "$seen_migration" == false ]] || return 1
-        seen_migration=true
+        valid_int64_decimal "$value" && [[ "$value" != 0 ]] || return 1
         MIGRATION_VERSION="$value"
         ;;
+      table_*_count)
+        valid_int64_decimal "$value" || return 1
+        numeric_value=$((10#$value))
+        ((row_sum <= 9223372036854775807 - numeric_value)) ||
+          return 1
+        row_sum=$((row_sum + numeric_value))
+        ;;
       row_count_total)
-        [[ "$seen_rows" == false ]] || return 1
-        seen_rows=true
+        valid_int64_decimal "$value" || return 1
         ROW_COUNT_TOTAL="$value"
         ;;
       checked_object_count)
-        [[ "$seen_checked" == false ]] || return 1
-        seen_checked=true
+        valid_int64_decimal "$value" || return 1
         CHECKED_OBJECT_COUNT="$value"
         ;;
       missing_object_count)
-        [[ "$seen_missing" == false ]] || return 1
-        seen_missing=true
+        valid_int64_decimal "$value" || return 1
         MISSING_OBJECT_COUNT="$value"
         ;;
       unexpected_object_count)
-        [[ "$seen_unexpected" == false ]] || return 1
-        seen_unexpected=true
+        valid_int64_decimal "$value" || return 1
         UNEXPECTED_OBJECT_COUNT="$value"
         ;;
       active_session_count)
-        [[ "$seen_sessions" == false ]] || return 1
-        seen_sessions=true
+        valid_int64_decimal "$value" || return 1
         ACTIVE_SESSION_COUNT="$value"
+        ;;
+      verification_report_sha256)
+        [[ "$value" =~ ^[a-f0-9]{64}$ ]] || return 1
+        VERIFICATION_REPORT_SHA256="$value"
+        ;;
+      evidence_sha256)
+        [[ "$value" =~ ^[a-f0-9]{64}$ ]] || return 1
+        EVIDENCE_SHA256="$value"
         ;;
       *) return 1 ;;
     esac
+    index=$((index + 1))
   done <"$path"
-  [[ "$seen_schema" == true &&
-    "$seen_migration" == true &&
-    "$seen_rows" == true &&
-    "$seen_checked" == true &&
-    "$seen_missing" == true &&
-    "$seen_unexpected" == true &&
-    "$seen_sessions" == true &&
-    "$SCHEMA_VERSION" == 1 &&
-    "$MIGRATION_VERSION" =~ ^[1-9][0-9]*$ &&
-    "$ROW_COUNT_TOTAL" =~ ^[0-9]+$ &&
-    "$CHECKED_OBJECT_COUNT" =~ ^[0-9]+$ &&
+  [[ "$index" -eq "${#expected_keys[@]}" &&
+    "$ROW_COUNT_TOTAL" == "$row_sum" &&
     "$MISSING_OBJECT_COUNT" == 0 &&
     "$UNEXPECTED_OBJECT_COUNT" == 0 &&
-    "$ACTIVE_SESSION_COUNT" == 0 ]]
+    "$ACTIVE_SESSION_COUNT" == 0 ]] ||
+    return 1
+  verify_bound_evidence_sha256 \
+    "$VERIFICATION_REPORT_SHA256" "$EVIDENCE_SHA256"
 }
 
 portable_sha256() {
@@ -1071,6 +1390,9 @@ write_sanitized_report() {
   printf '%s\n' \
     "schemaVersion=1" \
     "backupId=$BACKUP_ID" \
+    "manifestSHA256=$EXPECTED_MANIFEST_SHA256" \
+    "verificationReportSHA256=$VERIFICATION_REPORT_SHA256" \
+    "evidenceSHA256=$EVIDENCE_SHA256" \
     "durationSeconds=$duration" \
     "migrationVersion=$MIGRATION_VERSION" \
     "rowCountTotal=$ROW_COUNT_TOTAL" \
@@ -1083,7 +1405,7 @@ write_sanitized_report() {
   chmod 0600 "$canonical"
   report_sha256="$(portable_sha256 "$canonical")" || return 1
   printf '%s\n' \
-    "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"durationSeconds\":$duration,\"migrationVersion\":$MIGRATION_VERSION,\"rowCountTotal\":$ROW_COUNT_TOTAL,\"checkedObjectCount\":$CHECKED_OBJECT_COUNT,\"missingObjectCount\":$MISSING_OBJECT_COUNT,\"unexpectedObjectCount\":$UNEXPECTED_OBJECT_COUNT,\"activeSessionCount\":$ACTIVE_SESSION_COUNT,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$report_sha256\"}" \
+    "{\"schemaVersion\":1,\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$EXPECTED_MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_REPORT_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":$duration,\"migrationVersion\":$MIGRATION_VERSION,\"rowCountTotal\":$ROW_COUNT_TOTAL,\"checkedObjectCount\":$CHECKED_OBJECT_COUNT,\"missingObjectCount\":$MISSING_OBJECT_COUNT,\"unexpectedObjectCount\":$UNEXPECTED_OBJECT_COUNT,\"activeSessionCount\":$ACTIVE_SESSION_COUNT,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$report_sha256\"}" \
     >"$REPORT_TEMPORARY"
   chmod 0600 "$REPORT_TEMPORARY"
 }
@@ -1091,50 +1413,39 @@ write_sanitized_report() {
 cleanup_container() {
   local name="$1"
   local kind="$2"
-  local labels status
-  cleanup_intended containers "$name" "$kind" || return 0
-  if labels="$(inspect_container_labels "$name")"; then
-    :
-  else
-    status=$?
-    [[ "$status" -eq 3 ]] && return 0
-    return 1
-  fi
-  [[ "$labels" == "$(resource_labels "$kind")" ]] || return 1
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker rm --force "$name" >/dev/null
+  remove_verified_resource \
+    containers "$name" "$(resource_labels "$kind")"
 }
 
 cleanup_volume() {
   local name="$1"
   local kind="$2"
-  local labels status
-  cleanup_intended volumes "$name" "$kind" || return 0
-  if labels="$(inspect_volume_labels "$name")"; then
-    :
-  else
-    status=$?
-    [[ "$status" -eq 3 ]] && return 0
-    return 1
-  fi
-  [[ "$labels" == "$(resource_labels "$kind")" ]] || return 1
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker volume rm "$name" >/dev/null
+  remove_verified_resource \
+    volumes "$name" "$(resource_labels "$kind")"
 }
 
 cleanup_network() {
-  local labels status
-  cleanup_intended networks "$NETWORK_NAME" network || return 0
-  if labels="$(inspect_network_labels "$NETWORK_NAME")"; then
-    :
-  else
-    status=$?
-    [[ "$status" -eq 3 ]] && return 0
+  remove_verified_resource \
+    networks "$NETWORK_NAME" "$(resource_labels network)"
+}
+
+cleanup_ledger_valid() {
+  local line class name kind extra expected_name count
+  [[ -f "$CLEANUP_INTENT_LEDGER" &&
+    ! -L "$CLEANUP_INTENT_LEDGER" &&
+    "$(portable_mode "$CLEANUP_INTENT_LEDGER")" == 600 &&
+    "$(portable_owner "$CLEANUP_INTENT_LEDGER")" == "$(id -u)" ]] ||
     return 1
-  fi
-  [[ "$labels" == "$(resource_labels network)" ]] || return 1
-  run_bounded "$EXTERNAL_TIMEOUT_SECONDS" \
-    docker network rm "$NETWORK_NAME" >/dev/null
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    IFS='|' read -r class name kind extra <<<"$line"
+    [[ -n "$class" && -n "$name" && -n "$kind" && -z "$extra" ]] ||
+      return 1
+    expected_name="$(expected_resource_name "$PROJECT" "$class" "$kind")" ||
+      return 1
+    [[ "$name" == "$expected_name" ]] || return 1
+    count="$(grep -Fxc "$line" "$CLEANUP_INTENT_LEDGER")" || true
+    [[ "$count" == 1 ]] || return 1
+  done <"$CLEANUP_INTENT_LEDGER"
 }
 
 cleanup_restore() {
@@ -1146,8 +1457,8 @@ cleanup_restore() {
   CLEANING_UP=true
   if valid_project "$PROJECT" &&
     valid_owner_token "$OWNER_TOKEN" &&
-    [[ -f "$CLEANUP_INTENT_LEDGER" &&
-      ! -L "$CLEANUP_INTENT_LEDGER" ]]; then
+    [[ "$WORKSPACE_INITIALIZED" == true ]]; then
+    cleanup_ledger_valid || status=1
     while IFS='|' read -r name kind; do
       [[ -n "$name" && -n "$kind" ]] || continue
       cleanup_container "$name" "$kind" || status=1
@@ -1197,10 +1508,19 @@ discard_report_temporary() {
   fi
 }
 
+release_report_lock() {
+  if [[ "$REPORT_LOCK_FD_OPEN" == true ]]; then
+    exec 11>&-
+    REPORT_LOCK_FD_OPEN=false
+  fi
+}
+
 on_exit() {
   local status=$?
   local cleanup_status=0
-  trap - EXIT HUP INT TERM
+  trap - EXIT
+  trap '' HUP INT TERM
+  terminate_active_external
   if cleanup_restore "$status"; then
     cleanup_status=0
   else
@@ -1210,19 +1530,28 @@ on_exit() {
     discard_report_temporary || true
   fi
   if [[ "$status" -ne 0 ]]; then
+    release_report_lock || true
     exit "$status"
   fi
   if [[ "$cleanup_status" -ne 0 ]]; then
+    release_report_lock || true
     exit "$cleanup_status"
   fi
   if [[ -z "$REPORT_TEMPORARY" ||
     "$REPORT_TEMPORARY" != "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new" ||
     ! -f "$REPORT_TEMPORARY" || -L "$REPORT_TEMPORARY" ||
     -e "$REPORT_FILE" || -L "$REPORT_FILE" ]] ||
-    ! mv "$REPORT_TEMPORARY" "$REPORT_FILE"; then
+    ! ln "$REPORT_TEMPORARY" "$REPORT_FILE"; then
     discard_report_temporary || true
+    release_report_lock || true
     exit 1
   fi
+  if ! rm -f "$REPORT_TEMPORARY"; then
+    rm -f "$REPORT_FILE" || true
+    release_report_lock || true
+    exit 1
+  fi
+  release_report_lock || exit 1
   exit 0
 }
 
@@ -1236,14 +1565,16 @@ main() {
     safe_log 'restore_lock_unavailable'
     return 1
   }
+  acquire_report_lock || {
+    safe_log 'report_lock_unavailable'
+    return 1
+  }
   initialize_identity || {
     safe_log 'restore_identity_failed'
     return 1
   }
   trap on_exit EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  install_restore_signal_traps
   initialize_workspace || {
     safe_log 'restore_workspace_failed'
     return 1
@@ -1262,8 +1593,14 @@ main() {
   assert_new_empty_volume "$AISTOR_LICENSE_VOLUME" aistor-license
 
   repository_check
-  local snapshot_id
-  snapshot_id="$(select_snapshot)"
+  local selection snapshot_id selection_extra
+  selection="$(select_snapshot)"
+  IFS='|' read -r snapshot_id EXPECTED_MANIFEST_SHA256 selection_extra \
+    <<<"$selection"
+  [[ "$snapshot_id" =~ ^[a-f0-9]{64}$ &&
+    "$EXPECTED_MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ &&
+    -z "$selection_extra" ]] ||
+    return 1
   restore_snapshot "$snapshot_id"
   restore_object_data
   initialize_aistor_license

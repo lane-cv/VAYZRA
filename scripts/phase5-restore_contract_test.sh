@@ -12,24 +12,105 @@ SECRET_MARKER='phase5-restore-secret-marker'
 DATABASE_SECRET_MARKER='fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
 OBJECT_SECRET_MARKER='123456789abcdeffedcba98765432100123456789abcdeffedcba98765432100'
 SIGNING_SECRET_MARKER='abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd'
+MANIFEST_TEXT='{"schemaVersion":1,"batchId":"11111111-1111-4111-8111-111111111111","createdAt":"2026-07-29T01:02:03.000000004Z","databaseMigrationVersion":42,"databaseDumpSha256":"1111111111111111111111111111111111111111111111111111111111111111","objectSnapshotId":"2222222222222222222222222222222222222222222222222222222222222222","objectCount":1,"referencedBytes":41}'
+
+contract_sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  else
+    return 1
+  fi
+}
+
+MANIFEST_SHA256="$(
+  printf '%s' "$MANIFEST_TEXT" |
+    contract_sha256_stdin |
+    sed -n '1s/[[:space:]].*$//p'
+)"
+[[ "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ]] || exit 1
+VERIFICATION_REPORT_SHA256='3333333333333333333333333333333333333333333333333333333333333333'
+
+contract_hex_to_bytes() {
+  local value="$1"
+  [[ -n "$value" &&
+    "$value" =~ ^[a-f0-9]+$ &&
+    $((${#value} % 2)) -eq 0 ]] ||
+    return 1
+  while [[ -n "$value" ]]; do
+    printf '%b' "\\x${value:0:2}"
+    value="${value:2}"
+  done
+}
+
+EVIDENCE_SHA256="$(
+  {
+    contract_hex_to_bytes "${BACKUP_ID//-/}"
+    contract_hex_to_bytes "$MANIFEST_SHA256"
+    contract_hex_to_bytes "$VERIFICATION_REPORT_SHA256"
+  } |
+    contract_sha256_stdin |
+    sed -n '1s/[[:space:]].*$//p'
+)"
+[[ "$EVIDENCE_SHA256" =~ ^[a-f0-9]{64}$ ]] || exit 1
 CONTRACT_TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/phase5-restore-contract.XXXXXX")"
 ACTIVE_FIXTURE_PID=''
+CONTRACT_CLEANING_UP=false
 
 fail() {
   printf 'phase5 restore contract: %s\n' "$1" >&2
   exit 1
 }
 
-cleanup_contract() {
-  if [[ "$ACTIVE_FIXTURE_PID" =~ ^[1-9][0-9]*$ ]]; then
-    kill -TERM "$ACTIVE_FIXTURE_PID" 2>/dev/null || true
-    kill -KILL "$ACTIVE_FIXTURE_PID" 2>/dev/null || true
-    wait "$ACTIVE_FIXTURE_PID" 2>/dev/null || true
+active_fixture_is_direct_job() {
+  local wanted_pid="$1"
+  local child
+  [[ "$wanted_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  for child in $(jobs -pr); do
+    [[ "$child" == "$wanted_pid" ]] && return 0
+  done
+  return 1
+}
+
+stop_active_fixture() {
+  local pid="$ACTIVE_FIXTURE_PID"
+  local attempts=0
+  if active_fixture_is_direct_job "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while active_fixture_is_direct_job "$pid" &&
+      [[ "$attempts" -lt 100 ]]; do
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    if active_fixture_is_direct_job "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
   fi
+  ACTIVE_FIXTURE_PID=''
+}
+
+cleanup_contract() {
+  [[ "$CONTRACT_CLEANING_UP" == false ]] || return 0
+  CONTRACT_CLEANING_UP=true
+  stop_active_fixture
   chmod -R u+rwX "$CONTRACT_TEMP_ROOT" 2>/dev/null || true
   rm -rf "$CONTRACT_TEMP_ROOT"
 }
-trap cleanup_contract EXIT HUP INT TERM
+
+handle_contract_signal() {
+  local status="$1"
+  [[ "$status" =~ ^(129|130|143)$ ]] || status=1
+  trap - HUP INT TERM
+  cleanup_contract
+  exit "$status"
+}
+
+trap cleanup_contract EXIT
+trap 'handle_contract_signal 129' HUP
+trap 'handle_contract_signal 130' INT
+trap 'handle_contract_signal 143' TERM
 
 assert_no_resources() {
   local fixture="$1"
@@ -98,6 +179,13 @@ wait_for_direct_child() {
   wait "$pid"
 }
 
+fake_resource_identity() {
+  local name="$1"
+  local checksum
+  checksum="$(printf '%s' "$name" | cksum | awk '{print $1}')"
+  printf '%064x' "$checksum"
+}
+
 make_fixture() {
   local fixture
   fixture="$(mktemp -d "$CONTRACT_TEMP_ROOT/fixture.XXXXXX")"
@@ -147,9 +235,11 @@ FAKE_OD
 #!/usr/bin/env bash
 set -euo pipefail
 target="${*: -1}"
-if [[ "${PHASE5_FAKE_MODE:-}" == workspace_failure &&
-  "$target" == "${TMPDIR:-/tmp}/phase5-restore-verify."* ]]; then
+if [[ "$target" =~ /phase5-restore-verify\.[A-Za-z0-9]+$ ]]; then
   printf '%s\n' "$target" >"$PHASE5_FAKE_WORKSPACE_MARKER"
+fi
+if [[ "${PHASE5_FAKE_MODE:-}" == workspace_failure &&
+  "$target" =~ /phase5-restore-verify\.[A-Za-z0-9]+$ ]]; then
   exit 76
 fi
 exec /bin/chmod "$@"
@@ -203,7 +293,37 @@ set -euo pipefail
 [[ "$#" -eq 3 &&
   "$1" == '--exclusive' &&
   "$2" == '--nonblock' &&
-  "$3" =~ ^[0-9]+$ ]]
+  "$3" =~ ^[0-9]+$ ]] ||
+  exit 64
+expected_restore_lock="${PHASE5_FAKE_EXPECTED_RESTORE_LOCK:?}"
+expected_report_lock="${PHASE5_FAKE_EXPECTED_REPORT_LOCK:?}"
+actual_lock=''
+if [[ -L "/proc/$PPID/fd/$3" ]]; then
+  actual_lock="$(readlink "/proc/$PPID/fd/$3")"
+elif [[ -x /usr/sbin/lsof ]]; then
+  actual_lock="$(
+    /usr/sbin/lsof -a -p "$PPID" -d "$3" -Fn |
+      sed -n 's/^n//p'
+  )"
+fi
+case "$actual_lock" in
+  "$expected_restore_lock")
+    release_file="${PHASE5_FAKE_FLOCK_RELEASE_FILE:-}"
+    ;;
+  "$expected_report_lock")
+    release_file="${PHASE5_FAKE_REPORT_FLOCK_RELEASE_FILE:-}"
+    ;;
+  *) exit 64 ;;
+esac
+contract_lock="${actual_lock}.contract-held"
+mkdir "$contract_lock" 2>/dev/null || exit 75
+trap 'rmdir "$contract_lock"' EXIT
+if [[ -n "$release_file" ]]; then
+  printf '%s\n' started >"${release_file}.started"
+  while [[ ! -e "$release_file" ]]; do
+    sleep 0.01
+  done
+fi
 FAKE_FLOCK
   chmod 0700 "$fixture/bin/flock"
 
@@ -218,10 +338,29 @@ printf 'docker %s\n' "$*" >>"$log"
 
 resource_file() {
   local kind="$1"
-  local name="$2"
-  [[ "$name" =~ ^happylearn-phase5-restore-[a-f0-9]{12}[-a-z0-9]*$ ]] ||
-    exit 64
-  printf '%s/%s/%s' "$state" "$kind" "$name"
+  local identifier="$2"
+  local candidate observed_id matches=0
+  if [[ "$identifier" =~ ^happylearn-phase5-restore-[a-f0-9]{12}[-a-z0-9]*$ ]]; then
+    printf '%s/%s/%s' "$state" "$kind" "$identifier"
+    return 0
+  fi
+  [[ "$identifier" =~ ^[a-f0-9]{64}$ ]] || return 1
+  for candidate in "$state/$kind"/*; do
+    [[ -f "$candidate" ]] || continue
+    IFS='|' read -r observed_id _ <"$candidate"
+    if [[ "$observed_id" == "$identifier" ]]; then
+      matches=$((matches + 1))
+      printf '%s' "$candidate"
+    fi
+  done
+  [[ "$matches" -eq 1 ]]
+}
+
+fake_identity() {
+  local name="$1"
+  local checksum
+  checksum="$(printf '%s' "$name" | cksum | awk '{print $1}')"
+  printf '%064x' "$checksum"
 }
 
 arg_after() {
@@ -263,7 +402,15 @@ inspect_resource() {
   shift
   local name="${*: -1}"
   local file
-  file="$(resource_file "$kind" "$name")"
+  if ! file="$(resource_file "$kind" "$name")"; then
+    case "$kind" in
+      containers) printf 'Error: No such container: %s\n' "$name" >&2 ;;
+      volumes) printf 'Error: No such volume: %s\n' "$name" >&2 ;;
+      networks) printf 'Error: No such network: %s\n' "$name" >&2 ;;
+      *) exit 64 ;;
+    esac
+    exit 1
+  fi
   if [[ "$mode" == inspect_unknown && "$kind" == networks &&
     ! -f "$file" ]]; then
     printf '%s\n' 'Error response from daemon: temporarily unavailable' >&2
@@ -295,7 +442,7 @@ create_resource() {
   local kind="$1"
   shift
   local name="${*: -1}"
-  local project owner type backup file
+  local project owner type backup file identity
   project="$(label_value com.docker.compose.project "$@")" || exit 64
   owner="$(label_value io.happylearn.phase5.restore-owner "$@")" || exit 64
   type="$(label_value io.happylearn.phase5.restore-kind "$@")" || exit 64
@@ -308,7 +455,10 @@ create_resource() {
     exit 64
   file="$(resource_file "$kind" "$name")"
   [[ ! -e "$file" ]] || exit 1
-  printf '%s|%s|%s|%s\n' "$project" "$owner" "$type" "$backup" >"$file"
+  identity="$name"
+  [[ "$kind" == volumes ]] || identity="$(fake_identity "$name")"
+  printf '%s|%s|%s|%s|%s\n' \
+    "$identity" "$project" "$owner" "$type" "$backup" >"$file"
   if [[ "$mode" == "ambiguous_${kind%?}_create" ]] ||
     [[ "$mode" == ambiguous_network_create && "$kind" == networks ]] ||
     [[ "$mode" == ambiguous_volume_create &&
@@ -323,33 +473,45 @@ list_resources() {
   shift
   local wanted_backup=''
   local previous=''
-  local argument file project owner type backup
+  local argument file identity project owner type backup
+  local output_format=''
   for argument in "$@"; do
     if [[ "$previous" == '--filter' &&
       "$argument" == "label=io.happylearn.phase5.restore-backup-id="* ]]; then
       wanted_backup="${argument#*=}"
       wanted_backup="${wanted_backup#*=}"
     fi
+    if [[ "$previous" == '--format' ]]; then
+      output_format="$argument"
+    fi
     previous="$argument"
   done
   [[ "$wanted_backup" == "$PHASE5_FAKE_BACKUP_ID" ]] || exit 64
   for file in "$state/$kind"/*; do
     [[ -f "$file" ]] || continue
-    IFS='|' read -r project owner type backup <"$file"
+    IFS='|' read -r identity project owner type backup <"$file"
     [[ "$backup" == "$wanted_backup" ]] || continue
-    basename "$file"
+    case "$kind:$output_format" in
+      containers:'{{.Names}}' | volumes:'{{.Name}}' | networks:'{{.Name}}')
+        basename "$file"
+        ;;
+      containers:'' | networks:'') printf '%s\n' "$identity" ;;
+      volumes:'') basename "$file" ;;
+      *) exit 64 ;;
+    esac
   done
 }
 
 remove_resource() {
   local kind="$1"
   local name="$2"
-  local file
-  file="$(resource_file "$kind" "$name")"
+  local file resource_name
+  file="$(resource_file "$kind" "$name")" || exit 1
+  resource_name="$(basename "$file")"
   [[ -f "$file" ]] || exit 1
   rm -f "$file"
   if [[ "$mode" == cleanup_failure &&
-    "$kind:$name" == containers:*-app ]]; then
+    "$kind:$resource_name" == containers:*-app ]]; then
     exit 70
   fi
 }
@@ -437,6 +599,13 @@ backup="$(label_value io.happylearn.phase5.restore-backup-id "$@")" || exit 64
   "$*" == *'--memory-swap 512m'* &&
   "$*" == *'--pids-limit 256'* ]] ||
   exit 64
+if [[ "$mode" == sigterm_delayed_create && "$kind" == restic-check ]]; then
+  : >"$PHASE5_FAKE_SIGNAL_MARKER"
+  trap '' HUP INT TERM
+  while [[ ! -e "$PHASE5_FAKE_DELAYED_CREATE_RELEASE" ]]; do
+    sleep 0.01
+  done
+fi
 if [[ "$*" == *"$PHASE5_FAKE_SECRET_MARKER"* ||
   "$*" == *'POSTGRES_PASSWORD='* ||
   "$*" == *'MINIO_ROOT_PASSWORD='* ||
@@ -447,7 +616,13 @@ if [[ "$*" == *"$PHASE5_FAKE_SECRET_MARKER"* ||
 fi
 container_file="$(resource_file containers "$name")"
 [[ ! -e "$container_file" ]] || exit 1
-printf '%s|%s|%s|%s\n' "$project" "$owner" "$kind" "$backup" >"$container_file"
+container_identity="$(fake_identity "$name")"
+printf '%s|%s|%s|%s|%s\n' \
+  "$container_identity" "$project" "$owner" "$kind" "$backup" \
+  >"$container_file"
+if [[ "$mode" == sigterm_delayed_create && "$kind" == restic-check ]]; then
+  : >"$PHASE5_FAKE_DELAYED_CREATE_FINISHED"
+fi
 if [[ "$mode" == ambiguous_container_create && "$kind" == restic-check ]]; then
   exit 70
 fi
@@ -542,9 +717,20 @@ case "$kind" in
           "$PHASE5_FAKE_SNAPSHOT_ID" \
           'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
         ;;
+      extra_snapshot_tag)
+        printf '[{"id":"%s","tags":["happylearn-batch:%s","happylearn-manifest-sha256:%s","unexpected-tag"]}]\n' \
+          "$PHASE5_FAKE_SNAPSHOT_ID" "$PHASE5_FAKE_BACKUP_ID" \
+          "$PHASE5_FAKE_MANIFEST_SHA256"
+        ;;
+      duplicate_manifest_tag)
+        printf '[{"id":"%s","tags":["happylearn-batch:%s","happylearn-manifest-sha256:%s","happylearn-manifest-sha256:%s"]}]\n' \
+          "$PHASE5_FAKE_SNAPSHOT_ID" "$PHASE5_FAKE_BACKUP_ID" \
+          "$PHASE5_FAKE_MANIFEST_SHA256" "$PHASE5_FAKE_MANIFEST_SHA256"
+        ;;
       *)
-        printf '[{"id":"%s","tags":["happylearn-batch:%s"]}]\n' \
-          "$PHASE5_FAKE_SNAPSHOT_ID" "$PHASE5_FAKE_BACKUP_ID"
+        printf '[{"id":"%s","tags":["happylearn-batch:%s","happylearn-manifest-sha256:%s"]}]\n' \
+          "$PHASE5_FAKE_SNAPSHOT_ID" "$PHASE5_FAKE_BACKUP_ID" \
+          "$PHASE5_FAKE_MANIFEST_SHA256"
         ;;
     esac
     ;;
@@ -567,6 +753,10 @@ case "$kind" in
     mkdir -p "$restore_mount/source/aistor"
     printf 'database dump fixture\n' >"$restore_mount/database.dump"
     printf 'object fixture\n' >"$restore_mount/source/aistor/object"
+    printf '%s' "$PHASE5_FAKE_MANIFEST_TEXT" >"$restore_mount/manifest.json"
+    if [[ "$mode" == manifest_hash_mismatch ]]; then
+      printf 'x' >>"$restore_mount/manifest.json"
+    fi
     ;;
   object-restore)
     [[ "$*" == *'PHASE5_RESTORE_OBJECT_DATA'* ]] || exit 64
@@ -590,6 +780,7 @@ case "$kind" in
     [[ "$*" == *"/app/happylearn-backup restore-check --backup-id ${PHASE5_FAKE_BACKUP_ID} --report-file /work/restore-check.report"* ]] ||
       exit 64
     report_mount=''
+    manifest_mount=''
     previous=''
     for argument in "$@"; do
       if [[ "$previous" == '--mount' &&
@@ -597,31 +788,113 @@ case "$kind" in
         report_mount="${argument#type=bind,src=}"
         report_mount="${report_mount%,dst=/work}"
       fi
+      if [[ "$previous" == '--mount' &&
+        "$argument" == type=bind,src=*,dst=/run/restore/manifest.json,readonly ]]; then
+        manifest_mount="${argument#type=bind,src=}"
+        manifest_mount="${manifest_mount%,dst=/run/restore/manifest.json,readonly}"
+      fi
       previous="$argument"
     done
-    [[ -n "$report_mount" ]] || exit 64
+    [[ -n "$report_mount" &&
+      "$report_mount" == */check-output &&
+      -d "$report_mount" &&
+      ! -L "$report_mount" &&
+      ! -e "$report_mount/cleanup.intent" ]] ||
+      exit 64
+    [[ -f "$manifest_mount" && ! -L "$manifest_mount" ]] || exit 64
+    if command -v sha256sum >/dev/null 2>&1; then
+      observed_manifest_sha256="$(
+        sha256sum "$manifest_mount" |
+          sed -n '1s/[[:space:]].*$//p'
+      )"
+    elif command -v shasum >/dev/null 2>&1; then
+      observed_manifest_sha256="$(
+        shasum -a 256 "$manifest_mount" |
+          sed -n '1s/[[:space:]].*$//p'
+      )"
+    else
+      exit 64
+    fi
+    if [[ "$mode" != manifest_hash_mismatch ]]; then
+      [[ "$observed_manifest_sha256" == "$PHASE5_FAKE_MANIFEST_SHA256" ]] ||
+        exit 64
+    fi
+    grep -Fxq 'HAPPYLEARN_MINIO_USE_TLS=false' "$env_file" || exit 64
     active=0
     missing=0
     unexpected=0
+    report_backup_id="$PHASE5_FAKE_BACKUP_ID"
+    report_manifest_sha256="$PHASE5_FAKE_MANIFEST_SHA256"
+    report_row_count_total=136
+    report_evidence_sha256="$PHASE5_FAKE_EVIDENCE_SHA256"
     case "$mode" in
       stale_session) active=1 ;;
       missing_object) missing=1 ;;
+      report_wrong_backup)
+        report_backup_id='22222222-2222-4222-8222-222222222222'
+        ;;
+      report_wrong_manifest)
+        report_manifest_sha256='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+        ;;
+      report_wrong_evidence)
+        report_evidence_sha256='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+        ;;
+      report_row_total_mismatch) report_row_count_total=135 ;;
     esac
-    printf '%s\n' \
-      'schema_version=1' \
-      'migration_version=42' \
-      'row_count_total=123' \
-      'checked_object_count=7' \
-      "missing_object_count=$missing" \
-      "unexpected_object_count=$unexpected" \
-      "active_session_count=$active" \
-      >"$report_mount/restore-check.report"
+    {
+      printf '%s\n' 'schema_version=1'
+      [[ "$mode" != report_duplicate_field ]] ||
+        printf '%s\n' 'schema_version=1'
+      [[ "$mode" != report_unknown_field ]] ||
+        printf '%s\n' 'unknown_count=1'
+      printf '%s\n' \
+        "backup_id=$report_backup_id" \
+        "manifest_sha256=$report_manifest_sha256" \
+        'migration_version=42' \
+        'table_users_count=1' \
+        'table_sessions_count=2' \
+        'table_subjects_count=3' \
+        'table_grades_count=4' \
+        'table_terms_count=5' \
+        'table_chapters_count=6' \
+        'table_lessons_count=7' \
+        'table_lesson_revisions_count=8' \
+        'table_files_count=9' \
+        'table_file_versions_count=10' \
+        'table_file_previews_count=11' \
+        'table_qa_threads_count=12' \
+        'table_qa_messages_count=13' \
+        'table_ai_threads_count=14' \
+        'table_ai_messages_count=15'
+      [[ "$mode" == report_missing_field ]] ||
+        printf '%s\n' 'table_ai_runs_count=16'
+      printf '%s\n' \
+        "row_count_total=$report_row_count_total" \
+        'checked_object_count=7' \
+        "missing_object_count=$missing" \
+        "unexpected_object_count=$unexpected" \
+        "active_session_count=$active" \
+        "verification_report_sha256=$PHASE5_FAKE_VERIFICATION_REPORT_SHA256" \
+        "evidence_sha256=$report_evidence_sha256"
+    } >"$report_mount/restore-check.report"
     ;;
   student-one|student-two)
     index=1
     [[ "$kind" == student-two ]] && index=2
     [[ "$*" == *"/app/happylearn-backup restore-check --backup-id ${PHASE5_FAKE_BACKUP_ID} --student-isolation-probe ${index} --expected-status 404"* ]] ||
       exit 64
+    if [[ "$mode" == ledger_missing && "$index" == 2 ]]; then
+      : >"$PHASE5_FAKE_LEDGER_PAUSE_MARKER"
+      while [[ ! -e "$PHASE5_FAKE_LEDGER_PAUSE_RELEASE" ]]; do
+        sleep 0.01
+      done
+    fi
+    if [[ "$mode" == report_race && "$index" == 2 ]]; then
+      : >"$PHASE5_FAKE_REPORT_PAUSE_MARKER"
+      while [[ ! -e "$PHASE5_FAKE_REPORT_PAUSE_RELEASE" ]]; do
+        sleep 0.01
+      done
+    fi
     if [[ "$mode" == student_probe_failure && "$index" == 2 ]]; then
       exit 75
     fi
@@ -650,10 +923,24 @@ run_fixture() {
     "PHASE5_FAKE_DATABASE_SECRET_MARKER=$DATABASE_SECRET_MARKER"
     "PHASE5_FAKE_OBJECT_SECRET_MARKER=$OBJECT_SECRET_MARKER"
     "PHASE5_FAKE_SIGNING_SECRET_MARKER=$SIGNING_SECRET_MARKER"
+    "PHASE5_FAKE_MANIFEST_TEXT=$MANIFEST_TEXT"
+    "PHASE5_FAKE_MANIFEST_SHA256=$MANIFEST_SHA256"
+    "PHASE5_FAKE_VERIFICATION_REPORT_SHA256=$VERIFICATION_REPORT_SHA256"
+    "PHASE5_FAKE_EVIDENCE_SHA256=$EVIDENCE_SHA256"
     "PHASE5_FAKE_HOST_UID=$(id -u)"
     "PHASE5_FAKE_HOST_GID=$(id -g)"
+    "PHASE5_FAKE_EXPECTED_RESTORE_LOCK=$(cd "$fixture/repository" && pwd -P)/.phase5-restore-${BACKUP_ID}.lock"
+    "PHASE5_FAKE_EXPECTED_REPORT_LOCK=$(cd "${HAPPYLEARN_RESTORE_REPORT_DIRECTORY:-$fixture/reports}" && pwd -P)/.restore-${BACKUP_ID}.lock"
+    "PHASE5_FAKE_FLOCK_RELEASE_FILE=${PHASE5_FAKE_FLOCK_RELEASE_FILE:-}"
+    "PHASE5_FAKE_REPORT_FLOCK_RELEASE_FILE=${PHASE5_FAKE_REPORT_FLOCK_RELEASE_FILE:-}"
     "PHASE5_FAKE_WORKSPACE_MARKER=$fixture/workspace.path"
     "PHASE5_FAKE_SIGNAL_MARKER=$fixture/signal.started"
+    "PHASE5_FAKE_DELAYED_CREATE_RELEASE=$fixture/delayed-create.release"
+    "PHASE5_FAKE_DELAYED_CREATE_FINISHED=$fixture/delayed-create.finished"
+    "PHASE5_FAKE_LEDGER_PAUSE_MARKER=$fixture/ledger-pause.started"
+    "PHASE5_FAKE_LEDGER_PAUSE_RELEASE=$fixture/ledger-pause.release"
+    "PHASE5_FAKE_REPORT_PAUSE_MARKER=$fixture/report-pause.started"
+    "PHASE5_FAKE_REPORT_PAUSE_RELEASE=$fixture/report-pause.release"
     "HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY=$fixture/repository"
     "HAPPYLEARN_BACKUP_SECRET_DIRECTORY=$fixture/secrets"
     "HAPPYLEARN_AISTOR_LICENSE_FILE=$fixture/minio.license"
@@ -683,6 +970,19 @@ start_fixture_background() {
 
 test -x "$TARGET" || fail 'restore harness is absent'
 bash -n "$TARGET"
+if grep -Eq \
+  '^[[:space:]]*trap[[:space:]]+cleanup_contract[[:space:]]+EXIT[[:space:]]+HUP' \
+  "$0"; then
+  fail 'contract signal traps reuse the ordinary EXIT cleanup handler'
+fi
+grep -Fq 'handle_contract_signal 129' "$0" ||
+  fail 'contract HUP trap does not preserve 128+signal status'
+grep -Fq 'handle_contract_signal 130' "$0" ||
+  fail 'contract INT trap does not preserve 128+signal status'
+grep -Fq 'handle_contract_signal 143' "$0" ||
+  fail 'contract TERM trap does not preserve 128+signal status'
+grep -Fq 'active_fixture_is_direct_job' "$0" ||
+  fail 'contract cleanup does not verify the active direct job'
 grep -Fq 'stat --version' "$TARGET" ||
   fail 'restore harness does not prefer GNU stat explicitly'
 grep -Fq -- '--cpus "$CONTAINER_CPUS"' "$TARGET" ||
@@ -693,11 +993,63 @@ grep -Fq -- '--pids-limit "$CONTAINER_PIDS_LIMIT"' "$TARGET" ||
   fail 'restore containers do not cap process count'
 grep -Fq -- '--tmpfs /var/run/postgresql:rw,noexec,nosuid,size=8m' "$TARGET" ||
   fail 'PostgreSQL socket directory is not tmpfs-backed'
+grep -Fq \
+  'RESTORE_LOCK_FILE="$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY/.phase5-restore-${BACKUP_ID}.lock"' \
+  "$TARGET" ||
+  fail 'restore lock is not shared through the backup repository'
+grep -Fq \
+  'type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository"' \
+  "$TARGET" ||
+  fail 'restic repository is not mounted read-write for internal locks'
+if grep -Fq \
+  'type=bind,src=$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY,dst=/repository,readonly' \
+  "$TARGET"; then
+  fail 'restic repository is read-only while internal locks remain enabled'
+fi
 if grep -Eq 'restic[[:space:]]+[^[:cntrl:]]*--no-lock' "$TARGET"; then
   fail 'read-only repository bypassed restic locks without proven exclusion'
 fi
 grep -Fq 'cleanup.intent' "$TARGET" ||
   fail 'restore harness has no cleanup intent ledger'
+grep -Fq 'CHECK_OUTPUT_DIRECTORY="$WORK_DIRECTORY/check-output"' "$TARGET" ||
+  fail 'restore-check output has no independent private directory'
+grep -Fq \
+  'type=bind,src=$CHECK_OUTPUT_DIRECTORY,dst=/work' "$TARGET" ||
+  fail 'restore-check output directory is not mounted independently'
+if grep -Fq 'type=bind,src=$CONTROL_DIRECTORY,dst=/work' "$TARGET"; then
+  fail 'restore-check can mutate its cleanup control directory'
+fi
+grep -Fq -- '--report-file /work/restore-check.report' "$TARGET" ||
+  fail 'restore-check report does not target its independent output directory'
+grep -Fq \
+  'type=bind,src=$RESTORED_MANIFEST,dst=/run/restore/manifest.json,readonly' \
+  "$TARGET" ||
+  fail 'restore-check does not receive the verified manifest read-only'
+grep -Fq "'HAPPYLEARN_MINIO_USE_TLS=false'" "$TARGET" ||
+  fail 'restore-check does not explicitly disable TLS for minio:9000'
+grep -Fq 'verify_bound_evidence_sha256' "$TARGET" ||
+  fail 'restore report evidence is not independently recomputed'
+grep -Fq \
+  'REPORT_LOCK_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.lock"' \
+  "$TARGET" ||
+  fail 'restore report publication has no shared directory lock'
+grep -Fq 'ln "$REPORT_TEMPORARY" "$REPORT_FILE"' "$TARGET" ||
+  fail 'restore report publication is not atomic and no-clobber'
+if grep -Fq 'mv "$REPORT_TEMPORARY" "$REPORT_FILE"' "$TARGET"; then
+  fail 'restore report publication can overwrite a raced final artifact'
+fi
+grep -Fq "docker container ls --all --format '{{.Names}}'" "$TARGET" ||
+  fail 'container orphan listing does not request canonical names'
+grep -Fq "docker volume ls --format '{{.Name}}'" "$TARGET" ||
+  fail 'volume orphan listing does not request canonical names'
+grep -Fq "docker network ls --format '{{.Name}}'" "$TARGET" ||
+  fail 'network orphan listing does not request canonical names'
+grep -Fq '{{.Id}}|{{index .Config.Labels' "$TARGET" ||
+  fail 'container inspection omits immutable identity'
+grep -Fq '{{.Id}}|{{index .Labels' "$TARGET" ||
+  fail 'network inspection omits immutable identity'
+grep -Fq '{{.Name}}|{{index .Labels' "$TARGET" ||
+  fail 'volume inspection omits canonical identity'
 grep -Fq 'label=$BACKUP_LABEL=$BACKUP_ID' "$TARGET" ||
   fail 'restore orphan reaper lacks the exact backup label'
 grep -Fq 'owned_resources_absent' "$TARGET" ||
@@ -765,6 +1117,58 @@ fi
 test ! -s "$same_directory_fixture/docker.log" ||
   fail 'shared control/report directory accessed Docker'
 
+shared_lock_fixture="$(make_fixture)"
+mkdir "$shared_lock_fixture/control-one" "$shared_lock_fixture/control-two"
+chmod 0700 \
+  "$shared_lock_fixture/control-one" "$shared_lock_fixture/control-two"
+shared_lock_release="$shared_lock_fixture/shared-lock.release"
+HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$shared_lock_fixture/control-one" \
+  PHASE5_FAKE_FLOCK_RELEASE_FILE="$shared_lock_release" \
+  start_fixture_background "$shared_lock_fixture" success
+shared_lock_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$shared_lock_pid"
+wait_for_file "${shared_lock_release}.started" ||
+  fail 'shared repository lock holder did not start'
+if HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$shared_lock_fixture/control-two" \
+  run_fixture "$shared_lock_fixture"; then
+  fail 'different control directories bypassed the shared repository lock'
+fi
+test ! -s "$shared_lock_fixture/docker.log" ||
+  fail 'shared repository lock rejection accessed Docker'
+touch "$shared_lock_release"
+if ! wait_for_direct_child "$shared_lock_pid"; then
+  fail 'shared repository lock holder failed after release'
+fi
+ACTIVE_FIXTURE_PID=''
+assert_no_resources "$shared_lock_fixture"
+
+report_lock_fixture_one="$(make_fixture)"
+report_lock_fixture_two="$(make_fixture)"
+shared_report_directory="$CONTRACT_TEMP_ROOT/shared-reports"
+mkdir "$shared_report_directory"
+chmod 0700 "$shared_report_directory"
+report_lock_release="$CONTRACT_TEMP_ROOT/report-lock.release"
+HAPPYLEARN_RESTORE_REPORT_DIRECTORY="$shared_report_directory" \
+  PHASE5_FAKE_REPORT_FLOCK_RELEASE_FILE="$report_lock_release" \
+  start_fixture_background "$report_lock_fixture_one" success
+report_lock_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$report_lock_pid"
+wait_for_file "${report_lock_release}.started" ||
+  fail 'shared report lock holder did not start'
+if HAPPYLEARN_RESTORE_REPORT_DIRECTORY="$shared_report_directory" \
+  run_fixture "$report_lock_fixture_two"; then
+  fail 'different repositories bypassed the shared report lock'
+fi
+test ! -s "$report_lock_fixture_two/docker.log" ||
+  fail 'shared report lock rejection accessed Docker'
+touch "$report_lock_release"
+wait_for_direct_child "$report_lock_pid" ||
+  fail 'shared report lock holder failed after release'
+ACTIVE_FIXTURE_PID=''
+assert_no_resources "$report_lock_fixture_one"
+test -f "$shared_report_directory/restore-$BACKUP_ID.json" ||
+  fail 'shared report lock holder did not publish after release'
+
 success_fixture="$(make_fixture)"
 if ! run_fixture "$success_fixture"; then
   sed -n '1,240p' "$success_fixture/docker.log" >&2
@@ -772,6 +1176,54 @@ if ! run_fixture "$success_fixture"; then
   fail 'strict success restore fixture failed'
 fi
 assert_no_resources "$success_fixture"
+
+preexisting_report_fixture="$(make_fixture)"
+preexisting_report="$preexisting_report_fixture/reports/restore-$BACKUP_ID.json"
+printf '%s\n' sentinel >"$preexisting_report"
+chmod 0600 "$preexisting_report"
+if run_fixture "$preexisting_report_fixture"; then
+  fail 'preexisting final report was accepted'
+fi
+grep -Fxq sentinel "$preexisting_report" ||
+  fail 'preexisting final report was replaced'
+test ! -s "$preexisting_report_fixture/docker.log" ||
+  fail 'preexisting final report rejection accessed Docker'
+
+report_race_fixture="$(make_fixture)"
+start_fixture_background "$report_race_fixture" report_race
+report_race_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$report_race_pid"
+wait_for_file "$report_race_fixture/report-pause.started" ||
+  fail 'report race fixture did not reach its final external probe'
+report_race_final="$report_race_fixture/reports/restore-$BACKUP_ID.json"
+printf '%s\n' sentinel >"$report_race_final"
+chmod 0600 "$report_race_final"
+touch "$report_race_fixture/report-pause.release"
+if wait_for_direct_child "$report_race_pid"; then
+  fail 'raced final report was accepted'
+fi
+ACTIVE_FIXTURE_PID=''
+assert_no_resources "$report_race_fixture"
+grep -Fxq sentinel "$report_race_final" ||
+  fail 'raced final report was replaced'
+test ! -e "$report_race_fixture/reports/.restore-${BACKUP_ID}.new" ||
+  fail 'raced final report left a temporary artifact'
+
+manifest_mismatch_fixture="$(make_fixture)"
+if run_fixture "$manifest_mismatch_fixture" manifest_hash_mismatch; then
+  fail 'restored manifest bytes were not bound to the snapshot tag'
+fi
+assert_no_resources "$manifest_mismatch_fixture"
+test ! -e "$manifest_mismatch_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'manifest hash mismatch published a success report'
+
+for mode in extra_snapshot_tag duplicate_manifest_tag; do
+  manifest_tag_fixture="$(make_fixture)"
+  if run_fixture "$manifest_tag_fixture" "$mode"; then
+    fail "$mode snapshot tag set was accepted"
+  fi
+  assert_no_resources "$manifest_tag_fixture"
+done
 
 gnu_stat_fixture="$(make_fixture)"
 if ! run_fixture "$gnu_stat_fixture" gnu_stat; then
@@ -789,14 +1241,13 @@ project="$(
   fail 'restore project name was not unique and canonical'
 success_repository="$(cd "$success_fixture/repository" && pwd -P)"
 grep -Fq -- \
-  "--mount type=bind,src=$success_repository,dst=/repository,readonly" \
-  "$success_fixture/docker.log" ||
-  fail 'source repository was not mounted read-only'
-if grep -F -- \
   "--mount type=bind,src=$success_repository,dst=/repository" \
-  "$success_fixture/docker.log" |
-  grep -Fq 'rw'; then
-  fail 'source repository received a writable mount'
+  "$success_fixture/docker.log" ||
+  fail 'source repository was not mounted read-write for restic locks'
+if grep -Fq -- \
+  "--mount type=bind,src=$success_repository,dst=/repository,readonly" \
+  "$success_fixture/docker.log"; then
+  fail 'source repository remained read-only with restic locks enabled'
 fi
 grep -Fq "restic --no-cache snapshots --json --tag happylearn-batch:$BACKUP_ID" \
   "$success_fixture/docker.log" ||
@@ -846,8 +1297,16 @@ duration="$(sed -n 's/.*"durationSeconds":\([0-9][0-9]*\).*/\1/p' "$report")"
   fail 'restore report violated the four-hour RTO'
 grep -Eq '"checkedObjectCount":7' "$report" ||
   fail 'restore report omitted checked object count'
-grep -Eq '"rowCountTotal":123' "$report" ||
+grep -Eq '"rowCountTotal":136' "$report" ||
   fail 'restore report omitted safe row counts'
+grep -Fq "\"manifestSHA256\":\"$MANIFEST_SHA256\"" "$report" ||
+  fail 'restore report omitted its bound manifest hash'
+grep -Fq \
+  "\"verificationReportSHA256\":\"$VERIFICATION_REPORT_SHA256\"" \
+  "$report" ||
+  fail 'restore report omitted its verification report hash'
+grep -Fq "\"evidenceSHA256\":\"$EVIDENCE_SHA256\"" "$report" ||
+  fail 'restore report omitted its independently checked evidence hash'
 grep -Eq '"reportSHA256":"[a-f0-9]{64}"' "$report" ||
   fail 'restore report omitted its safe hash'
 if grep -Fq "$SECRET_MARKER" "$report" ||
@@ -910,14 +1369,37 @@ test ! -e "$cleanup_unknown_fixture/reports/restore-$BACKUP_ID.json" ||
 find "$cleanup_unknown_fixture/state/containers" -mindepth 1 -maxdepth 1 \
   -print -quit | grep -q . ||
   fail 'unknown inspect fixture did not preserve its ambiguous orphan'
+cleanup_unknown_orphan="$(
+  find "$cleanup_unknown_fixture/state/containers" \
+    -mindepth 1 -maxdepth 1 -type f -print -quit
+)"
+cleanup_unknown_orphan_name="$(basename "$cleanup_unknown_orphan")"
+IFS='|' read -r cleanup_unknown_orphan_id _ <"$cleanup_unknown_orphan"
+[[ "$cleanup_unknown_orphan_id" =~ ^[a-f0-9]{64}$ ]] ||
+  fail 'unknown inspect fixture recorded an invalid immutable ID'
 : >"$cleanup_unknown_fixture/docker.log"
 if ! run_fixture "$cleanup_unknown_fixture"; then
   fail 'next run did not reap the exact-label orphan'
 fi
 assert_no_resources "$cleanup_unknown_fixture"
 assert_before "$cleanup_unknown_fixture" \
-  'docker container ls --all --quiet --filter label=io.happylearn.phase5.restore-backup-id=' \
+  'docker container ls --all --format {{.Names}} --filter label=io.happylearn.phase5.restore-backup-id=' \
   'docker network create'
+grep -Fq "docker rm --force $cleanup_unknown_orphan_id" \
+  "$cleanup_unknown_fixture/docker.log" ||
+  fail 'exact-label orphan was not removed by immutable container ID'
+if grep -Fq "docker rm --force $cleanup_unknown_orphan_name" \
+  "$cleanup_unknown_fixture/docker.log"; then
+  fail 'exact-label orphan was removed through its reusable container name'
+fi
+orphan_id_inspections="$(
+  grep -F 'docker container inspect --format' \
+    "$cleanup_unknown_fixture/docker.log" |
+    grep -Fc " $cleanup_unknown_orphan_id" ||
+    true
+)"
+[[ "$orphan_id_inspections" -ge 2 ]] ||
+  fail 'orphan immutable ID was not verified before and after removal'
 
 sigterm_fixture="$(make_fixture)"
 start_fixture_background "$sigterm_fixture" sigterm
@@ -941,6 +1423,58 @@ assert_no_resources "$sigterm_fixture"
 test ! -e "$sigterm_fixture/reports/restore-$BACKUP_ID.json" ||
   fail 'SIGTERM restore published a success report'
 
+sigterm_delayed_fixture="$(make_fixture)"
+start_fixture_background "$sigterm_delayed_fixture" sigterm_delayed_create
+sigterm_delayed_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$sigterm_delayed_pid"
+if ! wait_for_file "$sigterm_delayed_fixture/signal.started"; then
+  kill -KILL "$sigterm_delayed_pid" 2>/dev/null || true
+  fail 'delayed create fixture did not reach its external Docker action'
+fi
+kill -TERM "$sigterm_delayed_pid"
+sigterm_delayed_status=0
+if wait_for_direct_child "$sigterm_delayed_pid"; then
+  fail 'delayed create restore unexpectedly succeeded after SIGTERM'
+else
+  sigterm_delayed_status=$?
+fi
+ACTIVE_FIXTURE_PID=''
+[[ "$sigterm_delayed_status" -eq 143 ]] ||
+  fail "delayed create restore exited with $sigterm_delayed_status instead of 143"
+touch "$sigterm_delayed_fixture/delayed-create.release"
+delayed_create_attempts=0
+while [[ ! -e "$sigterm_delayed_fixture/delayed-create.finished" &&
+  "$delayed_create_attempts" -lt 100 ]]; do
+  sleep 0.01
+  delayed_create_attempts=$((delayed_create_attempts + 1))
+done
+assert_no_resources "$sigterm_delayed_fixture"
+test ! -e "$sigterm_delayed_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'delayed create SIGTERM published a success report'
+
+ledger_missing_fixture="$(make_fixture)"
+start_fixture_background "$ledger_missing_fixture" ledger_missing
+ledger_missing_pid="$FIXTURE_BACKGROUND_PID"
+ACTIVE_FIXTURE_PID="$ledger_missing_pid"
+wait_for_file "$ledger_missing_fixture/ledger-pause.started" ||
+  fail 'ledger invalidation fixture did not reach the final external probe'
+wait_for_file "$ledger_missing_fixture/workspace.path" ||
+  fail 'ledger invalidation fixture did not expose its private workspace'
+ledger_missing_workspace="$(<"$ledger_missing_fixture/workspace.path")"
+[[ "$ledger_missing_workspace" == "${TMPDIR:-/tmp}/phase5-restore-verify."* &&
+  -d "$ledger_missing_workspace" &&
+  ! -L "$ledger_missing_workspace" ]] ||
+  fail 'ledger invalidation fixture exposed an unsafe workspace'
+rm -f "$ledger_missing_workspace/control/cleanup.intent"
+touch "$ledger_missing_fixture/ledger-pause.release"
+if wait_for_direct_child "$ledger_missing_pid"; then
+  fail 'missing cleanup ledger was accepted'
+fi
+ACTIVE_FIXTURE_PID=''
+assert_no_resources "$ledger_missing_fixture"
+test ! -e "$ledger_missing_fixture/reports/restore-$BACKUP_ID.json" ||
+  fail 'missing cleanup ledger published a success report'
+
 for mode in wrong_secret tampered_pack check_failure; do
   fixture="$(make_fixture)"
   if run_fixture "$fixture" "$mode"; then
@@ -950,7 +1484,10 @@ for mode in wrong_secret tampered_pack check_failure; do
 done
 
 for mode in missing_snapshot duplicate_snapshot missing_object stale_session \
-  nonempty_postgres nonempty_aistor student_probe_failure
+  nonempty_postgres nonempty_aistor student_probe_failure \
+  report_unknown_field report_duplicate_field report_missing_field \
+  report_wrong_backup report_wrong_manifest report_wrong_evidence \
+  report_row_total_mismatch
 do
   fixture="$(make_fixture)"
   if run_fixture "$fixture" "$mode"; then
@@ -981,9 +1518,10 @@ cleanup_project="$(
     head -n1
 )"
 for resource in app redis aistor postgres; do
-  grep -Fq "docker rm --force $cleanup_project-$resource" \
+  cleanup_container_id="$(fake_resource_identity "$cleanup_project-$resource")"
+  grep -Fq "docker rm --force $cleanup_container_id" \
     "$cleanup_fixture/docker.log" ||
-    fail "cleanup did not attempt exact container removal"
+    fail "cleanup did not remove $resource through its immutable ID"
 done
 grep -Fq "docker volume rm $cleanup_project-postgres" \
   "$cleanup_fixture/docker.log" ||
@@ -991,9 +1529,10 @@ grep -Fq "docker volume rm $cleanup_project-postgres" \
 grep -Fq "docker volume rm $cleanup_project-aistor" \
   "$cleanup_fixture/docker.log" ||
   fail 'cleanup did not attempt volume removal'
-grep -Fq "docker network rm $cleanup_project-network" \
+cleanup_network_id="$(fake_resource_identity "$cleanup_project-network")"
+grep -Fq "docker network rm $cleanup_network_id" \
   "$cleanup_fixture/docker.log" ||
-  fail 'cleanup did not attempt network removal'
+  fail 'cleanup did not remove the network through its immutable ID'
 assert_no_resources "$cleanup_fixture"
 test ! -e "$cleanup_fixture/reports/restore-$BACKUP_ID.json" ||
   fail 'cleanup failure published a successful restore artifact'
