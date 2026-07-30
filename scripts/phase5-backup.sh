@@ -1506,7 +1506,8 @@ restart_aistor_service() {
 restart_stopped_services() {
   restart_aistor_service || return 1
   if [[ "$WORKER_STOPPED" == true ]]; then
-    if ! run_guarded_external 60 compose start worker; then
+    if ! run_guarded_external 60 \
+      compose up --detach --no-deps worker; then
       RECOVERY_UNSAFE=true
       return 1
     fi

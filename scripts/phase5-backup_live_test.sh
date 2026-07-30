@@ -350,7 +350,7 @@ create_fixture() {
   login_throttle_secret="${SECRET_MARKER_PREFIX}-login-throttle-padding"
   metrics_bearer_secret="${SECRET_MARKER_PREFIX}-metrics-bearer"
   host_metrics_hmac_secret="${SECRET_MARKER_PREFIX}-host-metrics-hmac"
-  webhook_url="https://${SECRET_MARKER_PREFIX}.invalid/webhook"
+  webhook_url="http://localhost:8080/webhook/${SECRET_MARKER_PREFIX}"
   webhook_authorization="${SECRET_MARKER_PREFIX}-webhook-authorization"
   local_repository_password="$(
     uuidgen |
@@ -558,22 +558,17 @@ start_base_stack() {
   record_image "$COMPOSE_APP_IMAGE"
   compose build worker
   record_image "$COMPOSE_WORKER_IMAGE"
-  if ! compose up --no-build --no-deps \
-    --abort-on-container-exit \
-    --exit-code-from phase5-secrets-init \
-    phase5-secrets-init; then
-    record_compose_resources
-    return 1
-  fi
-  record_compose_resources
-  verify_phase5_secret_init
   if ! compose create postgres redis minio app worker; then
     record_compose_resources
     return 1
   fi
   record_compose_resources
-  compose up --detach --no-build postgres redis minio app worker
+  if ! compose up --detach --no-build postgres redis minio app worker; then
+    record_compose_resources
+    return 1
+  fi
   record_compose_resources
+  verify_phase5_secret_init
   probe_phase5_secret_consumers
   wait_base_stack
 }
@@ -753,6 +748,7 @@ audit_container_id() {
   local container_id="$1"
   local metadata host_config env_entries entry key value secret_value
   local mounts mount_type mount_name mount_source mount_destination mount_rw
+  local normalized_mount_source
   local host_mounts host_mount_type host_mount_source host_mount_target
   local host_mount_read_only host_mount_subpath actual_mount_rw
   local runtime_actual_mount_count runtime_host_mount_count
@@ -833,6 +829,22 @@ audit_container_id() {
           [[ "$value" == /run/phase5-secrets/webhook-authorization ]] ||
             fail 'webhook authorization secret file path was not fixed'
           ;;
+        MINIO_ROOT_USER_FILE)
+          [[ "$value" == access_key ]] ||
+            fail 'AIStor root user file default changed'
+          ;;
+        MINIO_ROOT_PASSWORD_FILE)
+          [[ "$value" == secret_key ]] ||
+            fail 'AIStor root password file default changed'
+          ;;
+        MINIO_KMS_SECRET_KEY_FILE)
+          [[ "$value" == kms_master_key ]] ||
+            fail 'AIStor KMS secret key file default changed'
+          ;;
+        MINIO_CONFIG_ENV_FILE)
+          [[ "$value" == config.env ]] ||
+            fail 'AIStor config environment file default changed'
+          ;;
         *_FILE)
           fail "unapproved Config.Env file key was present: $key"
           ;;
@@ -893,16 +905,24 @@ audit_container_id() {
         fi
       fi
       if [[ "$mount_type" == bind ]]; then
-        case "$mount_source:$mount_destination:$mount_rw" in
+        normalized_mount_source="$mount_source"
+        if [[ "$normalized_mount_source" == /host_mnt/* ]]; then
+          normalized_mount_source="${mount_source#/host_mnt}"
+        fi
+        case "$normalized_mount_source:$mount_destination:$mount_rw" in
           "$FIXTURE_ROOT/runtime-secrets:/secret-source:false" | \
             "$FIXTURE_ROOT/secrets:/source:false" | \
             "$FIXTURE_ROOT/repository:/repository:true" | \
             "$FIXTURE_ROOT/state:/state:true" | \
             "$FIXTURE_ROOT/server-certs:/certs:false" | \
             "$HAPPYLEARN_AISTOR_LICENSE_FILE:/minio.license:false" | \
+            "$ROOT/deploy/fixtures/development-metrics-bearer-do-not-use-in-production:/source/metrics-bearer:false" | \
+            "$ROOT/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production:/source/host-metrics-hmac:false" | \
             "$ROOT/deploy/fixtures/development-metrics-bearer-do-not-use-in-production:/run/secrets/metrics-bearer:false" | \
             "$ROOT/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production:/run/secrets/host-metrics-hmac:false") ;;
-          *) fail 'unexpected host bind entered a Phase 5 container' ;;
+          *)
+            fail "unexpected host bind entered a Phase 5 container: service=${service:-external} destination=$mount_destination"
+            ;;
         esac
       fi
     done <<<"$mounts"

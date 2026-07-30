@@ -164,7 +164,7 @@ require_literal "$TARGET" 'stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" minio'
 require_literal "$TARGET" 'snapshot --run-id "$RUN_ID"'
 require_literal "$TARGET" 'up --detach --no-deps minio'
 require_literal "$TARGET" 'wait_for_authenticated_aistor'
-require_literal "$TARGET" 'start worker'
+require_literal "$TARGET" 'up --detach --no-deps worker'
 require_literal "$TARGET" 'verify --run-id "$RUN_ID"'
 require_literal "$TARGET" 'sync --run-id "$RUN_ID"'
 require_literal "$TARGET" 'finish --run-id "$RUN_ID"'
@@ -320,8 +320,36 @@ require_literal "$LIVE_FIXTURE" 'METADATA_SECRET_VALUES_FILE'
 require_literal "$LIVE_FIXTURE" 'append_generated_secret_file_values'
 require_literal "$LIVE_FIXTURE" \
   'HAPPYLEARN_PHASE5_E2E_OWNER="$FIXTURE_SUFFIX"'
-require_literal "$LIVE_FIXTURE" \
+forbid_pattern "$LIVE_FIXTURE" \
   '--exit-code-from phase5-secrets-init'
+require_literal "$LIVE_FIXTURE" \
+  'webhook_url="http://localhost:8080/webhook/${SECRET_MARKER_PREFIX}"'
+forbid_pattern "$LIVE_FIXTURE" \
+  'webhook_url=.*\.invalid'
+require_literal "$LIVE_FIXTURE" \
+  'MINIO_ROOT_USER_FILE)'
+require_literal "$LIVE_FIXTURE" \
+  '[[ "$value" == access_key ]]'
+require_literal "$LIVE_FIXTURE" \
+  'MINIO_ROOT_PASSWORD_FILE)'
+require_literal "$LIVE_FIXTURE" \
+  '[[ "$value" == secret_key ]]'
+require_literal "$LIVE_FIXTURE" \
+  'MINIO_KMS_SECRET_KEY_FILE)'
+require_literal "$LIVE_FIXTURE" \
+  '[[ "$value" == kms_master_key ]]'
+require_literal "$LIVE_FIXTURE" \
+  'MINIO_CONFIG_ENV_FILE)'
+require_literal "$LIVE_FIXTURE" \
+  '[[ "$value" == config.env ]]'
+require_literal "$LIVE_FIXTURE" \
+  'normalized_mount_source="$mount_source"'
+require_literal "$LIVE_FIXTURE" \
+  'normalized_mount_source="${mount_source#/host_mnt}"'
+require_literal "$LIVE_FIXTURE" \
+  '"$ROOT/deploy/fixtures/development-metrics-bearer-do-not-use-in-production:/source/metrics-bearer:false"'
+require_literal "$LIVE_FIXTURE" \
+  '"$ROOT/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production:/source/host-metrics-hmac:false"'
 require_literal "$LIVE_FIXTURE" \
   '{{json .Config.Env}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}'
 require_literal "$LIVE_FIXTURE" \
@@ -1594,14 +1622,14 @@ assert_before "$success_log" 'run --rm --no-deps --entrypoint /usr/bin/timeout b
 assert_before "$success_log" 'up --detach --no-deps minio' \
   'exec -T app curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health/ready'
 assert_before "$success_log" 'exec -T app curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health/ready' \
-  'start worker'
+  'up --detach --no-deps worker'
 assert_before "$success_log" 'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup verify --run-id 11111111-1111-4111-8111-111111111111' \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111'
 assert_before "$success_log" 'entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s restic --no-cache --repository-file /run/secrets/local_repository --password-file /run/secrets/local_password check --read-data' \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111'
 assert_before "$success_log" \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111' \
-  'start worker'
+  'up --detach --no-deps worker'
 assert_before "$success_log" 'PHASE5_HOLD_LOCK' 'PHASE5_RELEASE_LOCK'
 grep -Fq 'SQL PHASE5_QUERY_LEASE_RENEW' "$success_log" ||
   fail "operational lease was not renewed across external stages"
@@ -1730,7 +1758,7 @@ do
   grep -Fq 'PHASE5_RELEASE_LOCK' "$failure_log" ||
     fail "failure trap did not release the operational lease: $stage"
   if grep -Fq ' stop --timeout ' "$failure_log"; then
-    grep -Eq '(up --detach --no-deps minio|start worker)' "$failure_log" ||
+    grep -Eq 'up --detach --no-deps (minio|worker)' "$failure_log" ||
       fail "failure trap did not restart a stopped service: $stage"
   fi
   grep -Fq "/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category $expected_category" \
