@@ -3,6 +3,7 @@ package files
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -47,6 +48,22 @@ func (s *aiSecurityAuditStub) Write(_ context.Context, event audit.Event) error 
 	return s.err
 }
 
+type aiAccessHTTPStub struct {
+	opened OpenedFile
+}
+
+func (s aiAccessHTTPStub) Status(context.Context, Principal, uuid.UUID) (AIFileStatus, error) {
+	return AIFileStatus{}, nil
+}
+
+func (s aiAccessHTTPStub) Open(context.Context, Principal, AIOpenInput) (OpenedFile, error) {
+	return s.opened, nil
+}
+
+func (s aiAccessHTTPStub) Reject(context.Context, Principal, uuid.UUID, string) error {
+	return nil
+}
+
 func TestAIAccessPreviewIsControlledAndAudited(t *testing.T) {
 	version := uuid.MustParse("30000000-0000-4000-8000-000000000001")
 	message := uuid.MustParse("30000000-0000-4000-8000-000000000002")
@@ -70,6 +87,35 @@ func TestAIAccessPreviewIsControlledAndAudited(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "private/object") {
 		t.Fatal("object key leaked")
+	}
+}
+
+func TestAIAccessHTTPReportsTransferAuditFailureThroughLogCallback(t *testing.T) {
+	version := uuid.New()
+	service := aiAccessHTTPStub{opened: OpenedFile{
+		Body: io.NopCloser(&failingGateReader{}),
+		ReportFailure: func(context.Context, string) error {
+			return errors.New("ai audit backend secret")
+		},
+	}}
+	var categories []string
+	handler := NewAIAccessHandlerWithLog(
+		service,
+		nil,
+		func(category string) {
+			categories = append(categories, category)
+		},
+	).Routes()
+	r := httptest.NewRequest(http.MethodGet, "/"+version.String()+"/preview", nil)
+	r = r.WithContext(auth.ContextWithUser(
+		r.Context(),
+		auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive},
+	))
+
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+
+	if len(categories) != 1 || categories[0] != "write_failed" {
+		t.Fatalf("categories = %v, want [write_failed]", categories)
 	}
 }
 

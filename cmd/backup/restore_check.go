@@ -19,6 +19,7 @@ import (
 	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 const (
@@ -73,12 +74,25 @@ type programFactories struct {
 }
 
 func productionProgramFactories() programFactories {
+	return productionProgramFactoriesWithLog(safelog.Logger{})
+}
+
+func productionProgramFactoriesWithLog(logger safelog.Logger) programFactories {
 	return programFactories{
 		newActions: func(
 			ctx context.Context,
 			getenv func(string) string,
 		) (commandActions, func(), error) {
-			return newProductionActions(ctx, getenv)
+			application, closeApplication, err := newProductionActions(ctx, getenv)
+			if application != nil {
+				application.logCategory = func(category string) {
+					logger.Error("backup.remote_sync", safelog.Field{
+						Name:  "category",
+						Value: category,
+					})
+				}
+			}
+			return application, closeApplication, err
 		},
 		runRestoreCheck:     runProductionRestoreCheck,
 		runRestoreHTTPProbe: runProductionRestoreHTTPProbe,

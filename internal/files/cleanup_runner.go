@@ -2,7 +2,6 @@ package files
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
@@ -79,17 +78,23 @@ func (r *cleanupRunner) runOnce(ctx context.Context) {
 func (r *cleanupRunner) logCategory(category string) {
 	if r.log != nil {
 		r.log(category)
-		return
 	}
-	log.Printf("upload_cleanup category=%s", category)
 }
 
 func StartCleanupRunner(cleaner ExpiredUploadCleaner, gate operations.WriteGate) func() {
+	return StartCleanupRunnerWithLog(cleaner, gate, nil)
+}
+
+func StartCleanupRunnerWithLog(
+	cleaner ExpiredUploadCleaner,
+	gate operations.WriteGate,
+	logCategory func(string),
+) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		newCleanupRunner(
-			cleaner, gate, nil,
+			cleaner, gate, logCategory,
 			cleanupRunnerInterval, cleanupRunTimeout, cleanupBatchLimit,
 		).Run(ctx)
 		close(done)

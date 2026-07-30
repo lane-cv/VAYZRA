@@ -2,6 +2,7 @@ package files
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,36 @@ func TestQAAccessHTTPStreamsAndRejectsNonQAActor(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != 403 || svc.opens != 1 {
 		t.Fatalf("status=%d opens=%d body=%s", w.Code, svc.opens, w.Body.String())
+	}
+}
+
+func TestQAAccessHTTPReportsTransferAuditFailureThroughLogCallback(t *testing.T) {
+	id := uuid.New()
+	svc := &qaAccessHTTPStub{opened: OpenedFile{
+		Body: io.NopCloser(&failingGateReader{}),
+		ReportFailure: func(context.Context, string) error {
+			return errors.New("qa audit backend secret")
+		},
+	}}
+	var categories []string
+	h := httpx.RequestID(NewQAAccessHandlerWithLog(
+		svc,
+		nil,
+		func(category string) {
+			categories = append(categories, category)
+		},
+	).Routes())
+	r := httptest.NewRequest(http.MethodGet, "/"+id.String()+"/preview", nil)
+	r.RemoteAddr = "192.0.2.4:1234"
+	r = r.WithContext(auth.ContextWithUser(
+		r.Context(),
+		auth.User{ID: uuid.New(), Role: auth.RoleStudent, Status: auth.StatusActive},
+	))
+
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	if len(categories) != 1 || categories[0] != "write_failed" {
+		t.Fatalf("categories = %v, want [write_failed]", categories)
 	}
 }
 

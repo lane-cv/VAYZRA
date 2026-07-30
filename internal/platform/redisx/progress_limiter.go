@@ -35,9 +35,18 @@ type ProgressLimiter struct {
 	degradations atomic.Uint64
 	warnMu       sync.Mutex
 	warnAfter    time.Time
+	logCategory  func(string)
 }
 
 func NewProgressWriteLimiter(rdb *redis.Client, policy ProgressLimitPolicy) *ProgressLimiter {
+	return NewProgressWriteLimiterWithLog(rdb, policy, nil)
+}
+
+func NewProgressWriteLimiterWithLog(
+	rdb *redis.Client,
+	policy ProgressLimitPolicy,
+	logCategory func(string),
+) *ProgressLimiter {
 	if policy.Window <= 0 {
 		policy.Window = time.Minute
 	}
@@ -54,7 +63,11 @@ func NewProgressWriteLimiter(rdb *redis.Client, policy ProgressLimitPolicy) *Pro
 		policy.LocalMaxKeys = resourceFallbackMaxKeys
 	}
 	policy.Secret = normalizedResourceSecret(policy.Secret)
-	return &ProgressLimiter{rdb: rdb, policy: policy, local: newBoundedCounterLRU(policy.LocalMaxKeys)}
+	return &ProgressLimiter{
+		rdb: rdb, policy: policy,
+		local:       newBoundedCounterLRU(policy.LocalMaxKeys),
+		logCategory: logCategory,
+	}
 }
 
 var progressWriteScript = redis.NewScript(`
@@ -104,6 +117,10 @@ func (l *ProgressLimiter) degraded(operation string) {
 	}
 	l.warnMu.Unlock()
 	if warn {
+		if l.logCategory != nil {
+			l.logCategory(operation)
+			return
+		}
 		log.Printf("level=warn event=progress_limiter_redis_unavailable metric=progress_limiter_redis_errors_total operation=%s", operation)
 	}
 }

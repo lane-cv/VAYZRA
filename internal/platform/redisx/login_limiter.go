@@ -67,12 +67,21 @@ type LoginLimiter struct {
 	probing          bool
 	warnAfter        time.Time
 	degradationCount atomic.Uint64
+	logCategory      func(string)
 }
 
 // NewLoginLimiter constructs a limiter. A random secret keeps accidental,
 // non-production uses private; production wiring always supplies a persistent
 // application-specific secret from configuration.
 func NewLoginLimiter(rdb *redis.Client, policy Policy) *LoginLimiter {
+	return NewLoginLimiterWithLog(rdb, policy, nil)
+}
+
+func NewLoginLimiterWithLog(
+	rdb *redis.Client,
+	policy Policy,
+	logCategory func(string),
+) *LoginLimiter {
 	policy = normalizedPolicy(policy)
 	if len(policy.Secret) == 0 {
 		policy.Secret = make([]byte, 32)
@@ -82,7 +91,9 @@ func NewLoginLimiter(rdb *redis.Client, policy Policy) *LoginLimiter {
 	}
 	policy.Secret = append([]byte(nil), policy.Secret...)
 	return &LoginLimiter{
-		rdb: rdb, policy: policy, fallback: newLocalLRU(fallbackMaxKeys), challenges: newLocalLRU(challengeMaxKeys), now: time.Now,
+		rdb: rdb, policy: policy, fallback: newLocalLRU(fallbackMaxKeys),
+		challenges: newLocalLRU(challengeMaxKeys), now: time.Now,
+		logCategory: logCategory,
 	}
 }
 
@@ -234,6 +245,10 @@ func (l *LoginLimiter) tripBreaker(operation string) {
 	}
 	l.localMu.Unlock()
 	if warn {
+		if l.logCategory != nil {
+			l.logCategory(operation)
+			return
+		}
 		log.Printf("level=warn event=login_limiter_redis_unavailable metric=login_limiter_redis_errors_total operation=%s", operation)
 	}
 }

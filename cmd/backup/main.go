@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"io"
-	"log"
 	"net"
 	"net/url"
 	"os"
@@ -24,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 const (
@@ -52,6 +52,10 @@ type commandActions interface {
 }
 
 func main() {
+	logger, err := safelog.New(os.Stderr, time.Now)
+	if err != nil {
+		os.Exit(1)
+	}
 	signalContext, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -60,15 +64,70 @@ func main() {
 	defer stop()
 	ctx, cancel := context.WithTimeout(signalContext, 45*time.Minute)
 	defer cancel()
-	err := runProgram(
+	err = runProgramWithLog(
 		ctx,
 		os.Args[1:],
 		os.Getenv,
-		productionProgramFactories(),
+		productionProgramFactoriesWithLog(logger),
+		logger,
 	)
 	if err != nil {
-		log.Print("backup_error")
 		os.Exit(1)
+	}
+}
+
+func runProgramWithLog(
+	ctx context.Context,
+	args []string,
+	getenv func(string) string,
+	factories programFactories,
+	logger safelog.Logger,
+) error {
+	stage := backupCommandStage(args)
+	logger.Info("backup.start", safelog.Field{
+		Name:  "stage",
+		Value: stage,
+	})
+	err := runProgram(ctx, args, getenv, factories)
+	if err != nil {
+		logger.Error("backup.failure", safelog.Field{
+			Name:  "stage",
+			Value: stage,
+		})
+		return err
+	}
+	logger.Info("backup.success", safelog.Field{
+		Name:  "stage",
+		Value: stage,
+	})
+	return nil
+}
+
+func backupCommandStage(args []string) string {
+	if len(args) == 0 {
+		return "arguments"
+	}
+	switch args[0] {
+	case "prepare":
+		return "prepare"
+	case "snapshot":
+		return "snapshot"
+	case "verify":
+		return "verify"
+	case "sync":
+		return "sync"
+	case "finish":
+		return "finish"
+	case "fail":
+		return "fail"
+	case "restore-check":
+		return "restore_check"
+	case "restore-http-probe":
+		return "restore_http_probe"
+	case "restore-record":
+		return "restore_record"
+	default:
+		return "arguments"
 	}
 }
 
@@ -192,6 +251,7 @@ type commandApplication struct {
 	newOwner         func() uuid.UUID
 	migrationVersion func(context.Context) (int64, error)
 	now              func() time.Time
+	logCategory      func(string)
 }
 
 func (application *commandApplication) Prepare(
@@ -418,10 +478,9 @@ func (application *commandApplication) Sync(
 		},
 	)
 	if syncErr != nil {
-		log.Printf(
-			"backup_remote_sync_stage_%s",
-			backup.RemoteSyncFailureStage(syncErr),
-		)
+		if application.logCategory != nil {
+			application.logCategory(backup.RemoteSyncFailureStage(syncErr))
+		}
 		if errors.Is(syncErr, backup.ErrCancelled) {
 			return errWorkflowUnavailable
 		}

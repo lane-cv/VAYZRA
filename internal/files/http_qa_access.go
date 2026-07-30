@@ -20,12 +20,25 @@ type QAAccessHTTPService interface {
 }
 
 type QAAccessHandler struct {
-	service QAAccessHTTPService
-	trusted []netip.Prefix
+	service     QAAccessHTTPService
+	trusted     []netip.Prefix
+	logCategory func(string)
 }
 
 func NewQAAccessHandler(service QAAccessHTTPService, trusted []netip.Prefix) *QAAccessHandler {
-	return &QAAccessHandler{service: service, trusted: append([]netip.Prefix(nil), trusted...)}
+	return NewQAAccessHandlerWithLog(service, trusted, nil)
+}
+
+func NewQAAccessHandlerWithLog(
+	service QAAccessHTTPService,
+	trusted []netip.Prefix,
+	logCategory func(string),
+) *QAAccessHandler {
+	return &QAAccessHandler{
+		service:     service,
+		trusted:     append([]netip.Prefix(nil), trusted...),
+		logCategory: logCategory,
+	}
 }
 
 func (h *QAAccessHandler) Routes() http.Handler {
@@ -151,5 +164,5 @@ func (h *QAAccessHandler) open(w http.ResponseWriter, r *http.Request, action Ac
 	w.WriteHeader(status)
 	dw := newIdleDeadlineWriter(w, defaultWriteIdleTimeout)
 	defer dw.finish()
-	_ = deliverOpenedFile(r.Context(), dw, opened)
+	_ = deliverOpenedFileWithLog(r.Context(), dw, opened, h.logCategory)
 }

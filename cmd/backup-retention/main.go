@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"io"
-	"log"
 	"net"
 	"net/url"
 	"os"
@@ -22,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/backup"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 const (
@@ -82,6 +82,11 @@ type retentionApplication struct {
 }
 
 func main() {
+	logger, err := safelog.New(os.Stderr, time.Now)
+	if err != nil {
+		os.Exit(1)
+	}
+	logRetentionStart(logger)
 	signalContext, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -91,6 +96,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(signalContext, retentionTimeout)
 	defer cancel()
 	repository, runID, err := parseRetentionArguments(os.Args[1:])
+	deleted := 0
 	if err == nil {
 		var application *retentionApplication
 		var closeApplication func()
@@ -100,23 +106,37 @@ func main() {
 		)
 		if err == nil {
 			defer closeApplication()
-			var deleted int
 			deleted, err = application.Run(ctx, repository, runID)
-			if err == nil {
-				log.Printf("retention_deleted=%d", deleted)
-			}
 		}
 	}
+	logRetentionResult(logger, deleted, err)
 	if err != nil {
-		var stageError retentionStageError
-		if errors.As(err, &stageError) &&
-			retentionStageName.MatchString(stageError.stage) {
-			log.Printf("retention_error_%s", stageError.stage)
-		} else {
-			log.Print("retention_error")
-		}
 		os.Exit(1)
 	}
+}
+
+func logRetentionStart(logger safelog.Logger) {
+	logger.Info("backup.retention.start")
+}
+
+func logRetentionResult(logger safelog.Logger, deleted int, err error) {
+	if err == nil {
+		logger.Info("backup.retention.success", safelog.Field{
+			Name:  "count",
+			Value: deleted,
+		})
+		return
+	}
+	stage := "retention"
+	var stageError retentionStageError
+	if errors.As(err, &stageError) &&
+		retentionStageName.MatchString(stageError.stage) {
+		stage = stageError.stage
+	}
+	logger.Error("backup.retention.failure", safelog.Field{
+		Name:  "stage",
+		Value: stage,
+	})
 }
 
 func parseRetentionArguments(

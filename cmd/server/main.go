@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,36 +26,86 @@ import (
 	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/internal/platform/redisx"
+	"happylearn.local/app/internal/platform/safelog"
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
 )
 
 func main() {
+	bootstrapLogger, err := safelog.New(os.Stderr, time.Now)
+	if err != nil {
+		os.Exit(1)
+	}
+	bootstrapLogger.Info("server.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
-		log.Print("configuration_error")
+		bootstrapLogger.Error("server.error", safelog.Field{
+			Name:  "stage",
+			Value: "configuration",
+		})
 		os.Exit(1)
 	}
-
-	runtime, closeResources, err := buildProductionApplication(context.Background(), cfg)
+	logger, err := safelog.NewFromConfig(os.Stderr, time.Now, cfg)
 	if err != nil {
-		log.Printf("startup_error stage=%s", err)
+		bootstrapLogger.Error("server.error", safelog.Field{
+			Name:  "stage",
+			Value: "logging",
+		})
 		os.Exit(1)
 	}
-	publicServer := newServer(cfg.ListenAddress, runtime.Public)
-	internalServer := newServer(cfg.InternalListenAddress, runtime.Internal)
+	logger.Info("server.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "success",
+	})
+	logger.Info("server.startup", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
+
+	runtime, closeResources, err := buildProductionApplicationWithLog(
+		context.Background(),
+		cfg,
+		logger,
+	)
+	if err != nil {
+		logger.Error("server.error", safelog.Field{
+			Name:  "stage",
+			Value: "startup",
+		})
+		os.Exit(1)
+	}
+	logger.Info("server.startup", safelog.Field{
+		Name:  "stage",
+		Value: "success",
+	})
+	publicServer := newServerWithLog(
+		cfg.ListenAddress,
+		runtime.Public,
+		logger,
+		"public",
+	)
+	internalServer := newServerWithLog(
+		cfg.InternalListenAddress,
+		runtime.Internal,
+		logger,
+		"internal",
+	)
 
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := runServerLifecycles(
+	if err := runServerLifecyclesWithLog(
 		signals,
 		[]serverLifecycle{publicServer, internalServer},
 		closeResources,
+		logger,
 	); err != nil {
-		log.Printf("server_error stage=%s", err)
 		os.Exit(1)
 	}
 }
@@ -84,12 +133,28 @@ func runServerLifecycles(
 	servers []serverLifecycle,
 	closeResources func(),
 ) error {
+	return runServerLifecyclesWithLog(
+		signals,
+		servers,
+		closeResources,
+		safelog.Logger{},
+	)
+}
+
+func runServerLifecyclesWithLog(
+	signals context.Context,
+	servers []serverLifecycle,
+	closeResources func(),
+	logger safelog.Logger,
+) error {
 	if len(servers) == 0 || closeResources == nil {
+		logServerError(logger, "configuration")
 		return errors.New("server configuration")
 	}
 	for _, server := range servers {
 		if server == nil {
 			closeResources()
+			logServerError(logger, "configuration")
 			return errors.New("server configuration")
 		}
 	}
@@ -99,14 +164,21 @@ func runServerLifecycles(
 			errCh <- server.ListenAndServe()
 		}(server)
 	}
+	logger.Info("server.started")
 	var result error
+	resultStage := ""
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
 			result = errors.New("server start")
+			resultStage = "listen"
 		}
 	case <-signals.Done():
 	}
+	logger.Info("server.shutdown", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	type shutdownResult struct {
@@ -136,19 +208,50 @@ func runServerLifecycles(
 		forceCloseFailed = forceCloseFailed || outcome.closeErr != nil
 	}
 	if forceCloseFailed {
+		logServerError(logger, "force_close")
 		return errors.New("server force close")
 	}
 	closeResources()
 	if shutdownFailed {
+		logServerError(logger, "shutdown")
+		logger.Info("server.stopped")
 		return errors.New("server shutdown")
 	}
+	if result != nil {
+		logServerError(logger, resultStage)
+		logger.Info("server.stopped")
+		return result
+	}
+	logger.Info("server.stopped")
 	return result
 }
 
+func logServerError(logger safelog.Logger, stage string) {
+	logger.Error("server.error", safelog.Field{
+		Name:  "stage",
+		Value: stage,
+	})
+}
+
 func newServer(address string, handler http.Handler) *http.Server {
+	return newServerWithLog(
+		address,
+		handler,
+		safelog.Logger{},
+		"server",
+	)
+}
+
+func newServerWithLog(
+	address string,
+	handler http.Handler,
+	logger safelog.Logger,
+	service string,
+) *http.Server {
 	return &http.Server{
 		Addr:              address,
 		Handler:           handler,
+		ErrorLog:          httpx.SafeServerErrorLog(logger, service),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -157,6 +260,7 @@ func newServer(address string, handler http.Handler) *http.Server {
 }
 
 type applicationDependencies struct {
+	logger                        safelog.Logger
 	open                          func(context.Context, string) (*pgxpool.Pool, error)
 	migrate                       func(context.Context, *pgxpool.Pool) error
 	newAuth                       func(*pgxpool.Pool) (auth.HTTPService, error)
@@ -214,6 +318,44 @@ type operationsRuntime interface {
 	operations.LeaseSessionCloser
 }
 
+type productionRunnerLogs struct {
+	uploadCleanup       func(string)
+	outbox              func(string)
+	ai                  func(string)
+	alert               func(string)
+	webhook             func(string)
+	loginLimiter        func(string)
+	progressLimiter     func(string)
+	searchLimiter       func(string)
+	providerTestLimiter func(string)
+}
+
+func newProductionRunnerLogs(logger safelog.Logger) productionRunnerLogs {
+	return productionRunnerLogs{
+		uploadCleanup:   safeCategoryLogger(logger, "upload.cleanup"),
+		outbox:          safeCategoryLogger(logger, "notifications.outbox"),
+		ai:              safeCategoryLogger(logger, "ai.runner"),
+		alert:           safeCategoryLogger(logger, "operations.alert"),
+		webhook:         safeCategoryLogger(logger, "operations.webhook"),
+		loginLimiter:    safeCategoryLogger(logger, "redis.login"),
+		progressLimiter: safeCategoryLogger(logger, "redis.progress"),
+		searchLimiter:   safeCategoryLogger(logger, "redis.search"),
+		providerTestLimiter: safeCategoryLogger(
+			logger,
+			"redis.provider_test",
+		),
+	}
+}
+
+func safeCategoryLogger(logger safelog.Logger, event string) func(string) {
+	return func(category string) {
+		logger.Error(event, safelog.Field{
+			Name:  "category",
+			Value: category,
+		})
+	}
+}
+
 type applicationRuntime struct {
 	Public   http.Handler
 	Internal http.Handler
@@ -223,31 +365,90 @@ func buildProductionApplication(
 	ctx context.Context,
 	cfg config.Config,
 ) (*applicationRuntime, func(), error) {
+	return buildProductionApplicationWithLog(ctx, cfg, safelog.Logger{})
+}
+
+func buildProductionApplicationWithLog(
+	ctx context.Context,
+	cfg config.Config,
+	logger safelog.Logger,
+) (*applicationRuntime, func(), error) {
+	runnerLogs := newProductionRunnerLogs(logger)
 	return buildApplicationRuntime(ctx, cfg, applicationDependencies{
-		open:                        database.Open,
-		migrate:                     database.Migrate,
-		newAuth:                     newProductionAuthService,
-		newStudents:                 newProductionStudentService,
-		newTeaching:                 newProductionTeachingService,
-		newUploads:                  newProductionUploadService,
-		newQAUploads:                newProductionQAUploadService,
-		newAIUploads:                newProductionAIUploadService,
-		newStudentAI:                newProductionStudentAIService,
-		newFileAccess:               newProductionFileAccessService,
-		newQAFileAccess:             newProductionQAFileAccessService,
-		newAIFileAccess:             newProductionAIFileAccessService,
-		newFileBindings:             newProductionFileBindingService,
-		newFileCenter:               newProductionFileCenterService,
-		startUploadCleanup:          files.StartCleanupRunner,
-		newStudentTeaching:          newProductionStudentTeachingService,
-		newQuestions:                newProductionQuestionServices,
-		newAdminAI:                  newProductionAdminAIService,
-		newAIReads:                  newProductionAIReadServices,
-		newNotifications:            newProductionNotificationService,
-		startOutbox:                 newProductionOutboxRunner,
-		startAIRunner:               newProductionAIRunner,
-		startAlertRunnerWithWebhook: newProductionAlertRunnerWithWebhook,
-		startWebhookRunner:          newProductionWebhookRunner,
+		logger:          logger,
+		open:            database.Open,
+		migrate:         database.Migrate,
+		newAuth:         newProductionAuthService,
+		newStudents:     newProductionStudentService,
+		newTeaching:     newProductionTeachingService,
+		newUploads:      newProductionUploadService,
+		newQAUploads:    newProductionQAUploadService,
+		newAIUploads:    newProductionAIUploadService,
+		newStudentAI:    newProductionStudentAIService,
+		newFileAccess:   newProductionFileAccessService,
+		newQAFileAccess: newProductionQAFileAccessService,
+		newAIFileAccess: newProductionAIFileAccessService,
+		newFileBindings: newProductionFileBindingService,
+		newFileCenter:   newProductionFileCenterService,
+		startUploadCleanup: func(
+			cleaner files.ExpiredUploadCleaner,
+			gate operations.WriteGate,
+		) func() {
+			return files.StartCleanupRunnerWithLog(
+				cleaner,
+				gate,
+				runnerLogs.uploadCleanup,
+			)
+		},
+		newStudentTeaching: newProductionStudentTeachingService,
+		newQuestions:       newProductionQuestionServices,
+		newAdminAI:         newProductionAdminAIService,
+		newAIReads:         newProductionAIReadServices,
+		newNotifications:   newProductionNotificationService,
+		startOutbox: func(
+			pool *pgxpool.Pool,
+			gate operations.ClaimGate,
+		) func() {
+			return newProductionOutboxRunnerWithLog(
+				pool,
+				gate,
+				runnerLogs.outbox,
+			)
+		},
+		startAIRunner: func(
+			ctx context.Context,
+			pool *pgxpool.Pool,
+			cfg config.Config,
+			gate operations.ClaimGate,
+		) (func(), error) {
+			return newProductionAIRunnerWithLog(
+				ctx,
+				pool,
+				cfg,
+				gate,
+				runnerLogs.ai,
+			)
+		},
+		startAlertRunnerWithWebhook: func(
+			pool *pgxpool.Pool,
+			webhookEnabled bool,
+		) func() {
+			return newProductionAlertRunnerWithWebhookAndLog(
+				pool,
+				webhookEnabled,
+				runnerLogs.alert,
+			)
+		},
+		startWebhookRunner: func(
+			pool *pgxpool.Pool,
+			sender operations.WebhookTestSender,
+		) (func(), error) {
+			return newProductionWebhookRunnerWithLog(
+				pool,
+				sender,
+				runnerLogs.webhook,
+			)
+		},
 		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
 			return operations.NewPostgresStore(pool)
 		},
@@ -263,16 +464,33 @@ func buildProductionApplication(
 		openRedis:   redisx.NewClient,
 		newThrottle: func(client *redis.Client, cfg config.Config) (redisx.Limiter, redisx.CaptchaService) {
 			policy := redisx.Policy{Secret: []byte(cfg.LoginThrottleSecret), Window: 15 * time.Minute, AccountFailures: 5, IPFailures: 20, Lockout: 15 * time.Minute}
-			return redisx.NewLoginLimiter(client, policy), redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
+			return redisx.NewLoginLimiterWithLog(
+					client,
+					policy,
+					runnerLogs.loginLimiter,
+				),
+				redisx.NewCaptchaStore(client, []byte(cfg.LoginThrottleSecret))
 		},
 		newProgressLimiter: func(client *redis.Client, cfg config.Config) redisx.ProgressWriteLimiter {
-			return redisx.NewProgressWriteLimiter(client, redisx.ProgressLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, SessionMaxWrites: 60, AccountMaxWrites: 120})
+			return redisx.NewProgressWriteLimiterWithLog(
+				client,
+				redisx.ProgressLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, SessionMaxWrites: 60, AccountMaxWrites: 120},
+				runnerLogs.progressLimiter,
+			)
 		},
 		newSearchLimiter: func(client *redis.Client, cfg config.Config) redisx.SearchRateLimiter {
-			return redisx.NewSearchLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 30})
+			return redisx.NewSearchLimiterWithLog(
+				client,
+				redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 30},
+				runnerLogs.searchLimiter,
+			)
 		},
 		newProviderTestLimiter: func(client *redis.Client, cfg config.Config) redisx.ProviderTestRateLimiter {
-			return redisx.NewProviderTestLimiter(client, redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 5})
+			return redisx.NewProviderTestLimiterWithLog(
+				client,
+				redisx.ResourceLimitPolicy{Secret: []byte(cfg.LoginThrottleSecret), Window: time.Minute, MaxRequests: 5},
+				runnerLogs.providerTestLimiter,
+			)
 		},
 		closeRedis:  func(client *redis.Client) { _ = client.Close() },
 		newInternal: newProductionInternalHandler,
@@ -530,6 +748,7 @@ func buildApplicationRuntime(
 		}
 	}
 	handler := app.New(app.Dependencies{
+		Logger:              deps.logger,
 		Ready:               ready,
 		Auth:                service,
 		Students:            studentService,
@@ -635,18 +854,35 @@ func buildApplicationRuntime(
 			closeResources()
 			return nil, nil, errors.New("initialize internal listener")
 		}
+		internalHandler = httpx.RequestID(
+			httpx.SafeRequestLog(deps.logger, time.Now)(
+				httpx.SafeRecoverer(deps.logger)(internalHandler),
+			),
+		)
 	}
 	return &applicationRuntime{
-		Public:   publicOnlyHandler(handler),
+		Public:   publicOnlyHandlerWithLog(handler, deps.logger),
 		Internal: internalHandler,
 	}, closeResources, nil
 }
 
 func publicOnlyHandler(next http.Handler) http.Handler {
+	return publicOnlyHandlerWithLog(next, safelog.Logger{})
+}
+
+func publicOnlyHandlerWithLog(
+	next http.Handler,
+	logger safelog.Logger,
+) http.Handler {
+	denied := httpx.RequestID(
+		httpx.SafeRequestLog(logger, time.Now)(
+			httpx.SafeRecoverer(logger)(http.NotFoundHandler()),
+		),
+	)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal" ||
 			strings.HasPrefix(r.URL.Path, "/internal/") {
-			http.NotFound(w, r)
+			denied.ServeHTTP(w, r)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -688,7 +924,6 @@ func newProductionObjectReadiness(ctx context.Context, cfg config.Config) (func(
 		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
-		log.Printf("object_store_startup_error stage=%s", err)
 		return nil, err
 	}
 	return stores.Ready, nil
@@ -746,7 +981,6 @@ func newProductionUploadServiceWithPolicy(ctx context.Context, pool *pgxpool.Poo
 		SkipLifecycleBootstrap: cfg.Environment == "development",
 	})
 	if err != nil {
-		log.Printf("object_store_startup_error stage=%s", err)
 		return nil, err
 	}
 	return files.NewUploadService(files.NewPostgresStore(pool), stores.Originals, policy, time.Now), nil
@@ -908,6 +1142,18 @@ func newProductionAlertRunnerWithWebhook(
 	pool *pgxpool.Pool,
 	webhookEnabled bool,
 ) func() {
+	return newProductionAlertRunnerWithWebhookAndLog(
+		pool,
+		webhookEnabled,
+		nil,
+	)
+}
+
+func newProductionAlertRunnerWithWebhookAndLog(
+	pool *pgxpool.Pool,
+	webhookEnabled bool,
+	logCategory func(string),
+) func() {
 	store := operations.NewPostgresAlertStore(pool)
 	if webhookEnabled {
 		var err error
@@ -925,6 +1171,7 @@ func newProductionAlertRunnerWithWebhook(
 		Clock:             time.Now,
 		PollInterval:      operations.DefaultAlertRunnerInterval,
 		EvaluationTimeout: 30 * time.Second,
+		LogCategory:       logCategory,
 	})
 }
 
@@ -943,6 +1190,14 @@ func newProductionWebhookRunner(
 	pool *pgxpool.Pool,
 	sender operations.WebhookTestSender,
 ) (func(), error) {
+	return newProductionWebhookRunnerWithLog(pool, sender, nil)
+}
+
+func newProductionWebhookRunnerWithLog(
+	pool *pgxpool.Pool,
+	sender operations.WebhookTestSender,
+	logCategory func(string),
+) (func(), error) {
 	if pool == nil || sender == nil {
 		return nil, operations.ErrInvalid
 	}
@@ -959,6 +1214,7 @@ func newProductionWebhookRunner(
 			PollInterval:    operations.DefaultWebhookPollInterval,
 			LeaseDuration:   operations.DefaultWebhookLeaseDuration,
 			DeliveryTimeout: 15 * time.Second,
+			LogCategory:     logCategory,
 		},
 	)
 }
@@ -1006,10 +1262,18 @@ func newProductionAdminBackupService(pool *pgxpool.Pool) backup.HTTPService {
 }
 
 func newProductionOutboxRunner(pool *pgxpool.Pool, gate operations.ClaimGate) func() {
+	return newProductionOutboxRunnerWithLog(pool, gate, nil)
+}
+
+func newProductionOutboxRunnerWithLog(
+	pool *pgxpool.Pool,
+	gate operations.ClaimGate,
+	logCategory func(string),
+) func() {
 	return notifications.StartOutboxRunner(notifications.Runner{
 		Store: notifications.NewPostgresOutboxStore(pool), Owner: uuid.NewString(),
 		PollInterval: time.Second, BatchTimeout: 10 * time.Second, ShutdownTimeout: 2 * time.Second,
-		ClaimGate: gate,
+		ClaimGate: gate, LogCategory: logCategory,
 	})
 }
 
@@ -1018,6 +1282,16 @@ func newProductionAIRunner(
 	pool *pgxpool.Pool,
 	cfg config.Config,
 	gate operations.ClaimGate,
+) (func(), error) {
+	return newProductionAIRunnerWithLog(ctx, pool, cfg, gate, nil)
+}
+
+func newProductionAIRunnerWithLog(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg config.Config,
+	gate operations.ClaimGate,
+	logCategory func(string),
 ) (func(), error) {
 	box, err := aiqa.NewAESGCMSecretBox(cfg.AIMasterKey, cfg.AIMasterKeyVersion, rand.Reader)
 	if err != nil {
@@ -1038,7 +1312,7 @@ func newProductionAIRunner(
 		Owner: uuid.NewString(), GlobalConcurrency: cfg.AIGlobalConcurrency,
 		PollInterval: time.Second, LeaseDuration: 30 * time.Second,
 		FlushInterval: 250 * time.Millisecond, FlushBytes: 4 << 10,
-		ClaimGate: gate,
+		ClaimGate: gate, LogCategory: logCategory,
 	}), nil
 }
 

@@ -46,9 +46,18 @@ type SearchLimiter struct {
 	degradations atomic.Uint64
 	warnMu       sync.Mutex
 	warnAfter    time.Time
+	logCategory  func(string)
 }
 
 func NewSearchLimiter(rdb *redis.Client, policy ResourceLimitPolicy) *SearchLimiter {
+	return NewSearchLimiterWithLog(rdb, policy, nil)
+}
+
+func NewSearchLimiterWithLog(
+	rdb *redis.Client,
+	policy ResourceLimitPolicy,
+	logCategory func(string),
+) *SearchLimiter {
 	if policy.Window <= 0 {
 		policy.Window = time.Minute
 	}
@@ -59,11 +68,23 @@ func NewSearchLimiter(rdb *redis.Client, policy ResourceLimitPolicy) *SearchLimi
 		policy.LocalMaxKeys = resourceFallbackMaxKeys
 	}
 	policy.Secret = normalizedResourceSecret(policy.Secret)
-	return &SearchLimiter{rdb: rdb, policy: policy, local: newBoundedCounterLRU(policy.LocalMaxKeys)}
+	return &SearchLimiter{
+		rdb: rdb, policy: policy,
+		local:       newBoundedCounterLRU(policy.LocalMaxKeys),
+		logCategory: logCategory,
+	}
 }
 
 func NewProviderTestLimiter(rdb *redis.Client, policy ResourceLimitPolicy) ProviderTestRateLimiter {
-	return NewSearchLimiter(rdb, policy)
+	return NewProviderTestLimiterWithLog(rdb, policy, nil)
+}
+
+func NewProviderTestLimiterWithLog(
+	rdb *redis.Client,
+	policy ResourceLimitPolicy,
+	logCategory func(string),
+) ProviderTestRateLimiter {
+	return NewSearchLimiterWithLog(rdb, policy, logCategory)
 }
 
 var resourceCounterScript = redis.NewScript(`
@@ -118,6 +139,10 @@ func (l *SearchLimiter) degraded(operation string) {
 	}
 	l.warnMu.Unlock()
 	if warn {
+		if l.logCategory != nil {
+			l.logCategory(operation)
+			return
+		}
 		log.Printf("level=warn event=resource_limiter_redis_unavailable operation=%s", operation)
 	}
 }

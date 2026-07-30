@@ -5,14 +5,15 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/objectstore"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 type gateAccessObjects struct {
@@ -64,18 +65,28 @@ func TestAccessNegativePathsFailClosedWhenAuditWriteFails(t *testing.T) {
 
 func TestTransferAuditFailureEmitsFixedRedactedStructuredEvent(t *testing.T) {
 	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logger, err := safelog.New(&logs, time.Now, "backend secret", "originals/private-key")
+	if err != nil {
+		t.Fatalf("safelog.New: %v", err)
+	}
 	opened := OpenedFile{
 		Body: io.NopCloser(&failingGateReader{}),
 		ReportFailure: func(context.Context, string) error {
 			return errors.New("backend secret at originals/private-key")
 		},
 	}
-	if err := deliverOpenedFileWithLogger(context.Background(), io.Discard, opened, logger); err == nil {
+	logCategory := func(category string) {
+		logger.Error("file.transfer.audit", safelog.Field{
+			Name:  "category",
+			Value: category,
+		})
+	}
+	if err := deliverOpenedFileWithLog(context.Background(), io.Discard, opened, logCategory); err == nil {
 		t.Fatal("expected stream failure")
 	}
 	got := logs.String()
-	if !strings.Contains(got, "file_transfer_audit_failed") {
+	if !strings.Contains(got, `"event":"file.transfer.audit"`) ||
+		!strings.Contains(got, `"category":"write_failed"`) {
 		t.Fatalf("missing fixed event: %q", got)
 	}
 	for _, secret := range []string{"backend secret", "originals/private-key", "stream_read"} {

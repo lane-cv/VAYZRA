@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"io"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +14,7 @@ import (
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/objectstore"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 type cleanupFunc func(context.Context, int) error
@@ -24,17 +24,71 @@ func main() {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
-	if err := run(ctx, os.Args[1:]); err != nil {
-		log.Print("maintenance_error")
+	if err := runMaintenanceWithLog(
+		ctx,
+		os.Args[1:],
+		os.Getenv,
+		os.Stderr,
+		time.Now,
+	); err != nil {
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, args []string) error {
-	cfg, err := config.Load(os.Getenv)
+	return runMaintenanceWithLog(
+		ctx,
+		args,
+		os.Getenv,
+		io.Discard,
+		time.Now,
+	)
+}
+
+func runMaintenanceWithLog(
+	ctx context.Context,
+	args []string,
+	getenv func(string) string,
+	output io.Writer,
+	clock func() time.Time,
+) error {
+	bootstrapLogger, err := safelog.New(output, clock)
 	if err != nil {
+		return errors.New("maintenance logging")
+	}
+	bootstrapLogger.Info("maintenance.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
+	cfg, err := config.Load(getenv)
+	if err != nil {
+		logMaintenanceResult(bootstrapLogger, "configuration", err)
 		return errors.New("maintenance configuration")
 	}
+	logger, err := safelog.NewFromConfig(output, clock, cfg)
+	if err != nil {
+		logMaintenanceResult(bootstrapLogger, "logging", err)
+		return errors.New("maintenance logging")
+	}
+	logger.Info("maintenance.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "success",
+	})
+	stage := maintenanceCommandStage(args)
+	logger.Info("maintenance.start", safelog.Field{
+		Name:  "stage",
+		Value: stage,
+	})
+	err = runConfiguredMaintenance(ctx, args, cfg)
+	logMaintenanceResult(logger, stage, err)
+	return err
+}
+
+func runConfiguredMaintenance(
+	ctx context.Context,
+	args []string,
+	cfg config.Config,
+) error {
 	pool, err := database.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return errors.New("maintenance database")
@@ -53,6 +107,29 @@ func run(ctx context.Context, args []string) error {
 	}
 	service := files.NewFileCleanupService(files.NewPostgresStore(pool), stores.Originals, stores.Previews, time.Now)
 	return runCommand(ctx, args, service.Cleanup)
+}
+
+func maintenanceCommandStage(args []string) string {
+	if len(args) > 0 && args[0] == "cleanup-files" {
+		return "cleanup_files"
+	}
+	return "arguments"
+}
+
+func logMaintenanceResult(logger safelog.Logger, stage string, err error) {
+	event := "maintenance.success"
+	if err != nil {
+		event = "maintenance.failure"
+	}
+	fields := []safelog.Field{{
+		Name:  "stage",
+		Value: stage,
+	}}
+	if err != nil {
+		logger.Error(event, fields...)
+		return
+	}
+	logger.Info(event, fields...)
 }
 
 func runCommand(ctx context.Context, args []string, cleanup cleanupFunc) error {

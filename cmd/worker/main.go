@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,7 +21,9 @@ import (
 	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
+	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/objectstore"
+	"happylearn.local/app/internal/platform/safelog"
 	"happylearn.local/app/internal/processing"
 )
 
@@ -43,21 +44,52 @@ var requiredCommands = map[string][]string{
 
 func main() {
 	if err := run(); err != nil {
-		log.Print("worker_error")
 		os.Exit(1)
 	}
 }
 
 func run() error {
+	bootstrapLogger, err := safelog.New(os.Stderr, time.Now)
+	if err != nil {
+		return errors.New("worker logging")
+	}
+	bootstrapLogger.Info("worker.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
+		bootstrapLogger.Error("worker.error", safelog.Field{
+			Name:  "stage",
+			Value: "configuration",
+		})
 		return errors.New("worker configuration")
 	}
+	logger, err := safelog.NewFromConfig(os.Stderr, time.Now, cfg)
+	if err != nil {
+		bootstrapLogger.Error("worker.error", safelog.Field{
+			Name:  "stage",
+			Value: "logging",
+		})
+		return errors.New("worker logging")
+	}
+	logger.Info("worker.configuration", safelog.Field{
+		Name:  "stage",
+		Value: "success",
+	})
+	logger.Info("worker.startup", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
+	return runConfiguredWorker(cfg, logger)
+}
+
+func runConfiguredWorker(cfg config.Config, logger safelog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool, err := database.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
-		return errors.New("worker database")
+		return workerStartupFailure(logger, "worker database")
 	}
 	cleanupDatabase := true
 	var operationalGate *operations.PostgresStore
@@ -76,12 +108,12 @@ func run() error {
 		pool.Close()
 	}()
 	if err := database.Migrate(ctx, pool); err != nil {
-		return errors.New("worker migration")
+		return workerStartupFailure(logger, "worker migration")
 	}
 	operationalGate = operations.NewPostgresStore(pool)
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development"})
 	if err != nil {
-		return errors.New("worker object storage")
+		return workerStartupFailure(logger, "worker object storage")
 	}
 	workDir := os.Getenv("HAPPYLEARN_WORK_DIR")
 	if workDir == "" {
@@ -91,21 +123,24 @@ func run() error {
 	startupCtx, startupCancel := context.WithTimeout(ctx, readinessLimit)
 	defer startupCancel()
 	if err := ready(startupCtx); err != nil {
-		return errors.New("worker dependencies")
+		return workerStartupFailure(logger, "worker dependencies")
 	}
 
 	owner, err := workerOwner()
 	if err != nil {
-		return errors.New("worker identity")
+		return workerStartupFailure(logger, "worker identity")
 	}
 	processingStore := processing.NewPostgresStore(pool)
-	worker, err := buildWorker(processingStore, operationalGate, owner, func() (processing.Processor, error) {
+	worker, err := buildWorkerWithLog(processingStore, operationalGate, owner, func() (processing.Processor, error) {
 		return newProductionProcessor(processingStore, stores.Originals, stores.Previews, workDir)
-	})
+	}, logger)
 	if err != nil {
-		return errors.New("worker processing pipeline")
+		return workerStartupFailure(logger, "worker processing pipeline")
 	}
-	health := &http.Server{Addr: workerHealthAddress, Handler: healthHandler(ready), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	health := newWorkerHealthServer(
+		productionWorkerHealthHandler(ready, logger),
+		logger,
+	)
 	workerDone := make(chan error, 1)
 	healthDone := make(chan error, 1)
 	go func() { workerDone <- worker.Run(ctx) }()
@@ -113,16 +148,44 @@ func run() error {
 
 	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	safeToClean, lifecycleErr := coordinateWorkerRuntime(
+	logger.Info("worker.startup", safelog.Field{
+		Name:  "stage",
+		Value: "success",
+	})
+	safeToClean, lifecycleErr := coordinateWorkerRuntimeWithLog(
 		signalCtx,
 		cancel,
 		health,
 		workerDone,
 		healthDone,
 		workerShutdownLimit,
+		logger,
 	)
 	cleanupDatabase = safeToClean
 	return lifecycleErr
+}
+
+func workerStartupFailure(logger safelog.Logger, message string) error {
+	logger.Error("worker.error", safelog.Field{
+		Name:  "stage",
+		Value: "startup",
+	})
+	return errors.New(message)
+}
+
+func newWorkerHealthServer(
+	handler http.Handler,
+	logger safelog.Logger,
+) *http.Server {
+	return &http.Server{
+		Addr:              workerHealthAddress,
+		Handler:           handler,
+		ErrorLog:          httpx.SafeServerErrorLog(logger, "worker-health"),
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 }
 
 type workerHealthLifecycle interface {
@@ -138,6 +201,27 @@ func coordinateWorkerRuntime(
 	healthDone <-chan error,
 	shutdownTimeout time.Duration,
 ) (bool, error) {
+	return coordinateWorkerRuntimeWithLog(
+		signalCtx,
+		cancel,
+		health,
+		workerDone,
+		healthDone,
+		shutdownTimeout,
+		safelog.Logger{},
+	)
+}
+
+func coordinateWorkerRuntimeWithLog(
+	signalCtx context.Context,
+	cancel context.CancelFunc,
+	health workerHealthLifecycle,
+	workerDone <-chan error,
+	healthDone <-chan error,
+	shutdownTimeout time.Duration,
+	logger safelog.Logger,
+) (bool, error) {
+	logger.Info("worker.started")
 	workerExited := false
 	var result error
 	select {
@@ -153,6 +237,10 @@ func coordinateWorkerRuntime(
 		}
 	}
 
+	logger.Info("worker.shutdown", safelog.Field{
+		Name:  "stage",
+		Value: "start",
+	})
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(
 		context.Background(),
@@ -179,7 +267,19 @@ func coordinateWorkerRuntime(
 			result = errors.New("worker health force close")
 		}
 	}
-	return workerStopped && healthStopped, result
+	safeToClean := workerStopped && healthStopped
+	if result != nil {
+		logger.Error("worker.error", safelog.Field{
+			Name:  "stage",
+			Value: "lifecycle",
+		})
+		if safeToClean {
+			logger.Info("worker.stopped")
+		}
+		return safeToClean, result
+	}
+	logger.Info("worker.stopped")
+	return safeToClean, nil
 }
 
 type processorFactory func() (processing.Processor, error)
@@ -201,6 +301,22 @@ func buildWorker(
 	owner string,
 	factory processorFactory,
 ) (*processing.Worker, error) {
+	return buildWorkerWithLog(
+		store,
+		gate,
+		owner,
+		factory,
+		safelog.Logger{},
+	)
+}
+
+func buildWorkerWithLog(
+	store processing.Store,
+	gate operations.ClaimGate,
+	owner string,
+	factory processorFactory,
+	logger safelog.Logger,
+) (*processing.Worker, error) {
 	if store == nil || gate == nil || owner == "" || factory == nil {
 		return nil, errors.New("invalid worker wiring")
 	}
@@ -210,6 +326,12 @@ func buildWorker(
 	}
 	return &processing.Worker{
 		Store: store, Processor: processor, Owner: owner, ClaimGate: gate,
+		LogCategory: func(category string) {
+			logger.Error("processing.worker", safelog.Field{
+				Name:  "category",
+				Value: category,
+			})
+		},
 	}, nil
 }
 
@@ -253,6 +375,17 @@ func healthHandler(ready func(context.Context) error) http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 	return mux
+}
+
+func productionWorkerHealthHandler(
+	ready func(context.Context) error,
+	logger safelog.Logger,
+) http.Handler {
+	return httpx.RequestID(
+		httpx.SafeRequestLog(logger, time.Now)(
+			httpx.SafeRecoverer(logger)(healthHandler(ready)),
+		),
+	)
 }
 
 func checkWorkDir(path string, requireTmpfs bool) error {

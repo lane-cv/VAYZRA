@@ -1,21 +1,41 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"happylearn.local/app/internal/auth"
 	"happylearn.local/app/internal/platform/config"
+	"happylearn.local/app/internal/platform/safelog"
 )
 
 func TestInternalServerBuildKeepsPrivateRoutesOutOfPublicApplication(t *testing.T) {
+	const (
+		querySecret = "internal-query-secret"
+		authSecret  = "internal-auth-secret"
+		bodySecret  = "internal-body-secret"
+	)
+	var logOutput bytes.Buffer
+	logger, err := safelog.New(
+		&logOutput,
+		time.Now,
+		querySecret,
+		authSecret,
+		bodySecret,
+	)
+	if err != nil {
+		t.Fatalf("safelog.New: %v", err)
+	}
 	internalFactoryCalls := 0
 	runtime, closeResources, err := buildApplicationRuntime(
 		context.Background(),
@@ -24,6 +44,7 @@ func TestInternalServerBuildKeepsPrivateRoutesOutOfPublicApplication(t *testing.
 			HostMetricsHMACSecret: []byte("host-secret"),
 		},
 		applicationDependencies{
+			logger: logger,
 			open: func(context.Context, string) (*pgxpool.Pool, error) {
 				return nil, nil
 			},
@@ -72,20 +93,55 @@ func TestInternalServerBuildKeepsPrivateRoutesOutOfPublicApplication(t *testing.
 	}
 
 	internalResult := httptest.NewRecorder()
-	runtime.Internal.ServeHTTP(
-		internalResult,
-		httptest.NewRequest(http.MethodGet, "/internal/metrics", nil),
+	internalRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/internal/metrics?signature="+querySecret,
+		strings.NewReader(bodySecret),
 	)
+	internalRequest.Header.Set("Authorization", "Bearer "+authSecret)
+	internalRequest.Header.Set("X-Request-ID", "request-id-internal")
+	runtime.Internal.ServeHTTP(internalResult, internalRequest)
 	if internalResult.Code != http.StatusNoContent {
 		t.Fatalf("internal status=%d", internalResult.Code)
 	}
+	var requestLog map[string]any
+	if err := json.Unmarshal(logOutput.Bytes(), &requestLog); err != nil {
+		t.Fatalf("decode internal request log %q: %v", logOutput.Bytes(), err)
+	}
+	if requestLog["event"] != "http.request" ||
+		requestLog["path"] != "/internal/metrics" ||
+		requestLog["status"] != float64(http.StatusNoContent) {
+		t.Fatalf("internal request log=%#v", requestLog)
+	}
+	for _, secret := range []string{querySecret, authSecret, bodySecret} {
+		if bytes.Contains(logOutput.Bytes(), []byte(secret)) {
+			t.Fatalf("internal request log leaked %q: %q", secret, logOutput.Bytes())
+		}
+	}
 	publicResult := httptest.NewRecorder()
-	runtime.Public.ServeHTTP(
-		publicResult,
-		httptest.NewRequest(http.MethodGet, "/internal/metrics", nil),
+	publicRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/internal/metrics?signature="+querySecret,
+		strings.NewReader(bodySecret),
 	)
+	publicRequest.Header.Set("Authorization", "Bearer "+authSecret)
+	publicRequest.Header.Set("X-Request-ID", "request-id-public-boundary")
+	runtime.Public.ServeHTTP(publicResult, publicRequest)
 	if publicResult.Code != http.StatusNotFound {
 		t.Fatalf("public internal-route status=%d", publicResult.Code)
+	}
+	records := decodeServerSafeLogs(t, logOutput.Bytes())
+	if len(records) != 2 ||
+		records[1]["event"] != "http.request" ||
+		records[1]["path"] != "/internal/metrics" ||
+		records[1]["status"] != float64(http.StatusNotFound) ||
+		records[1]["request_id"] != "request-id-public-boundary" {
+		t.Fatalf("public boundary request logs=%#v", records)
+	}
+	for _, secret := range []string{querySecret, authSecret, bodySecret} {
+		if bytes.Contains(logOutput.Bytes(), []byte(secret)) {
+			t.Fatalf("public boundary request log leaked %q: %q", secret, logOutput.Bytes())
+		}
 	}
 }
 

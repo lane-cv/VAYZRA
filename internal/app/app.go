@@ -5,9 +5,9 @@ import (
 	"io/fs"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 
 	"happylearn.local/app/internal/aiqa"
 	"happylearn.local/app/internal/auth"
@@ -21,10 +21,12 @@ import (
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
+	"happylearn.local/app/internal/platform/safelog"
 	"happylearn.local/app/internal/platform/staticweb"
 )
 
 type Dependencies struct {
+	Logger              safelog.Logger
 	Ready               func(context.Context) error
 	Auth                auth.HTTPService
 	Students            students.HTTPService
@@ -62,7 +64,11 @@ type Dependencies struct {
 
 func New(d Dependencies) http.Handler {
 	r := chi.NewRouter()
-	r.Use(httpx.RequestID, middleware.Recoverer)
+	r.Use(
+		httpx.RequestID,
+		httpx.SafeRequestLog(d.Logger, time.Now),
+		httpx.SafeRecoverer(d.Logger),
+	)
 	r.Get("/api/v1/health/live", func(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -154,14 +160,32 @@ func New(d Dependencies) http.Handler {
 				if d.Notifications != nil {
 					private.Mount("/notifications", notifications.NewHandler(d.Notifications).Routes())
 				}
+				transferAuditLog := func(category string) {
+					d.Logger.Error("file.transfer.audit", safelog.Field{
+						Name:  "category",
+						Value: category,
+					})
+				}
 				if d.FileAccess != nil {
-					private.Mount("/files", files.NewAccessHandler(d.FileAccess, d.TrustedProxyCIDRs).Routes())
+					private.Mount("/files", files.NewAccessHandlerWithLog(
+						d.FileAccess,
+						d.TrustedProxyCIDRs,
+						transferAuditLog,
+					).Routes())
 				}
 				if d.QAFileAccess != nil {
-					private.Mount("/question-files", files.NewQAAccessHandler(d.QAFileAccess, d.TrustedProxyCIDRs).Routes())
+					private.Mount("/question-files", files.NewQAAccessHandlerWithLog(
+						d.QAFileAccess,
+						d.TrustedProxyCIDRs,
+						transferAuditLog,
+					).Routes())
 				}
 				if d.AIFileAccess != nil {
-					private.Mount("/ai-question-files", files.NewAIAccessHandler(d.AIFileAccess, d.TrustedProxyCIDRs).Routes())
+					private.Mount("/ai-question-files", files.NewAIAccessHandlerWithLog(
+						d.AIFileAccess,
+						d.TrustedProxyCIDRs,
+						transferAuditLog,
+					).Routes())
 				}
 			})
 		})

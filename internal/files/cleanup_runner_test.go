@@ -1,8 +1,10 @@
 package files
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -79,6 +81,34 @@ func TestOperationalGateBlocksCleanupClaimsAndLogsSafeCategory(t *testing.T) {
 		if strings.Join(categories, ",") != want {
 			t.Fatalf("log=%q want=%q", strings.Join(categories, ","), want)
 		}
+	}
+}
+
+func TestCleanupRunnerWithoutCallbackDoesNotUseStandardLogger(t *testing.T) {
+	previousOutput := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	newCleanupRunner(
+		&countingCleaner{},
+		nil,
+		nil,
+		time.Hour,
+		time.Second,
+		100,
+	).runOnce(context.Background())
+
+	if output.Len() != 0 {
+		t.Fatalf("cleanup fallback wrote to standard logger: %q", output.Bytes())
 	}
 }
 

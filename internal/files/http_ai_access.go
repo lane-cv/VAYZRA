@@ -21,12 +21,25 @@ type AIAccessHTTPService interface {
 }
 
 type AIAccessHandler struct {
-	service AIAccessHTTPService
-	trusted []netip.Prefix
+	service     AIAccessHTTPService
+	trusted     []netip.Prefix
+	logCategory func(string)
 }
 
 func NewAIAccessHandler(service AIAccessHTTPService, trusted []netip.Prefix) *AIAccessHandler {
-	return &AIAccessHandler{service: service, trusted: append([]netip.Prefix(nil), trusted...)}
+	return NewAIAccessHandlerWithLog(service, trusted, nil)
+}
+
+func NewAIAccessHandlerWithLog(
+	service AIAccessHTTPService,
+	trusted []netip.Prefix,
+	logCategory func(string),
+) *AIAccessHandler {
+	return &AIAccessHandler{
+		service:     service,
+		trusted:     append([]netip.Prefix(nil), trusted...),
+		logCategory: logCategory,
+	}
 }
 
 func (h *AIAccessHandler) Routes() http.Handler {
@@ -159,5 +172,5 @@ func (h *AIAccessHandler) preview(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(status)
 	writer := newIdleDeadlineWriter(w, defaultWriteIdleTimeout)
 	defer writer.finish()
-	_ = deliverOpenedFile(r.Context(), writer, opened)
+	_ = deliverOpenedFileWithLog(r.Context(), writer, opened, h.logCategory)
 }
