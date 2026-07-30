@@ -16,6 +16,7 @@ TRIGGER=''
 ROOT=''
 COMPOSE_FILE=''
 LIVE_COMPOSE_FILE=''
+E2E_LIVE_COMPOSE_FILE=''
 LIVE_ROOT=''
 LOCK_DIRECTORY=''
 LOCK_HELD=false
@@ -302,6 +303,11 @@ configure_live_context() {
     return 1
   owner_only_directory "$live_root" || return 1
   LIVE_ROOT="$(cd "$live_root" && pwd -P)"
+  [[ "$LIVE_ROOT" == "$live_root" ]] || return 1
+  E2E_LIVE_COMPOSE_FILE="$ROOT/deploy/compose.phase5-e2e-live.yml"
+  [[ -f "$E2E_LIVE_COMPOSE_FILE" &&
+    ! -L "$E2E_LIVE_COMPOSE_FILE" ]] ||
+    return 1
   secret_root="$(cd "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" && pwd -P)"
   repository_root="$(cd "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" && pwd -P)"
   state_root="$(cd "$HAPPYLEARN_BACKUP_STATE_DIRECTORY" && pwd -P)"
@@ -315,6 +321,9 @@ configure_live_context() {
     "$state_root" == "$LIVE_ROOT/state" &&
     "$lock_path" == "$LIVE_ROOT/host.lock" ]] ||
     return 1
+  owner_only_directory "$LIVE_ROOT/runtime-secrets" || return 1
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$LIVE_ROOT"
+  export HAPPYLEARN_BACKUP_LIVE_ROOT
   EFFECTIVE_PROJECT="$live_project"
 }
 
@@ -735,6 +744,7 @@ compose() {
   )
   if [[ -n "$LIVE_ROOT" ]]; then
     arguments+=(--file "$LIVE_COMPOSE_FILE")
+    arguments+=(--file "$E2E_LIVE_COMPOSE_FILE")
   fi
   docker compose "${arguments[@]}" "$@"
 }

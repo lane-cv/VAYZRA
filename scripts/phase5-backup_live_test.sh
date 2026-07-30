@@ -9,16 +9,21 @@ readonly MAX_CPU_PERCENT='200'
 readonly MAX_MEMORY_MIB='4096'
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+FIXTURE_TEMP_BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"
 COMPOSE_LIVE_FILE="$ROOT/deploy/compose.backup-live.yml"
+COMPOSE_E2E_LIVE_FILE="$ROOT/deploy/compose.phase5-e2e-live.yml"
 PROJECT=''
 COMPOSE_APP_IMAGE=''
 COMPOSE_WORKER_IMAGE=''
 FIXTURE_ROOT=''
 FIXTURE_SUFFIX=''
 REMOTE_NAME=''
+REMOTE_INIT_NAME=''
 REMOTE_VOLUME=''
-REMOTE_ENV_FILE=''
+RUNTIME_SECRET_VOLUME=''
+EXTERNAL_SENTINEL_VOLUME=''
+SECRET_MARKER_PREFIX=''
 BACKUP_BASE_IMAGE=''
 BACKUP_CA_IMAGE=''
 AGE_IDENTITY_FILE=''
@@ -27,8 +32,8 @@ COMPOSE_CONTAINER_RECORD=''
 COMPOSE_VOLUME_RECORD=''
 COMPOSE_NETWORK_RECORD=''
 CA_PROBE_NAME=''
-REMOTE_CONTAINER_CREATED=false
 REMOTE_VOLUME_CREATED=false
+EXTERNAL_SENTINEL_CREATED=false
 CLEANED=false
 
 fail() {
@@ -41,6 +46,7 @@ compose() {
     --project-name "$PROJECT" \
     --file "$COMPOSE_FILE" \
     --file "$COMPOSE_LIVE_FILE" \
+    --file "$COMPOSE_E2E_LIVE_FILE" \
     "$@"
 }
 
@@ -141,24 +147,60 @@ remove_created_images() {
   done
 }
 
+create_external_sentinel() {
+  EXTERNAL_SENTINEL_CREATED=true
+  if ! docker volume create \
+    --label "io.happylearn.phase5-external-sentinel=${FIXTURE_SUFFIX}" \
+    "$EXTERNAL_SENTINEL_VOLUME" >/dev/null; then
+    EXTERNAL_SENTINEL_CREATED=false
+    return 1
+  fi
+}
+
+verify_external_sentinel() {
+  local sentinel_label
+  [[ "$EXTERNAL_SENTINEL_CREATED" == true &&
+    -n "$EXTERNAL_SENTINEL_VOLUME" ]] || return 0
+  sentinel_label="$(
+    docker volume inspect --format \
+      '{{index .Labels "io.happylearn.phase5-external-sentinel"}}' \
+      "$EXTERNAL_SENTINEL_VOLUME" 2>/dev/null || true
+  )"
+  if [[ "$sentinel_label" != "$FIXTURE_SUFFIX" ]]; then
+    printf 'phase5 backup live: external sentinel was removed or changed\n' >&2
+    return 1
+  fi
+}
+
+remove_external_sentinel() {
+  [[ "$EXTERNAL_SENTINEL_CREATED" == true &&
+    -n "$EXTERNAL_SENTINEL_VOLUME" ]] || return 0
+  verify_external_sentinel || return 1
+  docker volume rm "$EXTERNAL_SENTINEL_VOLUME" >/dev/null 2>&1 ||
+    return 1
+  EXTERNAL_SENTINEL_CREATED=false
+}
+
 cleanup_live() {
   local status="${1:-0}"
+  local cleanup_name cleanup_label
   if [[ "$CLEANED" == true ]]; then
     return "$status"
   fi
   CLEANED=true
-  if [[ "$REMOTE_CONTAINER_CREATED" == true && -n "$REMOTE_NAME" ]]; then
-    local remote_label
-    remote_label="$(docker container inspect --format \
+  for cleanup_name in \
+    "$REMOTE_NAME" "$REMOTE_INIT_NAME" "${REMOTE_INIT_NAME:+${REMOTE_INIT_NAME}-secret-probe}"; do
+    [[ -n "$cleanup_name" ]] || continue
+    cleanup_label="$(docker container inspect --format \
       '{{index .Config.Labels "io.happylearn.phase5-live"}}' \
-      "$REMOTE_NAME" 2>/dev/null || true)"
-    if [[ "$remote_label" == "$FIXTURE_SUFFIX" ]]; then
-      docker rm --force "$REMOTE_NAME" >/dev/null 2>&1 || status=1
-    elif [[ -n "$remote_label" ]]; then
+      "$cleanup_name" 2>/dev/null || true)"
+    if [[ "$cleanup_label" == "$FIXTURE_SUFFIX" ]]; then
+      docker rm --force "$cleanup_name" >/dev/null 2>&1 || status=1
+    elif [[ -n "$cleanup_label" ]]; then
       printf 'phase5 backup live: remote container ownership changed\n' >&2
       status=1
     fi
-  fi
+  done
   if [[ "$REMOTE_VOLUME_CREATED" == true && -n "$REMOTE_VOLUME" ]]; then
     local volume_label
     volume_label="$(docker volume inspect --format \
@@ -191,7 +233,7 @@ cleanup_live() {
   remove_compose_resources || status=1
   remove_created_images || status=1
   if [[ -n "$FIXTURE_ROOT" &&
-    "$FIXTURE_ROOT" == "${TMPDIR:-/tmp}/phase5-backup-live."* &&
+    "$FIXTURE_ROOT" == "$FIXTURE_TEMP_BASE/phase5-backup-live."* &&
     -d "$FIXTURE_ROOT" ]]; then
     chmod -R u+rwX "$FIXTURE_ROOT" 2>/dev/null || status=1
     rm -rf "$FIXTURE_ROOT" || status=1
@@ -207,6 +249,11 @@ on_exit() {
     cleanup_status=0
   else
     cleanup_status=$?
+  fi
+  if ! verify_external_sentinel; then
+    cleanup_status=1
+  elif ! remove_external_sentinel; then
+    cleanup_status=1
   fi
   if [[ "$status" -ne 0 ]]; then
     exit "$status"
@@ -225,6 +272,8 @@ require_dependencies() {
   docker compose version >/dev/null || fail 'Docker Compose v2 is required'
   [[ -f "$COMPOSE_LIVE_FILE" ]] ||
     fail 'fixed live Compose override is missing'
+  [[ -f "$COMPOSE_E2E_LIVE_FILE" && ! -L "$COMPOSE_E2E_LIVE_FILE" ]] ||
+    fail 'fixed Phase 5 E2E live Compose override is missing'
   [[ -n "${HAPPYLEARN_AISTOR_LICENSE_FILE:-}" ]] ||
     fail 'set HAPPYLEARN_AISTOR_LICENSE_FILE'
   [[ -f "$HAPPYLEARN_AISTOR_LICENSE_FILE" &&
@@ -238,8 +287,12 @@ create_fixture() {
   local remote_secret_key
   local local_repository_password
   local remote_repository_password
+  local database_password
+  local primary_access_key
+  local primary_secret_key
+  local login_throttle_secret
   FIXTURE_ROOT="$(mktemp -d \
-    "${TMPDIR:-/tmp}/phase5-backup-live.XXXXXX")"
+    "$FIXTURE_TEMP_BASE/phase5-backup-live.XXXXXX")"
   FIXTURE_SUFFIX="$(
     uuidgen |
       tr '[:upper:]' '[:lower:]' |
@@ -252,8 +305,10 @@ create_fixture() {
   COMPOSE_APP_IMAGE="${PROJECT}-app"
   COMPOSE_WORKER_IMAGE="${PROJECT}-worker"
   REMOTE_NAME="phase5-remote-${FIXTURE_SUFFIX}"
+  REMOTE_INIT_NAME="${REMOTE_NAME}-data-init"
   REMOTE_VOLUME="phase5-remote-data-${FIXTURE_SUFFIX}"
-  REMOTE_ENV_FILE="$FIXTURE_ROOT/remote.env"
+  EXTERNAL_SENTINEL_VOLUME="phase5-external-sentinel-${FIXTURE_SUFFIX}"
+  SECRET_MARKER_PREFIX="phase5-e2e-secret-marker-${FIXTURE_SUFFIX}"
   CA_PROBE_NAME="phase5-ca-negative-${FIXTURE_SUFFIX}"
   BACKUP_BASE_IMAGE="happylearn-backup:phase5-live-base-${FIXTURE_SUFFIX}"
   BACKUP_CA_IMAGE="happylearn-backup:phase5-live-ca-${FIXTURE_SUFFIX}"
@@ -263,15 +318,11 @@ create_fixture() {
   COMPOSE_VOLUME_RECORD="$FIXTURE_ROOT/compose-volumes"
   COMPOSE_NETWORK_RECORD="$FIXTURE_ROOT/compose-networks"
   remote_access_key="p5${FIXTURE_SUFFIX}"
-  remote_secret_key="$(
-    uuidgen |
-      tr '[:upper:]' '[:lower:]' |
-      tr -d '-'
-  )$(
-    uuidgen |
-      tr '[:upper:]' '[:lower:]' |
-      tr -d '-'
-  )"
+  remote_secret_key="${SECRET_MARKER_PREFIX}-remote-secret"
+  database_password="${SECRET_MARKER_PREFIX}-database"
+  primary_access_key="p5primary${FIXTURE_SUFFIX}"
+  primary_secret_key="${SECRET_MARKER_PREFIX}-primary-secret"
+  login_throttle_secret="${SECRET_MARKER_PREFIX}-login-throttle-padding"
   local_repository_password="$(
     uuidgen |
       tr '[:upper:]' '[:lower:]' |
@@ -289,8 +340,12 @@ create_fixture() {
     [[ -n "$(docker network ls --quiet \
       --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
     docker container inspect "$REMOTE_NAME" >/dev/null 2>&1 ||
+    docker container inspect "$REMOTE_INIT_NAME" >/dev/null 2>&1 ||
+    docker container inspect "${REMOTE_INIT_NAME}-secret-probe" \
+      >/dev/null 2>&1 ||
     docker container inspect "$CA_PROBE_NAME" >/dev/null 2>&1 ||
     docker volume inspect "$REMOTE_VOLUME" >/dev/null 2>&1 ||
+    docker volume inspect "$EXTERNAL_SENTINEL_VOLUME" >/dev/null 2>&1 ||
     docker image inspect "$BACKUP_BASE_IMAGE" >/dev/null 2>&1 ||
     docker image inspect "$BACKUP_CA_IMAGE" >/dev/null 2>&1 ||
     docker image inspect "$COMPOSE_APP_IMAGE" >/dev/null 2>&1 ||
@@ -300,6 +355,12 @@ create_fixture() {
 
   mkdir -m 0700 \
     "$FIXTURE_ROOT/secrets" \
+    "$FIXTURE_ROOT/runtime-secrets" \
+    "$FIXTURE_ROOT/runtime-secrets/postgres" \
+    "$FIXTURE_ROOT/runtime-secrets/minio" \
+    "$FIXTURE_ROOT/runtime-secrets/app" \
+    "$FIXTURE_ROOT/runtime-secrets/worker" \
+    "$FIXTURE_ROOT/runtime-secrets/remote-s3" \
     "$FIXTURE_ROOT/repository" \
     "$FIXTURE_ROOT/state" \
     "$FIXTURE_ROOT/offline" \
@@ -307,7 +368,7 @@ create_fixture() {
     "$FIXTURE_ROOT/server-certs" \
     "$FIXTURE_ROOT/server-certs/CAs" \
     "$FIXTURE_ROOT/results"
-  printf '%s\n' 'happylearn_dev' \
+  printf '%s\n' "$database_password" \
     >"$FIXTURE_ROOT/secrets/database_password"
   printf '%s\n' '/repository' \
     >"$FIXTURE_ROOT/secrets/local_repository"
@@ -322,10 +383,34 @@ create_fixture() {
   printf '%s\n' "$remote_secret_key" \
     >"$FIXTURE_ROOT/secrets/remote_secret_access_key"
   chmod 0400 "$FIXTURE_ROOT/secrets/"*
-  printf 'MINIO_ROOT_USER=%s\n' "$remote_access_key" >"$REMOTE_ENV_FILE"
-  printf 'MINIO_ROOT_PASSWORD=%s\n' "$remote_secret_key" >>"$REMOTE_ENV_FILE"
-  printf '%s\n' 'SSL_CERT_FILE=/certs/CAs/ca.crt' >>"$REMOTE_ENV_FILE"
-  chmod 0600 "$REMOTE_ENV_FILE"
+  printf '%s\n' "$database_password" \
+    >"$FIXTURE_ROOT/runtime-secrets/postgres/password"
+  printf 'MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n' \
+    "$primary_access_key" "$primary_secret_key" \
+    >"$FIXTURE_ROOT/runtime-secrets/minio/runtime.env"
+  printf '%s\n' \
+    "HAPPYLEARN_DATABASE_URL=postgres://happylearn:${database_password}@postgres:5432/happylearn?sslmode=disable" \
+    "HAPPYLEARN_LOGIN_THROTTLE_SECRET=${login_throttle_secret}" \
+    "HAPPYLEARN_MINIO_ACCESS_KEY=${primary_access_key}" \
+    "HAPPYLEARN_MINIO_SECRET_KEY=${primary_secret_key}" \
+    >"$FIXTURE_ROOT/runtime-secrets/app/runtime.env"
+  printf '%s\n' \
+    "HAPPYLEARN_DATABASE_URL=postgres://happylearn:${database_password}@postgres:5432/happylearn?sslmode=disable" \
+    "HAPPYLEARN_LOGIN_THROTTLE_SECRET=${login_throttle_secret}" \
+    "HAPPYLEARN_MINIO_ACCESS_KEY=${primary_access_key}" \
+    "HAPPYLEARN_MINIO_SECRET_KEY=${primary_secret_key}" \
+    >"$FIXTURE_ROOT/runtime-secrets/worker/runtime.env"
+  printf '%s\n' \
+    "MINIO_ROOT_USER=${remote_access_key}" \
+    "MINIO_ROOT_PASSWORD=${remote_secret_key}" \
+    'SSL_CERT_FILE=/certs/CAs/ca.crt' \
+    >"$FIXTURE_ROOT/runtime-secrets/remote-s3/runtime.env"
+  chmod 0400 \
+    "$FIXTURE_ROOT/runtime-secrets/postgres/password" \
+    "$FIXTURE_ROOT/runtime-secrets/minio/runtime.env" \
+    "$FIXTURE_ROOT/runtime-secrets/app/runtime.env" \
+    "$FIXTURE_ROOT/runtime-secrets/worker/runtime.env" \
+    "$FIXTURE_ROOT/runtime-secrets/remote-s3/runtime.env"
   : >"$CREATED_IMAGE_RECORD"
   : >"$COMPOSE_CONTAINER_RECORD"
   : >"$COMPOSE_VOLUME_RECORD"
@@ -413,6 +498,15 @@ start_base_stack() {
   record_image "$COMPOSE_APP_IMAGE"
   compose build worker
   record_image "$COMPOSE_WORKER_IMAGE"
+  if ! compose up --no-build --no-deps \
+    --abort-on-container-exit \
+    --exit-code-from phase5-secrets-init \
+    phase5-secrets-init; then
+    record_compose_resources
+    return 1
+  fi
+  record_compose_resources
+  verify_phase5_secret_init
   if ! compose create postgres redis minio app worker; then
     record_compose_resources
     return 1
@@ -420,7 +514,53 @@ start_base_stack() {
   record_compose_resources
   compose up --detach --no-build postgres redis minio app worker
   record_compose_resources
+  probe_phase5_secret_consumers
   wait_base_stack
+}
+
+verify_phase5_secret_init() {
+  local container_id state exit_code
+  container_id="$(compose ps --all --quiet phase5-secrets-init)"
+  [[ -n "$container_id" && "$container_id" != *$'\n'* ]] ||
+    fail 'Phase 5 secret init container was not created'
+  state="$(docker container inspect --format '{{.State.Status}}' "$container_id")"
+  exit_code="$(docker container inspect --format '{{.State.ExitCode}}' "$container_id")"
+  [[ "$state" == exited && "$exit_code" == 0 ]] ||
+    fail 'Phase 5 secret init did not complete successfully'
+  docker logs "$container_id" 2>&1 |
+    grep -Fxq PHASE5_E2E_SECRET_INIT ||
+    fail 'Phase 5 secret init completion marker was absent'
+  RUNTIME_SECRET_VOLUME="$(
+    docker volume ls --quiet \
+      --filter "label=com.docker.compose.project=${PROJECT}" \
+      --filter 'label=com.docker.compose.volume=phase5_runtime_secrets'
+  )"
+  [[ -n "$RUNTIME_SECRET_VOLUME" &&
+    "$RUNTIME_SECRET_VOLUME" != *$'\n'* ]] ||
+    fail 'could not resolve the project-owned runtime secret volume'
+}
+
+probe_phase5_secret_consumers() {
+  compose run --rm --no-deps --user 999:999 \
+    --entrypoint /bin/sh postgres -ceu '
+      test "$(stat -c "%u:%g:%a" /run/phase5-secrets/password)" = 999:999:400
+      test -s /run/phase5-secrets/password
+    '
+  compose run --rm --no-deps --user 1000:0 \
+    --entrypoint /bin/sh minio -ceu '
+      test "$(stat -c "%u:%g:%a" /run/phase5-secrets/runtime.env)" = 1000:0:400
+      test -s /run/phase5-secrets/runtime.env
+    '
+  compose run --rm --no-deps --user 10001:10001 \
+    --entrypoint /bin/sh app -ceu '
+      test "$(stat -c "%u:%g:%a" /run/phase5-secrets/runtime.env)" = 10001:10001:400
+      test -s /run/phase5-secrets/runtime.env
+    '
+  compose run --rm --no-deps --user 10002:10002 \
+    --entrypoint /bin/sh worker -ceu '
+      test "$(stat -c "%u:%g:%a" /run/phase5-secrets/runtime.env)" = 10002:10002:400
+      test -s /run/phase5-secrets/runtime.env
+    '
 }
 
 wait_base_stack() {
@@ -474,8 +614,6 @@ wait_remote_ready() {
 
 start_remote_fixture() {
   local network_id
-  local entrypoint
-  local command_prefix
   network_id="$(
     docker network ls --quiet \
       --filter "label=com.docker.compose.project=${PROJECT}" \
@@ -487,49 +625,262 @@ start_remote_fixture() {
     docker volume inspect "$REMOTE_VOLUME" >/dev/null 2>&1; then
     fail 'unique remote fixture name unexpectedly collided'
   fi
-  docker volume create \
-    --label "io.happylearn.phase5-live=${FIXTURE_SUFFIX}" \
-    "$REMOTE_VOLUME" >/dev/null
   REMOTE_VOLUME_CREATED=true
-  entrypoint="$(docker image inspect --format \
-    '{{json .Config.Entrypoint}}' "$REMOTE_IMAGE")"
-  case "$entrypoint" in
-    '["minio"]'|'["/usr/bin/minio"]'|'["/usr/local/bin/minio"]')
-      command_prefix='server'
-      ;;
-    *)
-      command_prefix='minio server'
-      ;;
-  esac
+  if ! docker volume create \
+    --label "io.happylearn.phase5-live=${FIXTURE_SUFFIX}" \
+    "$REMOTE_VOLUME" >/dev/null; then
+    REMOTE_VOLUME_CREATED=false
+    return 1
+  fi
+  docker run --rm \
+    --name "$REMOTE_INIT_NAME" \
+    --label "io.happylearn.phase5-live=${FIXTURE_SUFFIX}" \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --security-opt no-new-privileges:true \
+    --memory 64m \
+    --cpus 0.05 \
+    --mount "type=volume,src=$REMOTE_VOLUME,dst=/data" \
+    --entrypoint /bin/sh \
+    "$REMOTE_IMAGE" -ceu \
+    'chmod 0750 /data; chown 1000:0 /data; test "$(stat -c %u:%g:%a /data)" = 1000:0:750'
+  docker run --rm \
+    --name "${REMOTE_INIT_NAME}-secret-probe" \
+    --label "io.happylearn.phase5-live=${FIXTURE_SUFFIX}" \
+    --network none \
+    --read-only \
+    --user 1000:0 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --memory 32m \
+    --cpus 0.05 \
+    --mount "type=volume,src=$RUNTIME_SECRET_VOLUME,dst=/run/phase5-secrets,volume-subpath=remote-s3,readonly" \
+    --entrypoint /bin/sh \
+    "$REMOTE_IMAGE" -ceu \
+    'test "$(stat -c %u:%g:%a /run/phase5-secrets/runtime.env)" = 1000:0:400; test -s /run/phase5-secrets/runtime.env'
   docker run --detach \
     --name "$REMOTE_NAME" \
     --label "io.happylearn.phase5-live=${FIXTURE_SUFFIX}" \
     --network "$network_id" \
     --network-alias "$REMOTE_NAME" \
-    --user 0:0 \
+    --user 1000:0 \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=16m \
     --cap-drop ALL \
     --security-opt no-new-privileges:true \
     --memory 512m \
     --cpus 0.3 \
-    --env-file "$REMOTE_ENV_FILE" \
-    --volume "$REMOTE_VOLUME:/data" \
-    --volume "$FIXTURE_ROOT/server-certs:/certs:ro" \
-    --volume "$HAPPYLEARN_AISTOR_LICENSE_FILE:/minio.license:ro" \
+    --mount "type=volume,src=$REMOTE_VOLUME,dst=/data" \
+    --mount "type=volume,src=$RUNTIME_SECRET_VOLUME,dst=/run/phase5-secrets,volume-subpath=remote-s3,readonly" \
+    --mount "type=bind,src=$FIXTURE_ROOT/server-certs,dst=/certs,readonly" \
+    --mount "type=bind,src=$HAPPYLEARN_AISTOR_LICENSE_FILE,dst=/minio.license,readonly" \
+    --entrypoint /bin/sh \
     "$REMOTE_IMAGE" \
-    $command_prefix /data \
-      --address :9000 \
-      --console-address :9001 \
-      --certs-dir /certs \
-      --license /minio.license >/dev/null
-  REMOTE_CONTAINER_CREATED=true
+    -ceu \
+    'set -a; . /run/phase5-secrets/runtime.env; set +a; exec minio server /data --address :9000 --console-address :9001 --certs-dir /certs --license /minio.license' \
+    >/dev/null
   wait_remote_ready ||
     fail 'remote HTTPS S3 fixture did not become ready'
 }
 
+audit_container_metadata() {
+  local ids container_id metadata host_config env_entries entry key value
+  local mounts mount_type mount_name mount_source mount_destination mount_rw
+  local host_mounts host_mount_type host_mount_source host_mount_target
+  local host_mount_read_only host_mount_subpath actual_mount_rw
+  local runtime_actual_mount_count runtime_host_mount_count
+  local service
+  ids="$(
+    {
+      docker ps -aq \
+        --filter "label=com.docker.compose.project=${PROJECT}"
+      docker ps -aq \
+        --filter "label=io.happylearn.phase5-live=${FIXTURE_SUFFIX}"
+    } |
+      awk 'NF && !seen[$0]++'
+  )"
+  [[ -n "$ids" ]] || fail 'metadata audit found no Phase 5 containers'
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    metadata="$(
+      docker container inspect --format \
+        '{{json .Config.Env}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}' \
+        "$container_id"
+    )" || fail 'could not audit Phase 5 container configuration'
+    host_config="$(
+      docker container inspect --format \
+        '{{json .HostConfig.Binds}}|{{json .HostConfig.Privileged}}|{{json .HostConfig.NetworkMode}}' \
+        "$container_id"
+    )" || fail 'could not audit Phase 5 container host configuration'
+    host_mounts="$(
+      docker container inspect --format \
+        '{{range .HostConfig.Mounts}}{{printf "%s|%s|%s|%t|" .Type .Source .Target .ReadOnly}}{{if .VolumeOptions}}{{printf "%s" .VolumeOptions.Subpath}}{{end}}{{printf "\n"}}{{end}}' \
+        "$container_id"
+    )" || fail 'could not audit Phase 5 requested mounts'
+    mounts="$(
+      docker container inspect --format \
+        '{{range .Mounts}}{{printf "%s|%s|%s|%s|%t\n" .Type .Name .Source .Destination .RW}}{{end}}' \
+        "$container_id"
+    )" || fail 'could not audit Phase 5 container mounts'
+    service="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.service"}}' \
+        "$container_id"
+    )" || service=''
+    if [[ "$service" == '<no value>' ]]; then
+      service=''
+    fi
+    env_entries="$(
+      docker container inspect --format \
+        '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$container_id"
+    )" || fail 'could not audit Phase 5 container environment'
+    while IFS= read -r entry; do
+      [[ -n "$entry" && "$entry" == *=* ]] || continue
+      key="${entry%%=*}"
+      value="${entry#*=}"
+      case "$key" in
+        POSTGRES_PASSWORD_FILE)
+          [[ "$value" == /run/phase5-secrets/password ]] ||
+            fail 'PostgreSQL password file path was not fixed'
+          ;;
+        HAPPYLEARN_METRICS_BEARER_SECRET_FILE)
+          [[ "$value" == /run/secrets/metrics-bearer ]] ||
+            fail 'metrics bearer secret file path was not fixed'
+          ;;
+        HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE)
+          [[ "$value" == /run/secrets/host-metrics-hmac ]] ||
+            fail 'host metrics HMAC file path was not fixed'
+          ;;
+        *_FILE)
+          fail "unapproved Config.Env file key was present: $key"
+          ;;
+        POSTGRES_PASSWORD|MINIO_ROOT_USER|MINIO_ROOT_PASSWORD|\
+          HAPPYLEARN_DATABASE_URL|HAPPYLEARN_LOGIN_THROTTLE_SECRET|\
+          HAPPYLEARN_AI_MASTER_KEY|HAPPYLEARN_MINIO_ACCESS_KEY|\
+          HAPPYLEARN_MINIO_SECRET_KEY|HAPPYLEARN_METRICS_BEARER_SECRET|\
+          HAPPYLEARN_HOST_METRICS_HMAC_SECRET|HAPPYLEARN_WEBHOOK_URL|\
+          HAPPYLEARN_WEBHOOK_AUTHORIZATION|RESTIC_PASSWORD|\
+          AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|E2E_ADMIN_PASSWORD|\
+          E2E_STUDENT_PASSWORD|E2E_STUDENT_NEW_PASSWORD|\
+          E2E_AI_PROVIDER_KEY|E2E_AI_PROCESSING_CONTROL_TOKEN)
+          fail "secret-bearing Config.Env key was present: $key"
+          ;;
+      esac
+    done <<<"$env_entries"
+    if grep -Fq "$SECRET_MARKER_PREFIX" <<<"$metadata" ||
+      grep -Fq 'happylearn_minio_dev_secret' <<<"$metadata" ||
+      grep -Fq 'development-only-app-secret' <<<"$metadata" ||
+      grep -Fq 'development-only-worker-secret' <<<"$metadata"; then
+      fail 'secret entered Phase 5 container metadata'
+    fi
+    if grep -Fq '/var/run/docker.sock' <<<"$host_config" ||
+      [[ "$host_config" == *'|true|'* ||
+        "$host_config" == *'|"host"'* ]]; then
+      fail 'unsafe socket, privileged mode, or host network entered Phase 5 container metadata'
+    fi
+    runtime_actual_mount_count=0
+    while IFS='|' read -r mount_type mount_name mount_source \
+      mount_destination mount_rw; do
+      [[ -n "$mount_type" ]] || continue
+      if [[ "$mount_source" == *docker.sock* ||
+        "$mount_destination" == *docker.sock* ]]; then
+        fail 'Docker socket entered a Phase 5 container mount'
+      fi
+      if [[ "$mount_type" == volume &&
+        "$mount_name" == "$RUNTIME_SECRET_VOLUME" ]]; then
+        runtime_actual_mount_count=$((runtime_actual_mount_count + 1))
+        if [[ "$service" == phase5-secrets-init &&
+          "$mount_destination" == /secret-target &&
+          "$mount_rw" == true ]]; then
+          :
+        elif [[ "$mount_destination" == /run/phase5-secrets &&
+          "$mount_rw" == false ]]; then
+          :
+        else
+          fail 'runtime secret volume mount was not an allowed read-only consumer'
+        fi
+      fi
+      if [[ "$mount_type" == bind ]]; then
+        case "$mount_source:$mount_destination:$mount_rw" in
+          "$FIXTURE_ROOT/runtime-secrets:/secret-source:false" | \
+            "$FIXTURE_ROOT/server-certs:/certs:false" | \
+            "$HAPPYLEARN_AISTOR_LICENSE_FILE:/minio.license:false" | \
+            "$ROOT/deploy/fixtures/development-metrics-bearer-do-not-use-in-production:/run/secrets/metrics-bearer:false" | \
+            "$ROOT/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production:/run/secrets/host-metrics-hmac:false") ;;
+          *) fail 'unexpected host bind entered a Phase 5 container' ;;
+        esac
+      fi
+    done <<<"$mounts"
+    runtime_host_mount_count=0
+    while IFS='|' read -r host_mount_type host_mount_source \
+      host_mount_target host_mount_read_only host_mount_subpath; do
+      [[ -n "$host_mount_type" ]] || continue
+      if [[ "$host_mount_type" != volume ||
+        "$host_mount_source" != "$RUNTIME_SECRET_VOLUME" ]]; then
+        continue
+      fi
+      runtime_host_mount_count=$((runtime_host_mount_count + 1))
+      case "$service" in
+        phase5-secrets-init)
+          [[ "$host_mount_target" == /secret-target &&
+            "$host_mount_read_only" == false &&
+            -z "$host_mount_subpath" ]] ||
+            fail 'runtime secret HostConfig mount did not match init ownership'
+          ;;
+        postgres|minio|app|worker)
+          [[ "$host_mount_target" == /run/phase5-secrets &&
+            "$host_mount_read_only" == true &&
+            "$host_mount_subpath" == "$service" ]] ||
+            fail 'runtime secret HostConfig mount did not match its Compose consumer'
+          ;;
+        '')
+          [[ "$host_mount_target" == /run/phase5-secrets &&
+            "$host_mount_read_only" == true &&
+            "$host_mount_subpath" == remote-s3 ]] ||
+            fail 'runtime secret HostConfig mount did not match the remote S3 consumer'
+          ;;
+        *)
+          fail 'runtime secret HostConfig mount entered an unexpected service'
+          ;;
+      esac
+      if [[ "$host_mount_read_only" == true ]]; then
+        actual_mount_rw=false
+      else
+        actual_mount_rw=true
+      fi
+      awk -F '|' \
+        -v expected_name="$host_mount_source" \
+        -v expected_target="$host_mount_target" \
+        -v expected_rw="$actual_mount_rw" '
+          $1 == "volume" &&
+          $2 == expected_name &&
+          $4 == expected_target &&
+          $5 == expected_rw { found=1 }
+          END { exit !found }
+        ' <<<"$mounts" ||
+        fail 'runtime secret HostConfig mount was not realized in container Mounts'
+    done <<<"$host_mounts"
+    if [[ "$service" == phase5-secrets-init ]]; then
+      [[ "$runtime_actual_mount_count" -eq 1 &&
+        "$runtime_host_mount_count" -eq 0 &&
+        "$host_config" == *"\"${RUNTIME_SECRET_VOLUME}:/secret-target:rw\""* ]] ||
+        fail 'runtime secret init bind request was not realized exactly once'
+    else
+      [[ "$runtime_actual_mount_count" -eq "$runtime_host_mount_count" ]] ||
+        fail 'runtime secret requested and realized mount counts diverged'
+    fi
+  done <<<"$ids"
+}
+
 create_remote_bucket() {
   docker exec "$REMOTE_NAME" /bin/sh -eu -c '
+    set -a
+    . /run/phase5-secrets/runtime.env
+    set +a
     export MC_CONFIG_DIR=/tmp/mc
     client=
     for candidate in /usr/bin/mc /usr/local/bin/mc /usr/bin/mcli /usr/local/bin/mcli; do
@@ -1112,6 +1463,7 @@ SQL
 }
 
 verify_no_orphans() {
+  local container_name
   [[ ! -e "$FIXTURE_ROOT" ]] ||
     fail 'fixture root remained after exact cleanup'
   [[ -z "$(docker ps -aq \
@@ -1123,9 +1475,12 @@ verify_no_orphans() {
   [[ -z "$(docker network ls --quiet \
     --filter "label=com.docker.compose.project=${PROJECT}")" ]] ||
     fail 'Compose networks remained after exact cleanup'
-  if docker container inspect "$REMOTE_NAME" >/dev/null 2>&1; then
-    fail 'remote fixture container remained after exact cleanup'
-  fi
+  for container_name in \
+    "$REMOTE_NAME" "$REMOTE_INIT_NAME" "${REMOTE_INIT_NAME}-secret-probe"; do
+    if docker container inspect "$container_name" >/dev/null 2>&1; then
+      fail "remote fixture container remained after exact cleanup: ${container_name}"
+    fi
+  done
   if docker volume inspect "$REMOTE_VOLUME" >/dev/null 2>&1; then
     fail 'remote fixture volume remained after exact cleanup'
   fi
@@ -1271,13 +1626,16 @@ main() {
   local actual_state
   require_dependencies
   create_fixture
+  create_external_sentinel
   create_fixture_ca
   build_backup_images
   start_base_stack
   start_remote_fixture
+  audit_container_metadata
   create_remote_bucket
 
   run_backup_monitored success
+  audit_container_metadata
   actual_state="$(latest_state)"
   [[ "$actual_state" == succeeded ]] ||
     fail "real local/remote success was not recorded: ${actual_state}"
@@ -1285,6 +1643,7 @@ main() {
 
   docker pause "$REMOTE_NAME" >/dev/null
   run_backup_monitored remote-outage
+  audit_container_metadata
   actual_state="$(latest_state)"
   [[ "$actual_state" == degraded ]] ||
     fail "remote outage did not preserve a degraded local recovery point: ${actual_state}"
@@ -1292,6 +1651,7 @@ main() {
   docker unpause "$REMOTE_NAME" >/dev/null
   wait_remote_ready || fail 'remote fixture did not recover'
   run_backup_monitored remote-recovery
+  audit_container_metadata
   actual_state="$(latest_state)"
   [[ "$actual_state" == succeeded ]] ||
     fail "remote recovery retry did not succeed: ${actual_state}"
@@ -1300,12 +1660,15 @@ main() {
 
   seed_retention_boundaries
   run_backup_monitored retention
+  audit_container_metadata
   actual_state="$(latest_state)"
   [[ "$actual_state" == succeeded ]] ||
     fail "retention-triggering recovery point did not succeed: ${actual_state}"
   assert_retention_results
 
   cleanup_live 0
+  verify_external_sentinel
+  remove_external_sentinel
   trap - EXIT HUP INT TERM
   verify_no_orphans
   printf 'phase5 backup live: PASS\n'

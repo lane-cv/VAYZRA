@@ -1,0 +1,183 @@
+services:
+  phase5-secrets-init:
+    image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=10s
+      - 120s
+      - /bin/sh
+      - -ceu
+    command:
+      - |
+        test -z "$(find /secret-target -mindepth 1 -maxdepth 1 -print -quit)"
+        install_secret() {
+          source="$${1}"
+          target="$${2}"
+          owner="$${3}"
+          cp "$${source}" "$${target}"
+          chmod 0400 "$${target}"
+          chown "$${owner}" "$${target}"
+          test "$(stat -c '%u:%g:%a' "$${target}")" = "$${owner}:400"
+        }
+        for consumer in postgres minio app worker remote-s3; do
+          mkdir "/secret-target/$${consumer}"
+        done
+        install_secret /secret-source/postgres/password \
+          /secret-target/postgres/password 999:999
+        install_secret /secret-source/minio/runtime.env \
+          /secret-target/minio/runtime.env 1000:0
+        install_secret /secret-source/app/runtime.env \
+          /secret-target/app/runtime.env 10001:10001
+        install_secret /secret-source/worker/runtime.env \
+          /secret-target/worker/runtime.env 10002:10002
+        install_secret /secret-source/remote-s3/runtime.env \
+          /secret-target/remote-s3/runtime.env 1000:0
+        chmod 0500 /secret-target /secret-target/postgres \
+          /secret-target/minio /secret-target/app /secret-target/worker \
+          /secret-target/remote-s3
+        chown 999:999 /secret-target/postgres
+        chown 1000:0 /secret-target/minio /secret-target/remote-s3
+        chown 10001:10001 /secret-target/app
+        chown 10002:10002 /secret-target/worker
+        test "$(stat -c '%u:%g:%a' /secret-target/postgres)" = 999:999:500
+        test "$(stat -c '%u:%g:%a' /secret-target/minio)" = 1000:0:500
+        test "$(stat -c '%u:%g:%a' /secret-target/app)" = 10001:10001:500
+        test "$(stat -c '%u:%g:%a' /secret-target/worker)" = 10002:10002:500
+        test "$(stat -c '%u:%g:%a' /secret-target/remote-s3)" = 1000:0:500
+        printf '%s\n' PHASE5_E2E_SECRET_INIT
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${HAPPYLEARN_BACKUP_LIVE_ROOT:?}/runtime-secrets
+        target: /secret-source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: phase5_runtime_secrets
+        target: /secret-target
+        read_only: false
+    network_mode: "none"
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.05
+
+  postgres:
+    user: "999:999"
+    environment: !override
+      POSTGRES_USER: happylearn
+      POSTGRES_DB: happylearn
+      POSTGRES_PASSWORD_FILE: /run/phase5-secrets/password
+    volumes:
+      - type: volume
+        source: phase5_runtime_secrets
+        target: /run/phase5-secrets
+        read_only: true
+        volume:
+          subpath: postgres
+    depends_on:
+      phase5-secrets-init:
+        condition: service_completed_successfully
+
+  minio:
+    environment: !override {}
+    entrypoint:
+      - /bin/sh
+      - -ceu
+    command:
+      - |
+        set -a
+        . /run/phase5-secrets/runtime.env
+        set +a
+        exec minio server /data --console-address :9001 --license /minio.license
+    volumes:
+      - type: volume
+        source: phase5_runtime_secrets
+        target: /run/phase5-secrets
+        read_only: true
+        volume:
+          subpath: minio
+    depends_on:
+      phase5-secrets-init:
+        condition: service_completed_successfully
+
+  app:
+    environment: !override
+      HAPPYLEARN_ENV: development
+      HAPPYLEARN_LISTEN: ":8080"
+      HAPPYLEARN_INTERNAL_LISTEN: ":9090"
+      HAPPYLEARN_REDIS_URL: redis://redis:6379/0
+      HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer
+      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac
+      HAPPYLEARN_AI_MASTER_KEY_VERSION: "1"
+      HAPPYLEARN_AI_BUSINESS_TIMEZONE: Asia/Shanghai
+      HAPPYLEARN_AI_GLOBAL_CONCURRENCY: "2"
+      HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY: "1"
+      HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER: "false"
+      HAPPYLEARN_MINIO_ENDPOINT: minio:9000
+      HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
+      HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
+    entrypoint:
+      - /bin/sh
+      - -ceu
+    command:
+      - |
+        set -a
+        . /run/phase5-secrets/runtime.env
+        set +a
+        exec /app/happylearn
+    volumes:
+      - type: volume
+        source: phase5_runtime_secrets
+        target: /run/phase5-secrets
+        read_only: true
+        volume:
+          subpath: app
+    depends_on:
+      phase5-secrets-init:
+        condition: service_completed_successfully
+
+  worker:
+    environment: !override
+      HAPPYLEARN_ENV: development
+      HAPPYLEARN_LISTEN: ":8080"
+      HAPPYLEARN_REDIS_URL: redis://redis:6379/0
+      HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_MINIO_ENDPOINT: minio:9000
+      HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
+      HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
+      HAPPYLEARN_WORK_DIR: /work
+    entrypoint:
+      - /bin/sh
+      - -ceu
+    command:
+      - |
+        set -a
+        . /run/phase5-secrets/runtime.env
+        set +a
+        exec /app/happylearn-worker
+    volumes:
+      - type: volume
+        source: phase5_runtime_secrets
+        target: /run/phase5-secrets
+        read_only: true
+        volume:
+          subpath: worker
+    depends_on:
+      phase5-secrets-init:
+        condition: service_completed_successfully
+
+volumes:
+  phase5_runtime_secrets:
+    labels:
+      io.happylearn.phase5.e2e-secrets: "true"

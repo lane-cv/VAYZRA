@@ -8,7 +8,11 @@ MAKEFILE="$ROOT/Makefile"
 PACKAGE_JSON="$ROOT/package.json"
 LIVE_FIXTURE="$ROOT/scripts/phase5-backup_live_test.sh"
 LIVE_COMPOSE="$ROOT/deploy/compose.backup-live.yml"
-CONTRACT_TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/phase5-backup-contract-root.XXXXXX")"
+E2E_LIVE_COMPOSE="$ROOT/deploy/compose.phase5-e2e-live.yml"
+CONTRACT_TEMP_BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+CONTRACT_TEMP_ROOT="$(
+  mktemp -d "$CONTRACT_TEMP_BASE/phase5-backup-contract-root.XXXXXX"
+)"
 ACTIVE_FIXTURE_PID=''
 ACTIVE_FIXTURE_RELEASE_FILES=('')
 ACTIVE_FIXTURE_FINISH_FILES=('')
@@ -28,7 +32,7 @@ cleanup_contract() {
     done
   fi
   if [[ -d "$CONTRACT_TEMP_ROOT" &&
-    "$CONTRACT_TEMP_ROOT" == "${TMPDIR:-/tmp}/phase5-backup-contract-root."* ]]; then
+    "$CONTRACT_TEMP_ROOT" == "$CONTRACT_TEMP_BASE/phase5-backup-contract-root."* ]]; then
     rm -rf "$CONTRACT_TEMP_ROOT"
   fi
 }
@@ -99,17 +103,26 @@ portable_owner() {
 
 test -f "$TARGET" || fail "scripts/phase5-backup.sh is absent"
 bash -n "$TARGET"
+test -f "$E2E_LIVE_COMPOSE" ||
+  fail 'fixed Phase 5 E2E live Compose override is absent'
 
 require_literal "$TARGET" 'set -euo pipefail'
 require_literal "$TARGET" 'Usage: scripts/phase5-backup.sh --project happylearn-dev --trigger scheduled|manual|pre_release'
 require_literal "$TARGET" '[[ "$PROJECT" == "happylearn-dev" ]]'
 require_pattern "$TARGET" 'scheduled\|manual\|pre_release'
 require_literal "$TARGET" 'COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"'
+require_literal "$TARGET" \
+  'E2E_LIVE_COMPOSE_FILE="$ROOT/deploy/compose.phase5-e2e-live.yml"'
 require_literal "$TARGET" '--project-name "$EFFECTIVE_PROJECT"'
 require_literal "$TARGET" 'arguments+=(--file "$LIVE_COMPOSE_FILE")'
+require_literal "$TARGET" 'arguments+=(--file "$E2E_LIVE_COMPOSE_FILE")'
 require_literal "$TARGET" 'HAPPYLEARN_BACKUP_LIVE_TEST'
 require_literal "$TARGET" '^happylearn-phase5-live-[a-f0-9]{12}$'
 require_literal "$TARGET" 'configure_live_context'
+require_literal "$TARGET" 'owner_only_directory "$LIVE_ROOT/runtime-secrets"'
+require_literal "$TARGET" '[[ "$LIVE_ROOT" == "$live_root" ]]'
+require_literal "$TARGET" 'HAPPYLEARN_BACKUP_LIVE_ROOT="$LIVE_ROOT"'
+require_literal "$TARGET" 'export HAPPYLEARN_BACKUP_LIVE_ROOT'
 require_literal "$TARGET" 'SYNC_CONTAINER_NAME'
 require_literal "$TARGET" 'sync_hostname_for_run'
 require_literal "$TARGET" 'io.happylearn.phase5.sync-run'
@@ -226,6 +239,43 @@ require_literal "$COMPOSE" '${HAPPYLEARN_BACKUP_STATE_DIRECTORY:-/var/lib/happyl
 require_literal "$COMPOSE" '${HAPPYLEARN_BACKUP_SECRET_DIRECTORY:-/var/lib/happylearn/backup/secrets}:/source:ro'
 require_literal "$COMPOSE" 'backup_secrets:/secrets:rw'
 require_literal "$COMPOSE" 'backup_secrets:/run/secrets:ro'
+
+for service in phase5-secrets-init postgres minio app worker; do
+  require_pattern "$E2E_LIVE_COMPOSE" \
+    "^[[:space:]]{2}${service}:$"
+done
+require_literal "$E2E_LIVE_COMPOSE" 'network_mode: "none"'
+require_literal "$E2E_LIVE_COMPOSE" 'user: "0:0"'
+require_literal "$E2E_LIVE_COMPOSE" 'read_only: true'
+require_literal "$E2E_LIVE_COMPOSE" 'cap_drop:'
+require_literal "$E2E_LIVE_COMPOSE" 'cap_add:'
+require_literal "$E2E_LIVE_COMPOSE" '- CHOWN'
+require_literal "$E2E_LIVE_COMPOSE" '- DAC_READ_SEARCH'
+require_literal "$E2E_LIVE_COMPOSE" \
+  'source: ${HAPPYLEARN_BACKUP_LIVE_ROOT:?}/runtime-secrets'
+require_literal "$E2E_LIVE_COMPOSE" 'target: /secret-source'
+require_literal "$E2E_LIVE_COMPOSE" 'create_host_path: false'
+require_literal "$E2E_LIVE_COMPOSE" 'source: phase5_runtime_secrets'
+require_literal "$E2E_LIVE_COMPOSE" 'target: /secret-target'
+require_literal "$E2E_LIVE_COMPOSE" 'read_only: false'
+forbid_pattern "$E2E_LIVE_COMPOSE" \
+  'phase5_runtime_secrets:/secret-target'
+require_literal "$E2E_LIVE_COMPOSE" 'chmod 0400'
+require_literal "$E2E_LIVE_COMPOSE" 'chmod 0500'
+require_literal "$E2E_LIVE_COMPOSE" 'PHASE5_E2E_SECRET_INIT'
+require_literal "$E2E_LIVE_COMPOSE" 'environment: !override'
+require_literal "$E2E_LIVE_COMPOSE" \
+  'POSTGRES_PASSWORD_FILE: /run/phase5-secrets/password'
+for consumer in postgres minio app worker; do
+  require_literal "$E2E_LIVE_COMPOSE" \
+    "subpath: ${consumer}"
+done
+require_literal "$E2E_LIVE_COMPOSE" \
+  '. /run/phase5-secrets/runtime.env'
+require_literal "$E2E_LIVE_COMPOSE" \
+  'exec minio server /data'
+require_literal "$E2E_LIVE_COMPOSE" 'exec /app/happylearn'
+require_literal "$E2E_LIVE_COMPOSE" 'exec /app/happylearn-worker'
 require_literal "$COMPOSE" 'mv -f "/secrets/.$${name}.new" "/secrets/$${name}"'
 forbid_pattern "$COMPOSE" 'rm -f "/secrets/\.\$\$\{name\}\.new" "/secrets/\$\$\{name\}"'
 require_literal "$COMPOSE" 'backup-storage-init:'
@@ -248,11 +298,38 @@ test -f "$LIVE_COMPOSE" ||
 bash -n "$LIVE_FIXTURE"
 require_literal "$LIVE_COMPOSE" 'ports: !reset []'
 require_literal "$LIVE_FIXTURE" 'PROJECT="happylearn-phase5-live-${FIXTURE_SUFFIX}"'
+require_literal "$LIVE_FIXTURE" 'FIXTURE_TEMP_BASE='
 require_literal "$LIVE_FIXTURE" 'HAPPYLEARN_BACKUP_LIVE_TEST'
 require_literal "$LIVE_FIXTURE" '--file "$COMPOSE_LIVE_FILE"'
-require_literal "$LIVE_FIXTURE" '--env-file "$REMOTE_ENV_FILE"'
+require_literal "$LIVE_FIXTURE" '--file "$COMPOSE_E2E_LIVE_FILE"'
+forbid_pattern "$LIVE_FIXTURE" '--env-file'
+require_literal "$LIVE_FIXTURE" \
+  'volume-subpath=remote-s3,readonly'
+require_literal "$LIVE_FIXTURE" \
+  '. /run/phase5-secrets/runtime.env'
+require_literal "$LIVE_FIXTURE" 'audit_container_metadata'
+require_literal "$LIVE_FIXTURE" \
+  '--exit-code-from phase5-secrets-init'
+require_literal "$LIVE_FIXTURE" \
+  '{{json .Config.Env}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}'
+require_literal "$LIVE_FIXTURE" \
+  '{{json .HostConfig.Binds}}|{{json .HostConfig.Privileged}}|{{json .HostConfig.NetworkMode}}'
+require_literal "$LIVE_FIXTURE" \
+  '{{range .HostConfig.Mounts}}{{printf "%s|%s|%s|%t|" .Type .Source .Target .ReadOnly}}{{if .VolumeOptions}}{{printf "%s" .VolumeOptions.Subpath}}{{end}}{{printf "\n"}}{{end}}'
+require_literal "$LIVE_FIXTURE" \
+  '{{range .Mounts}}{{printf "%s|%s|%s|%s|%t\n" .Type .Name .Source .Destination .RW}}{{end}}'
+require_literal "$LIVE_FIXTURE" 'runtime secret HostConfig mount'
+forbid_pattern "$LIVE_FIXTURE" \
+  '\{\{println \.Type "\|" \.Name "\|" \.Source'
+require_literal "$LIVE_FIXTURE" 'phase5-e2e-secret-marker'
+require_literal "$LIVE_FIXTURE" '/var/run/docker.sock'
+require_literal "$LIVE_FIXTURE" 'EXTERNAL_SENTINEL_VOLUME'
+require_literal "$LIVE_FIXTURE" 'create_external_sentinel'
+require_literal "$LIVE_FIXTURE" 'verify_external_sentinel'
+require_literal "$LIVE_FIXTURE" 'remove_external_sentinel'
 require_literal "$LIVE_FIXTURE" '"$FIXTURE_ROOT/ca-context"'
-require_literal "$LIVE_FIXTURE" '"$FIXTURE_ROOT/server-certs:/certs:ro"'
+require_literal "$LIVE_FIXTURE" \
+  'type=bind,src=$FIXTURE_ROOT/server-certs,dst=/certs,readonly'
 require_literal "$LIVE_FIXTURE" 'monitor_backup_runtime'
 require_literal "$LIVE_FIXTURE" 'backup-storage-init|backup-secrets-init|backup'
 require_literal "$LIVE_FIXTURE" 'local saw_heavy=false'
@@ -390,6 +467,218 @@ live_backup_block="$(
 )"
 grep -Eq '^[[:space:]]+init:[[:space:]]+true$' <<<"$live_backup_block" ||
   fail "rendered backup service must enable an init reaper"
+if grep -Fq 'phase5-secrets-init' <<<"$live_rendered" ||
+  grep -Fq 'phase5_runtime_secrets' <<<"$live_rendered"; then
+  fail 'non-live Compose rendering unexpectedly loaded the E2E override'
+fi
+
+render_live_root="$CONTRACT_TEMP_ROOT/render-live"
+mkdir -m 0700 "$render_live_root" "$render_live_root/runtime-secrets"
+render_phase5_e2e_config() {
+  local output="$1"
+  shift
+  HAPPYLEARN_AISTOR_LICENSE_FILE="$CONTRACT_TEMP_ROOT/compose.license" \
+    HAPPYLEARN_BACKUP_LIVE_ROOT="$render_live_root" \
+    docker compose \
+      --project-name happylearn-phase5-live-012345abcdef \
+      --profile backup \
+      --file "$COMPOSE" \
+      --file "$LIVE_COMPOSE" \
+      --file "$E2E_LIVE_COMPOSE" \
+      "$@" \
+      config --format json >"$output"
+}
+
+validate_phase5_e2e_config() {
+  node - "$1" "$render_live_root" <<'NODE'
+const fs = require('node:fs')
+const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const expectedLiveRoot = process.argv[3]
+const fail = (message) => { throw new Error(message) }
+const expectedUsers = {
+  postgres: '999:999',
+  minio: '1000:0',
+  app: '10001:10001',
+  worker: '10002:10002',
+}
+const forbiddenKeys = new Set([
+  'POSTGRES_PASSWORD',
+  'MINIO_ROOT_USER',
+  'MINIO_ROOT_PASSWORD',
+  'HAPPYLEARN_DATABASE_URL',
+  'HAPPYLEARN_LOGIN_THROTTLE_SECRET',
+  'HAPPYLEARN_AI_MASTER_KEY',
+  'HAPPYLEARN_MINIO_ACCESS_KEY',
+  'HAPPYLEARN_MINIO_SECRET_KEY',
+  'HAPPYLEARN_METRICS_BEARER_SECRET',
+  'HAPPYLEARN_HOST_METRICS_HMAC_SECRET',
+  'HAPPYLEARN_WEBHOOK_URL',
+  'HAPPYLEARN_WEBHOOK_AUTHORIZATION',
+  'RESTIC_PASSWORD',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+])
+const allowedFileKeys = new Map([
+  ['POSTGRES_PASSWORD_FILE', '/run/phase5-secrets/password'],
+  ['HAPPYLEARN_METRICS_BEARER_SECRET_FILE', '/run/secrets/metrics-bearer'],
+  ['HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE', '/run/secrets/host-metrics-hmac'],
+])
+const services = config.services || {}
+const init = services['phase5-secrets-init']
+if (!init) fail('secret init service absent')
+if (init.user !== '0:0' || init.network_mode !== 'none' ||
+    init.read_only !== true || init.restart !== 'no') {
+  fail('secret init isolation mismatch')
+}
+if (JSON.stringify(init.entrypoint) !== JSON.stringify([
+  '/usr/bin/timeout',
+  '--foreground',
+  '--kill-after=10s',
+  '120s',
+  '/bin/sh',
+  '-ceu',
+])) fail('secret init entrypoint mismatch')
+if (JSON.stringify(init.cap_drop) !== JSON.stringify(['ALL']) ||
+    JSON.stringify(init.cap_add) !== JSON.stringify(['CHOWN', 'DAC_READ_SEARCH'])) {
+  fail('secret init capabilities mismatch')
+}
+if (init.profiles) fail('secret init unexpectedly profiled')
+const initSource = init.volumes.find((mount) => mount.target === '/secret-source')
+const initTarget = init.volumes.find((mount) => mount.target === '/secret-target')
+if (!initSource || initSource.type !== 'bind' ||
+    initSource.source !== `${expectedLiveRoot}/runtime-secrets` ||
+    initSource.read_only !== true ||
+    initSource.bind?.create_host_path !== false) fail('secret init source mismatch')
+if (!initTarget || initTarget.type !== 'volume' ||
+    initTarget.source !== 'phase5_runtime_secrets' ||
+    initTarget.read_only === true) fail('secret init target mismatch')
+const initCommand = (init.command || []).join('\n')
+const fileChmod = initCommand.indexOf('chmod 0400')
+const fileChown = initCommand.indexOf('chown "$${owner}"')
+const directoryChmod = initCommand.indexOf('chmod 0500')
+const directoryChown = initCommand.indexOf('chown 1000:0')
+if (!initCommand.includes('PHASE5_E2E_SECRET_INIT') ||
+    fileChmod < 0 || fileChown < 0 || directoryChmod < 0 ||
+    directoryChown < 0 || fileChmod > fileChown ||
+    directoryChmod > directoryChown) {
+  fail('secret init permission order mismatch')
+}
+const expectedExecutables = {
+  minio: 'exec minio server /data',
+  app: 'exec /app/happylearn',
+  worker: 'exec /app/happylearn-worker',
+}
+for (const [name, expectedUser] of Object.entries(expectedUsers)) {
+  const service = services[name]
+  if (!service || service.user !== expectedUser) fail(`${name} user mismatch`)
+  if (service.profiles) fail(`${name} unexpectedly profiled`)
+  for (const [key, value] of Object.entries(service.environment || {})) {
+    if (forbiddenKeys.has(key)) fail(`${name} leaked ${key}`)
+    if (key.endsWith('_FILE') && allowedFileKeys.get(key) !== value) {
+      fail(`${name} has an unapproved file environment`)
+    }
+  }
+  const mount = (service.volumes || []).find(
+    (candidate) => candidate.target === '/run/phase5-secrets',
+  )
+  if (!mount || mount.type !== 'volume' ||
+      mount.source !== 'phase5_runtime_secrets' ||
+      mount.read_only !== true ||
+      mount.volume?.subpath !== name) fail(`${name} secret mount mismatch`)
+  if (service.depends_on?.['phase5-secrets-init']?.condition !==
+      'service_completed_successfully') fail(`${name} init dependency mismatch`)
+  if (name === 'postgres') {
+    if (service.environment?.POSTGRES_PASSWORD_FILE !==
+        '/run/phase5-secrets/password' ||
+        service.entrypoint != null) fail('postgres password-file contract mismatch')
+  } else {
+    if (JSON.stringify(service.entrypoint) !==
+        JSON.stringify(['/bin/sh', '-ceu'])) fail(`${name} entrypoint mismatch`)
+    const command = (service.command || []).join('\n')
+    if (!command.includes('. /run/phase5-secrets/runtime.env') ||
+        !command.includes(expectedExecutables[name])) {
+      fail(`${name} source/exec mismatch`)
+    }
+  }
+}
+if (!config.volumes?.phase5_runtime_secrets ||
+    config.volumes.phase5_runtime_secrets.labels?.[
+      'io.happylearn.phase5.e2e-secrets'
+    ] !== 'true') fail('labeled secret volume absent')
+NODE
+}
+
+live_e2e_json="$CONTRACT_TEMP_ROOT/live-e2e.json"
+render_phase5_e2e_config "$live_e2e_json" ||
+  fail 'fixed Phase 5 E2E live Compose override does not render'
+validate_phase5_e2e_config "$live_e2e_json" ||
+  fail 'rendered Phase 5 E2E live Compose contract failed'
+
+for mutation in \
+  postgres:POSTGRES_PASSWORD \
+  minio:MINIO_ROOT_PASSWORD \
+  app:HAPPYLEARN_DATABASE_URL \
+  app:HAPPYLEARN_LOGIN_THROTTLE_SECRET \
+  app:HAPPYLEARN_AI_MASTER_KEY \
+  app:HAPPYLEARN_MINIO_SECRET_KEY \
+  app:HAPPYLEARN_WEBHOOK_URL \
+  app:HAPPYLEARN_DATABASE_URL_FILE \
+  worker:AWS_SECRET_ACCESS_KEY; do
+  mutation_service="${mutation%%:*}"
+  mutation_key="${mutation##*:}"
+  mutation_override="$CONTRACT_TEMP_ROOT/mutation-${mutation_service}-${mutation_key}.yml"
+  printf '%s\n' \
+    'services:' \
+    "  ${mutation_service}:" \
+    '    environment:' \
+    "      ${mutation_key}: phase5-e2e-secret-marker" \
+    >"$mutation_override"
+  mutation_json="$mutation_override.json"
+  render_phase5_e2e_config "$mutation_json" --file "$mutation_override" ||
+    fail "secret Config.Env mutation did not render: $mutation"
+  if validate_phase5_e2e_config "$mutation_json" >/dev/null 2>&1; then
+    fail "secret Config.Env mutation survived: $mutation"
+  fi
+done
+
+missing_marker_override="$CONTRACT_TEMP_ROOT/mutation-init-missing-marker.yml"
+printf '%s\n' \
+  'services:' \
+  '  phase5-secrets-init:' \
+  '    command: !override' \
+  '      - |' \
+  '        chmod 0400 /tmp/file' \
+  '        chown "$${owner}" /tmp/file' \
+  '        chmod 0500 /tmp/directory' \
+  '        chown 1000:0 /tmp/directory' \
+  >"$missing_marker_override"
+missing_marker_json="$missing_marker_override.json"
+render_phase5_e2e_config "$missing_marker_json" \
+  --file "$missing_marker_override" ||
+  fail 'missing secret-init marker mutation did not render'
+if validate_phase5_e2e_config "$missing_marker_json" >/dev/null 2>&1; then
+  fail 'missing secret-init completion marker survived validation'
+fi
+
+reordered_permissions_override="$CONTRACT_TEMP_ROOT/mutation-init-permission-order.yml"
+printf '%s\n' \
+  'services:' \
+  '  phase5-secrets-init:' \
+  '    command: !override' \
+  '      - |' \
+  '        chown "$${owner}" /tmp/file' \
+  '        chmod 0400 /tmp/file' \
+  '        chown 1000:0 /tmp/directory' \
+  '        chmod 0500 /tmp/directory' \
+  '        printf "%s\n" PHASE5_E2E_SECRET_INIT' \
+  >"$reordered_permissions_override"
+reordered_permissions_json="$reordered_permissions_override.json"
+render_phase5_e2e_config "$reordered_permissions_json" \
+  --file "$reordered_permissions_override" ||
+  fail 'reordered secret-init permissions mutation did not render'
+if validate_phase5_e2e_config "$reordered_permissions_json" >/dev/null 2>&1; then
+  fail 'chown-before-chmod secret-init mutation survived validation'
+fi
 
 require_literal "$MAKEFILE" 'phase5-backup-contract:'
 require_literal "$MAKEFILE" 'bash scripts/phase5-backup_contract_test.sh'
@@ -498,7 +787,8 @@ make_fixture() {
   local fixture
   fixture="$(mktemp -d "$CONTRACT_TEMP_ROOT/fixture.XXXXXX")"
   mkdir -m 0700 "$fixture/bin" "$fixture/secrets" \
-    "$fixture/repository" "$fixture/state" "$fixture/secret-volume"
+    "$fixture/repository" "$fixture/state" "$fixture/secret-volume" \
+    "$fixture/runtime-secrets"
   printf 'license-fixture\n' >"$fixture/minio.license"
   printf 'database-password\n' >"$fixture/secrets/database_password"
   printf '/repository\n' >"$fixture/secrets/local_repository"
@@ -1078,6 +1368,12 @@ if ! run_fixture "$success_fixture"; then
   fail "baseline fixture failed"
 fi
 success_log="$success_fixture/docker.log"
+grep -Fq -- "--project-name happylearn-dev --file $COMPOSE" "$success_log" ||
+  fail 'production execution omitted the fixed base Compose file'
+if grep -Fq -- "--file $LIVE_COMPOSE" "$success_log" ||
+  grep -Fq -- "--file $E2E_LIVE_COMPOSE" "$success_log"; then
+  fail 'production execution loaded a live-only Compose override'
+fi
 assert_before "$success_log" \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup prepare --run-id 11111111-1111-4111-8111-111111111111' \
   'stop --timeout 60 worker'
@@ -1116,9 +1412,9 @@ if ! HAPPYLEARN_BACKUP_LIVE_TEST='1' \
   fail "strict live execution context was rejected"
 fi
 grep -Fq -- \
-  "--project-name happylearn-phase5-live-012345abcdef --file $COMPOSE --file $LIVE_COMPOSE" \
+  "--project-name happylearn-phase5-live-012345abcdef --file $COMPOSE --file $LIVE_COMPOSE --file $E2E_LIVE_COMPOSE" \
   "$live_context_fixture/docker.log" ||
-  fail "live execution did not use the unique project and fixed override"
+  fail "live execution did not use the unique project and both fixed overrides"
 
 invalid_live_context_fixture="$(make_fixture)"
 if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
@@ -1129,6 +1425,32 @@ if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
 fi
 test ! -s "$invalid_live_context_fixture/docker.log" ||
   fail "unsafe live execution context mutated Compose state"
+
+symlink_live_context_fixture="$(make_fixture)"
+symlink_live_parent="$CONTRACT_TEMP_ROOT/live-parent-link"
+ln -s "$(dirname "$symlink_live_context_fixture")" "$symlink_live_parent"
+symlink_live_root="$symlink_live_parent/$(basename "$symlink_live_context_fixture")"
+if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$symlink_live_root" \
+  run_fixture "$symlink_live_context_fixture"; then
+  fail 'live root with a symlink ancestor was accepted'
+fi
+test ! -s "$symlink_live_context_fixture/docker.log" ||
+  fail 'live root with a symlink ancestor reached Compose'
+
+noncanonical_live_context_fixture="$(make_fixture)"
+noncanonical_live_root="$(
+  dirname "$noncanonical_live_context_fixture"
+)/../$(basename "$(dirname "$noncanonical_live_context_fixture")")/$(basename "$noncanonical_live_context_fixture")"
+if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$noncanonical_live_root" \
+  run_fixture "$noncanonical_live_context_fixture"; then
+  fail 'non-canonical live root was accepted'
+fi
+test ! -s "$noncanonical_live_context_fixture/docker.log" ||
+  fail 'non-canonical live root reached Compose'
 
 zero_interval_fixture="$(make_fixture)"
 if HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS='0.0' \
@@ -1965,16 +2287,22 @@ do
   blocked_sql_fixture="$(make_fixture)"
   blocked_sql_started="$SECONDS"
   blocked_sql_heartbeat_interval='1'
+  blocked_sql_block_seconds='4'
   if [[ "$blocked_sql" == 'PHASE5_QUERY_LEASE_RENEW' ]]; then
     blocked_sql_heartbeat_interval='0.01'
+  elif [[ "$blocked_sql" == 'PHASE5_QUERY_LEASE_RELEASE' ]]; then
+    # The release failure is retried during cleanup. Keep the synthetic block
+    # comfortably beyond both bounded attempts so integer SECONDS rounding
+    # cannot make the host-deadline assertion flaky.
+    blocked_sql_block_seconds='8'
   fi
   if PHASE5_FAKE_BLOCK_SQL_MATCH="$blocked_sql" \
-    PHASE5_FAKE_BLOCK_SQL_SECONDS='4' \
+    PHASE5_FAKE_BLOCK_SQL_SECONDS="$blocked_sql_block_seconds" \
     HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS="$blocked_sql_heartbeat_interval" \
     run_fixture "$blocked_sql_fixture"; then
     fail "hung database query was accepted: $blocked_sql"
   fi
-  if ((SECONDS - blocked_sql_started >= 4)); then
+  if ((SECONDS - blocked_sql_started >= blocked_sql_block_seconds)); then
     fail "hung database query exceeded its host deadline: $blocked_sql"
   fi
   test ! -e "$blocked_sql_fixture/host.lock" ||
