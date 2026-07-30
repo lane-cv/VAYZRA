@@ -1437,9 +1437,39 @@ test -x "$TARGET" || fail 'restore harness is absent'
 bash -n "$TARGET"
 assert_secret_transport_contract() {
   local candidate="$1"
+  local initializer file_chmod_line file_chown_line
+  local directory_chmod_line directory_chown_line
   if grep -Fq -- '--env-file' "$candidate"; then
     fail 'restore secret entered Docker configured environment'
   fi
+  initializer="$(
+    sed -n '/^initialize_secret_volume()/,/^}/p' "$candidate"
+  )"
+  file_chmod_line="$(
+    grep -nF 'chmod 0400 "$target"' <<<"$initializer" |
+      head -n1 |
+      cut -d: -f1
+  )"
+  file_chown_line="$(
+    grep -nF 'chown "$owner" "$target"' <<<"$initializer" |
+      head -n1 |
+      cut -d: -f1
+  )"
+  directory_chmod_line="$(
+    grep -nF 'chmod 0500 /secret-target' <<<"$initializer" |
+      head -n1 |
+      cut -d: -f1
+  )"
+  directory_chown_line="$(
+    grep -nF 'chown 1000:0 /secret-target/aistor' <<<"$initializer" |
+      head -n1 |
+      cut -d: -f1
+  )"
+  [[ -n "$file_chmod_line" && -n "$file_chown_line" &&
+    -n "$directory_chmod_line" && -n "$directory_chown_line" &&
+    "$file_chmod_line" -lt "$file_chown_line" &&
+    "$directory_chmod_line" -lt "$directory_chown_line" ]] ||
+    fail 'restore secret permissions are changed after ownership handoff'
   for literal in \
     'SECRET_VOLUME="$PROJECT-secrets"' \
     'create_volume "$SECRET_VOLUME" secrets' \
@@ -1454,6 +1484,8 @@ assert_secret_transport_contract() {
     'type=bind,src=$CONTROL_DIRECTORY,dst=/secret-source,readonly' \
     'type=volume,src=$SECRET_VOLUME,dst=/secret-target' \
     'chmod 0400' \
+    'test "$(stat -c %u:%g:%a /secret-target/aistor)" = 1000:0:500' \
+    'test "$(stat -c %u:%g:%a /secret-target/app)" = 10001:10001:500' \
     'PHASE5_RESTORE_SECRET_INIT' \
     'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=postgres,readonly' \
     'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=aistor,readonly' \
@@ -1496,6 +1528,14 @@ run_secret_transport_mutant \
   writable-app-secret \
   's@volume-subpath=app,readonly@volume-subpath=app@' \
   'restore secret transport omitted: type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=app,readonly'
+run_secret_transport_mutant \
+  file-chown-before-chmod \
+  's@chmod 0400 "$target"@chown "$owner" "$target"; chmod 0400 "$target"@' \
+  'restore secret permissions are changed after ownership handoff'
+run_secret_transport_mutant \
+  directory-chown-before-chmod \
+  's@chmod 0500 /secret-target@chown 1000:0 /secret-target/aistor; chmod 0500 /secret-target@' \
+  'restore secret permissions are changed after ownership handoff'
 if grep -Eq \
   '^[[:space:]]*trap[[:space:]]+cleanup_contract[[:space:]]+EXIT[[:space:]]+HUP' \
   "$0"; then

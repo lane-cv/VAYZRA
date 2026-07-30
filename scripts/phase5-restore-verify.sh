@@ -1688,8 +1688,8 @@ initialize_secret_volume() {
         target="$2"
         owner="$3"
         cp "$source" "$target"
-        chown "$owner" "$target"
         chmod 0400 "$target"
+        chown "$owner" "$target"
         test "$(stat -c %u:%g:%a "$target")" = "${owner}:400"
       }
       for consumer in postgres aistor app client restore-check; do
@@ -1707,15 +1707,23 @@ initialize_secret_volume() {
         /secret-target/restore-check/runtime.env "$host_uid:$host_gid"
       install_secret /secret-source/pgpass \
         /secret-target/restore-check/pgpass "$host_uid:$host_gid"
+      chmod 0500 /secret-target \
+        /secret-target/postgres /secret-target/aistor \
+        /secret-target/app /secret-target/client \
+        /secret-target/restore-check
       chown 0:0 /secret-target/postgres
       chown 1000:0 /secret-target/aistor
       chown 10001:10001 /secret-target/app
       chown "$host_uid:$host_gid" \
         /secret-target/client /secret-target/restore-check
-      chmod 0500 /secret-target \
-        /secret-target/postgres /secret-target/aistor \
-        /secret-target/app /secret-target/client \
-        /secret-target/restore-check
+      test "$(stat -c %u:%g:%a /secret-target)" = 0:0:500
+      test "$(stat -c %u:%g:%a /secret-target/postgres)" = 0:0:500
+      test "$(stat -c %u:%g:%a /secret-target/aistor)" = 1000:0:500
+      test "$(stat -c %u:%g:%a /secret-target/app)" = 10001:10001:500
+      test "$(stat -c %u:%g:%a /secret-target/client)" = \
+        "${host_uid}:${host_gid}:500"
+      test "$(stat -c %u:%g:%a /secret-target/restore-check)" = \
+        "${host_uid}:${host_gid}:500"
       printf "%s\n" PHASE5_RESTORE_SECRET_INIT
     ' restore-secret-init "$HOST_UID" "$HOST_GID" \
     >/dev/null
