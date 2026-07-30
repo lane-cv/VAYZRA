@@ -146,7 +146,7 @@ require_literal "$TARGET" 'host_lock_owner_matches'
 require_literal "$TARGET" 'publish_host_lock'
 
 lock_line="$(grep -nE '^[[:space:]]*acquire_host_lock$' "$TARGET" | tail -n1 | cut -d: -f1)"
-trap_line="$(grep -nF 'trap cleanup EXIT HUP INT TERM' "$TARGET" | tail -n1 | cut -d: -f1)"
+trap_line="$(grep -nF 'trap cleanup EXIT' "$TARGET" | tail -n1 | cut -d: -f1)"
 mutation_line="$(grep -nE '^[[:space:]]*(if[[:space:]]+(![[:space:]]+)?)?queue_or_select_run' "$TARGET" | tail -n1 | cut -d: -f1)"
 test -n "$lock_line" || fail "missing host lock acquisition"
 test -n "$trap_line" || fail "missing cleanup trap installation"
@@ -169,7 +169,10 @@ require_literal "$TARGET" 'verify --run-id "$RUN_ID"'
 require_literal "$TARGET" 'sync --run-id "$RUN_ID"'
 require_literal "$TARGET" 'finish --run-id "$RUN_ID"'
 require_literal "$TARGET" 'fail --run-id "$RUN_ID" --category "$FAILURE_CATEGORY"'
-require_literal "$TARGET" 'trap cleanup EXIT HUP INT TERM'
+require_literal "$TARGET" 'trap cleanup EXIT'
+require_literal "$TARGET" "trap 'exit 129' HUP"
+require_literal "$TARGET" "trap 'exit 130' INT"
+require_literal "$TARGET" "trap 'exit 143' TERM"
 require_literal "$TARGET" 'restart_stopped_services'
 require_literal "$TARGET" 'release_operational_lease'
 
@@ -212,6 +215,15 @@ require_literal "$TARGET" 'compose run --rm "$@"'
 require_literal "$TARGET" \
   'compose_run --no-deps --entrypoint /usr/bin/timeout backup'
 require_literal "$TARGET" 'record_live_coordinator_one_shots'
+require_literal "$TARGET" 'cleanup_recorded_live_coordinator_one_shots'
+require_literal "$TARGET" 'terminate_active_external_group'
+require_literal "$TARGET" 'ACTIVE_EXTERNAL_GROUP_PID'
+require_literal "$TARGET" \
+  "readonly EXTERNAL_TERMINATION_GRACE_SECONDS='0.1'"
+require_literal "$TARGET" \
+  "readonly EXTERNAL_MONITOR_POLL_SECONDS='0.01'"
+forbid_pattern "$TARGET" \
+  '(^|[^>])>[[:space:]]*"\$LIVE_ONE_SHOT_RECORD_FILE"'
 require_literal "$TARGET" '/app/happylearn-backup "$@"'
 require_literal "$TARGET" 'exec /usr/bin/timeout --foreground --kill-after=10s "$deadline" restic'
 require_literal "$TARGET" 'initialize_backup_mounts'
@@ -221,7 +233,8 @@ forbid_pattern "$TARGET" 'happylearn-pre-release'
 
 forbid_pattern "$TARGET" 'set[[:space:]]+-[^[:space:]]*x'
 forbid_pattern "$TARGET" '(^|[;&|[:space:]])(env|printenv)([;&|[:space:]]|$)'
-forbid_pattern "$TARGET" 'docker([[:space:]]+[^[:space:]]+)*[[:space:]]+inspect'
+forbid_pattern "$TARGET" 'docker[[:space:]]+inspect'
+require_literal "$TARGET" 'docker container inspect --format'
 forbid_pattern "$TARGET" 'docker[[:space:]]+compose.*[[:space:]]down([[:space:]]|$)'
 forbid_pattern "$TARGET" 'docker[[:space:]].*(volume|network)[[:space:]]+(rm|prune)'
 forbid_pattern "$TARGET" 'rm[[:space:]]+-rf'
@@ -1022,6 +1035,36 @@ if [[ "${1:-}" == 'ps' ]]; then
   fi
   exit 0
 fi
+if [[ "${1:-}" == 'container' && "${2:-}" == 'inspect' &&
+  "$*" == *'com.docker.compose.project'* &&
+  "$*" == *'com.docker.compose.oneoff'* &&
+  "$*" == *'io.happylearn.phase5.e2e-owner'* ]]; then
+  container_id="${!#}"
+  grep -Fxq "$container_id" "$PHASE5_FAKE_LIVE_ONE_SHOT_STATE" ||
+    exit 81
+  live_owner="${HAPPYLEARN_BACKUP_LIVE_PROJECT##*-}"
+  if [[ -n "${PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE:-}" ]]; then
+    live_owner="$PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE"
+  fi
+  printf '%s|True|%s\n' \
+    "$HAPPYLEARN_BACKUP_LIVE_PROJECT" "$live_owner"
+  exit 0
+fi
+if [[ "${1:-}" == 'rm' && "${2:-}" == '--force' ]]; then
+  container_id="${3:-}"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ &&
+    -s "${PHASE5_FAKE_LIVE_ONE_SHOT_STATE:-}" ]] ||
+    exit 82
+  grep -Fxq "$container_id" "$PHASE5_FAKE_LIVE_ONE_SHOT_STATE" ||
+    exit 82
+  awk -v removed="$container_id" '$0 != removed' \
+    "$PHASE5_FAKE_LIVE_ONE_SHOT_STATE" \
+    >"${PHASE5_FAKE_LIVE_ONE_SHOT_STATE}.new"
+  mv -f "${PHASE5_FAKE_LIVE_ONE_SHOT_STATE}.new" \
+    "$PHASE5_FAKE_LIVE_ONE_SHOT_STATE"
+  printf '%s\n' "$container_id"
+  exit 0
+fi
 if [[ "${1:-}" == 'compose' ]]; then
   saw_run=false
   saw_remove=false
@@ -1040,6 +1083,36 @@ if [[ "${1:-}" == 'compose' ]]; then
     printf '%s\n' "$retained_id" \
       >>"$PHASE5_FAKE_LIVE_ONE_SHOT_STATE"
   fi
+fi
+if [[ -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH:-}" &&
+  "$*" == *"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH"* ]]; then
+  [[ -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER:-}" &&
+    -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID:-}" &&
+    -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID:-}" &&
+    -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID:-}" &&
+    -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER:-}" &&
+    -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE:-}" ]] ||
+    exit 83
+  (
+    trap '' HUP INT TERM
+    while [[ ! -e "$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE" ]]; do
+      sleep 0.01
+    done
+  ) &
+  blocked_child_pid="$!"
+  blocked_pgid="$PPID"
+  [[ "$blocked_pgid" =~ ^[1-9][0-9]*$ ]] || exit 83
+  printf '%s\n' "$$" >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID"
+  printf '%s\n' "$blocked_child_pid" \
+    >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID"
+  printf '%s\n' "$blocked_pgid" >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID"
+  trap 'printf "%s\n" TERM >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER"' \
+    TERM
+  printf '%s\n' started >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER"
+  while kill -0 "$blocked_child_pid" 2>/dev/null; do
+    wait "$blocked_child_pid" 2>/dev/null || true
+  done
+  exit 84
 fi
 if [[ "${1:-}" == 'stop' ]]; then
   IFS='|' read -r container_id container_name run_id owner state \
@@ -1455,6 +1528,14 @@ run_fixture() {
     "PHASE5_FAKE_DELAY_MATCH=${PHASE5_FAKE_DELAY_MATCH:-}"
     "PHASE5_FAKE_DELAY_SECONDS=${PHASE5_FAKE_DELAY_SECONDS:-3}"
     "PHASE5_FAKE_DELAY_RELEASE_FILE=${PHASE5_FAKE_DELAY_RELEASE_FILE:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER:-}"
+    "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE:-}"
+    "PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE=${PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE:-}"
     "PHASE5_FAKE_BLOCK_LOCK_SECONDS=${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}"
     "PHASE5_FAKE_FAIL_BACKUP_FAIL=${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}"
     "PHASE5_FAKE_RENEW_OWNER_PID_FILE=${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}"
@@ -1639,6 +1720,132 @@ if grep -Fq 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
 fi
 grep -Fq '/app/happylearn-backup sync ' "$success_log" &&
   fail "remote sync ran without the complete optional tuple"
+
+signal_live_fixture="$(make_fixture)"
+signal_live_started="$signal_live_fixture/blocked-live.started"
+signal_live_parent_pid_file="$signal_live_fixture/blocked-live.parent.pid"
+signal_live_child_pid_file="$signal_live_fixture/blocked-live.child.pid"
+signal_live_pgid_file="$signal_live_fixture/blocked-live.pgid"
+signal_live_term_marker="$signal_live_fixture/blocked-live.term"
+signal_live_release="$signal_live_fixture/blocked-live.release"
+PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH='run --no-deps backup-storage-init' \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER="$signal_live_started" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID="$signal_live_parent_pid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID="$signal_live_child_pid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID="$signal_live_pgid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER="$signal_live_term_marker" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE="$signal_live_release" \
+  HAPPYLEARN_BACKUP_POLL_INTERVAL_SECONDS='3' \
+  HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$signal_live_fixture" \
+  start_fixture_background "$signal_live_fixture"
+signal_live_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$signal_live_runner" "$signal_live_release"
+if ! wait_for_file "$signal_live_started"; then
+  sed -n '1,120p' "$signal_live_fixture/docker.log" >&2
+  fail 'live signal fixture did not block inside Compose run'
+fi
+signal_live_parent_pid="$(<"$signal_live_parent_pid_file")"
+signal_live_child_pid="$(<"$signal_live_child_pid_file")"
+signal_live_pgid="$(<"$signal_live_pgid_file")"
+signal_live_id="$(<"$signal_live_fixture/live-one-shots.state")"
+[[ "$signal_live_parent_pid" =~ ^[1-9][0-9]*$ &&
+  "$signal_live_child_pid" =~ ^[1-9][0-9]*$ &&
+  "$signal_live_pgid" =~ ^[1-9][0-9]*$ &&
+  "$signal_live_id" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'live signal fixture published invalid process/container identity'
+signal_live_cleanup_started="$SECONDS"
+kill -TERM "$signal_live_runner" ||
+  fail 'could not signal the live backup coordinator'
+set +e
+wait "$signal_live_runner"
+signal_live_status=$?
+set -e
+clear_active_fixture
+if ((SECONDS - signal_live_cleanup_started >= 3)); then
+  fail 'live TERM cleanup inherited the unbounded polling interval'
+fi
+[[ "$signal_live_status" -eq 143 ]] ||
+  fail "live TERM cleanup returned ${signal_live_status}, expected 143"
+wait_for_file "$signal_live_term_marker" ||
+  fail 'live TERM cleanup did not signal the active external process group'
+wait_for_process_gone "$signal_live_parent_pid" ||
+  fail 'live TERM cleanup left the blocked Compose process'
+wait_for_process_gone "$signal_live_child_pid" ||
+  fail 'live TERM cleanup left a blocked Compose descendant'
+if kill -0 "-$signal_live_pgid" 2>/dev/null; then
+  fail 'live TERM cleanup left the active external process group'
+fi
+grep -Fxq "$signal_live_id" \
+  "$signal_live_fixture/coordinator-one-shots" ||
+  fail 'live TERM cleanup did not record the active one-shot ID'
+test ! -s "$signal_live_fixture/live-one-shots.state" ||
+  fail 'live TERM cleanup did not remove the active one-shot'
+assert_before "$signal_live_fixture/docker.log" \
+  'label=com.docker.compose.oneoff=True' \
+  'container inspect --format'
+assert_before "$signal_live_fixture/docker.log" \
+  'container inspect --format' \
+  "rm --force $signal_live_id"
+test ! -e "$signal_live_fixture/host.lock" ||
+  fail 'live TERM cleanup left the host lock'
+
+signal_owner_fixture="$(make_fixture)"
+signal_owner_started="$signal_owner_fixture/blocked-live.started"
+signal_owner_parent_pid_file="$signal_owner_fixture/blocked-live.parent.pid"
+signal_owner_child_pid_file="$signal_owner_fixture/blocked-live.child.pid"
+signal_owner_pgid_file="$signal_owner_fixture/blocked-live.pgid"
+signal_owner_term_marker="$signal_owner_fixture/blocked-live.term"
+signal_owner_release="$signal_owner_fixture/blocked-live.release"
+PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH='run --no-deps backup-storage-init' \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER="$signal_owner_started" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID="$signal_owner_parent_pid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_CHILD_PID="$signal_owner_child_pid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID="$signal_owner_pgid_file" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER="$signal_owner_term_marker" \
+  PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE="$signal_owner_release" \
+  PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE='ffffffffffff' \
+  HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$signal_owner_fixture" \
+  start_fixture_background "$signal_owner_fixture"
+signal_owner_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture "$signal_owner_runner" "$signal_owner_release"
+wait_for_file "$signal_owner_started" ||
+  fail 'live owner-mismatch fixture did not block inside Compose run'
+signal_owner_parent_pid="$(<"$signal_owner_parent_pid_file")"
+signal_owner_child_pid="$(<"$signal_owner_child_pid_file")"
+signal_owner_pgid="$(<"$signal_owner_pgid_file")"
+signal_owner_id="$(<"$signal_owner_fixture/live-one-shots.state")"
+kill -TERM "$signal_owner_runner" ||
+  fail 'could not signal the live owner-mismatch coordinator'
+set +e
+wait "$signal_owner_runner"
+signal_owner_status=$?
+set -e
+clear_active_fixture
+[[ "$signal_owner_status" -eq 143 ]] ||
+  fail "owner-mismatch TERM cleanup returned ${signal_owner_status}, expected 143"
+wait_for_process_gone "$signal_owner_parent_pid" ||
+  fail 'owner-mismatch cleanup left the blocked Compose process'
+wait_for_process_gone "$signal_owner_child_pid" ||
+  fail 'owner-mismatch cleanup left a blocked Compose descendant'
+if kill -0 "-$signal_owner_pgid" 2>/dev/null; then
+  fail 'owner-mismatch cleanup left the active external process group'
+fi
+grep -Fxq "$signal_owner_id" \
+  "$signal_owner_fixture/coordinator-one-shots" ||
+  fail 'owner-mismatch cleanup cleared or omitted the one-shot ledger'
+grep -Fxq "$signal_owner_id" \
+  "$signal_owner_fixture/live-one-shots.state" ||
+  fail 'owner-mismatch cleanup removed an unaudited one-shot'
+if grep -Fq "rm --force $signal_owner_id" \
+  "$signal_owner_fixture/docker.log"; then
+  fail 'owner-mismatch cleanup removed an unaudited one-shot'
+fi
+test ! -e "$signal_owner_fixture/host.lock" ||
+  fail 'owner-mismatch TERM cleanup left the host lock'
 
 live_context_fixture="$(make_fixture)"
 printf 's3:https://remote.test/happylearn\n' \

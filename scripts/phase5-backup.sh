@@ -9,6 +9,8 @@ readonly SYNC_RUN_LABEL='io.happylearn.phase5.sync-run'
 readonly SYNC_OWNER_LABEL='io.happylearn.phase5.sync-owner'
 readonly HEARTBEAT_HANDSHAKE_ATTEMPTS=500
 readonly HEARTBEAT_HANDSHAKE_POLL_SECONDS='0.01'
+readonly EXTERNAL_MONITOR_POLL_SECONDS='0.01'
+readonly EXTERNAL_TERMINATION_GRACE_SECONDS='0.1'
 
 PROJECT=''
 EFFECTIVE_PROJECT=''
@@ -19,6 +21,7 @@ LIVE_COMPOSE_FILE=''
 E2E_LIVE_COMPOSE_FILE=''
 LIVE_ROOT=''
 LIVE_ONE_SHOT_RECORD_FILE=''
+ACTIVE_EXTERNAL_GROUP_PID=''
 LOCK_DIRECTORY=''
 LOCK_HELD=false
 LOCK_OWNER_DIRECTORY=''
@@ -775,6 +778,39 @@ record_live_coordinator_one_shots() {
   done <<<"$ids"
 }
 
+cleanup_recorded_live_coordinator_one_shots() {
+  [[ -n "$LIVE_ROOT" && -n "$LIVE_ONE_SHOT_RECORD_FILE" ]] || return 0
+  local expected_owner
+  local ids container_id ownership remaining
+  expected_owner="${EFFECTIVE_PROJECT#happylearn-phase5-live-}"
+  [[ "$EFFECTIVE_PROJECT" == "happylearn-phase5-live-${expected_owner}" &&
+    "$expected_owner" =~ ^[a-f0-9]{12}$ ]] ||
+    return 1
+  record_live_coordinator_one_shots || return 1
+  ids="$(sort -u "$LIVE_ONE_SHOT_RECORD_FILE")" || return 1
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    ownership="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}' \
+        "$container_id"
+    )" || return 1
+    [[ "$ownership" == "$EFFECTIVE_PROJECT|True|$expected_owner" ]] ||
+      return 1
+  done <<<"$ids"
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    docker rm --force "$container_id" >/dev/null || return 1
+  done <<<"$ids"
+  remaining="$(
+    docker ps --all --quiet --no-trunc \
+      --filter "label=com.docker.compose.project=${EFFECTIVE_PROJECT}" \
+      --filter 'label=com.docker.compose.oneoff=True'
+  )" || return 1
+  [[ -z "$remaining" ]]
+}
+
 compose_run() {
   if [[ -z "$LIVE_ROOT" ]]; then
     compose run --rm "$@"
@@ -1197,11 +1233,25 @@ assert_lease_heartbeat() {
 
 terminate_external_group() {
   local pid="$1"
+  local grace_seconds="${2:-$POLL_INTERVAL_SECONDS}"
   kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  sleep "$POLL_INTERVAL_SECONDS"
+  sleep "$grace_seconds"
   kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   return 0
+}
+
+terminate_active_external_group() {
+  local pid="$ACTIVE_EXTERNAL_GROUP_PID"
+  ACTIVE_EXTERNAL_GROUP_PID=''
+  [[ -n "$pid" ]] || return 0
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  terminate_external_group "$pid" "$EXTERNAL_TERMINATION_GRACE_SECONDS"
+}
+
+cleanup_timed_out_external() {
+  terminate_active_external_group || return 1
+  cleanup_recorded_live_coordinator_one_shots
 }
 
 wait_for_lease_session_exit() {
@@ -1231,6 +1281,7 @@ run_guarded_external() {
     ( "$@" ) &
     pid="$!"
   fi
+  ACTIVE_EXTERNAL_GROUP_PID="$pid"
   while kill -0 "$pid" 2>/dev/null; do
     if [[ "$ALLOW_LOST_LEASE_ACTIONS" == false &&
       "$LEASE_DURABLE" == true ]] &&
@@ -1238,16 +1289,21 @@ run_guarded_external() {
         [[ -z "$LEASE_HEARTBEAT_PID" ]] ||
         ! kill -0 "$LEASE_HEARTBEAT_PID" 2>/dev/null; }; then
       FAILURE_CATEGORY='lease_lost'
-      terminate_external_group "$pid"
+      if ! cleanup_timed_out_external; then
+        RECOVERY_UNSAFE=true
+      fi
       return 1
     fi
     if ((SECONDS >= deadline)); then
       FAILURE_CATEGORY='timeout'
-      terminate_external_group "$pid"
+      if ! cleanup_timed_out_external; then
+        RECOVERY_UNSAFE=true
+      fi
       return 1
     fi
-    sleep "$POLL_INTERVAL_SECONDS"
+    sleep "$EXTERNAL_MONITOR_POLL_SECONDS"
   done
+  ACTIVE_EXTERNAL_GROUP_PID=''
   if wait "$pid"; then
     return 0
   else
@@ -1874,12 +1930,24 @@ remove_host_lock() {
 cleanup() {
   local status=$?
   local failed_stage="$FAILURE_CATEGORY"
+  local signal_cleanup=false
+  local signal_status=''
   if [[ "$CLEANING_UP" == true ]]; then
     exit "$status"
   fi
   CLEANING_UP=true
   trap - EXIT HUP INT TERM
   ALLOW_LOST_LEASE_ACTIONS=true
+  case "$status" in
+    129|130|143)
+      signal_cleanup=true
+      signal_status="$status"
+      ;;
+  esac
+  if ! terminate_active_external_group; then
+    safe_log 'cleanup_external_group_failed'
+    status=1
+  fi
   if restart_stopped_services; then
     FAILURE_CATEGORY="$failed_stage"
   else
@@ -1900,6 +1968,15 @@ cleanup() {
     safe_log 'cleanup_host_lock_failed'
     status=1
   fi
+  if [[ "$signal_cleanup" == true ]] &&
+    ! cleanup_recorded_live_coordinator_one_shots; then
+    safe_log 'cleanup_live_one_shots_failed'
+    RECOVERY_UNSAFE=true
+    status=1
+  fi
+  if [[ "$signal_cleanup" == true ]]; then
+    status="$signal_status"
+  fi
   if [[ "$status" -ne 0 ]]; then
     safe_log "failed_${CURRENT_STAGE}_${failed_stage}"
   fi
@@ -1912,7 +1989,10 @@ main() {
   resolve_root
   validate_paths_and_secrets
   configure_live_context
-  trap cleanup EXIT HUP INT TERM
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   acquire_host_lock
   CURRENT_STAGE='mount_init'
   initialize_backup_mounts
