@@ -1,4 +1,28 @@
 services:
+  postgres-tls-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  minio-data-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  app-secrets-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  backup-storage-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  backup-secrets-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  backup:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
   phase5-secrets-init:
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     user: "0:0"
@@ -28,8 +52,11 @@ services:
           /secret-target/postgres/password 999:999
         install_secret /secret-source/minio/runtime.env \
           /secret-target/minio/runtime.env 1000:0
-        install_secret /secret-source/app/runtime.env \
-          /secret-target/app/runtime.env 10001:10001
+        for name in runtime.env metrics-bearer host-metrics-hmac \
+          webhook-url webhook-authorization; do
+          install_secret "/secret-source/app/$${name}" \
+            "/secret-target/app/$${name}" 10001:10001
+        done
         install_secret /secret-source/worker/runtime.env \
           /secret-target/worker/runtime.env 10002:10002
         install_secret /secret-source/remote-s3/runtime.env \
@@ -70,6 +97,8 @@ services:
     restart: "no"
     mem_limit: 64m
     cpus: 0.05
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   postgres:
     user: "999:999"
@@ -87,6 +116,8 @@ services:
     depends_on:
       phase5-secrets-init:
         condition: service_completed_successfully
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   minio:
     environment: !override {}
@@ -109,6 +140,12 @@ services:
     depends_on:
       phase5-secrets-init:
         condition: service_completed_successfully
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
+  redis:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   app:
     environment: !override
@@ -117,8 +154,10 @@ services:
       HAPPYLEARN_INTERNAL_LISTEN: ":9090"
       HAPPYLEARN_REDIS_URL: redis://redis:6379/0
       HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
-      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer
-      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac
+      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/phase5-secrets/metrics-bearer
+      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/phase5-secrets/host-metrics-hmac
+      HAPPYLEARN_WEBHOOK_URL_SECRET_FILE: /run/phase5-secrets/webhook-url
+      HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE: /run/phase5-secrets/webhook-authorization
       HAPPYLEARN_AI_MASTER_KEY_VERSION: "1"
       HAPPYLEARN_AI_BUSINESS_TIMEZONE: Asia/Shanghai
       HAPPYLEARN_AI_GLOBAL_CONCURRENCY: "2"
@@ -146,6 +185,14 @@ services:
     depends_on:
       phase5-secrets-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   worker:
     environment: !override
@@ -165,7 +212,7 @@ services:
         set -a
         . /run/phase5-secrets/runtime.env
         set +a
-        exec /app/happylearn-worker
+        exec "$${HAPPYLEARN_PHASE5_WORKER_EXECUTABLE:-/app/happylearn-worker}"
     volumes:
       - type: volume
         source: phase5_runtime_secrets
@@ -176,6 +223,18 @@ services:
     depends_on:
       phase5-secrets-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+    networks:
+      happylearn:
+        aliases:
+          - processing-supervisor
 
 volumes:
   phase5_runtime_secrets:

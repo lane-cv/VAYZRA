@@ -24,6 +24,9 @@ REMOTE_VOLUME=''
 RUNTIME_SECRET_VOLUME=''
 EXTERNAL_SENTINEL_VOLUME=''
 SECRET_MARKER_PREFIX=''
+METADATA_SECRET_VALUES_FILE=''
+COORDINATOR_ONE_SHOT_RECORD=''
+COORDINATOR_COVERAGE_RECORD=''
 BACKUP_BASE_IMAGE=''
 BACKUP_CA_IMAGE=''
 AGE_IDENTITY_FILE=''
@@ -39,6 +42,21 @@ CLEANED=false
 fail() {
   printf 'phase5 backup live: %s\n' "$1" >&2
   exit 1
+}
+
+append_generated_secret_file_values() {
+  local source="$1"
+  local value
+  [[ -f "$source" && ! -L "$source" &&
+    -n "$METADATA_SECRET_VALUES_FILE" ]] ||
+    fail 'generated secret source was not a regular file'
+  chmod 0600 "$METADATA_SECRET_VALUES_FILE"
+  while IFS= read -r value; do
+    [[ -n "$value" && "$value" != --* && "$value" != \#* &&
+      "${#value}" -ge 20 ]] || continue
+    printf '%s\n' "$value" >>"$METADATA_SECRET_VALUES_FILE"
+  done <"$source"
+  chmod 0400 "$METADATA_SECRET_VALUES_FILE"
 }
 
 compose() {
@@ -291,6 +309,10 @@ create_fixture() {
   local primary_access_key
   local primary_secret_key
   local login_throttle_secret
+  local metrics_bearer_secret
+  local host_metrics_hmac_secret
+  local webhook_url
+  local webhook_authorization
   FIXTURE_ROOT="$(mktemp -d \
     "$FIXTURE_TEMP_BASE/phase5-backup-live.XXXXXX")"
   FIXTURE_SUFFIX="$(
@@ -309,6 +331,9 @@ create_fixture() {
   REMOTE_VOLUME="phase5-remote-data-${FIXTURE_SUFFIX}"
   EXTERNAL_SENTINEL_VOLUME="phase5-external-sentinel-${FIXTURE_SUFFIX}"
   SECRET_MARKER_PREFIX="phase5-e2e-secret-marker-${FIXTURE_SUFFIX}"
+  METADATA_SECRET_VALUES_FILE="$FIXTURE_ROOT/metadata-secret-values"
+  COORDINATOR_ONE_SHOT_RECORD="$FIXTURE_ROOT/coordinator-one-shots"
+  COORDINATOR_COVERAGE_RECORD="$FIXTURE_ROOT/coordinator-coverage"
   CA_PROBE_NAME="phase5-ca-negative-${FIXTURE_SUFFIX}"
   BACKUP_BASE_IMAGE="happylearn-backup:phase5-live-base-${FIXTURE_SUFFIX}"
   BACKUP_CA_IMAGE="happylearn-backup:phase5-live-ca-${FIXTURE_SUFFIX}"
@@ -323,6 +348,10 @@ create_fixture() {
   primary_access_key="p5primary${FIXTURE_SUFFIX}"
   primary_secret_key="${SECRET_MARKER_PREFIX}-primary-secret"
   login_throttle_secret="${SECRET_MARKER_PREFIX}-login-throttle-padding"
+  metrics_bearer_secret="${SECRET_MARKER_PREFIX}-metrics-bearer"
+  host_metrics_hmac_secret="${SECRET_MARKER_PREFIX}-host-metrics-hmac"
+  webhook_url="https://${SECRET_MARKER_PREFIX}.invalid/webhook"
+  webhook_authorization="${SECRET_MARKER_PREFIX}-webhook-authorization"
   local_repository_password="$(
     uuidgen |
       tr '[:upper:]' '[:lower:]' |
@@ -394,6 +423,14 @@ create_fixture() {
     "HAPPYLEARN_MINIO_ACCESS_KEY=${primary_access_key}" \
     "HAPPYLEARN_MINIO_SECRET_KEY=${primary_secret_key}" \
     >"$FIXTURE_ROOT/runtime-secrets/app/runtime.env"
+  printf '%s\n' "$metrics_bearer_secret" \
+    >"$FIXTURE_ROOT/runtime-secrets/app/metrics-bearer"
+  printf '%s\n' "$host_metrics_hmac_secret" \
+    >"$FIXTURE_ROOT/runtime-secrets/app/host-metrics-hmac"
+  printf '%s\n' "$webhook_url" \
+    >"$FIXTURE_ROOT/runtime-secrets/app/webhook-url"
+  printf '%s\n' "$webhook_authorization" \
+    >"$FIXTURE_ROOT/runtime-secrets/app/webhook-authorization"
   printf '%s\n' \
     "HAPPYLEARN_DATABASE_URL=postgres://happylearn:${database_password}@postgres:5432/happylearn?sslmode=disable" \
     "HAPPYLEARN_LOGIN_THROTTLE_SECRET=${login_throttle_secret}" \
@@ -408,13 +445,32 @@ create_fixture() {
   chmod 0400 \
     "$FIXTURE_ROOT/runtime-secrets/postgres/password" \
     "$FIXTURE_ROOT/runtime-secrets/minio/runtime.env" \
-    "$FIXTURE_ROOT/runtime-secrets/app/runtime.env" \
+    "$FIXTURE_ROOT/runtime-secrets/app/"* \
     "$FIXTURE_ROOT/runtime-secrets/worker/runtime.env" \
     "$FIXTURE_ROOT/runtime-secrets/remote-s3/runtime.env"
+  printf '%s\n' \
+    "$remote_access_key" \
+    "$remote_secret_key" \
+    "$local_repository_password" \
+    "$remote_repository_password" \
+    "$database_password" \
+    "$primary_access_key" \
+    "$primary_secret_key" \
+    "$login_throttle_secret" \
+    "$metrics_bearer_secret" \
+    "$host_metrics_hmac_secret" \
+    "$webhook_url" \
+    "$webhook_authorization" \
+    >"$METADATA_SECRET_VALUES_FILE"
+  chmod 0400 "$METADATA_SECRET_VALUES_FILE"
   : >"$CREATED_IMAGE_RECORD"
   : >"$COMPOSE_CONTAINER_RECORD"
   : >"$COMPOSE_VOLUME_RECORD"
   : >"$COMPOSE_NETWORK_RECORD"
+  : >"$COORDINATOR_ONE_SHOT_RECORD"
+  : >"$COORDINATOR_COVERAGE_RECORD"
+  chmod 0600 "$COORDINATOR_ONE_SHOT_RECORD" \
+    "$COORDINATOR_COVERAGE_RECORD"
 }
 
 create_fixture_ca() {
@@ -445,6 +501,8 @@ create_fixture_ca() {
     "$FIXTURE_ROOT/ca-context/ca.crt"
   chmod 0400 "$FIXTURE_ROOT/offline/ca.key" \
     "$FIXTURE_ROOT/server-certs/private.key"
+  append_generated_secret_file_values "$FIXTURE_ROOT/offline/ca.key"
+  append_generated_secret_file_values "$FIXTURE_ROOT/server-certs/private.key"
   chmod 0444 "$FIXTURE_ROOT/offline/ca.crt" \
     "$FIXTURE_ROOT/server-certs/public.crt" \
     "$FIXTURE_ROOT/server-certs/CAs/ca.crt" \
@@ -472,6 +530,7 @@ build_backup_images() {
   docker run --rm --entrypoint /usr/local/bin/age-keygen \
     "$BACKUP_BASE_IMAGE" >"$AGE_IDENTITY_FILE" 2>/dev/null
   chmod 0400 "$AGE_IDENTITY_FILE"
+  append_generated_secret_file_values "$AGE_IDENTITY_FILE"
   HAPPYLEARN_BACKUP_AGE_RECIPIENT="$(
     docker run --rm --interactive \
       --entrypoint /usr/local/bin/age-keygen \
@@ -486,6 +545,7 @@ start_base_stack() {
   export HAPPYLEARN_BACKUP_LIVE_TEST='1'
   export HAPPYLEARN_BACKUP_LIVE_PROJECT="$PROJECT"
   export HAPPYLEARN_BACKUP_LIVE_ROOT="$FIXTURE_ROOT"
+  export HAPPYLEARN_PHASE5_E2E_OWNER="$FIXTURE_SUFFIX"
   export HAPPYLEARN_BACKUP_IMAGE="$BACKUP_CA_IMAGE"
   export HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$FIXTURE_ROOT/secrets"
   export HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$FIXTURE_ROOT/repository"
@@ -553,8 +613,11 @@ probe_phase5_secret_consumers() {
     '
   compose run --rm --no-deps --user 10001:10001 \
     --entrypoint /bin/sh app -ceu '
-      test "$(stat -c "%u:%g:%a" /run/phase5-secrets/runtime.env)" = 10001:10001:400
-      test -s /run/phase5-secrets/runtime.env
+      for name in runtime.env metrics-bearer host-metrics-hmac \
+        webhook-url webhook-authorization; do
+        test "$(stat -c "%u:%g:%a" "/run/phase5-secrets/${name}")" = 10001:10001:400
+        test -s "/run/phase5-secrets/${name}"
+      done
     '
   compose run --rm --no-deps --user 10002:10002 \
     --entrypoint /bin/sh worker -ceu '
@@ -686,25 +749,15 @@ start_remote_fixture() {
     fail 'remote HTTPS S3 fixture did not become ready'
 }
 
-audit_container_metadata() {
-  local ids container_id metadata host_config env_entries entry key value
+audit_container_id() {
+  local container_id="$1"
+  local metadata host_config env_entries entry key value secret_value
   local mounts mount_type mount_name mount_source mount_destination mount_rw
   local host_mounts host_mount_type host_mount_source host_mount_target
   local host_mount_read_only host_mount_subpath actual_mount_rw
   local runtime_actual_mount_count runtime_host_mount_count
-  local service
-  ids="$(
-    {
-      docker ps -aq \
-        --filter "label=com.docker.compose.project=${PROJECT}"
-      docker ps -aq \
-        --filter "label=io.happylearn.phase5-live=${FIXTURE_SUFFIX}"
-    } |
-      awk 'NF && !seen[$0]++'
-  )"
-  [[ -n "$ids" ]] || fail 'metadata audit found no Phase 5 containers'
-  while IFS= read -r container_id; do
-    [[ -n "$container_id" ]] || continue
+  local service e2e_owner
+  [[ -n "$container_id" ]] || fail 'metadata audit received an empty container ID'
     metadata="$(
       docker container inspect --format \
         '{{json .Config.Env}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}' \
@@ -733,6 +786,23 @@ audit_container_metadata() {
     if [[ "$service" == '<no value>' ]]; then
       service=''
     fi
+    e2e_owner="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}' \
+        "$container_id"
+    )" || e2e_owner=''
+    [[ "$e2e_owner" != '<no value>' ]] || e2e_owner=''
+    if [[ -n "$e2e_owner" && "$e2e_owner" != "$FIXTURE_SUFFIX" ]]; then
+      fail 'Phase 5 E2E container owner label changed'
+    fi
+    case "$service" in
+      phase5-secrets-init|postgres-tls-init|postgres|redis|\
+        minio-data-init|minio|app-secrets-init|app|worker|\
+        backup-storage-init|backup-secrets-init|backup)
+        [[ "$e2e_owner" == "$FIXTURE_SUFFIX" ]] ||
+          fail "Phase 5 E2E owner label was absent: $service"
+        ;;
+    esac
     env_entries="$(
       docker container inspect --format \
         '{{range .Config.Env}}{{println .}}{{end}}' \
@@ -748,12 +818,20 @@ audit_container_metadata() {
             fail 'PostgreSQL password file path was not fixed'
           ;;
         HAPPYLEARN_METRICS_BEARER_SECRET_FILE)
-          [[ "$value" == /run/secrets/metrics-bearer ]] ||
+          [[ "$value" == /run/phase5-secrets/metrics-bearer ]] ||
             fail 'metrics bearer secret file path was not fixed'
           ;;
         HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE)
-          [[ "$value" == /run/secrets/host-metrics-hmac ]] ||
+          [[ "$value" == /run/phase5-secrets/host-metrics-hmac ]] ||
             fail 'host metrics HMAC file path was not fixed'
+          ;;
+        HAPPYLEARN_WEBHOOK_URL_SECRET_FILE)
+          [[ "$value" == /run/phase5-secrets/webhook-url ]] ||
+            fail 'webhook URL secret file path was not fixed'
+          ;;
+        HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE)
+          [[ "$value" == /run/phase5-secrets/webhook-authorization ]] ||
+            fail 'webhook authorization secret file path was not fixed'
           ;;
         *_FILE)
           fail "unapproved Config.Env file key was present: $key"
@@ -769,6 +847,10 @@ audit_container_metadata() {
           E2E_AI_PROVIDER_KEY|E2E_AI_PROCESSING_CONTROL_TOKEN)
           fail "secret-bearing Config.Env key was present: $key"
           ;;
+        *PASSWORD*|*PASSWD*|*SECRET*|*TOKEN*|*API_KEY*|*ACCESS_KEY*|\
+          *PRIVATE_KEY*|*CREDENTIAL*)
+          fail "unknown secret-bearing Config.Env key was present: $key"
+          ;;
       esac
     done <<<"$env_entries"
     if grep -Fq "$SECRET_MARKER_PREFIX" <<<"$metadata" ||
@@ -777,6 +859,12 @@ audit_container_metadata() {
       grep -Fq 'development-only-worker-secret' <<<"$metadata"; then
       fail 'secret entered Phase 5 container metadata'
     fi
+    while IFS= read -r secret_value; do
+      [[ -n "$secret_value" ]] || continue
+      if [[ "$metadata" == *"$secret_value"* ]]; then
+        fail 'generated secret value entered Phase 5 container metadata'
+      fi
+    done <"$METADATA_SECRET_VALUES_FILE"
     if grep -Fq '/var/run/docker.sock' <<<"$host_config" ||
       [[ "$host_config" == *'|true|'* ||
         "$host_config" == *'|"host"'* ]]; then
@@ -807,6 +895,9 @@ audit_container_metadata() {
       if [[ "$mount_type" == bind ]]; then
         case "$mount_source:$mount_destination:$mount_rw" in
           "$FIXTURE_ROOT/runtime-secrets:/secret-source:false" | \
+            "$FIXTURE_ROOT/secrets:/source:false" | \
+            "$FIXTURE_ROOT/repository:/repository:true" | \
+            "$FIXTURE_ROOT/state:/state:true" | \
             "$FIXTURE_ROOT/server-certs:/certs:false" | \
             "$HAPPYLEARN_AISTOR_LICENSE_FILE:/minio.license:false" | \
             "$ROOT/deploy/fixtures/development-metrics-bearer-do-not-use-in-production:/run/secrets/metrics-bearer:false" | \
@@ -873,7 +964,120 @@ audit_container_metadata() {
       [[ "$runtime_actual_mount_count" -eq "$runtime_host_mount_count" ]] ||
         fail 'runtime secret requested and realized mount counts diverged'
     fi
+}
+
+audit_container_metadata() {
+  local ids container_id
+  ids="$(
+    {
+      docker ps -aq \
+        --filter "label=com.docker.compose.project=${PROJECT}"
+      docker ps -aq \
+        --filter "label=io.happylearn.phase5-live=${FIXTURE_SUFFIX}"
+    } |
+      awk 'NF && !seen[$0]++'
+  )"
+  [[ -n "$ids" ]] || fail 'metadata audit found no Phase 5 containers'
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    audit_container_id "$container_id"
   done <<<"$ids"
+}
+
+record_coordinator_one_shot_id() {
+  local container_id="$1"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] ||
+    fail 'coordinator monitor captured an invalid container ID'
+  if ! grep -Fxq "$container_id" "$COORDINATOR_ONE_SHOT_RECORD"; then
+    printf '%s\n' "$container_id" >>"$COORDINATOR_ONE_SHOT_RECORD" ||
+      fail 'could not record coordinator one-shot container'
+  fi
+}
+
+record_coordinator_coverage() {
+  local service="$1"
+  local command="$2"
+  local coverage=''
+  case "$service" in
+    backup-storage-init) coverage=storage-init ;;
+    backup-secrets-init) coverage=secrets-init ;;
+    backup)
+      if [[ "$command" == *'/app/happylearn-backup'* &&
+        "$command" == *'"snapshot"'* ]]; then
+        coverage=snapshot
+      elif [[ "$command" == *'/app/happylearn-backup'* &&
+        "$command" == *'"verify"'* ]]; then
+        coverage=verify
+      elif [[ "$command" == *'/app/happylearn-backup'* &&
+        "$command" == *'"sync"'* ]]; then
+        coverage=sync
+      elif [[ "$command" == *'/app/happylearn-backup-retention'* ]]; then
+        coverage=retention
+      elif [[ "$command" == *restic* ]]; then
+        coverage=restic
+      fi
+      ;;
+  esac
+  [[ -n "$coverage" ]] || return 0
+  if ! grep -Fxq "$coverage" "$COORDINATOR_COVERAGE_RECORD"; then
+    printf '%s\n' "$coverage" >>"$COORDINATOR_COVERAGE_RECORD" ||
+      fail 'could not record coordinator metadata coverage'
+  fi
+}
+
+audit_recorded_coordinator_one_shots() {
+  local container_id service project_label oneoff command ownership
+  [[ -s "$COORDINATOR_ONE_SHOT_RECORD" ]] ||
+    fail 'coordinator one-shot record was empty'
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    service="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.service"}}' \
+        "$container_id"
+    )" || fail 'retained coordinator container disappeared before audit'
+    project_label="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project"}}' \
+        "$container_id"
+    )" || fail 'could not inspect retained coordinator project ownership'
+    oneoff="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.oneoff"}}' \
+        "$container_id"
+    )" || fail 'could not inspect retained coordinator one-shot ownership'
+    [[ "$project_label" == "$PROJECT" && "$oneoff" == True ]] ||
+      fail 'retained coordinator container ownership mismatch'
+    case "$service" in
+      backup-storage-init|backup-secrets-init|backup) ;;
+      *) fail 'unexpected Compose one-shot entered coordinator audit' ;;
+    esac
+    command="$(
+      docker container inspect --format '{{json .Config.Cmd}}' \
+        "$container_id"
+    )" || fail 'could not inspect retained coordinator command'
+    audit_container_id "$container_id"
+    record_coordinator_coverage "$service" "$command"
+    ownership="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+        "$container_id"
+    )" || fail 'retained coordinator ownership changed after audit'
+    [[ "$ownership" == "$PROJECT|True|$service" ]] ||
+      fail 'retained coordinator ownership changed before removal'
+    docker rm --force "$container_id" >/dev/null ||
+      fail 'could not remove audited coordinator one-shot'
+  done < <(sort -u "$COORDINATOR_ONE_SHOT_RECORD")
+  : >"$COORDINATOR_ONE_SHOT_RECORD"
+}
+
+assert_coordinator_coverage() {
+  local coverage
+  for coverage in \
+    storage-init secrets-init snapshot verify sync restic retention; do
+    grep -Fxq "$coverage" "$COORDINATOR_COVERAGE_RECORD" ||
+      fail "coordinator metadata audit coverage was absent: $coverage"
+  done
 }
 
 create_remote_bucket() {
@@ -1273,7 +1477,7 @@ monitor_backup_runtime() {
     local worker_running=false
     local heavy_running=false
     listing="$(
-      docker ps \
+      docker ps --no-trunc \
         --filter "label=com.docker.compose.project=${PROJECT}" \
         --format '{{.ID}}|{{.Label "com.docker.compose.service"}}' ||
         true
@@ -1288,6 +1492,7 @@ monitor_backup_runtime() {
       case "$service" in
         backup-storage-init|backup-secrets-init|backup)
           saw_backup=true
+          record_coordinator_one_shot_id "$container_id"
           if [[ "$service" == backup ]]; then
             local container_arguments
             if ! container_arguments="$(
@@ -1399,6 +1604,8 @@ run_backup_monitored() {
   local result_file="$FIXTURE_ROOT/results/${label}.runtime"
   local backup_pid
   local monitor_pid
+  [[ ! -s "$COORDINATOR_ONE_SHOT_RECORD" ]] ||
+    fail "coordinator one-shot record was not empty: ${label}"
   "$ROOT/scripts/phase5-backup.sh" \
     --project "$ORCHESTRATOR_PROJECT" \
     --trigger manual &
@@ -1413,6 +1620,7 @@ run_backup_monitored() {
   fi
   wait "$monitor_pid" ||
     fail "runtime monitor failed: ${label}"
+  audit_recorded_coordinator_one_shots
   if [[ "$backup_status" -ne 0 ]]; then
     local evidence
     evidence="$(
@@ -1665,6 +1873,7 @@ main() {
   [[ "$actual_state" == succeeded ]] ||
     fail "retention-triggering recovery point did not succeed: ${actual_state}"
   assert_retention_results
+  assert_coordinator_coverage
 
   cleanup_live 0
   verify_external_sentinel

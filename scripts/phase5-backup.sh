@@ -18,6 +18,7 @@ COMPOSE_FILE=''
 LIVE_COMPOSE_FILE=''
 E2E_LIVE_COMPOSE_FILE=''
 LIVE_ROOT=''
+LIVE_ONE_SHOT_RECORD_FILE=''
 LOCK_DIRECTORY=''
 LOCK_HELD=false
 LOCK_OWNER_DIRECTORY=''
@@ -322,6 +323,13 @@ configure_live_context() {
     "$lock_path" == "$LIVE_ROOT/host.lock" ]] ||
     return 1
   owner_only_directory "$LIVE_ROOT/runtime-secrets" || return 1
+  LIVE_ONE_SHOT_RECORD_FILE="$LIVE_ROOT/coordinator-one-shots"
+  [[ -f "$LIVE_ONE_SHOT_RECORD_FILE" &&
+    ! -L "$LIVE_ONE_SHOT_RECORD_FILE" &&
+    ! -s "$LIVE_ONE_SHOT_RECORD_FILE" &&
+    "$(portable_mode "$LIVE_ONE_SHOT_RECORD_FILE")" == '600' &&
+    "$(portable_owner "$LIVE_ONE_SHOT_RECORD_FILE")" == "$(id -u)" ]] ||
+    return 1
   HAPPYLEARN_BACKUP_LIVE_ROOT="$LIVE_ROOT"
   export HAPPYLEARN_BACKUP_LIVE_ROOT
   EFFECTIVE_PROJECT="$live_project"
@@ -749,16 +757,45 @@ compose() {
   docker compose "${arguments[@]}" "$@"
 }
 
+record_live_coordinator_one_shots() {
+  [[ -n "$LIVE_ROOT" && -n "$LIVE_ONE_SHOT_RECORD_FILE" ]] || return 0
+  local ids container_id
+  ids="$(
+    docker ps --all --quiet --no-trunc \
+      --filter "label=com.docker.compose.project=${EFFECTIVE_PROJECT}" \
+      --filter 'label=com.docker.compose.oneoff=True'
+  )" || return 1
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if ! grep -Fxq "$container_id" "$LIVE_ONE_SHOT_RECORD_FILE"; then
+      printf '%s\n' "$container_id" >>"$LIVE_ONE_SHOT_RECORD_FILE" ||
+        return 1
+    fi
+  done <<<"$ids"
+}
+
+compose_run() {
+  if [[ -z "$LIVE_ROOT" ]]; then
+    compose run --rm "$@"
+    return
+  fi
+  local status=0
+  compose run "$@" || status=$?
+  record_live_coordinator_one_shots || return 1
+  return "$status"
+}
+
 initialize_backup_mounts() {
   run_guarded_external 300 \
-    compose run --rm --no-deps backup-storage-init
+    compose_run --no-deps backup-storage-init
   run_guarded_external 300 \
-    compose run --rm --no-deps backup-secrets-init
+    compose_run --no-deps backup-secrets-init
 }
 
 verify_backup_mount_ownership() {
   run_guarded_external 120 \
-    compose run --rm --no-deps --entrypoint /bin/sh backup -eu -c '
+    compose_run --no-deps --entrypoint /bin/sh backup -eu -c '
       test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700" ||
         { printf "%s\n" repository_ownership >&2; exit 1; }
       test "$(stat -c "%u:%g:%a" /state)" = "10003:0:700" ||
@@ -1261,7 +1298,7 @@ backup_command() {
 }
 
 bounded_backup_compose() {
-  compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+  compose_run --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
     /app/happylearn-backup "$@"
 }
@@ -1289,12 +1326,15 @@ prepare_sync_container_identity() {
 }
 
 bounded_backup_sync_compose() {
+  local removal_argument='--rm'
+  [[ -z "$LIVE_ROOT" ]] || removal_argument=''
   export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$SYNC_CONTAINER_HOSTNAME"
   compose run \
     --name "$SYNC_CONTAINER_NAME" \
     --label "${SYNC_RUN_LABEL}=${RUN_ID}" \
     --label "${SYNC_OWNER_LABEL}=${SYNC_CONTAINER_OWNER}" \
-    --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    ${removal_argument:+"$removal_argument"} \
+    --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
     /app/happylearn-backup sync --run-id "$RUN_ID"
 }
@@ -1405,7 +1445,13 @@ backup_sync_command() {
   else
     command_status=$?
   fi
-  if cleanup_sync_container; then
+  if [[ -n "$LIVE_ROOT" ]]; then
+    if record_live_coordinator_one_shots; then
+      cleanup_status=0
+    else
+      cleanup_status=$?
+    fi
+  elif cleanup_sync_container; then
     cleanup_status=0
   else
     cleanup_status=$?
@@ -1499,7 +1545,7 @@ SQL
 
 local_restic() {
   run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
-    compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    compose_run --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" restic \
     --no-cache \
     --repository-file /run/secrets/local_repository \
@@ -1509,7 +1555,7 @@ local_restic() {
 
 remote_restic() {
   run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
-    compose run --rm --no-deps --entrypoint /bin/sh backup \
+    compose_run --no-deps --entrypoint /bin/sh backup \
     -eu -c '
       deadline="$1"
       shift
@@ -1526,7 +1572,7 @@ remote_restic() {
 bounded_local_unlock() {
   local hostname="$1"
   export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$hostname"
-  compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+  compose_run --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${SYNC_CONTAINER_STOP_TIMEOUT_SECONDS}s" \
     restic --no-cache \
     --repository-file /run/secrets/local_repository \
@@ -1537,7 +1583,7 @@ bounded_local_unlock() {
 bounded_remote_unlock() {
   local hostname="$1"
   export HAPPYLEARN_BACKUP_CONTAINER_HOSTNAME="$hostname"
-  compose run --rm --no-deps --entrypoint /bin/sh backup \
+  compose_run --no-deps --entrypoint /bin/sh backup \
     -eu -c '
       deadline="$1"
       AWS_ACCESS_KEY_ID="$(sed -n "1p" /run/secrets/remote_access_key_id)"
@@ -1662,7 +1708,7 @@ run_retention() {
     *) return 1 ;;
   esac
   run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
-    compose run --rm --no-deps --entrypoint /usr/bin/timeout backup \
+    compose_run --no-deps --entrypoint /usr/bin/timeout backup \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
     /app/happylearn-backup-retention \
     --repository "$repository" --run-id "$RUN_ID"
