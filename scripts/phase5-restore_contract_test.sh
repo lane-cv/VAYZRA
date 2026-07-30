@@ -726,7 +726,8 @@ case "${1:-} ${2:-}" in
     ;;
   'exec '*)
     case "$*" in
-      *pg_isready*|*minio/health/ready*|*api/v1/health/ready*)
+      *pg_isready*|*'/proc/1/comm'*'psql'*'SELECT 1'*|\
+        *minio/health/ready*|*api/v1/health/ready*)
         exit 0
         ;;
       *) exit 64 ;;
@@ -1649,6 +1650,10 @@ grep -Fq 'HTTP_PROBE_SUCCEEDED=true' "$TARGET" ||
   fail 'restore harness does not fence its report on HTTP probe success'
 grep -Fq 'UPDATE operational_modes' "$TARGET" ||
   fail 'restored operational mode is not normalized before app startup'
+grep -Fq '/proc/1/comm' "$TARGET" ||
+  fail 'PostgreSQL readiness does not wait for the final server process'
+grep -Fq 'psql --no-psqlrc' "$TARGET" ||
+  fail 'PostgreSQL readiness does not prove a final-server SQL query'
 
 run_tampered_supervisor_case supervisor_identity_timeout 124
 run_tampered_supervisor_case supervisor_identity_term 143
@@ -2287,6 +2292,13 @@ grep -Fq 'volume-subpath=client,readonly' \
 grep -Fq 'PGPASSFILE=/run/restore-secrets/pgpass' \
   "$success_fixture/docker.log" ||
   fail 'database clients did not use the fixed pgpass path'
+grep -Fq '/proc/1/comm' "$success_fixture/docker.log" ||
+  fail 'PostgreSQL readiness did not wait for the final server process'
+grep -Fq 'psql --no-psqlrc' "$success_fixture/docker.log" ||
+  fail 'PostgreSQL readiness did not prove a final-server SQL query'
+assert_before "$success_fixture" \
+  '/proc/1/comm' \
+  ' pg_restore '
 for secret_consumer in \
   '/usr/local/bin/docker-entrypoint.sh postgres' \
   'minio server /data --license /minio-license/minio.license' \

@@ -75,6 +75,34 @@ func TestRunProgramWithLogEmitsFixedFailureWithoutRawError(t *testing.T) {
 	}
 }
 
+func TestProductionRestoreCheckLogsOnlyFixedFailureCategory(t *testing.T) {
+	const secret = "restore-check-diagnostic-secret"
+	var output bytes.Buffer
+	logger, err := safelog.New(&output, time.Now, secret)
+	if err != nil {
+		t.Fatalf("safelog.New: %v", err)
+	}
+	factories := productionProgramFactoriesWithLog(logger)
+	err = factories.runRestoreCheck(
+		context.Background(),
+		restoreCheckInput{},
+		func(string) string { return secret },
+	)
+	if !errors.Is(err, errWorkflowUnavailable) {
+		t.Fatalf("restore check error=%v", err)
+	}
+
+	records := decodeBackupSafeLogs(t, output.Bytes())
+	if len(records) != 1 ||
+		records[0]["event"] != "backup.restore_check_failure" ||
+		records[0]["category"] != "input" {
+		t.Fatalf("records = %#v", records)
+	}
+	if bytes.Contains(output.Bytes(), []byte(secret)) {
+		t.Fatalf("restore check diagnostic leaked secret in %q", output.Bytes())
+	}
+}
+
 func decodeBackupSafeLogs(t *testing.T, output []byte) []map[string]any {
 	t.Helper()
 	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})

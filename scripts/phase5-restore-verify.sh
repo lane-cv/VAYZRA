@@ -1747,6 +1747,17 @@ start_postgres() {
   poll_until "$READY_TIMEOUT_SECONDS" \
     docker exec "$POSTGRES_CONTAINER" \
     pg_isready -U happylearn -d happylearn >/dev/null
+  poll_until "$READY_TIMEOUT_SECONDS" \
+    docker exec "$POSTGRES_CONTAINER" \
+    /bin/sh -ceu '
+      test "$(cat /proc/1/comm)" = postgres
+      test "$(
+        psql --no-psqlrc --set ON_ERROR_STOP=1 \
+          --tuples-only --no-align --quiet \
+          --username happylearn --dbname happylearn \
+          --command "SELECT 1"
+      )" = 1
+    ' >/dev/null
 }
 
 restore_database() {

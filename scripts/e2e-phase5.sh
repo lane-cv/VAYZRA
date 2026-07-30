@@ -49,6 +49,9 @@ case "$#" in
     case "$1" in
       --audit-container-metadata) probe_mode=audit ;;
       --resource-contract-probe) probe_mode=resource ;;
+      --resource-child-status-contract-probe)
+        probe_mode=resource_child_status
+        ;;
       *)
         printf '%s\n' 'invalid Phase 5 E2E harness arguments' >&2
         exit 2
@@ -97,6 +100,14 @@ case "$#" in
     probe_mode=resource_identity
     probe_arguments=("${@:2}")
     ;;
+  7)
+    [[ "$1" == '--resource-identity-contract-probe' ]] || {
+      printf '%s\n' 'invalid Phase 5 E2E harness arguments' >&2
+      exit 2
+    }
+    probe_mode=resource_identity
+    probe_arguments=("${@:2}")
+    ;;
   *)
     printf '%s\n' 'invalid Phase 5 E2E harness arguments' >&2
     exit 2
@@ -121,6 +132,8 @@ fake_ai="${prefix}_fake_ai"
 backup="${prefix}_backup"
 host_sample="${prefix}_host_sample"
 browser_runner="${prefix}_browser_runner"
+restore_controller="${prefix}_restore_controller"
+restore_repository_handoff="${prefix}_restore_repository_handoff"
 secret_init="${prefix}_secret_init"
 data_init="${prefix}_data_init"
 runner_init="${prefix}_runner_init"
@@ -149,6 +162,7 @@ backup_base_image="happylearn-backup:phase5-base-${nonce}"
 fake_ai_image="happylearn-fake-ai:phase5-${nonce}"
 supervisor_image="${live_project}-worker"
 host_sample_image="happylearn-host-sample:phase5-${nonce}"
+restore_controller_image="happylearn-restore-controller:phase5-${nonce}"
 playwright_image="mcr.microsoft.com/playwright:v1.57.0-noble"
 init_image="alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
 aistor_image="quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120"
@@ -187,6 +201,10 @@ remote_cert_dir="$tmpdir/remote-certs"
 offline_dir="$tmpdir/offline"
 restore_control_dir="$tmpdir/restore-control"
 restore_report_dir="$tmpdir/restore-report"
+restore_license_file="$tmpdir/restore-minio.license"
+restore_controller_tmp="$tmpdir/restore-controller-tmp"
+restore_docker_socket=''
+restore_docker_socket_group=''
 owned_container_ledger="$tmpdir/owned-containers.tsv"
 owned_network_ledger="$tmpdir/owned-networks.tsv"
 owned_volume_ledger="$tmpdir/owned-volumes.tsv"
@@ -195,9 +213,14 @@ container_intent_ledger="$tmpdir/container-intents.tsv"
 network_intent_ledger="$tmpdir/network-intents.tsv"
 volume_intent_ledger="$tmpdir/volume-intents.tsv"
 image_intent_ledger="$tmpdir/image-intents.tsv"
+host_sample_dockerfile="$tmpdir/Dockerfile.host-sampler"
+seed_sql_file="$tmpdir/phase5-browser-seed.sql"
 coordinator_one_shot_file="$backup_host_root/coordinator-one-shots"
 resource_browser_pid=''
 resource_backup_pid=''
+resource_child_status_file=''
+resource_browser_status_file="$tmpdir/resource-browser.status"
+resource_backup_status_file="$tmpdir/resource-backup.status"
 mkdir -m 0700 "$secret_source_dir" "$backup_host_root" \
   "$backup_host_root/secrets" "$backup_host_root/repository" \
   "$backup_host_root/state" "$backup_host_root/runtime-secrets" \
@@ -209,6 +232,7 @@ mkdir -m 0700 "$secret_source_dir" "$backup_host_root" \
   "$ca_context_dir" "$remote_cert_dir" "$remote_cert_dir/CAs" \
   "$offline_dir" \
   "$restore_control_dir" "$restore_report_dir"
+mkdir -m 0700 "$restore_controller_tmp"
 for ledger in \
   "$owned_container_ledger" "$owned_network_ledger" \
   "$owned_volume_ledger" "$owned_image_ledger" \
@@ -239,8 +263,16 @@ umask 077
 new_secret() {
   openssl rand -base64 36 | tr -d '\n'
 }
+new_ai_master() {
+  openssl rand -base64 32 | tr -d '\n'
+}
+new_database_password() {
+  openssl rand -hex 32
+}
+new_ai_master >"$secret_source_dir/ai-master"
+new_database_password >"$secret_source_dir/database-password"
 for secret_name in \
-  ai-master database-password object-access object-secret metrics-bearer \
+  object-access object-secret metrics-bearer \
   host-metrics-hmac restic-local-password restic-remote-password \
   restic-remote-access-key restic-remote-secret-key \
   webhook-authorization login-throttle provider-key control-token \
@@ -262,6 +294,7 @@ secret_probe_containers=(
   "${prefix}_secret_probe_postgres"
   "${prefix}_secret_probe_minio"
   "${prefix}_secret_probe_app"
+  "${prefix}_secret_probe_admin"
   "${prefix}_secret_probe_worker"
   "${prefix}_secret_probe_backup"
 )
@@ -269,7 +302,8 @@ temporary_containers=(
   "$secret_init" "$data_init" "$runner_init" "$fixture_runner"
   "$install_runner" "$admin_init" "$artifact_init" "$artifact_write_probe"
   "$age_keygen_runner" "$age_recipient_runner"
-  "$backup" "$host_sample" "$browser_runner"
+  "$backup" "$host_sample" "$browser_runner" "$restore_controller"
+  "$restore_repository_handoff"
   "${secret_probe_containers[@]}"
 )
 service_containers=(
@@ -284,7 +318,7 @@ owned_volumes=(
 owned_images=(
   "$host_sample_image" "$supervisor_image" "$fake_ai_image" "$backup_image"
   "$backup_base_image"
-  "$worker_image" "$app_image"
+  "$worker_image" "$app_image" "$restore_controller_image"
 )
 
 persist_resource_intents() {
@@ -731,7 +765,7 @@ artifact_target_is_safe() {
 
 audit_container_metadata() {
   local container metadata env_entries host_config entry key value
-  local secret_path secret_value
+  local secret_path secret_name secret_value
   [[ "$#" -ge 1 ]] || return 1
   for container in "$@"; do
     docker_capture_bounded metadata 15 inspect --format \
@@ -797,10 +831,17 @@ audit_container_metadata() {
     done <<<"$env_entries"
     for secret_path in "$secret_source_dir"/*; do
       [[ -f "$secret_path" && ! -L "$secret_path" ]] || continue
+      secret_name="${secret_path##*/}"
       secret_value="$(<"$secret_path")"
       [[ ${#secret_value} -ge 8 ]] || continue
+      if [[ "$secret_name" == restic-local-repository &&
+        "$secret_value" == /repository ]]; then
+        continue
+      fi
       if grep -Fq "$secret_value" <<<"$metadata"; then
-        printf 'Phase 5 runtime metadata contained a literal secret\n' >&2
+        printf \
+          'Phase 5 runtime metadata contained a literal secret from %s\n' \
+          "$secret_name" >&2
         return 1
       fi
     done
@@ -829,6 +870,14 @@ portable_file_owner() {
     stat -c '%u' "$1"
   else
     stat -f '%u' "$1"
+  fi
+}
+
+portable_file_group() {
+  if stat -c '%g' "$1" >/dev/null 2>&1; then
+    stat -c '%g' "$1"
+  else
+    stat -f '%g' "$1"
   fi
 }
 
@@ -1118,11 +1167,59 @@ cancel_resource_workloads() {
 }
 
 run_resource_child() {
+  local status_file="${1:?resource child status file required}"
+  local status=0
+  shift
+  resource_child_status_file="$status_file"
   trap - EXIT
-  trap 'cancel_bounded_command; exit 129' HUP
-  trap 'cancel_bounded_command; exit 130' INT
-  trap 'cancel_bounded_command; exit 143' TERM
-  "$@"
+  trap 'handle_resource_child_signal 129' HUP
+  trap 'handle_resource_child_signal 130' INT
+  trap 'handle_resource_child_signal 143' TERM
+  "$@" || status=$?
+  record_resource_child_status "$resource_child_status_file" "$status" ||
+    status=125
+  return "$status"
+}
+
+record_resource_child_status() {
+  local status_file="${1:?resource child status file required}"
+  local status="${2:?resource child status required}"
+  [[ "$status_file" == /* &&
+    -f "$status_file" &&
+    ! -L "$status_file" &&
+    "$(portable_file_mode "$status_file")" == 600 &&
+    "$(portable_file_owner "$status_file")" == "$(id -u)" &&
+    "$status" =~ ^([0-9]|[1-9][0-9]{1,2})$ &&
+    "$status" -le 255 ]] ||
+    return 1
+  printf '%s\n' "$status" >"$status_file"
+}
+
+read_resource_child_status() {
+  local status_file="${1:?resource child status file required}"
+  local status
+  [[ "$status_file" == /* &&
+    -f "$status_file" &&
+    ! -L "$status_file" &&
+    "$(portable_file_mode "$status_file")" == 600 &&
+    "$(portable_file_owner "$status_file")" == "$(id -u)" &&
+    "$(wc -l <"$status_file" | tr -d '[:space:]')" == 1 ]] ||
+    return 1
+  status="$(<"$status_file")"
+  [[ "$status" =~ ^([0-9]|[1-9][0-9]{1,2})$ &&
+    "$status" -le 255 ]] ||
+    return 1
+  printf '%s\n' "$status"
+}
+
+handle_resource_child_signal() {
+  local signal_status="${1:?resource child signal status required}"
+  [[ "$signal_status" =~ ^(129|130|143)$ ]] || return 1
+  trap '' HUP INT TERM
+  cancel_bounded_command || true
+  record_resource_child_status \
+    "$resource_child_status_file" "$signal_status" || true
+  exit "$signal_status"
 }
 
 if [[ -z "$probe_mode" ||
@@ -1187,6 +1284,26 @@ create_fixture_ca() {
   chmod 0400 "$remote_cert_dir/private.key"
 }
 
+prepare_restore_license() {
+  [[ ! -e "$restore_license_file" && ! -L "$restore_license_file" ]] ||
+    return 1
+  install -m 0400 "$license_file" "$restore_license_file"
+  [[ -f "$restore_license_file" &&
+    ! -L "$restore_license_file" &&
+    "$(portable_file_mode "$restore_license_file")" == 400 &&
+    "$(portable_file_owner "$restore_license_file")" == "$(id -u)" ]]
+}
+
+build_restore_controller_image() {
+  docker_bounded 900 build \
+    --file "$repo_root/deploy/Dockerfile.restore-live-controller" \
+    --target restore_live_controller \
+    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --tag "$restore_controller_image" \
+    "$repo_root"
+  record_owned_image "$restore_controller_image"
+}
+
 build_images() {
   local reference
   for reference in "${owned_images[@]}"; do
@@ -1223,9 +1340,11 @@ build_images() {
     --build-arg "WORKER_IMAGE=$worker_image" \
     -t "$supervisor_image" "$repo_root"
   record_owned_image "$supervisor_image"
-  docker_bounded 900 build -f - \
-    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
-    -t "$host_sample_image" "$repo_root" <<'DOCKERFILE'
+  if [[ -e "$host_sample_dockerfile" || -L "$host_sample_dockerfile" ]]; then
+    printf '%s\n' 'host sampler Dockerfile path already exists' >&2
+    return 1
+  fi
+  cat >"$host_sample_dockerfile" <<'DOCKERFILE'
 FROM golang:1.26.5-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -1241,7 +1360,20 @@ RUN chmod 0555 /app/host-sampler
 USER 10004:0
 ENTRYPOINT ["/app/host-sampler"]
 DOCKERFILE
+  chmod 0600 "$host_sample_dockerfile"
+  if [[ ! -f "$host_sample_dockerfile" ||
+        -L "$host_sample_dockerfile" ||
+        "$(portable_file_mode "$host_sample_dockerfile")" != 600 ]]; then
+    printf '%s\n' 'host sampler Dockerfile was not materialized safely' >&2
+    return 1
+  fi
+  docker_bounded 900 build -f "$host_sample_dockerfile" \
+    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    -t "$host_sample_image" "$repo_root"
   record_owned_image "$host_sample_image"
+  case "$e2e_group" in
+    all|recovery) build_restore_controller_image ;;
+  esac
   docker_bounded 60 run --rm --name "$age_keygen_runner" --network none \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
@@ -1249,12 +1381,13 @@ DOCKERFILE
     "$backup_image" >"$secret_source_dir/age-identity" 2>/dev/null
   chmod 0600 "$secret_source_dir/age-identity"
   HAPPYLEARN_BACKUP_AGE_RECIPIENT="$(
-    docker_bounded 60 run --rm --interactive \
+    docker_bounded 60 run --rm --read-only \
       --name "$age_recipient_runner" --network none \
       --label "com.docker.compose.project=${live_project}" \
       --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+      --mount "type=bind,src=$secret_source_dir/age-identity,dst=/input/age-identity,readonly" \
       --entrypoint /usr/local/bin/age-keygen \
-      "$backup_image" -y <"$secret_source_dir/age-identity"
+      "$backup_image" -y /input/age-identity
   )"
   [[ "$HAPPYLEARN_BACKUP_AGE_RECIPIENT" =~ ^age1[0-9a-z]+$ ]]
   export HAPPYLEARN_BACKUP_AGE_RECIPIENT
@@ -1412,37 +1545,43 @@ initialize_secret_volume() {
     -v "$secret_source_dir:/secrets:ro" -v "$secret_volume:/owned-secrets" \
     "$init_image" /bin/sh -eu -c '
       install_consumer() {
-        consumer="$1"; owner="$2"; shift 2
+        consumer="$1"; owner="$2"; mode="$3"; shift 3
+        case "$mode" in
+          0400|0600) ;;
+          *) exit 2 ;;
+        esac
         directory="/owned-secrets/$consumer"
         mkdir "$directory"
         for name in "$@"; do
           target="$directory/$name"
           cp "/secrets/$name" "$target"
-          chmod 0400 "$target"
+          chmod "$mode" "$target"
           chown "$owner" "$target"
-          test "$(stat -c "%u:%g:%a" "$target")" = "$owner:400"
+          test "$(stat -c "%u:%g:%a" "$target")" = "$owner:${mode#0}"
         done
         chmod 0500 "$directory"
         chown "$owner" "$directory"
         test "$(stat -c "%u:%g:%a" "$directory")" = "$owner:500"
       }
-      install_consumer postgres 999:999 database-password
-      install_consumer primary-aistor 1000:0 object-access object-secret
-      install_consumer remote-s3 1000:0 restic-remote-access-key restic-remote-secret-key
-      install_consumer app 10001:10001 ai-master database-password object-access object-secret metrics-bearer host-metrics-hmac webhook-url webhook-authorization login-throttle
-      install_consumer worker 10002:10002 database-password object-access object-secret login-throttle
-      install_consumer backup 10003:0 database-password restic-local-repository restic-local-password restic-remote-repository restic-remote-password restic-remote-access-key restic-remote-secret-key age-identity
-      install_consumer fake-ai 10003:10003 provider-key
-      install_consumer supervisor 10002:10002 control-token
-      install_consumer browser 1000:1000 admin-password student-password student-new-password provider-key control-token
-      install_consumer host-sample 10004:0 metrics-bearer host-metrics-hmac
+      install_consumer postgres 999:999 0400 database-password
+      install_consumer primary-aistor 1000:0 0400 object-access object-secret
+      install_consumer remote-s3 1000:0 0400 restic-remote-access-key restic-remote-secret-key
+      install_consumer app 10001:10001 0400 ai-master database-password object-access object-secret metrics-bearer host-metrics-hmac webhook-url webhook-authorization login-throttle
+      install_consumer worker 10002:10002 0400 database-password object-access object-secret login-throttle
+      install_consumer backup 10003:0 0400 database-password restic-local-repository restic-local-password restic-remote-repository restic-remote-password restic-remote-access-key restic-remote-secret-key age-identity
+      install_consumer fake-ai 10003:10003 0400 provider-key
+      install_consumer supervisor 10002:10002 0400 control-token
+      install_consumer admin 10001:10001 0600 admin-password
+      install_consumer browser 1000:1000 0400 admin-password student-password student-new-password provider-key control-token
+      install_consumer host-sample 10004:0 0400 metrics-bearer host-metrics-hmac
       chmod 0500 /owned-secrets
     '
 }
 
 verify_secret_consumer_reads() {
-  local probe_name uid consumer secret expected
-  while IFS='|' read -r probe_name uid consumer secret expected; do
+  local probe_name uid consumer secret expected mode
+  while IFS='|' read -r probe_name uid consumer secret expected mode; do
+    [[ "$mode" == 400 || "$mode" == 600 ]] || return 2
     docker_bounded 60 run --rm --name "${prefix}_${probe_name}" \
       --label "com.docker.compose.project=${live_project}" \
       --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
@@ -1450,41 +1589,47 @@ verify_secret_consumer_reads() {
       --security-opt no-new-privileges --memory 16m --cpus .05 \
       --mount "type=volume,src=$secret_volume,dst=/run/secrets,volume-subpath=$consumer,readonly" \
       "$init_image" /bin/sh -eu -c \
-      'test "$(stat -c "%u:%g:%a" "/run/secrets/'"$secret"'")" = "'"$expected"':400"; test -s "/run/secrets/'"$secret"'"'
+      'test "$(stat -c "%u:%g:%a" "/run/secrets/'"$secret"'")" = "'"$expected"':'"$mode"'"; test -s "/run/secrets/'"$secret"'"'
   done <<'PROBES'
-secret_probe_postgres|999:999|postgres|database-password|999:999
-secret_probe_minio|1000:0|primary-aistor|object-access|1000:0
-secret_probe_app|10001:10001|app|ai-master|10001:10001
-secret_probe_worker|10002:10002|worker|database-password|10002:10002
-secret_probe_backup|10003:0|backup|restic-local-password|10003:0
+secret_probe_postgres|999:999|postgres|database-password|999:999|400
+secret_probe_minio|1000:0|primary-aistor|object-access|1000:0|400
+secret_probe_app|10001:10001|app|ai-master|10001:10001|400
+secret_probe_admin|10001:10001|admin|admin-password|10001:10001|600
+secret_probe_worker|10002:10002|worker|database-password|10002:10002|400
+secret_probe_backup|10003:0|backup|restic-local-password|10003:0|400
 PROBES
   : '999:999' '1000:0' '10001:10001' '10002:10002' '10003:0'
 }
 
-start_dependencies() {
+run_compose_one_shot() {
+  local service="${1:?service required}"
+  local name="${live_project}-${service}-1"
+  case "$service" in
+    phase5-secrets-init|postgres-tls-init|minio-data-init) ;;
+    *) return 2 ;;
+  esac
   if ! compose_live up --no-build --abort-on-container-exit \
-    --exit-code-from phase5-secrets-init phase5-secrets-init; then
+    --exit-code-from "$service" "$service"; then
     record_owned_container \
-      "${live_project}-phase5-secrets-init-1" \
-      "$live_project" "$fixture_suffix" || true
+      "$name" "$live_project" "$fixture_suffix" || true
     return 1
   fi
   record_owned_container \
-    "${live_project}-phase5-secrets-init-1" \
+    "$name" \
     "$live_project" "$fixture_suffix"
-  if ! compose_live up --detach --no-build postgres redis minio; then
-    for name in \
-      "${live_project}-postgres-tls-init-1" \
-      "${live_project}-minio-data-init-1" \
-      "$postgres" "$redis" "$primary_aistor"; do
+}
+
+start_dependencies() {
+  run_compose_one_shot phase5-secrets-init
+  run_compose_one_shot postgres-tls-init
+  run_compose_one_shot minio-data-init
+  if ! compose_live up --detach --no-build --no-deps postgres redis minio; then
+    for name in "$postgres" "$redis" "$primary_aistor"; do
       record_owned_container "$name" "$live_project" "$fixture_suffix" || true
     done
     return 1
   fi
-  for name in \
-    "${live_project}-postgres-tls-init-1" \
-    "${live_project}-minio-data-init-1" \
-    "$postgres" "$redis" "$primary_aistor"; do
+  for name in "$postgres" "$redis" "$primary_aistor"; do
     record_owned_container "$name" "$live_project" "$fixture_suffix"
   done
   docker_bounded 60 run -d --name "$remote_s3" --network "$network" \
@@ -1574,7 +1719,7 @@ worker|$worker
 CLAIMS
   compose_live stop --timeout 30 worker
   [[ "$(docker_bounded 15 inspect --format '{{.State.Status}}' "$worker")" == exited ]]
-  compose_live start worker
+  compose_live up --detach --no-build --no-deps worker
   wait_for worker-after-compose-start "$worker" exec "$worker" \
     curl --fail --silent http://127.0.0.1:8081/ready
   compose_id="$(compose_live ps --quiet worker)"
@@ -1595,9 +1740,9 @@ create_teacher_and_sample() {
     -e HAPPYLEARN_MINIO_ORIGINALS_BUCKET=happylearn-originals \
     -e HAPPYLEARN_MINIO_PREVIEWS_BUCKET=happylearn-previews \
     --mount "type=volume,src=$secret_volume,dst=/run/secrets-app,volume-subpath=app,readonly" \
-    --mount "type=volume,src=$secret_volume,dst=/run/secrets-browser,volume-subpath=browser,readonly" \
+    --mount "type=volume,src=$secret_volume,dst=/run/secrets-admin,volume-subpath=admin,readonly" \
     --entrypoint /bin/sh "$app_image" -eu -c \
-    'export HAPPYLEARN_AI_MASTER_KEY="$(cat /run/secrets-app/ai-master)" HAPPYLEARN_DATABASE_URL="postgres://happylearn:$(cat /run/secrets-app/database-password)@postgres:5432/'"$database"'?sslmode=disable" HAPPYLEARN_REDIS_URL="redis://redis:6379/0" HAPPYLEARN_LOGIN_THROTTLE_SECRET="$(cat /run/secrets-app/login-throttle)" HAPPYLEARN_MINIO_ACCESS_KEY="$(cat /run/secrets-app/object-access)" HAPPYLEARN_MINIO_SECRET_KEY="$(cat /run/secrets-app/object-secret)"; exec /app/happylearn-admin create-teacher --username admin --display-name "Phase 5 Teacher" --password-file /run/secrets-browser/admin-password'
+    'export HAPPYLEARN_AI_MASTER_KEY="$(cat /run/secrets-app/ai-master)" HAPPYLEARN_DATABASE_URL="postgres://happylearn:$(cat /run/secrets-app/database-password)@postgres:5432/'"$database"'?sslmode=disable" HAPPYLEARN_REDIS_URL="redis://redis:6379/0" HAPPYLEARN_LOGIN_THROTTLE_SECRET="$(cat /run/secrets-app/login-throttle)" HAPPYLEARN_MINIO_ACCESS_KEY="$(cat /run/secrets-app/object-access)" HAPPYLEARN_MINIO_SECRET_KEY="$(cat /run/secrets-app/object-secret)"; exec /app/happylearn-admin create-teacher --username admin --display-name "Phase 5 Teacher" --password-file /run/secrets-admin/admin-password'
   docker_bounded 120 run --rm --name "$host_sample" --network "$network" \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
@@ -1625,9 +1770,11 @@ create_teacher_and_sample() {
 }
 
 seed_phase5_browser_data() {
-  docker_bounded 120 exec --interactive "$postgres" \
-    psql --username happylearn --dbname happylearn \
-      --no-psqlrc --set ON_ERROR_STOP=1 <<'SQL'
+  if [[ -e "$seed_sql_file" || -L "$seed_sql_file" ]]; then
+    printf '%s\n' 'Phase 5 browser seed path already exists' >&2
+    return 1
+  fi
+  cat >"$seed_sql_file" <<'SQL'
 INSERT INTO operational_alerts(
   id,dedupe_key,category,severity,state,first_observed_at,last_observed_at,
   current_value,threshold_value,summary,trace_id,
@@ -1685,6 +1832,36 @@ INSERT INTO restore_verifications(
   0,0,0,true,120,decode(repeat('d',64),'hex')
 );
 SQL
+  chmod 0600 "$seed_sql_file"
+  if [[ ! -f "$seed_sql_file" ||
+        -L "$seed_sql_file" ||
+        "$(portable_file_mode "$seed_sql_file")" != 600 ]]; then
+    printf '%s\n' 'Phase 5 browser seed was not materialized safely' >&2
+    return 1
+  fi
+  docker_bounded 120 exec "$postgres" \
+    psql --username happylearn --dbname happylearn \
+      --no-psqlrc --set ON_ERROR_STOP=1 \
+      --command "$(<"$seed_sql_file")"
+}
+
+remove_phase5_browser_backup_seed() {
+  local remaining
+  docker_bounded 120 exec "$postgres" \
+    psql --username happylearn --dbname happylearn \
+      --no-psqlrc --set ON_ERROR_STOP=1 --command "
+BEGIN;
+DELETE FROM restore_verifications WHERE backup_run_id='53000000-0000-4000-8000-000000000001';
+DELETE FROM backup_artifacts WHERE backup_run_id='53000000-0000-4000-8000-000000000001';
+DELETE FROM backup_runs WHERE id='53000000-0000-4000-8000-000000000001';
+COMMIT;"
+  docker_capture_bounded remaining 120 exec "$postgres" \
+    psql --username happylearn --dbname happylearn \
+      --no-psqlrc --quiet --tuples-only --no-align \
+      --set ON_ERROR_STOP=1 --command \
+      "SELECT count(*) FROM backup_runs
+       WHERE id='53000000-0000-4000-8000-000000000001';"
+  [[ "$remaining" == 0 ]]
 }
 
 prepare_browser_workspace() {
@@ -1711,8 +1888,9 @@ prepare_browser_workspace() {
 }
 
 run_browser_command() {
-  local command="$1"
-  docker_bounded 1800 run --rm --name "$browser_runner" --network "$network" \
+  local command="$1" timeout="${2:-1800}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ && "$timeout" -le 3600 ]] || return 2
+  docker_bounded "$timeout" run --rm --name "$browser_runner" --network "$network" \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
     --read-only --user 1000:1000 --shm-size 384m --memory 1024m --cpus .5 \
@@ -1804,30 +1982,147 @@ write_recovery_backup_id() {
   install -m 0600 "$temporary" "$artifact_dir/backup-id"
 }
 
+resolve_restore_docker_socket() {
+  local endpoint
+  endpoint="$(
+    docker_bounded 15 context inspect \
+      --format '{{.Endpoints.docker.Host}}'
+  )" || return 1
+  [[ "$endpoint" == unix:///* &&
+    "$endpoint" != *$'\n'* &&
+    "$endpoint" != *$'\r'* ]] ||
+    return 1
+  restore_docker_socket="${endpoint#unix://}"
+  [[ -S "$restore_docker_socket" &&
+    ! -L "$restore_docker_socket" ]] ||
+    return 1
+  restore_docker_socket_group="$(portable_file_group "$restore_docker_socket")" ||
+    return 1
+  [[ "$restore_docker_socket_group" =~ ^[0-9]+$ ]]
+}
+
+prepare_restore_repository_access() {
+  local host_uid host_gid
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+  [[ "$host_uid" =~ ^[0-9]+$ && "$host_gid" =~ ^[0-9]+$ ]] ||
+    return 1
+  docker_bounded 300 run --rm --name "$restore_repository_handoff" \
+    --label "com.docker.compose.project=${live_project}" \
+    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --network none --read-only --user 0:0 --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    --security-opt no-new-privileges --memory 128m --cpus .1 \
+    --mount "type=bind,src=$backup_host_root/repository,dst=/repository" \
+    --entrypoint /usr/bin/timeout "$backup_image" \
+    --foreground --kill-after=10s 240s /bin/sh -ceu '
+      uid="$1"
+      gid="$2"
+      case "$uid:$gid" in
+        *[!0-9:]* | :* | *: | *:*:*) exit 1 ;;
+      esac
+      repository_find_empty() {
+        result="$(find -P /repository -xdev "$@")" || return 1
+        test -z "$result"
+      }
+      repository_find_empty -type l -print -quit
+      repository_find_empty ! -type d ! -type f -print -quit
+      repository_find_empty -type f -links +1 -print -quit
+      chown -R -- "$uid:$gid" /repository
+      chmod 0700 /repository
+      test "$(stat -c "%u:%g:%a" /repository)" = "$uid:$gid:700"
+      repository_find_empty ! -user "$uid" -print -quit
+      repository_find_empty ! -group "$gid" -print -quit
+    ' handoff "$host_uid" "$host_gid"
+  [[ "$(portable_file_owner "$backup_host_root/repository")" == "$host_uid" &&
+    "$(portable_file_mode "$backup_host_root/repository")" == 700 ]]
+}
+
+verify_restore_resources_absent() {
+  local backup_id="${1:?backup ID required}" class resources
+  [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  for class in container volume network; do
+    case "$class" in
+      container)
+        docker_capture_bounded resources 15 container ls --all --quiet \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=${backup_id}" ||
+          return 1
+        ;;
+      volume)
+        docker_capture_bounded resources 15 volume ls --quiet \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=${backup_id}" ||
+          return 1
+        ;;
+      network)
+        docker_capture_bounded resources 15 network ls --quiet \
+          --filter \
+          "label=io.happylearn.phase5.restore-backup-id=${backup_id}" ||
+          return 1
+        ;;
+    esac
+    [[ -z "$resources" ]] || return 1
+  done
+}
+
 run_restore_proof() {
   local backup_id_file="$artifact_dir/backup-id"
+  local backup_id controller_status=0 report_file
   [[ -f "$backup_id_file" && ! -L "$backup_id_file" ]] || return 1
-  local backup_id
   backup_id="$(<"$backup_id_file")"
   [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
     return 1
-  HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY="$backup_host_root/repository" \
-  HAPPYLEARN_BACKUP_SECRET_DIRECTORY="$backup_host_root/secrets" \
-  HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$restore_control_dir" \
-  HAPPYLEARN_RESTORE_REPORT_DIRECTORY="$restore_report_dir" \
-  HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file" \
-  HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE="$teacher_credential_file" \
-  HAPPYLEARN_BACKUP_IMAGE="$backup_image" \
-  HAPPYLEARN_RESTORE_APP_IMAGE="$app_image" \
-    run_bounded 3600 bash "$script_dir/phase5-restore-verify.sh" \
-      --backup-id "$backup_id"
+  resolve_restore_docker_socket
+  prepare_restore_repository_access
+  docker_bounded 3600 run --rm --name "$restore_controller" \
+    --label "com.docker.compose.project=${live_project}" \
+    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --network none --read-only --user "$(id -u):$(id -g)" \
+    --group-add "$restore_docker_socket_group" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --memory 256m --memory-swap 256m --cpus .2 --pids-limit 128 \
+    --tmpfs "/tmp:rw,noexec,nosuid,size=16m,uid=$(id -u),gid=$(id -g),mode=0700" \
+    --mount "type=bind,src=$restore_docker_socket,dst=/var/run/docker.sock" \
+    --mount "type=bind,src=$repo_root,dst=$repo_root,readonly" \
+    --mount "type=bind,src=$backup_host_root/repository,dst=$backup_host_root/repository" \
+    --mount "type=bind,src=$backup_host_root/secrets,dst=$backup_host_root/secrets,readonly" \
+    --mount "type=bind,src=$restore_control_dir,dst=$restore_control_dir" \
+    --mount "type=bind,src=$restore_report_dir,dst=$restore_report_dir" \
+    --mount "type=bind,src=$restore_controller_tmp,dst=$restore_controller_tmp" \
+    --mount "type=bind,src=$restore_license_file,dst=$restore_license_file,readonly" \
+    --mount "type=bind,src=$teacher_credential_file,dst=$teacher_credential_file,readonly" \
+    --env 'DOCKER_HOST=unix:///var/run/docker.sock' \
+    --env "TMPDIR=$restore_controller_tmp" \
+    --env "RESTORE_SCRIPT=$script_dir/phase5-restore-verify.sh" \
+    --env "BACKUP_ID=$backup_id" \
+    --env "HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY=$backup_host_root/repository" \
+    --env "HAPPYLEARN_BACKUP_SECRET_DIRECTORY=$backup_host_root/secrets" \
+    --env "HAPPYLEARN_RESTORE_CONTROL_DIRECTORY=$restore_control_dir" \
+    --env "HAPPYLEARN_RESTORE_REPORT_DIRECTORY=$restore_report_dir" \
+    --env "HAPPYLEARN_AISTOR_LICENSE_FILE=$restore_license_file" \
+    --env "HAPPYLEARN_RESTORE_TEACHER_CREDENTIAL_FILE=$teacher_credential_file" \
+    --env "HAPPYLEARN_BACKUP_IMAGE=$backup_image" \
+    --env "HAPPYLEARN_RESTORE_APP_IMAGE=$app_image" \
+    --entrypoint /bin/bash "$restore_controller_image" -ceu \
+    'exec /bin/bash "$RESTORE_SCRIPT" --backup-id "$BACKUP_ID"' ||
+    controller_status=$?
+  verify_restore_resources_absent "$backup_id" || return 1
+  ((controller_status == 0)) || return "$controller_status"
+  report_file="$restore_report_dir/restore-${backup_id}.json"
+  [[ -f "$report_file" &&
+    ! -L "$report_file" &&
+    "$(portable_file_mode "$report_file")" == 600 &&
+    "$(portable_file_owner "$report_file")" == "$(id -u)" ]]
 }
 
 run_resource_browser_load() {
   local duration="${1:?duration required}"
   [[ "$duration" =~ ^[1-9][0-9]*$ ]] || return 2
   run_browser_command \
-    'deadline=$((SECONDS + '"$duration"')); resource_success=0; while ((SECONDS < deadline)); do if corepack pnpm exec playwright screenshot --wait-for-timeout 500 http://app:8080/login /tmp/phase5-resource.png >/dev/null 2>&1; then resource_success=1; fi; done; test "$resource_success" = 1'
+    'deadline=$((SECONDS + '"$duration"')); resource_success=0; while ((SECONDS < deadline)); do if corepack pnpm exec playwright screenshot --wait-for-timeout 500 http://app:8080/login /tmp/phase5-resource.png >/dev/null 2>&1; then resource_success=1; fi; done; test "$resource_success" = 1' \
+    "$((duration + 300))"
 }
 
 merge_resource_statuses() {
@@ -1879,23 +2174,25 @@ validate_resource_container_identity() {
   local expected_project="${3:?project required}"
   local expected_owner="${4:?owner required}"
   local expected_service="${5:?service required}"
+  local running_policy="${6:-running}"
   local listing metadata inspected_id inspected_name inspected_project
   local inspected_owner inspected_service extra resource_state
-  local container_oom restart_count nano_cpus memory_bytes
+  local container_running container_oom restart_count nano_cpus memory_bytes
   [[ "$expected_name" =~ ^[A-Za-z0-9_.-]+$ &&
     "$expected_id" =~ ^[a-f0-9]{64}$ &&
     "$expected_project" =~ ^happylearn-phase5-live-[a-f0-9]{12}$ &&
     "$expected_owner" =~ ^[a-f0-9]{12}$ &&
-    "$expected_service" =~ ^(postgres|redis|minio|app|worker)$ ]] ||
+    "$expected_service" =~ ^(postgres|redis|minio|app|worker)$ &&
+    "$running_policy" =~ ^(running|backup_snapshot)$ ]] ||
     return 1
   docker_capture_bounded listing 15 container ls --all --quiet --no-trunc \
     --filter "name=^/${expected_name}$" || return 1
   [[ "$listing" == "$expected_id" ]] || return 1
   docker_capture_bounded metadata 15 inspect --format \
-    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Running}}' \
     "$expected_id" || return 1
   IFS='|' read -r inspected_id inspected_name inspected_project \
-    inspected_owner inspected_service extra <<<"$metadata"
+    inspected_owner inspected_service container_running extra <<<"$metadata"
   [[ "$inspected_id" == "$expected_id" &&
     "$inspected_name" == "/$expected_name" &&
     "$inspected_project" == "$expected_project" &&
@@ -1903,6 +2200,12 @@ validate_resource_container_identity() {
     "$inspected_service" == "$expected_service" &&
     -z "$extra" ]] ||
     return 1
+  if [[ "$container_running" != true ]] &&
+    [[ "$running_policy" != backup_snapshot ||
+      ! "$expected_service" =~ ^(minio|worker)$ ||
+      "$container_running" != false ]]; then
+    return 1
+  fi
   docker_capture_bounded resource_state 15 inspect --format \
     '{{.State.OOMKilled}}|{{.RestartCount}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}' \
     "$expected_id" || return 1
@@ -1916,9 +2219,11 @@ validate_resource_container_identity() {
 }
 
 validate_required_resource_roster() {
+  local running_policy="${1:-running}"
   local specification expected_name expected_service
   local recorded_name recorded_id recorded_project recorded_owner extra
   local matched
+  [[ "$running_policy" =~ ^(running|backup_snapshot)$ ]] || return 1
   [[ -f "$owned_container_ledger" &&
     ! -L "$owned_container_ledger" &&
     "$(portable_file_mode "$owned_container_ledger")" == 600 &&
@@ -1941,7 +2246,7 @@ validate_required_resource_roster() {
         return 1
       validate_resource_container_identity \
         "$recorded_name" "$recorded_id" "$recorded_project" \
-        "$recorded_owner" "$expected_service" ||
+        "$recorded_owner" "$expected_service" "$running_policy" ||
         return 1
     done <"$owned_container_ledger"
     [[ "$matched" == 1 ]] || return 1
@@ -1963,7 +2268,7 @@ validate_resource_ephemeral_container() {
     "$expected_oneoff" =~ ^(True)?$ ]] ||
     return 1
   if ! docker_capture_bounded metadata 15 inspect --format \
-    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}' \
+    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.oneoff"}}{{.}}{{end}}' \
     "$expected_id"; then
     docker_capture_bounded current_listing 15 container ls --all --quiet \
       --no-trunc --filter "id=${expected_id}" || return 1
@@ -1997,37 +2302,98 @@ validate_resource_ephemeral_container() {
     -z "$extra" ]]
 }
 
+resource_ephemeral_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    browser_listing|browser_identity|backup_listing|backup_metadata|\
+      backup_identity) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'resource ephemeral identity failed: category=%s\n' \
+    "$category" >&2
+}
+
 validate_resource_ephemeral_identities() {
   local listing id metadata inspected_id inspected_name extra current_listing
   docker_capture_bounded listing 15 container ls --all --quiet --no-trunc \
-    --filter "name=^/${browser_runner}$" || return 1
+    --filter "name=^/${browser_runner}$" || {
+    resource_ephemeral_failure browser_listing
+    return 1
+  }
   if [[ -n "$listing" ]]; then
-    [[ "$listing" =~ ^[a-f0-9]{64}$ ]] || return 1
-    validate_resource_ephemeral_container \
-      "$listing" "$browser_runner" '' '' ||
+    [[ "$listing" =~ ^[a-f0-9]{64}$ ]] || {
+      resource_ephemeral_failure browser_identity
       return 1
+    }
+    validate_resource_ephemeral_container \
+      "$listing" "$browser_runner" '' '' || {
+      resource_ephemeral_failure browser_identity
+      return 1
+    }
   fi
   docker_capture_bounded listing 15 container ls --all --quiet --no-trunc \
-    --filter "name=^/${live_project}-backup-run-" || return 1
+    --filter "name=^/${live_project}-backup-run-" || {
+    resource_ephemeral_failure backup_listing
+    return 1
+  }
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
-    [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ "$id" =~ ^[a-f0-9]{64}$ ]] || {
+      resource_ephemeral_failure backup_metadata
+      return 1
+    }
     if ! docker_capture_bounded metadata 15 inspect --format \
       '{{.Id}}|{{.Name}}' "$id"; then
       docker_capture_bounded current_listing 15 container ls --all --quiet \
-        --no-trunc --filter "id=${id}" || return 1
+        --no-trunc --filter "id=${id}" || {
+        resource_ephemeral_failure backup_metadata
+        return 1
+      }
       [[ -z "$current_listing" ]] && continue
+      resource_ephemeral_failure backup_metadata
       return 1
     fi
     IFS='|' read -r inspected_id inspected_name extra <<<"$metadata"
     [[ "$inspected_id" == "$id" &&
       "$inspected_name" =~ ^/${live_project}-backup-run-[A-Za-z0-9_.-]+$ &&
-      -z "$extra" ]] ||
+      -z "$extra" ]] || {
+      resource_ephemeral_failure backup_metadata
       return 1
+    }
     validate_resource_ephemeral_container \
-      "$id" "${inspected_name#/}" backup True ||
+      "$id" "${inspected_name#/}" backup True || {
+      resource_ephemeral_failure backup_identity
       return 1
+    }
   done <<<"$listing"
+}
+
+resource_monitor_retry() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "$@"; then return 0; fi
+    ((attempt == 3)) || sleep 1
+  done
+  return 1
+}
+
+resource_monitor_capture() {
+  local output_variable="${1:?output variable required}"
+  local seconds="${2:?deadline required}"
+  shift 2
+  resource_monitor_retry \
+    docker_capture_bounded "$output_variable" "$seconds" "$@"
+}
+
+resource_monitor_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    required_roster|ephemeral_identity|listing|ownership|resource_state|\
+      invariant|command|production_stats|production_parse|browser_stats|\
+      browser_parse|final_roster) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'resource monitor failed: category=%s\n' "$category" >&2
 }
 
 monitor_resource_workloads() {
@@ -2043,7 +2409,9 @@ monitor_resource_workloads() {
   local max_restart_count=0
   local listing id ownership inspected_id inspected_name inspected_project
   local inspected_owner service oneoff extra state
-  local resource_state container_oom restart_count nano_cpus memory_bytes
+  local resource_state current_listing container_oom restart_count
+  local roster_policy
+  local nano_cpus memory_bytes
   local command worker_running heavy_running backup_running browser_id
   local configured_cpu configured_memory stats sample live_cpu live_memory
   local browser_stats browser_sample browser_cpu browser_memory
@@ -2051,12 +2419,26 @@ monitor_resource_workloads() {
   install -m 0600 /dev/null "$evidence"
   while kill -0 "$browser_pid" 2>/dev/null ||
     kill -0 "$backup_pid" 2>/dev/null; do
-    validate_required_resource_roster || return 1
-    validate_resource_ephemeral_identities || return 1
-    docker_capture_bounded listing 15 ps --all --no-trunc \
+    roster_policy=running
+    if kill -0 "$backup_pid" 2>/dev/null; then
+      roster_policy=backup_snapshot
+    fi
+    resource_monitor_retry \
+      validate_required_resource_roster "$roster_policy" || {
+      resource_monitor_failure required_roster
+      return 1
+    }
+    resource_monitor_retry validate_resource_ephemeral_identities || {
+      resource_monitor_failure ephemeral_identity
+      return 1
+    }
+    resource_monitor_capture listing 15 ps --all --no-trunc \
       --filter "label=com.docker.compose.project=${live_project}" \
       --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
-      --format '{{.ID}}' || return 1
+      --format '{{.ID}}' || {
+      resource_monitor_failure listing
+      return 1
+    }
     worker_running=false
     heavy_running=false
     backup_running=false
@@ -2066,11 +2448,18 @@ monitor_resource_workloads() {
     production_ids=()
     while IFS= read -r id; do
       [[ -n "$id" ]] || continue
-      [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
-      if ! docker_capture_bounded ownership 15 inspect --format \
-        '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{.State.Running}}' \
+      [[ "$id" =~ ^[a-f0-9]{64}$ ]] || {
+        resource_monitor_failure invariant
+        return 1
+      }
+      if ! resource_monitor_capture ownership 15 inspect --format \
+        '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{with index .Config.Labels "com.docker.compose.service"}}{{.}}{{end}}|{{with index .Config.Labels "com.docker.compose.oneoff"}}{{.}}{{end}}|{{.State.Running}}' \
         "$id" 2>/dev/null; then
-        docker_bounded 15 inspect "$id" >/dev/null 2>&1 && return 1
+        if resource_monitor_retry \
+          docker_bounded 15 inspect "$id" >/dev/null 2>&1; then
+          resource_monitor_failure ownership
+          return 1
+        fi
         continue
       fi
       IFS='|' read -r inspected_id inspected_name inspected_project \
@@ -2082,19 +2471,31 @@ monitor_resource_workloads() {
         ! "$state" =~ ^(true|false)$ ||
         -n "$extra" ]]; then
         owned_samples=false
+        resource_monitor_failure invariant
         return 1
       fi
-      docker_capture_bounded resource_state 15 inspect --format \
+      if ! resource_monitor_capture resource_state 15 inspect --format \
         '{{.State.OOMKilled}}|{{.RestartCount}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}' \
-        "$id" || return 1
+        "$id"; then
+        resource_monitor_capture current_listing 15 container ls --all --quiet \
+          --no-trunc --filter "id=${id}" || {
+          resource_monitor_failure resource_state
+          return 1
+        }
+        [[ -z "$current_listing" ]] && continue
+        resource_monitor_failure resource_state
+        return 1
+      fi
       IFS='|' read -r container_oom restart_count nano_cpus \
         memory_bytes extra <<<"$resource_state"
       [[ "$container_oom" =~ ^(true|false)$ &&
         "$restart_count" =~ ^[0-9]+$ &&
         "$nano_cpus" =~ ^[0-9]+$ &&
         "$memory_bytes" =~ ^[0-9]+$ &&
-        -z "$extra" ]] ||
+        -z "$extra" ]] || {
+        resource_monitor_failure invariant
         return 1
+      }
       [[ "$container_oom" == false ]] || oom_killed=true
       if ((restart_count > max_restart_count)); then
         max_restart_count="$restart_count"
@@ -2104,8 +2505,11 @@ monitor_resource_workloads() {
         browser_id="$id"
       fi
       if [[ "$service" == backup ]]; then
-        docker_capture_bounded command 15 inspect --format \
-          '{{json .Config.Cmd}}' "$id" || return 1
+        resource_monitor_capture command 15 inspect --format \
+          '{{json .Config.Cmd}}' "$id" || {
+          resource_monitor_failure command
+          return 1
+        }
         if {
           [[ "$command" == *'/app/happylearn-backup'* &&
             "$command" =~ \"(snapshot|verify|sync)\" ]]
@@ -2156,10 +2560,16 @@ monitor_resource_workloads() {
         'BEGIN { printf "%.3f", (new > old ? new : old) }'
     )"
     if ((${#production_ids[@]} > 0)); then
-      docker_capture_bounded stats 30 stats --no-stream \
+      resource_monitor_capture stats 30 stats --no-stream \
         --format '{{.CPUPerc}}|{{.MemUsage}}' \
-        "${production_ids[@]}" || return 1
-      sample="$(printf '%s\n' "$stats" | parse_resource_stats)" || return 1
+        "${production_ids[@]}" || {
+        resource_monitor_failure production_stats
+        return 1
+      }
+      sample="$(printf '%s\n' "$stats" | parse_resource_stats)" || {
+        resource_monitor_failure production_parse
+        return 1
+      }
       live_cpu="${sample%%|*}"
       live_memory="${sample##*|}"
       peak_live_cpu_percent="$(
@@ -2173,16 +2583,23 @@ monitor_resource_workloads() {
       [[ "$backup_running" == true ]] && saw_backup=true
     fi
     if [[ -n "$browser_id" ]]; then
-      if ! docker_capture_bounded browser_stats 30 stats --no-stream \
+      if ! resource_monitor_capture browser_stats 30 stats --no-stream \
         --format '{{.CPUPerc}}|{{.MemUsage}}' "$browser_id"; then
-        docker_capture_bounded listing 15 container ls --all --quiet \
-          --no-trunc --filter "id=${browser_id}" || return 1
+        resource_monitor_capture listing 15 container ls --all --quiet \
+          --no-trunc --filter "id=${browser_id}" || {
+          resource_monitor_failure browser_stats
+          return 1
+        }
         [[ -z "$listing" ]] && continue
+        resource_monitor_failure browser_stats
         return 1
       fi
       browser_sample="$(
         printf '%s\n' "$browser_stats" | parse_resource_stats
-      )" || return 1
+      )" || {
+        resource_monitor_failure browser_parse
+        return 1
+      }
       browser_cpu="${browser_sample%%|*}"
       browser_memory="${browser_sample##*|}"
       peak_browser_cpu_percent="$(
@@ -2197,6 +2614,10 @@ monitor_resource_workloads() {
     fi
     sleep 0.2
   done
+  resource_monitor_retry validate_required_resource_roster running || {
+    resource_monitor_failure final_roster
+    return 1
+  }
   {
     printf '%s\n' \
       'resource_evidence_version=1' \
@@ -2223,22 +2644,38 @@ run_resource_sample() {
   local report="$artifact_dir/resource-samples.tsv"
   local temporary="$tmpdir/resource-evidence"
   local browser_status=0 backup_status=0 monitor_status=0
-  local status=0
-  run_resource_child run_resource_browser_load "$duration" &
+  local child_status_file status=0
+  for child_status_file in \
+    "$resource_browser_status_file" "$resource_backup_status_file"; do
+    [[ ! -e "$child_status_file" && ! -L "$child_status_file" ]] ||
+      return 1
+    install -m 0600 /dev/null "$child_status_file"
+  done
+  run_resource_child "$resource_browser_status_file" \
+    run_resource_browser_load "$duration" &
   resource_browser_pid=$!
-  run_resource_child run_backup_proof &
+  run_resource_child "$resource_backup_status_file" run_backup_proof &
   resource_backup_pid=$!
   monitor_resource_workloads \
     "$resource_browser_pid" "$resource_backup_pid" "$temporary" ||
     monitor_status=$?
-  wait "$resource_browser_pid" || browser_status=$?
+  wait "$resource_browser_pid" 2>/dev/null || true
   resource_browser_pid=''
-  wait "$resource_backup_pid" || backup_status=$?
+  wait "$resource_backup_pid" 2>/dev/null || true
   resource_backup_pid=''
+  browser_status="$(read_resource_child_status "$resource_browser_status_file")" ||
+    browser_status=125
+  backup_status="$(read_resource_child_status "$resource_backup_status_file")" ||
+    backup_status=125
   merge_resource_statuses \
     "$browser_status" "$backup_status" "$monitor_status" ||
     status=$?
-  if ((status != 0)); then return "$status"; fi
+  if ((status != 0)); then
+    printf \
+      'resource sample failed: browser=%s backup=%s monitor=%s\n' \
+      "$browser_status" "$backup_status" "$monitor_status" >&2
+    return "$status"
+  fi
   validate_resource_evidence "$temporary"
   install -m 0600 "$temporary" "$report"
 }
@@ -2336,6 +2773,12 @@ if [[ "$probe_mode" == resource ]]; then
   validate_resource_evidence "${probe_arguments[0]}"
   exit $?
 fi
+if [[ "$probe_mode" == resource_child_status ]]; then
+  [[ "${HAPPYLEARN_PHASE5_RESOURCE_CHILD_STATUS_CONTRACT:-}" == 1 ]] ||
+    exit 2
+  read_resource_child_status "${probe_arguments[0]}"
+  exit $?
+fi
 if [[ "$probe_mode" == cleanup ]]; then
   remove_owned_container_if_match \
     "${probe_arguments[0]}" "${probe_arguments[1]}" \
@@ -2381,7 +2824,7 @@ if [[ "$probe_mode" == resource_identity ]]; then
   validate_resource_container_identity \
     "${probe_arguments[0]}" "${probe_arguments[1]}" \
     "${probe_arguments[2]}" "${probe_arguments[3]}" \
-    "${probe_arguments[4]}"
+    "${probe_arguments[4]}" "${probe_arguments[5]:-running}"
   exit $?
 fi
 if [[ "$probe_mode" == signal ]]; then
@@ -2396,6 +2839,7 @@ if [[ "$probe_mode" == ownership_signal ]]; then
 fi
 
 create_fixture_ca
+prepare_restore_license
 build_images
 populate_live_secret_sources
 initialize_resources
@@ -2405,7 +2849,9 @@ start_dependencies
 start_application
 verify_compose_service_claims
 create_teacher_and_sample
-seed_phase5_browser_data
+case "$e2e_group" in
+  all|phase5|phase5-mobile) seed_phase5_browser_data ;;
+esac
 audit_container_metadata \
   "$postgres" "$redis" "$primary_aistor" "$remote_s3" \
   "$app" "$worker" "$fake_ai"
@@ -2431,6 +2877,8 @@ case "$e2e_group" in
     status=0
     run_all_desktop || status="$(preserve_first_failure "$status" "$?")"
     run_all_mobile || status="$(preserve_first_failure "$status" "$?")"
+    remove_phase5_browser_backup_seed ||
+      status="$(preserve_first_failure "$status" "$?")"
     run_resource_sample 60 ||
       status="$(preserve_first_failure "$status" "$?")"
     run_restore_proof || status="$(preserve_first_failure "$status" "$?")"

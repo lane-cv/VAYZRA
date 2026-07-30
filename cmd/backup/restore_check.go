@@ -25,7 +25,7 @@ import (
 const (
 	restoreCheckReportFile      = "/work/restore-check.report"
 	restoreCheckManifestFile    = "/run/restore/manifest.json"
-	restoreCheckPassfile        = "/run/secrets/pgpass"
+	restoreCheckPassfile        = "/run/restore-secrets/pgpass"
 	restoreCheckOriginalsBucket = "happylearn-originals"
 	restoreCheckPreviewsBucket  = "happylearn-previews"
 )
@@ -57,6 +57,53 @@ type restoreCheckConfig struct {
 type restoreCheckManifest struct {
 	manifest backup.Manifest
 	sha256   [sha256.Size]byte
+}
+
+type restoreCheckFailure struct {
+	category string
+}
+
+func (failure *restoreCheckFailure) Error() string {
+	return errWorkflowUnavailable.Error()
+}
+
+func (failure *restoreCheckFailure) Unwrap() error {
+	return errWorkflowUnavailable
+}
+
+func newRestoreCheckFailure(category string) error {
+	switch category {
+	case "input",
+		"manifest",
+		"migration_catalog",
+		"configuration",
+		"configuration_database_host",
+		"configuration_database_port",
+		"configuration_database_user",
+		"configuration_database_name",
+		"configuration_database_sslmode",
+		"configuration_passfile",
+		"configuration_minio_endpoint",
+		"configuration_minio_access",
+		"configuration_minio_secret",
+		"configuration_minio_tls",
+		"database",
+		"object_store",
+		"verification",
+		"migration_state",
+		"report":
+	default:
+		category = "unavailable"
+	}
+	return &restoreCheckFailure{category: category}
+}
+
+func restoreCheckFailureCategory(err error) string {
+	var failure *restoreCheckFailure
+	if errors.As(err, &failure) && failure != nil {
+		return failure.category
+	}
+	return "unavailable"
 }
 
 type programFactories struct {
@@ -94,7 +141,20 @@ func productionProgramFactoriesWithLog(logger safelog.Logger) programFactories {
 			}
 			return application, closeApplication, err
 		},
-		runRestoreCheck:     runProductionRestoreCheck,
+		runRestoreCheck: func(
+			ctx context.Context,
+			input restoreCheckInput,
+			getenv func(string) string,
+		) error {
+			err := runProductionRestoreCheck(ctx, input, getenv)
+			if err != nil {
+				logger.Error("backup.restore_check_failure", safelog.Field{
+					Name:  "category",
+					Value: restoreCheckFailureCategory(err),
+				})
+			}
+			return err
+		},
 		runRestoreHTTPProbe: runProductionRestoreHTTPProbe,
 		runRestoreRecord:    runProductionRestoreRecord,
 	}
@@ -183,8 +243,9 @@ func loadRestoreCheckConfig(
 	getenv func(string) string,
 ) (restoreCheckConfig, error) {
 	if getenv == nil {
-		return restoreCheckConfig{}, errWorkflowUnavailable
+		return restoreCheckConfig{}, newRestoreCheckFailure("configuration")
 	}
+	minioTLS := getenv("HAPPYLEARN_MINIO_USE_TLS")
 	config := restoreCheckConfig{
 		databaseHost:    getenv("HAPPYLEARN_DATABASE_HOST"),
 		databasePort:    getenv("HAPPYLEARN_DATABASE_PORT"),
@@ -198,39 +259,53 @@ func loadRestoreCheckConfig(
 		originalsBucket: restoreCheckOriginalsBucket,
 		previewsBucket:  restoreCheckPreviewsBucket,
 	}
-	for _, value := range []string{
-		config.databaseHost,
-		config.databasePort,
-		config.databaseUser,
-		config.databaseName,
-		config.databaseSSLMode,
-		config.passfile,
-		config.minioEndpoint,
-		config.minioAccessKey,
-		config.minioSecretKey,
+	for _, required := range []struct {
+		value    string
+		category string
+	}{
+		{config.databaseHost, "configuration_database_host"},
+		{config.databasePort, "configuration_database_port"},
+		{config.databaseUser, "configuration_database_user"},
+		{config.databaseName, "configuration_database_name"},
+		{config.databaseSSLMode, "configuration_database_sslmode"},
+		{config.passfile, "configuration_passfile"},
+		{config.minioEndpoint, "configuration_minio_endpoint"},
+		{config.minioAccessKey, "configuration_minio_access"},
+		{config.minioSecretKey, "configuration_minio_secret"},
+		{minioTLS, "configuration_minio_tls"},
 	} {
-		if value == "" || strings.TrimSpace(value) != value {
-			return restoreCheckConfig{}, errWorkflowUnavailable
+		if required.value == "" ||
+			strings.TrimSpace(required.value) != required.value {
+			return restoreCheckConfig{},
+				newRestoreCheckFailure(required.category)
 		}
 	}
 	port, err := strconv.ParseUint(config.databasePort, 10, 16)
-	if err != nil || port == 0 || config.passfile != restoreCheckPassfile {
-		return restoreCheckConfig{}, errWorkflowUnavailable
+	if err != nil || port == 0 {
+		return restoreCheckConfig{},
+			newRestoreCheckFailure("configuration_database_port")
+	}
+	if config.passfile != restoreCheckPassfile {
+		return restoreCheckConfig{},
+			newRestoreCheckFailure("configuration_passfile")
 	}
 	switch config.databaseSSLMode {
 	case "disable", "require", "verify-ca", "verify-full":
 	default:
-		return restoreCheckConfig{}, errWorkflowUnavailable
+		return restoreCheckConfig{},
+			newRestoreCheckFailure("configuration_database_sslmode")
 	}
-	switch getenv("HAPPYLEARN_MINIO_USE_TLS") {
+	switch minioTLS {
 	case "false":
 		if config.minioEndpoint != "minio:9000" {
-			return restoreCheckConfig{}, errWorkflowUnavailable
+			return restoreCheckConfig{},
+				newRestoreCheckFailure("configuration_minio_endpoint")
 		}
 	case "true":
 		config.useTLS = true
 	default:
-		return restoreCheckConfig{}, errWorkflowUnavailable
+		return restoreCheckConfig{},
+			newRestoreCheckFailure("configuration_minio_tls")
 	}
 	return config, nil
 }
@@ -374,23 +449,25 @@ func runProductionRestoreCheck(
 		input.backupID.Version() != 4 ||
 		input.backupID.Variant() != uuid.RFC4122 ||
 		input.reportFile != restoreCheckReportFile {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("input")
 	}
 	manifest, err := loadRestoreCheckManifest(
 		restoreCheckManifestFile,
 		input.backupID,
 	)
 	if err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("manifest")
 	}
 	latestMigration, err := latestEmbeddedMigrationVersion(migrations.FS)
-	if err != nil ||
-		manifest.manifest.DatabaseMigrationVersion > latestMigration {
-		return errWorkflowUnavailable
+	if err != nil {
+		return newRestoreCheckFailure("migration_catalog")
+	}
+	if manifest.manifest.DatabaseMigrationVersion > latestMigration {
+		return newRestoreCheckFailure("migration_state")
 	}
 	config, err := loadRestoreCheckConfig(getenv)
 	if err != nil {
-		return errWorkflowUnavailable
+		return err
 	}
 	databaseURL := &url.URL{
 		Scheme: "postgres",
@@ -407,7 +484,7 @@ func runProductionRestoreCheck(
 
 	pool, err := database.Open(ctx, databaseURL.String())
 	if err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("database")
 	}
 	defer pool.Close()
 	stores, err := objectstore.NewReadOnlyMinIO(ctx, objectstore.MinIOConfig{
@@ -419,7 +496,7 @@ func runProductionRestoreCheck(
 		PreviewsBucket:  config.previewsBucket,
 	})
 	if err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("object_store")
 	}
 	verifier := backup.NewRestoreVerifier(
 		backup.NewPostgresRestoreVerificationDatabase(pool),
@@ -428,14 +505,14 @@ func runProductionRestoreCheck(
 	)
 	result, err := verifier.Verify(ctx)
 	if err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("verification")
 	}
 	if err := validateRestoreMigrationVersions(
 		manifest.manifest.DatabaseMigrationVersion,
 		result.RestoredMigrationVersion,
 		latestMigration,
 	); err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("migration_state")
 	}
 	if err := backup.WriteBoundRestoreVerificationReport(
 		input.reportFile,
@@ -443,7 +520,7 @@ func runProductionRestoreCheck(
 		manifest.sha256,
 		result,
 	); err != nil {
-		return errWorkflowUnavailable
+		return newRestoreCheckFailure("report")
 	}
 	return nil
 }

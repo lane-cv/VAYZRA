@@ -51,7 +51,88 @@ require_pattern "$target" \
 require_literal "$target" 'case "$e2e_group" in'
 require_literal "$target" 'all|phase5|phase5-mobile|recovery|resources)'
 require_literal "$target" \
+  'all|phase5|phase5-mobile) seed_phase5_browser_data ;;'
+if grep -Fxq 'seed_phase5_browser_data' "$target"; then
+  fail 'browser-only database seed ran unconditionally'
+fi
+require_literal "$target" 'remove_phase5_browser_backup_seed()'
+require_literal "$target" \
+  "DELETE FROM restore_verifications WHERE backup_run_id='53000000-0000-4000-8000-000000000001'"
+require_literal "$target" \
+  "DELETE FROM backup_artifacts WHERE backup_run_id='53000000-0000-4000-8000-000000000001'"
+require_literal "$target" \
+  "DELETE FROM backup_runs WHERE id='53000000-0000-4000-8000-000000000001'"
+all_group_block="$(sed -n '/^  all)$/,/^    ;;$/p' "$target")"
+all_seed_cleanup_line="$(
+  grep -n 'remove_phase5_browser_backup_seed' <<<"$all_group_block" |
+    cut -d: -f1
+)"
+all_resource_line="$(
+  grep -n 'run_resource_sample 60' <<<"$all_group_block" |
+    cut -d: -f1
+)"
+[[ "$all_seed_cleanup_line" =~ ^[0-9]+$ &&
+  "$all_resource_line" =~ ^[0-9]+$ &&
+  "$all_seed_cleanup_line" -lt "$all_resource_line" ]] ||
+  fail 'all group did not remove the browser backup seed before retention'
+require_literal "$target" \
   'live_project="happylearn-phase5-live-${fixture_suffix}"'
+require_literal "$target" \
+  'restore_license_file="$tmpdir/restore-minio.license"'
+require_literal "$target" \
+  'restore_controller_image="happylearn-restore-controller:phase5-${nonce}"'
+require_literal "$target" \
+  'restore_controller="${prefix}_restore_controller"'
+require_literal "$target" \
+  'restore_repository_handoff="${prefix}_restore_repository_handoff"'
+require_literal "$target" \
+  'install -m 0400 "$license_file" "$restore_license_file"'
+require_literal "$target" \
+  '"$(portable_file_mode "$restore_license_file")" == 400'
+require_literal "$target" \
+  '--env "HAPPYLEARN_AISTOR_LICENSE_FILE=$restore_license_file"'
+require_literal "$target" \
+  '--target restore_live_controller'
+require_literal "$target" \
+  'prepare_restore_repository_access'
+require_literal "$target" \
+  'chown -R -- "$uid:$gid" /repository'
+require_literal "$target" \
+  'docker_bounded 3600 run --rm --name "$restore_controller"'
+require_literal "$target" \
+  '--mount "type=bind,src=$restore_docker_socket,dst=/var/run/docker.sock"'
+require_literal "$target" \
+  'restore_docker_socket_group='
+require_literal "$target" 'portable_file_group()'
+require_literal "$target" \
+  'restore_docker_socket_group="$(portable_file_group "$restore_docker_socket")"'
+require_literal "$target" \
+  '--group-add "$restore_docker_socket_group"'
+if grep -Fq -- '--group-add 0' "$target"; then
+  fail 'restore controller assumed the Docker socket belongs to group 0'
+fi
+restore_proof_block="$(sed -n '/^run_restore_proof()/,/^}/p' "$target")"
+if grep -Fq -- \
+  'run_bounded 3600 bash "$script_dir/phase5-restore-verify.sh"' \
+  <<<"$restore_proof_block"; then
+  fail 'restore proof depended on host flock instead of the pinned controller'
+fi
+handoff_line="$(
+  grep -n 'prepare_restore_repository_access' <<<"$restore_proof_block" |
+    cut -d: -f1
+)"
+controller_line="$(
+  grep -n 'docker_bounded 3600 run --rm --name "$restore_controller"' \
+    <<<"$restore_proof_block" |
+    cut -d: -f1
+)"
+[[ "$handoff_line" =~ ^[0-9]+$ &&
+  "$controller_line" =~ ^[0-9]+$ &&
+  "$handoff_line" -lt "$controller_line" ]] ||
+  fail 'restore controller started before the repository ownership handoff'
+if grep -Fq -- 'chmod 0400 "$license_file"' "$target"; then
+  fail 'restore preparation mutated the caller-owned license file'
+fi
 require_literal "$target" \
   'compose_file="$repo_root/deploy/compose.dev.yml"'
 require_literal "$target" \
@@ -83,6 +164,20 @@ for secret in \
   webhook-url webhook-authorization login-throttle; do
   require_literal "$target" "$secret"
 done
+require_literal "$target" 'openssl rand -base64 32'
+require_literal "$target" \
+  'new_ai_master >"$secret_source_dir/ai-master"'
+require_literal "$target" 'openssl rand -hex 32'
+require_literal "$target" \
+  'new_database_password >"$secret_source_dir/database-password"'
+if grep -A1 -F 'for secret_name in \' "$target" |
+  grep -Fq 'ai-master database-password'; then
+  fail 'AI master key used the generic 36-byte secret generator'
+fi
+if grep -A1 -F 'for secret_name in \' "$target" |
+  grep -Fq 'database-password object-access'; then
+  fail 'database password used a URL-unsafe generic secret generator'
+fi
 require_literal "$target" \
   "printf '%s' 'http://localhost:8080/happylearn-phase5'"
 if grep -Fq '.invalid' "$target"; then
@@ -90,7 +185,6 @@ if grep -Fq '.invalid' "$target"; then
 fi
 require_literal "$target" 'umask 077'
 require_literal "$target" 'chmod 0600 "$secret_source_dir/"*'
-require_literal "$target" 'chmod 0400 "$target"'
 require_literal "$target" 'chmod 0500 "$directory"'
 require_literal "$target" '--cap-add DAC_READ_SEARCH'
 secret_init_block="$(sed -n \
@@ -100,11 +194,35 @@ if grep -Fq -- '--cap-add FOWNER' <<<"$secret_init_block" ||
   fail 'secret init retained an unnecessary mutation capability'
 fi
 require_literal "$target" 'verify_secret_consumer_reads'
+require_literal "$target" \
+  'install_consumer admin 10001:10001 0600 admin-password'
+require_literal "$target" \
+  'install_consumer postgres 999:999 0400 database-password'
+require_literal "$target" \
+  'chmod "$mode" "$target"'
+require_literal "$target" \
+  'chown "$owner" "$target"'
+if grep -Fq -- \
+  'chmod 0600 /owned-secrets/admin/admin-password' \
+  "$target"; then
+  fail 'admin secret mode was mutated after ownership transfer'
+fi
+require_literal "$target" \
+  'secret_probe_admin|10001:10001|admin|admin-password|10001:10001|600'
+require_literal "$target" \
+  '--mount "type=volume,src=$secret_volume,dst=/run/secrets-admin,volume-subpath=admin,readonly"'
+require_literal "$target" \
+  '--password-file /run/secrets-admin/admin-password'
+if grep -Fq -- \
+  '--mount "type=volume,src=$secret_volume,dst=/run/secrets-browser,volume-subpath=browser,readonly"' \
+  "$target"; then
+  fail 'teacher bootstrap mounted browser-owned credentials'
+fi
 for uid in 999:999 1000:0 10001:10001 10002:10002 10003:0; do
   require_literal "$target" "'$uid'"
 done
 require_literal "$target" \
-  'test "$(stat -c "%u:%g:%a" "$target")" = "$owner:400"'
+  'test "$(stat -c "%u:%g:%a" "$target")" = "$owner:${mode#0}"'
 require_literal "$target" \
   'test "$(stat -c "%u:%g:%a" "$directory")" = "$owner:500"'
 require_literal "$target" 'owned_container_ledger="$tmpdir/owned-containers.tsv"'
@@ -113,6 +231,28 @@ require_literal "$target" \
 require_literal "$target" 'network_intent_ledger="$tmpdir/network-intents.tsv"'
 require_literal "$target" 'volume_intent_ledger="$tmpdir/volume-intents.tsv"'
 require_literal "$target" 'image_intent_ledger="$tmpdir/image-intents.tsv"'
+require_literal "$target" \
+  'host_sample_dockerfile="$tmpdir/Dockerfile.host-sampler"'
+require_literal "$target" 'seed_sql_file="$tmpdir/phase5-browser-seed.sql"'
+require_literal "$target" 'chmod 0600 "$host_sample_dockerfile"'
+require_literal "$target" \
+  '"$(portable_file_mode "$host_sample_dockerfile")" != 600'
+require_literal "$target" \
+  'docker_bounded 900 build -f "$host_sample_dockerfile"'
+if grep -Fq -- 'docker_bounded 900 build -f -' "$target"; then
+  fail 'bounded host sampler build cannot depend on background stdin'
+fi
+require_literal "$target" \
+  '--mount "type=bind,src=$secret_source_dir/age-identity,dst=/input/age-identity,readonly"'
+require_literal "$target" '"$backup_image" -y /input/age-identity'
+if grep -Fq -- 'docker_bounded 60 run --rm --interactive' "$target"; then
+  fail 'bounded age recipient derivation cannot depend on background stdin'
+fi
+require_literal "$target" 'chmod 0600 "$seed_sql_file"'
+require_literal "$target" '--command "$(<"$seed_sql_file")"'
+if grep -Fq -- 'docker_bounded 120 exec --interactive "$postgres"' "$target"; then
+  fail 'bounded database seeding cannot depend on background stdin'
+fi
 require_literal "$target" 'persist_resource_intents'
 require_literal "$target" 'remove_intended_containers'
 require_literal "$target" 'remove_intended_networks'
@@ -133,13 +273,29 @@ require_literal "$target" '--cleanup-container-ownership-probe'
 require_literal "$target" '--resource-identity-contract-probe'
 
 require_literal "$target" \
+  'run_compose_one_shot phase5-secrets-init'
+require_literal "$target" \
+  'run_compose_one_shot postgres-tls-init'
+require_literal "$target" \
+  'run_compose_one_shot minio-data-init'
+require_literal "$target" \
+  'compose_live up --detach --no-build --no-deps postgres redis minio'
+if grep -Fq -- \
+  'compose_live up --detach --no-build postgres redis minio' "$target"; then
+  fail 'long-lived dependencies can restart completed one-shot initializers'
+fi
+require_literal "$target" \
   'compose_live up --detach --no-build --no-deps app'
 require_literal "$target" \
   'compose_live up --detach --no-build --no-deps worker'
 require_literal "$target" 'verify_compose_service_claims'
 require_literal "$target" 'compose_live ps --quiet "$service"'
 require_literal "$target" 'compose_live stop --timeout 30 worker'
-require_literal "$target" 'compose_live start worker'
+require_literal "$target" \
+  'compose_live up --detach --no-build --no-deps worker'
+if grep -Fq -- 'compose_live start worker' "$target"; then
+  fail 'worker restart can re-run completed one-shot dependencies'
+fi
 require_literal "$target" '--name "$backup" --network "$network"'
 require_literal "$target" '--read-only --user 10003:0 --cap-drop ALL'
 require_literal "$target" '--name "$browser_runner" --network "$network"'
@@ -192,17 +348,27 @@ require_literal "$target" \
   'HAPPYLEARN_PHASE5_E2E_OWNER="$fixture_suffix"'
 require_literal "$target" \
   '{{index .Config.Labels "com.docker.compose.oneoff"}}'
-require_literal "$target" 'HAPPYLEARN_RESTORE_CONTROL_DIRECTORY="$restore_control_dir"'
-require_literal "$target" 'HAPPYLEARN_RESTORE_REPORT_DIRECTORY="$restore_report_dir"'
+require_literal "$target" \
+  '--env "HAPPYLEARN_RESTORE_CONTROL_DIRECTORY=$restore_control_dir"'
+require_literal "$target" \
+  '--env "HAPPYLEARN_RESTORE_REPORT_DIRECTORY=$restore_report_dir"'
 if grep -Eq 'phase5-(backup|restore)_live_test\.sh' "$target"; then
   fail 'an unsafe live fixture was used as a black-box acceptance proof'
 fi
 require_literal "$target" 'run_resource_sample 60'
 require_literal "$target" 'run_resource_sample 1800'
 require_literal "$target" 'run_resource_browser_load'
+require_literal "$target" \
+  'local command="$1" timeout="${2:-1800}"'
+require_literal "$target" \
+  '[[ "$timeout" =~ ^[1-9][0-9]*$ && "$timeout" -le 3600 ]]'
+require_literal "$target" '"$((duration + 300))"'
+require_literal "$target" \
+  'resource sample failed: browser=%s backup=%s monitor=%s'
 require_literal "$target" 'run_backup_proof &'
 require_literal "$target" 'monitor_resource_workloads'
 require_literal "$target" 'run_resource_child'
+require_literal "$target" 'read_resource_child_status'
 require_literal "$target" 'cancel_resource_workloads'
 require_literal "$target" 'merge_resource_statuses'
 require_literal "$target" 'validate_resource_evidence'
@@ -228,11 +394,68 @@ require_literal "$target" 'saw_browser'
 require_literal "$target" 'saw_backup'
 require_literal "$target" 'saw_heavy'
 require_literal "$target" 'saw_worker'
+require_literal "$target" 'resource_monitor_retry()'
+require_literal "$target" 'for attempt in 1 2 3; do'
+require_literal "$target" '((attempt == 3)) || sleep 1'
+require_literal "$target" 'resource monitor failed: category=%s'
+require_literal "$target" 'resource ephemeral identity failed: category=%s'
 resource_sample_block="$(sed -n '/^run_resource_sample()/,/^}/p' "$target")"
+for literal in \
+  'run_resource_child "$resource_browser_status_file"' \
+  'run_resource_child "$resource_backup_status_file"' \
+  'browser_status="$(read_resource_child_status "$resource_browser_status_file")"' \
+  'backup_status="$(read_resource_child_status "$resource_backup_status_file")"'; do
+  grep -Fq -- "$literal" <<<"$resource_sample_block" ||
+    fail "resource sample omitted durable child status handling: $literal"
+done
+if grep -Fq 'wait "$resource_backup_pid" || backup_status=$?' \
+  <<<"$resource_sample_block"; then
+  fail 'resource sample depended on a long-retained Bash child status'
+fi
 if grep -Fq 'pause "$worker"' <<<"$resource_sample_block" ||
   grep -Fq 'unpause "$worker"' <<<"$resource_sample_block"; then
   fail 'resource proof faked worker/backup exclusion by pausing the worker'
 fi
+resource_monitor_block="$(
+  sed -n '/^monitor_resource_workloads()/,/^}/p' "$target"
+)"
+for literal in \
+  'roster_policy=backup_snapshot' \
+  'validate_required_resource_roster "$roster_policy"' \
+  'if ! resource_monitor_capture resource_state 15 inspect --format' \
+  '--filter "id=${id}"' \
+  '[[ -z "$current_listing" ]] && continue' \
+  'validate_required_resource_roster running ||'; do
+  grep -Fq -- "$literal" <<<"$resource_monitor_block" ||
+    fail "resource monitor did not tolerate an owned ephemeral exit: $literal"
+done
+for category in \
+  required_roster ephemeral_identity listing ownership resource_state \
+  invariant command production_stats production_parse browser_stats \
+  browser_parse final_roster; do
+  grep -Fq -- "resource_monitor_failure $category" \
+    <<<"$resource_monitor_block" ||
+    fail "resource monitor omitted fixed failure category: $category"
+done
+resource_ephemeral_block="$(
+  sed -n '/^validate_resource_ephemeral_identities()/,/^}/p' "$target"
+)"
+resource_ephemeral_container_block="$(
+  sed -n '/^validate_resource_ephemeral_container()/,/^}/p' "$target"
+)"
+for label in com.docker.compose.service com.docker.compose.oneoff; do
+  grep -Fq -- \
+    "{{with index .Config.Labels \"$label\"}}{{.}}{{end}}" \
+    <<<"$resource_ephemeral_container_block" ||
+    fail "ephemeral identity did not normalize missing label: $label"
+done
+for category in \
+  browser_listing browser_identity backup_listing backup_metadata \
+  backup_identity; do
+  grep -Fq -- "resource_ephemeral_failure $category" \
+    <<<"$resource_ephemeral_block" ||
+    fail "ephemeral monitor omitted fixed failure category: $category"
+done
 require_literal "$target" 'preserve_first_failure'
 require_literal "$target" 'audit_container_metadata'
 require_literal "$target" '--audit-container-metadata'
@@ -385,6 +608,7 @@ if [[ "${1:-}" == create ]]; then
     case "$argument" in
       --env-file|-e|--env) previous="$argument" ;;
       phase5-e2e-secret-marker) command="$argument" ;;
+      /repository) command="$argument" ;;
     esac
   done
   printf '%s\n' "$environment" >"${state}.env"
@@ -436,9 +660,12 @@ if [[ "${1:-}" == inspect &&
     owner=ffffffffffff
   [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_service ]] ||
     service=redis
-  printf '%s|/%s|%s|%s|%s\n' \
+  running=true
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_stopped ]] ||
+    running=false
+  printf '%s|/%s|%s|%s|%s|%s\n' \
     "${E2E_RESOURCE_ID:?}" "${E2E_RESOURCE_NAME:?}" \
-    "$project" "$owner" "$service"
+    "$project" "$owner" "$service" "$running"
   exit 0
 fi
 if [[ "${1:-}" == inspect &&
@@ -786,9 +1013,60 @@ run_resource_status_probe 5 0 0 5
 run_resource_status_probe 0 6 7 6
 run_resource_status_probe 0 0 8 8
 
+run_resource_child_status_probe() {
+  local mutation="$1"
+  local expected_status="$2"
+  local status_file="$tmpdir/resource-child-${mutation}.status"
+  local status=0
+  case "$mutation" in
+    safe) install -m 0600 /dev/null "$status_file"; printf '17\n' >"$status_file" ;;
+    malformed)
+      install -m 0600 /dev/null "$status_file"
+      printf 'not-a-status\n' >"$status_file"
+      ;;
+    multiple)
+      install -m 0600 /dev/null "$status_file"
+      printf '0\n1\n' >"$status_file"
+      ;;
+    out_of_range)
+      install -m 0600 /dev/null "$status_file"
+      printf '256\n' >"$status_file"
+      ;;
+    permissive)
+      install -m 0600 /dev/null "$status_file"
+      printf '0\n' >"$status_file"
+      chmod 0644 "$status_file"
+      ;;
+    symlink)
+      install -m 0600 /dev/null "${status_file}.target"
+      printf '0\n' >"${status_file}.target"
+      ln -s "${status_file}.target" "$status_file"
+      ;;
+    *) fail "unknown resource child status mutation: $mutation" ;;
+  esac
+  HAPPYLEARN_PHASE5_RESOURCE_CHILD_STATUS_CONTRACT=1 \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=resources \
+    "$target" --resource-child-status-contract-probe "$status_file" \
+      >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "resource child status probe $mutation returned $status, expected $expected_status"
+  if [[ "$mutation" == safe ]]; then
+    [[ "$(<"$tmpdir/stdout")" == 17 ]] ||
+      fail 'resource child status probe did not return the recorded status'
+  fi
+}
+
+run_resource_child_status_probe safe 0
+for mutation in malformed multiple out_of_range permissive symlink; do
+  run_resource_child_status_probe "$mutation" 1
+done
+
 run_resource_identity_probe() {
   local mode="$1"
   local expected_status="$2"
+  local running_policy="${3:-running}"
+  local service="${4:-worker}"
   local resource_id
   local status=0
   resource_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -801,13 +1079,14 @@ run_resource_identity_probe() {
     E2E_RESOURCE_ID="$resource_id" \
     E2E_RESOURCE_PROJECT=happylearn-phase5-live-a1b2c3d4e5f6 \
     E2E_RESOURCE_OWNER=a1b2c3d4e5f6 \
-    E2E_RESOURCE_SERVICE=worker \
+    E2E_RESOURCE_SERVICE="$service" \
     HAPPYLEARN_PHASE5_RESOURCE_IDENTITY_CONTRACT=1 \
     HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
     HAPPYLEARN_E2E_GROUP=resources \
     "$target" --resource-identity-contract-probe \
       phase5-resource-canary "$resource_id" \
-      happylearn-phase5-live-a1b2c3d4e5f6 a1b2c3d4e5f6 worker \
+      happylearn-phase5-live-a1b2c3d4e5f6 a1b2c3d4e5f6 "$service" \
+      "$running_policy" \
       >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
   [[ "$status" -eq "$expected_status" ]] ||
     fail "resource identity probe $mode returned $status, expected $expected_status"
@@ -822,6 +1101,13 @@ for mode in \
   resource_identity_oom resource_identity_restart; do
   run_resource_identity_probe "$mode" 1
 done
+run_resource_identity_probe resource_identity_stopped 1 running worker
+run_resource_identity_probe \
+  resource_identity_stopped 0 backup_snapshot worker
+run_resource_identity_probe \
+  resource_identity_stopped 0 backup_snapshot minio
+run_resource_identity_probe \
+  resource_identity_stopped 1 backup_snapshot redis
 
 run_audit_probe() {
   local mode="$1"
@@ -865,6 +1151,14 @@ run_audit_probe() {
         E2E_FAKE_DOCKER_STATE="$tmpdir/canary-state" \
         docker create --name phase5-contract-canary \
           alpine:3.22.1 phase5-e2e-secret-marker >/dev/null
+      ;;
+    repository_locator)
+      PATH="$tmpdir/bin:$PATH" \
+        E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+        E2E_FAKE_DOCKER_MODE="$mode" \
+        E2E_FAKE_DOCKER_STATE="$tmpdir/canary-state" \
+        docker create --name phase5-contract-canary \
+          alpine:3.22.1 /repository >/dev/null
       ;;
     aistor_defaults|aistor_user_mutation|aistor_password_mutation|\
       aistor_kms_mutation|aistor_config_mutation|aistor_empty_mutation)
@@ -910,6 +1204,7 @@ run_audit_probe safe 0
 run_audit_probe env_file 1
 run_audit_probe secret_env 1
 run_audit_probe literal_argv 1
+run_audit_probe repository_locator 0
 run_audit_probe aistor_defaults 0
 run_audit_probe aistor_user_mutation 1
 run_audit_probe aistor_password_mutation 1

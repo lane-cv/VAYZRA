@@ -184,7 +184,7 @@ func TestRestoreCheckConfigIsDedicatedAndFailClosed(t *testing.T) {
 		"HAPPYLEARN_DATABASE_USER":          "happylearn",
 		"HAPPYLEARN_DATABASE_NAME":          "happylearn",
 		"HAPPYLEARN_DATABASE_SSLMODE":       "disable",
-		"PGPASSFILE":                        "/run/secrets/pgpass",
+		"PGPASSFILE":                        "/run/restore-secrets/pgpass",
 		"HAPPYLEARN_MINIO_ENDPOINT":         "minio:9000",
 		"HAPPYLEARN_MINIO_ACCESS_KEY":       "restore-access-key",
 		"HAPPYLEARN_MINIO_SECRET_KEY":       "restore-secret-key",
@@ -200,20 +200,24 @@ func TestRestoreCheckConfigIsDedicatedAndFailClosed(t *testing.T) {
 	}
 	if config.databaseHost != "postgres" ||
 		config.databasePort != "5432" ||
-		config.passfile != "/run/secrets/pgpass" ||
+		config.passfile != "/run/restore-secrets/pgpass" ||
 		config.originalsBucket != "happylearn-originals" ||
 		config.previewsBucket != "happylearn-previews" ||
 		config.useTLS {
 		t.Fatalf("config=%+v", config)
 	}
 
-	for _, key := range []string{
-		"HAPPYLEARN_DATABASE_HOST",
-		"PGPASSFILE",
-		"HAPPYLEARN_MINIO_ENDPOINT",
-		"HAPPYLEARN_MINIO_ACCESS_KEY",
-		"HAPPYLEARN_MINIO_SECRET_KEY",
-		"HAPPYLEARN_MINIO_USE_TLS",
+	for key, category := range map[string]string{
+		"HAPPYLEARN_DATABASE_HOST":    "configuration_database_host",
+		"HAPPYLEARN_DATABASE_PORT":    "configuration_database_port",
+		"HAPPYLEARN_DATABASE_USER":    "configuration_database_user",
+		"HAPPYLEARN_DATABASE_NAME":    "configuration_database_name",
+		"HAPPYLEARN_DATABASE_SSLMODE": "configuration_database_sslmode",
+		"PGPASSFILE":                  "configuration_passfile",
+		"HAPPYLEARN_MINIO_ENDPOINT":   "configuration_minio_endpoint",
+		"HAPPYLEARN_MINIO_ACCESS_KEY": "configuration_minio_access",
+		"HAPPYLEARN_MINIO_SECRET_KEY": "configuration_minio_secret",
+		"HAPPYLEARN_MINIO_USE_TLS":    "configuration_minio_tls",
 	} {
 		t.Run(key, func(t *testing.T) {
 			broken := make(map[string]string, len(values))
@@ -226,6 +230,9 @@ func TestRestoreCheckConfigIsDedicatedAndFailClosed(t *testing.T) {
 			)
 			if !errors.Is(err, errWorkflowUnavailable) {
 				t.Fatalf("error=%v", err)
+			}
+			if actual := restoreCheckFailureCategory(err); actual != category {
+				t.Fatalf("category=%q want=%q", actual, category)
 			}
 			if strings.Contains(err.Error(), "restore-secret-key") ||
 				strings.Contains(err.Error(), "/run/secrets") {
