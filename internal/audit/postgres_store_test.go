@@ -315,6 +315,49 @@ func TestOperationsSystemAuditActorExceptionIsExact(t *testing.T) {
 	}
 }
 
+func TestOperationsRetentionSystemAuditActorExceptionIsExact(t *testing.T) {
+	event := Event{
+		Action: "operations.retention_completed", TargetType: "metadata_retention",
+		TargetID: "global",
+		Metadata: map[string]any{
+			"samples":              "1",
+			"alertDeliveries":      "2",
+			"alerts":               "3",
+			"restoreVerifications": "4",
+			"backupRuns":           "5",
+		},
+		RequestID: "operations-retention", IP: net.ParseIP("127.0.0.1"),
+	}
+	if _, err := validateAndMarshal(event); err != nil {
+		t.Fatalf("exact retention system event rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Event){
+		"actor user ID": func(e *Event) { e.ActorUserID = uuid.New() },
+		"action":        func(e *Event) { e.Action = "operations.lease_taken_over" },
+		"target type":   func(e *Event) { e.TargetType = "operational_mode" },
+		"target ID":     func(e *Event) { e.TargetID = "other" },
+		"request ID":    func(e *Event) { e.RequestID = "other-system-request" },
+		"IP":            func(e *Event) { e.IP = net.ParseIP("127.0.0.2") },
+		"missing key":   func(e *Event) { delete(e.Metadata, "samples") },
+		"extra key":     func(e *Event) { e.Metadata["reason"] = "retention" },
+		"negative":      func(e *Event) { e.Metadata["alerts"] = "-1" },
+		"non-decimal":   func(e *Event) { e.Metadata["backupRuns"] = "01" },
+		"wrong type":    func(e *Event) { e.Metadata["samples"] = 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := event
+			changed.Metadata = make(map[string]any, len(event.Metadata))
+			for key, value := range event.Metadata {
+				changed.Metadata[key] = value
+			}
+			mutate(&changed)
+			if _, err := validateAndMarshal(changed); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("inexact retention system event error=%v", err)
+			}
+		})
+	}
+}
+
 func TestOperationsSettingsRejectionAuditAllowsOnlyRedactedClassification(t *testing.T) {
 	event := Event{
 		ActorUserID: uuid.New(), Action: "operations.settings_rejected",
