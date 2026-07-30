@@ -15,6 +15,7 @@ readonly contract_run_argument='--contract-run'
 readonly hang_case='webhook_timeout'
 readonly lifecycle_stages='fixture shim inject terminal maintenance alert plaintext sanitize cleanup'
 readonly outer_deadline_seconds=12
+readonly live_outer_deadline_seconds=60
 
 expected_entries=(
   drain_timeout:failed
@@ -166,7 +167,7 @@ mkdir -m 0700 "$tmpdir/bin" "$tmpdir/runs" "$tmpdir/mutants"
 
 unexpected_external_log="$tmpdir/unexpected-external.log"
 for external_name in \
-  docker curl restic psql pg_dump mc aws \
+  curl restic psql pg_dump mc aws \
   sanitize-e2e-artifacts.sh publish-e2e-diagnostics.sh
 do
   external_path="$tmpdir/bin/$external_name"
@@ -179,6 +180,283 @@ do
   } >"$external_path"
   chmod 0700 "$external_path"
 done
+
+fake_docker="$tmpdir/bin/docker"
+cat >"$fake_docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+root="${HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_ROOT:?}"
+call_log="$root/calls"
+containers="$root/containers"
+networks="$root/networks"
+mkdir -p "$containers" "$networks"
+printf '%s' "$1" >>"$call_log"
+printf '|%q' "${@:2}" >>"$call_log"
+printf '\n' >>"$call_log"
+
+record_value() {
+  local record="$1"
+  local key="$2"
+  sed -n "s/^${key}=//p" "$record"
+}
+
+write_value() {
+  local record="$1"
+  local key="$2"
+  local value="$3"
+  local pending="${record}.pending"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 {
+      print key "=" value
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print key "=" value
+    }
+  ' "$record" >"$pending"
+  mv "$pending" "$record"
+}
+
+case "${1:-}" in
+  version)
+    printf '29.6.1\n'
+    ;;
+  image)
+    [[ "${2:-}" == inspect ]] || exit 64
+    printf 'sha256:phase5failurematrixfixture\n'
+    ;;
+  network)
+    case "${2:-}" in
+      create)
+        shift 2
+        owner=''
+        project=''
+        name=''
+        while [[ "$#" -gt 0 ]]; do
+          case "$1" in
+            --internal) shift ;;
+            --label)
+              value="${2:?}"
+              case "$value" in
+                io.happylearn.phase5.failure-matrix-owner=*)
+                  owner="${value#*=}"
+                  ;;
+                io.happylearn.phase5.failure-matrix-project=*)
+                  project="${value#*=}"
+                  ;;
+              esac
+              shift 2
+              ;;
+            --*) exit 64 ;;
+            *)
+              [[ -z "$name" ]] || exit 64
+              name="$1"
+              shift
+              ;;
+          esac
+        done
+        [[ -n "$owner" && -n "$project" && -n "$name" ]] || exit 64
+        id="network-$name"
+        record="$networks/$id"
+        [[ ! -e "$record" ]] || exit 65
+        printf 'owner=%s\nproject=%s\nname=%s\n' \
+          "$owner" "$project" "$name" >"$record"
+        printf '%s\n' "$id"
+        ;;
+      inspect)
+        shift 2
+        [[ "${1:-}" == --format ]] || exit 64
+        shift 2
+        id="${1:?}"
+        record="$networks/$id"
+        [[ -f "$record" ]] || exit 1
+        printf '%s|%s|%s\n' \
+          "$(record_value "$record" owner)" \
+          "$(record_value "$record" project)" \
+          "$(record_value "$record" name)"
+        ;;
+      rm)
+        id="${3:?}"
+        record="$networks/$id"
+        [[ -f "$record" ]] || exit 1
+        rm -f "$record"
+        printf '%s\n' "$id"
+        ;;
+      ls)
+        find "$networks" -mindepth 1 -maxdepth 1 -type f \
+          -exec basename {} \; | sort
+        ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  create)
+    shift
+    owner=''
+    project=''
+    case_name=''
+    name=''
+    evidence=''
+    image_seen=false
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        --name)
+          name="${2:?}"
+          shift 2
+          ;;
+        --label)
+          value="${2:?}"
+          case "$value" in
+            io.happylearn.phase5.failure-matrix-owner=*)
+              owner="${value#*=}"
+              ;;
+            io.happylearn.phase5.failure-matrix-project=*)
+              project="${value#*=}"
+              ;;
+            io.happylearn.phase5.failure-matrix-case=*)
+              case_name="${value#*=}"
+              ;;
+          esac
+          shift 2
+          ;;
+        --network|--security-opt|--memory|--cpus|--pids-limit|--user|--tmpfs)
+          shift 2
+          ;;
+        --mount)
+          value="${2:?}"
+          if [[ "$value" == type=bind,source=*,target=/evidence ]]; then
+            evidence="${value#type=bind,source=}"
+            evidence="${evidence%,target=/evidence}"
+          fi
+          shift 2
+          ;;
+        --read-only)
+          shift
+          ;;
+        --cap-drop)
+          [[ "${2:-}" == ALL ]] || exit 64
+          shift 2
+          ;;
+        alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1)
+          image_seen=true
+          shift
+          break
+          ;;
+        *) exit 64 ;;
+      esac
+    done
+    [[ "$image_seen" == true &&
+      -n "$owner" &&
+      -n "$project" &&
+      -n "$case_name" &&
+      -n "$name" &&
+      -n "$evidence" &&
+      "${*: -1}" == "$case_name" ]] ||
+      exit 64
+    id="container-$name"
+    record="$containers/$id"
+    [[ ! -e "$record" ]] || exit 65
+    printf \
+      'owner=%s\nproject=%s\ncase=%s\nname=%s\nevidence=%s\nstatus=created\nexit_code=0\n' \
+      "$owner" "$project" "$case_name" "$name" "$evidence" >"$record"
+    printf '%s\n' "$id"
+    ;;
+  start)
+    shift
+    [[ "${1:-}" == -a ]] || exit 64
+    id="${2:?}"
+    record="$containers/$id"
+    [[ -f "$record" ]] || exit 1
+    case_name="$(record_value "$record" case)"
+    write_value "$record" status running
+    if [[ "$case_name" == \
+      "${HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_HANG_CASE:-}" ]]; then
+      : >"$root/hang.started"
+      printf '%s\n' "$$" >"$root/hang.pid"
+      exec sleep 30
+    fi
+    case "$case_name" in
+      remote_outage)
+        actual=degraded
+        alert=active
+        ;;
+      webhook_private_target | host_sample_replay)
+        actual=rejected
+        alert=suppressed
+        ;;
+      *)
+        actual=failed
+        alert=active
+        ;;
+    esac
+    maintenance=normal
+    plaintext=absent
+    case "${HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_MUTATION:-}" in
+      terminal) actual=succeeded ;;
+      maintenance) maintenance=backup ;;
+      alert) alert=unknown ;;
+      plaintext) plaintext=present ;;
+      '') ;;
+      *) exit 64 ;;
+    esac
+    report="$(record_value "$record" evidence)/report"
+    printf \
+      'evidence_version=1\ncase=%s\nactual=%s\nmaintenance=%s\nalert=%s\nplaintext_dump=%s\n' \
+      "$case_name" "$actual" "$maintenance" "$alert" "$plaintext" >"$report"
+    write_value "$record" status exited
+    ;;
+  inspect)
+    shift
+    [[ "${1:-}" == --type && "${2:-}" == container &&
+      "${3:-}" == --format ]] ||
+      exit 64
+    shift 4
+    id="${1:?}"
+    record="$containers/$id"
+    [[ -f "$record" ]] || exit 1
+    printf '%s|%s|%s|%s|%s|%s\n' \
+      "$(record_value "$record" owner)" \
+      "$(record_value "$record" project)" \
+      "$(record_value "$record" case)" \
+      "$(record_value "$record" status)" \
+      "$(record_value "$record" exit_code)" \
+      "/$(record_value "$record" name)"
+    ;;
+  cp)
+    source="${2:?}"
+    destination="${3:?}"
+    id="${source%%:*}"
+    [[ "${source#*:}" == /evidence/report ]] || exit 64
+    record="$containers/$id"
+    [[ -f "$record" && -f "${record}.report" ]] || exit 1
+    cp "${record}.report" "$destination"
+    ;;
+  rm)
+    shift
+    [[ "${1:-}" == -f ]] || exit 64
+    id="${2:?}"
+    record="$containers/$id"
+    [[ -f "$record" ]] || exit 1
+    rm -f "$record" "${record}.report"
+    printf '%s\n' "$id"
+    ;;
+  ps)
+    find "$containers" -mindepth 1 -maxdepth 1 -type f \
+      ! -name '*.report' -exec basename {} \; | sort
+    ;;
+  volume)
+    [[ "${2:-}" == ls ]] || exit 64
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+FAKE_DOCKER
+chmod 0700 "$fake_docker"
 
 adapter="$tmpdir/bin/phase5-failure-matrix-adapter"
 cat >"$adapter" <<'FAKE_ADAPTER'
@@ -597,6 +875,168 @@ drain_timeout|failed|$project|cleanup|ok" ]] ||
     fail 'signal probe lifecycle was not exact or entered a later case'
 }
 
+new_live_root() {
+  local name="$1"
+  local root="$tmpdir/runs/live-$name"
+  [[ "$name" =~ ^[a-z0-9-]+$ && ! -e "$root" && ! -L "$root" ]] ||
+    return 1
+  mkdir -m 0700 "$root" "$root/containers" "$root/networks"
+  : >"$root/calls"
+  : >"$root/stdout"
+  : >"$root/stderr"
+  chmod 0600 "$root/calls" "$root/stdout" "$root/stderr"
+  printf '%s' "$root"
+}
+
+run_live_candidate() {
+  local root="$1"
+  local mutation="${2:-}"
+  local hang="${3:-}"
+  local candidate="${4:-$target}"
+  local status=0
+  PATH="$tmpdir/bin:/usr/bin:/bin:/opt/homebrew/bin" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_ROOT="$root" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_MUTATION="$mutation" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_HANG_CASE="$hang" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_UNEXPECTED_EXTERNAL_LOG="$unexpected_external_log" \
+    run_bounded "$live_outer_deadline_seconds" \
+      env HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 "$candidate" \
+    >"$root/stdout" 2>"$root/stderr" ||
+    status=$?
+  printf '%s\n' "$status" >"$root/status"
+}
+
+validate_live_calls() {
+  local root="$1"
+  local projects="$root/projects"
+  local create_count start_count copy_count container_rm_count
+  local network_create_count network_rm_count line project
+  create_count="$(grep -c '^create|' "$root/calls" || true)"
+  start_count="$(grep -c '^start|' "$root/calls" || true)"
+  copy_count="$(grep -c '^cp|' "$root/calls" || true)"
+  container_rm_count="$(grep -c '^rm|' "$root/calls" || true)"
+  network_create_count="$(grep -c '^network|create|' "$root/calls" || true)"
+  network_rm_count="$(grep -c '^network|rm|' "$root/calls" || true)"
+  [[ "$create_count" == 15 &&
+    "$start_count" == 15 &&
+    "$copy_count" == 0 &&
+    "$container_rm_count" == 15 &&
+    "$network_create_count" == 15 &&
+    "$network_rm_count" == 15 ]] ||
+    fail "live Docker lifecycle was not exact create=$create_count start=$start_count copy=$copy_count container_rm=$container_rm_count network_create=$network_create_count network_rm=$network_rm_count"
+
+  : >"$projects"
+  chmod 0600 "$projects"
+  while IFS= read -r line; do
+    [[ "$line" == *'--read-only'* &&
+      "$line" == *'--cap-drop|ALL'* &&
+      "$line" == *'--security-opt|no-new-privileges:true'* &&
+      "$line" == *'--pids-limit|'* &&
+      "$line" == *'--memory|'* &&
+      "$line" == *'--cpus|'* &&
+      "$line" == *'--tmpfs|'* &&
+      "$line" == *'--mount|'* &&
+      "$line" == *'/run/happylearn-e2e-shims'* &&
+      "$line" == *'alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1'* ]] ||
+      fail 'live case container omitted an isolation control or pinned image'
+    project="$(
+      sed -n \
+        's/.*io\.happylearn\.phase5\.failure-matrix-project=\([^|]*\).*/\1/p' \
+        <<<"$line"
+    )"
+    [[ "$project" =~ ^happylearn-phase5-live-[a-z0-9][a-z0-9-]{0,95}$ ]] ||
+      fail 'live case container used an invalid project label'
+    printf '%s\n' "$project" >>"$projects"
+  done < <(grep '^create|' "$root/calls")
+  [[ "$(sort "$projects" | uniq | wc -l | tr -d '[:space:]')" == 15 ]] ||
+    fail 'live case project labels were not unique'
+  [[ -z "$(find "$root/containers" -mindepth 1 -maxdepth 1 -print -quit)" &&
+    -z "$(find "$root/networks" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail 'live Docker inventory was not empty after all cases'
+}
+
+validate_live_candidate() {
+  local root="$1"
+  [[ "$(<"$root/status")" == 0 ]] ||
+    fail "live target exited with status $(<"$root/status")"
+  validate_summary "$root/stdout" "$root/traces"
+  validate_live_calls "$root"
+  [[ ! -s "$root/stderr" ]] ||
+    fail 'live target wrote unexpected stderr'
+  [[ ! -e "$unexpected_external_log" ]] ||
+    fail 'live target invoked an unexpected external command'
+}
+
+expect_live_rejection() {
+  local name="$1"
+  local mutation="${2:-}"
+  local hang="${3:-}"
+  local candidate="${4:-$target}"
+  local root
+  root="$(new_live_root "reject-$name")"
+  run_live_candidate "$root" "$mutation" "$hang" "$candidate"
+  [[ "$(<"$root/status")" != 0 &&
+    ! -s "$root/stdout" &&
+    ! -s "$root/stderr" &&
+    -z "$(find "$root/containers" -mindepth 1 -maxdepth 1 -print -quit)" &&
+    -z "$(find "$root/networks" -mindepth 1 -maxdepth 1 -print -quit)" &&
+    "$(grep -c '^create|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^rm|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|create|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|rm|' "$root/calls" || true)" == 1 &&
+    ! -e "$unexpected_external_log" ]] ||
+    fail "live $name mutation was accepted or left residue"
+}
+
+expect_live_signal_cleanup() {
+  local root target_pid docker_pid signal_status=0
+  local target_alive=false docker_alive=false
+  root="$(new_live_root signal)"
+  PATH="$tmpdir/bin:/usr/bin:/bin:/opt/homebrew/bin" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_ROOT="$root" \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_MUTATION='' \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_HANG_CASE=drain_timeout \
+    HAPPYLEARN_PHASE5_FAILURE_MATRIX_UNEXPECTED_EXTERNAL_LOG="$unexpected_external_log" \
+    HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 \
+    "$target" >"$root/stdout" 2>"$root/stderr" &
+  target_pid=$!
+  ACTIVE_SIGNAL_TARGET_PID="$target_pid"
+  wait_for_file "$root/hang.started" ||
+    fail 'live signal probe did not reach the hanging Docker command'
+  wait_for_file "$root/hang.pid" ||
+    fail 'live signal probe did not expose the Docker command PID'
+  docker_pid="$(<"$root/hang.pid")"
+  [[ "$docker_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail 'live signal probe exposed an invalid Docker command PID'
+  kill -TERM "$target_pid"
+  if wait "$target_pid"; then
+    signal_status=0
+  else
+    signal_status=$?
+  fi
+  ACTIVE_SIGNAL_TARGET_PID=''
+  kill -0 "$target_pid" 2>/dev/null && target_alive=true
+  kill -0 "$docker_pid" 2>/dev/null && docker_alive=true
+  if [[ "$docker_alive" == true ]]; then
+    kill -TERM "$docker_pid" 2>/dev/null || true
+    sleep 0.1
+    kill -KILL "$docker_pid" 2>/dev/null || true
+  fi
+  [[ "$signal_status" == 143 &&
+    "$target_alive" == false &&
+    "$docker_alive" == false &&
+    ! -s "$root/stdout" &&
+    ! -s "$root/stderr" &&
+    -z "$(find "$root/containers" -mindepth 1 -maxdepth 1 -print -quit)" &&
+    -z "$(find "$root/networks" -mindepth 1 -maxdepth 1 -print -quit)" &&
+    "$(grep -c '^create|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^rm|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|create|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|rm|' "$root/calls" || true)" == 1 &&
+    ! -e "$unexpected_external_log" ]] ||
+    fail "live signal cleanup failed status=$signal_status target_alive=$target_alive docker_alive=$docker_alive"
+}
+
 expect_contract_mode_rejection
 
 relative_adapter='bin/phase5-failure-matrix-adapter'
@@ -697,4 +1137,41 @@ expect_dynamic_rejection \
   canned-branch "$canned_branch_mutant" '' \
   'lifecycle event count was 0 instead of 135'
 
-printf 'phase 5 failure matrix contract: PASS cases=15 lifecycle=135 timeout=1 inventory=0 mutations=3\n'
+live_baseline_root="$(new_live_root baseline)"
+run_live_candidate "$live_baseline_root"
+validate_live_candidate "$live_baseline_root"
+
+expect_live_rejection terminal terminal
+expect_live_rejection maintenance maintenance
+expect_live_rejection alert alert
+expect_live_rejection plaintext plaintext
+expect_live_rejection deadline '' drain_timeout
+
+sanitizer_mutant_directory="$tmpdir/mutants/live-sanitizer"
+mkdir -m 0700 "$sanitizer_mutant_directory"
+cp \
+  "$target" \
+  "$harness_lib" \
+  "$sanitizer" \
+  "$publisher" \
+  "$sanitizer_mutant_directory/"
+sanitizer_mutant="$sanitizer_mutant_directory/e2e-phase5_failure_matrix.sh"
+awk '
+  $0 == "  \"$SANITIZER\" \"$raw_directory\"" {
+    print "  : \"$raw_directory\""
+    replaced++
+    next
+  }
+  { print }
+  END {
+    if (replaced != 1) exit 42
+  }
+' "$target" >"$sanitizer_mutant.pending" ||
+  fail 'could not create the live sanitizer-bypass mutation'
+mv "$sanitizer_mutant.pending" "$sanitizer_mutant"
+chmod 0700 "$sanitizer_mutant"
+expect_live_rejection sanitizer-bypass '' '' "$sanitizer_mutant"
+
+expect_live_signal_cleanup
+
+printf 'phase 5 failure matrix contract: PASS cases=15 lifecycle=135 live=15 timeouts=2 signals=2 inventory=0 mutations=8\n'
