@@ -1,5 +1,12 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres-tls-init:
+    logging: *default-logging
     image: postgres:18.4
     user: "0:0"
     entrypoint:
@@ -26,6 +33,7 @@ services:
     restart: "no"
 
   postgres:
+    logging: *default-logging
     image: postgres:18.4
     command:
       - postgres
@@ -57,6 +65,7 @@ services:
     cpus: 0.35
 
   redis:
+    logging: *default-logging
     image: redis:8.8
     ports:
       - "127.0.0.1:56379:6379"
@@ -71,6 +80,7 @@ services:
     cpus: 0.15
 
   minio-data-init:
+    logging: *default-logging
     image: quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
@@ -81,6 +91,7 @@ services:
     restart: "no"
 
   minio:
+    logging: *default-logging
     image: quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120
     user: "1000:0"
     command: ["minio", "server", "/data", "--console-address", ":9001", "--license", "/minio.license"]
@@ -113,6 +124,7 @@ services:
     cpus: 0.3
 
   app:
+    logging: *default-logging
     build:
       context: ..
       dockerfile: Dockerfile
@@ -163,6 +175,7 @@ services:
       - happylearn
 
   worker:
+    logging: *default-logging
     build:
       context: ..
       dockerfile: Dockerfile.worker
@@ -213,6 +226,7 @@ services:
       - happylearn
 
   backup-storage-init:
+    logging: *default-logging
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:
@@ -251,6 +265,7 @@ services:
     cpus: 0.05
 
   backup-secrets-init:
+    logging: *default-logging
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:
@@ -305,6 +320,7 @@ services:
     cpus: 0.05
 
   backup:
+    logging: *default-logging
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:

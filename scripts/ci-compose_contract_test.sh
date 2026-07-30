@@ -11,6 +11,81 @@ fail() {
   exit 1
 }
 
+assert_log_rotation() {
+  local config="$1"
+  local label="$2"
+
+  if jq -e '
+    (.services | type == "object" and length > 0) and
+    all(
+      .services | to_entries[];
+      .value.logging == {
+        "driver": "json-file",
+        "options": {
+          "max-file": "5",
+          "max-size": "10m"
+        }
+      }
+    )
+  ' "$config" >/dev/null; then
+    return 0
+  fi
+
+  echo "CI Compose log-rotation contract: FAIL: every parsed service in $label must use json-file with max-size=10m and max-file=5" >&2
+  return 1
+}
+
+assert_expected_services() {
+  local config="$1"
+  local label="$2"
+  local expected_services='[
+    "app",
+    "backup",
+    "backup-secrets-init",
+    "backup-storage-init",
+    "minio",
+    "minio-data-init",
+    "postgres",
+    "postgres-tls-init",
+    "redis",
+    "worker"
+  ]'
+
+  if jq -e --argjson expected "$expected_services" \
+    '(.services | keys) == $expected' "$config" >/dev/null; then
+    return 0
+  fi
+
+  echo "CI Compose log-rotation contract: FAIL: $label must contain the complete expected service set" >&2
+  return 1
+}
+
+verify_log_rotation_mutations() {
+  local config="$1"
+  local label="$2"
+  local mutated="$tmp_dir/log-rotation-mutated.json"
+  local service
+  local option
+
+  while IFS= read -r service; do
+    for option in max-size max-file; do
+      jq --arg service "$service" --arg option "$option" \
+        'del(.services[$service].logging.options[$option])' \
+        "$config" >"$mutated"
+      if assert_log_rotation "$mutated" "$label mutation" >/dev/null 2>&1; then
+        fail "log-rotation assertion accepted $label service $service without $option"
+      fi
+    done
+
+    jq --arg service "$service" \
+      'del(.services[$service].logging.driver)' \
+      "$config" >"$mutated"
+    if assert_log_rotation "$mutated" "$label mutation" >/dev/null 2>&1; then
+      fail "log-rotation assertion accepted $label service $service without logging.driver"
+    fi
+  done < <(jq -r '.services | keys[]' "$config")
+}
+
 test -f "$workflow" ||
   fail "workflow contract input must be a regular file: $workflow"
 
@@ -71,8 +146,19 @@ fi
 
 base_json="$tmp_dir/base.json"
 merged_json="$tmp_dir/merged.json"
-docker compose -f "$base" config --format json >"$base_json"
-docker compose -f "$base" -f "$ci" config --format json >"$merged_json"
+docker compose --profile '*' -f "$base" config --format json >"$base_json"
+docker compose --profile '*' -f "$base" -f "$ci" config --format json >"$merged_json"
+
+assert_expected_services "$base_json" "base Compose config" ||
+  fail "base Compose service-set contract is not satisfied"
+assert_expected_services "$merged_json" "base+CI merged Compose config" ||
+  fail "merged Compose service-set contract is not satisfied"
+assert_log_rotation "$base_json" "base Compose config" ||
+  fail "base Compose log-rotation contract is not satisfied"
+assert_log_rotation "$merged_json" "base+CI merged Compose config" ||
+  fail "merged Compose log-rotation contract is not satisfied"
+verify_log_rotation_mutations "$base_json" "base Compose config"
+verify_log_rotation_mutations "$merged_json" "base+CI merged Compose config"
 
 jq -e '.networks.happylearn.internal == true' "$base_json" >/dev/null ||
   fail "base networks.happylearn.internal must be true"
