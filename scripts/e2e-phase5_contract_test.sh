@@ -30,6 +30,18 @@ require_pattern() {
   fail 'Phase 5 command entrypoint files are absent'
 bash -n "$target"
 
+intent_line="$(grep -n '^persist_resource_intents$' "$target" | cut -d: -f1)"
+full_trap_line="$(
+  grep -n '^if \[\[ -z "\$probe_mode"' "$target" | cut -d: -f1
+)"
+first_resource_line="$(grep -n '^create_fixture_ca$' "$target" | cut -d: -f1)"
+[[ "$intent_line" =~ ^[0-9]+$ &&
+  "$full_trap_line" =~ ^[0-9]+$ &&
+  "$first_resource_line" =~ ^[0-9]+$ &&
+  "$intent_line" -lt "$full_trap_line" &&
+  "$full_trap_line" -lt "$first_resource_line" ]] ||
+  fail 'resource intents/traps were not persistent before resource creation'
+
 require_literal "$target" 'source "$script_dir/e2e-harness-lib.sh"'
 require_literal "$target" '"$license_file" != /*'
 require_literal "$target" '! -r "$license_file"'
@@ -71,6 +83,11 @@ for secret in \
   webhook-url webhook-authorization login-throttle; do
   require_literal "$target" "$secret"
 done
+require_literal "$target" \
+  "printf '%s' 'http://localhost:8080/happylearn-phase5'"
+if grep -Fq '.invalid' "$target"; then
+  fail 'Phase 5 webhook fixture used a non-resolving .invalid host'
+fi
 require_literal "$target" 'umask 077'
 require_literal "$target" 'chmod 0600 "$secret_source_dir/"*'
 require_literal "$target" 'chmod 0400 "$target"'
@@ -91,11 +108,29 @@ require_literal "$target" \
 require_literal "$target" \
   'test "$(stat -c "%u:%g:%a" "$directory")" = "$owner:500"'
 require_literal "$target" 'owned_container_ledger="$tmpdir/owned-containers.tsv"'
+require_literal "$target" \
+  'container_intent_ledger="$tmpdir/container-intents.tsv"'
+require_literal "$target" 'network_intent_ledger="$tmpdir/network-intents.tsv"'
+require_literal "$target" 'volume_intent_ledger="$tmpdir/volume-intents.tsv"'
+require_literal "$target" 'image_intent_ledger="$tmpdir/image-intents.tsv"'
+require_literal "$target" 'persist_resource_intents'
+require_literal "$target" 'remove_intended_containers'
+require_literal "$target" 'remove_intended_networks'
+require_literal "$target" 'remove_intended_volumes'
+require_literal "$target" 'remove_intended_images'
+require_literal "$target" \
+  '"$intended_reference" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9_.-]+)?$'
 require_literal "$target" 'record_owned_container'
 require_literal "$target" 'remove_owned_container_if_match'
+require_literal "$target" 'remove_owned_network_if_match'
+require_literal "$target" 'remove_owned_volume_if_match'
+require_literal "$target" 'remove_owned_image_if_match'
+require_literal "$target" 'validate_resource_container_identity'
+require_literal "$target" 'validate_resource_ephemeral_identities'
 require_literal "$target" \
   '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}'
 require_literal "$target" '--cleanup-container-ownership-probe'
+require_literal "$target" '--resource-identity-contract-probe'
 
 require_literal "$target" \
   'compose_live up --detach --no-build --no-deps app'
@@ -164,6 +199,40 @@ if grep -Eq 'phase5-(backup|restore)_live_test\.sh' "$target"; then
 fi
 require_literal "$target" 'run_resource_sample 60'
 require_literal "$target" 'run_resource_sample 1800'
+require_literal "$target" 'run_resource_browser_load'
+require_literal "$target" 'run_backup_proof &'
+require_literal "$target" 'monitor_resource_workloads'
+require_literal "$target" 'run_resource_child'
+require_literal "$target" 'cancel_resource_workloads'
+require_literal "$target" 'merge_resource_statuses'
+require_literal "$target" 'validate_resource_evidence'
+require_literal "$target" \
+  '--filter "label=com.docker.compose.project=${live_project}"'
+require_literal "$target" \
+  '--filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}"'
+require_literal "$target" \
+  '{{.State.OOMKilled}}|{{.RestartCount}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}'
+require_literal "$target" 'worker_heavy_overlap'
+require_literal "$target" 'configured_limits_complete'
+require_literal "$target" 'peak_configured_cpu'
+require_literal "$target" 'peak_configured_memory_mib'
+require_literal "$target" 'peak_live_cpu_percent'
+require_literal "$target" 'peak_live_memory_mib'
+require_literal "$target" 'peak_browser_cpu_percent'
+require_literal "$target" 'peak_browser_memory_mib'
+require_literal "$target" 'preserved_resource_evidence'
+require_literal "$target" 'validate_resource_evidence "$resource_report"'
+require_literal "$target" \
+  'install -m 0600 "$preserved_resource_evidence" "$resource_report"'
+require_literal "$target" 'saw_browser'
+require_literal "$target" 'saw_backup'
+require_literal "$target" 'saw_heavy'
+require_literal "$target" 'saw_worker'
+resource_sample_block="$(sed -n '/^run_resource_sample()/,/^}/p' "$target")"
+if grep -Fq 'pause "$worker"' <<<"$resource_sample_block" ||
+  grep -Fq 'unpause "$worker"' <<<"$resource_sample_block"; then
+  fail 'resource proof faked worker/backup exclusion by pausing the worker'
+fi
 require_literal "$target" 'preserve_first_failure'
 require_literal "$target" 'audit_container_metadata'
 require_literal "$target" '--audit-container-metadata'
@@ -186,21 +255,29 @@ require_literal "$target" 'publish-e2e-diagnostics.sh'
 require_literal "$target" 'allowed_artifact_root="$repo_root/test-results"'
 require_literal "$target" 'artifact_input="${E2E_ARTIFACT_DIR:-$allowed_artifact_root/phase5}"'
 require_literal "$target" 'initialize_artifact_directory'
+require_literal "$target" 'rm -f "$artifact_dir/resource-samples.tsv"'
 require_literal "$target" 'init-e2e-artifacts.sh'
 require_literal "$target" 'PHASE5_ARTIFACT_WRITE_PROBE'
 require_literal "$target" '--user 1000:1000 --cap-drop ALL'
+cleanup_block="$(sed -n '/^cleanup()/,/^}/p' "$target")"
 if grep -Fq -- 'docker_bounded 30 rm -f "${temporary_containers[@]}"' "$target" ||
   grep -Fq -- 'docker_bounded 30 rm -f "${service_containers[@]}"' "$target" ||
-  grep -Fq -- '--filter "label=com.docker.compose.project=${live_project}"' "$target"; then
+  grep -Fq -- \
+    '--filter "label=com.docker.compose.project=${live_project}"' \
+    <<<"$cleanup_block"; then
   fail 'cleanup retained name-only or project-wide container deletion'
 fi
-require_literal "$target" 'docker_bounded 30 network rm "$recorded_id"'
+require_literal "$target" 'docker_bounded 30 network rm "$expected_id"'
 require_literal "$target" 'owned_volume_ledger="$tmpdir/owned-volumes.tsv"'
 require_literal "$target" 'owned_image_ledger="$tmpdir/owned-images.tsv"'
 require_literal "$target" \
-  'docker_bounded 30 volume rm "$recorded_name"'
+  '"$reference" "$id" "$fixture_suffix" >>"$owned_image_ledger"'
 require_literal "$target" \
-  'docker_bounded 60 image rm "$recorded_reference"'
+  'docker_bounded 30 volume rm "$name"'
+require_literal "$target" \
+  'docker_bounded 60 image rm "$expected_id"'
+require_literal "$target" \
+  '--label "io.happylearn.phase5.e2e-owner=${fixture_suffix}"'
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/phase5-e2e-contract.XXXXXX")"
 signal_target_pid=''
@@ -244,6 +321,51 @@ if [[ "${1:-}" == run && "$E2E_FAKE_DOCKER_MODE" == signal ]]; then
   : >"${E2E_SIGNAL_READY_FILE:?}"
   exec sleep 300
 fi
+if [[ "${1:-}" == network && "${2:-}" == create &&
+  "$E2E_FAKE_DOCKER_MODE" == ownership_signal* ]]; then
+  name="${*: -1}"
+  project='' owner='' previous=''
+  for argument in "$@"; do
+    if [[ "$previous" == --label ]]; then
+      case "$argument" in
+        com.docker.compose.project=*) project="${argument#*=}" ;;
+        io.happylearn.phase5.e2e-owner=*) owner="${argument#*=}" ;;
+      esac
+      previous=''
+      continue
+    fi
+    [[ "$argument" == --label ]] && previous=--label
+  done
+  [[ -n "$name" && -n "$project" && -n "$owner" ]] || exit 94
+  if [[ "$E2E_FAKE_DOCKER_MODE" == ownership_signal_collision ]]; then
+    owner=foreign-owner
+  fi
+  printf '%s|%s|%s|%s\n' \
+    ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+    "$name" "$project" "$owner" \
+    >"${E2E_FAKE_DOCKER_STATE:?}.network"
+  printf '%s\n' "$$" >"${E2E_SIGNAL_CHILD_PID_FILE:?}"
+  : >"${E2E_SIGNAL_READY_FILE:?}"
+  exec sleep 300
+fi
+if [[ "${1:-}" == network && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == ownership_signal* ]]; then
+  IFS='|' read -r id name project owner \
+    <"${E2E_FAKE_DOCKER_STATE:?}.network"
+  [[ "$*" == *"name=^${name}$"* ]] && printf '%s\n' "$id"
+  exit 0
+fi
+if [[ "${1:-}" == network && "${2:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == ownership_signal* ]]; then
+  IFS='|' read -r id name project owner \
+    <"${E2E_FAKE_DOCKER_STATE:?}.network"
+  printf '%s|%s|%s\n' "$id" "$name" "$owner"
+  exit 0
+fi
+if [[ "${1:-}" == network && "${2:-}" == rm &&
+  "$E2E_FAKE_DOCKER_MODE" == ownership_signal* ]]; then
+  exit 0
+fi
 if [[ "${1:-}" == create ]]; then
   state="${E2E_FAKE_DOCKER_STATE:?}"
   environment='PATH=/usr/bin'
@@ -256,7 +378,7 @@ if [[ "${1:-}" == create ]]; then
       continue
     fi
     if [[ "$previous" == -e || "$previous" == --env ]]; then
-      environment="$argument"
+      environment="${environment}"$'\n'"${argument}"
       previous=''
       continue
     fi
@@ -279,24 +401,94 @@ if [[ "${1:-}" == inspect && "$*" == *'{{json .Config.Env}}'* ]]; then
 fi
 if [[ "${1:-}" == inspect && "$*" == *'{{range .Config.Env}}'* ]]; then
   state="${E2E_FAKE_DOCKER_STATE:?}"
-  sed -n '1p' "${state}.env"
+  sed -n '1,$p' "${state}.env"
   exit 0
 fi
 if [[ "${1:-}" == inspect && "$*" == *'{{json .HostConfig.Binds}}'* ]]; then
   printf '%s\n' '[]|false|"none"'
   exit 0
 fi
+if [[ "${1:-}" == container && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == resource_identity* ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_list_failure ]] ||
+    exit 98
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_not_found ]] ||
+    exit 0
+  if [[ "$E2E_FAKE_DOCKER_MODE" == resource_identity_id ]]; then
+    printf '%s\n' \
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  else
+    printf '%s\n' "${E2E_RESOURCE_ID:?}"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == resource_identity* &&
+  "$*" == *'com.docker.compose.service'* ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_inspect_failure ]] ||
+    exit 98
+  project="${E2E_RESOURCE_PROJECT:?}"
+  owner="${E2E_RESOURCE_OWNER:?}"
+  service="${E2E_RESOURCE_SERVICE:?}"
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_project ]] ||
+    project=happylearn-phase5-live-ffffffffffff
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_owner ]] ||
+    owner=ffffffffffff
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_service ]] ||
+    service=redis
+  printf '%s|/%s|%s|%s|%s\n' \
+    "${E2E_RESOURCE_ID:?}" "${E2E_RESOURCE_NAME:?}" \
+    "$project" "$owner" "$service"
+  exit 0
+fi
+if [[ "${1:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == resource_identity* &&
+  "$*" == *'{{.State.OOMKilled}}'* ]]; then
+  oom=false restart=0 nano_cpus=100000000 memory_bytes=134217728
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_unbounded ]] ||
+    nano_cpus=0
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_memory_unbounded ]] ||
+    memory_bytes=0
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_oom ]] || oom=true
+  [[ "$E2E_FAKE_DOCKER_MODE" != resource_identity_restart ]] || restart=1
+  printf '%s|%s|%s|%s\n' \
+    "$oom" "$restart" "$nano_cpus" "$memory_bytes"
+  exit 0
+fi
 if [[ "${1:-}" == inspect && "$*" == *'io.happylearn.phase5.e2e-owner'* ]]; then
   target="${*: -1}"
   case "$E2E_FAKE_DOCKER_MODE" in
     cleanup_owned)
+      [[ "${E2E_CLEANUP_KIND:-container}" == container ]] || exit 97
+      [[ "$target" == "${E2E_CLEANUP_NAME:?}" ||
+        "$target" == "${E2E_CLEANUP_ID:?}" ]] || exit 97
       printf '%s|/%s|%s|%s\n' \
-        "${E2E_CLEANUP_ID:?}" "$target" \
+        "$E2E_CLEANUP_ID" "$E2E_CLEANUP_NAME" \
         "${E2E_CLEANUP_PROJECT:?}" "${E2E_CLEANUP_OWNER:?}"
       ;;
     cleanup_collision)
-      printf 'foreign-id|/%s|%s|foreign-owner\n' \
-        "$target" "${E2E_CLEANUP_PROJECT:?}"
+      [[ "${E2E_CLEANUP_KIND:-container}" == container ]] || exit 97
+      [[ "$target" == "${E2E_CLEANUP_NAME:?}" ||
+        "$target" == "${E2E_CLEANUP_ID:?}" ]] || exit 97
+      printf '%s|/%s|%s|foreign-owner\n' \
+        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+        "$E2E_CLEANUP_NAME" "${E2E_CLEANUP_PROJECT:?}"
+      ;;
+    cleanup_inspect_failure)
+      [[ "${E2E_CLEANUP_KIND:-container}" == container ]] || exit 97
+      exit 98
+      ;;
+    cleanup_remove_failure)
+      [[ "${E2E_CLEANUP_KIND:-container}" == container ]] || exit 97
+      [[ "$target" == "${E2E_CLEANUP_NAME:?}" ||
+        "$target" == "${E2E_CLEANUP_ID:?}" ]] || exit 97
+      printf '%s|/%s|%s|%s\n' \
+        "$E2E_CLEANUP_ID" "$E2E_CLEANUP_NAME" \
+        "${E2E_CLEANUP_PROJECT:?}" "${E2E_CLEANUP_OWNER:?}"
+      ;;
+    cleanup_not_found)
+      [[ "${E2E_CLEANUP_KIND:-container}" == container ]] || exit 97
+      exit 97
       ;;
     signal)
       IFS='|' read -r id name project owner \
@@ -304,16 +496,131 @@ if [[ "${1:-}" == inspect && "$*" == *'io.happylearn.phase5.e2e-owner'* ]]; then
       [[ "$target" == "$name" || "$target" == "$id" ]] || exit 1
       printf '%s|/%s|%s|%s\n' "$id" "$name" "$project" "$owner"
       ;;
-    coordinator)
+    coordinator*)
+      [[ "$E2E_FAKE_DOCKER_MODE" != coordinator_inspect_failure ]] ||
+        exit 98
+      owner="${E2E_COORDINATOR_OWNER:?}"
+      [[ "$E2E_FAKE_DOCKER_MODE" != coordinator_collision ]] ||
+        owner=ffffffffffff
       printf '%s|/%s|%s|True|%s\n' \
         "${E2E_COORDINATOR_ID:?}" phase5-coordinator-one-shot \
-        "${E2E_COORDINATOR_PROJECT:?}" "${E2E_COORDINATOR_OWNER:?}"
+        "${E2E_COORDINATOR_PROJECT:?}" "$owner"
       ;;
     *) exit 96 ;;
   esac
   exit 0
 fi
-if [[ "${1:-}" == rm && "${2:-}" == -f ]]; then
+if [[ "${1:-}" == container && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == container ]]; then
+  if [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_not_found &&
+    "$*" == *"name=^/${E2E_CLEANUP_NAME:?}$"* ]]; then
+    printf '%s\n' "${E2E_CLEANUP_ID:?}"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == network && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == network ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_not_found ]] || exit 0
+  if [[ "$E2E_FAKE_DOCKER_MODE" == cleanup_collision ]]; then
+    printf '%s\n' \
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  else
+    printf '%s\n' "${E2E_CLEANUP_ID:?}"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == network && "${2:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == network ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_inspect_failure ]] || exit 98
+  printf '%s|%s|%s\n' \
+    "${E2E_CLEANUP_ID:?}" "${E2E_CLEANUP_NAME:?}" \
+    "${E2E_CLEANUP_OWNER:?}"
+  exit 0
+fi
+if [[ "${1:-}" == network && "${2:-}" == rm &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == network ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_remove_failure ]] || exit 98
+  exit 0
+fi
+if [[ "${1:-}" == volume && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == volume ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_not_found ]] || exit 0
+  printf '%s\n' "${E2E_CLEANUP_NAME:?}"
+  exit 0
+fi
+if [[ "${1:-}" == volume && "${2:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == volume ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_inspect_failure ]] || exit 98
+  owner="${E2E_CLEANUP_OWNER:?}"
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_collision ]] || owner=ffffffffffff
+  printf '%s|%s\n' "${E2E_CLEANUP_NAME:?}" "$owner"
+  exit 0
+fi
+if [[ "${1:-}" == volume && "${2:-}" == rm &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == volume ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_remove_failure ]] || exit 98
+  exit 0
+fi
+if [[ "${1:-}" == image && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == image ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_not_found ]] || exit 0
+  if [[ "$E2E_FAKE_DOCKER_MODE" == cleanup_collision ]]; then
+    printf '%s\n' \
+      sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  else
+    printf 'sha256:%s\n' "${E2E_CLEANUP_ID:?}"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == image && "${2:-}" == inspect &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == image ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_inspect_failure ]] || exit 98
+  if [[ "$E2E_FAKE_DOCKER_MODE" == cleanup_retag_race ]]; then
+    touch "${E2E_FAKE_DOCKER_STATE:?}.retagged"
+  fi
+  printf 'sha256:%s|%s\n' \
+    "${E2E_CLEANUP_ID:?}" "${E2E_CLEANUP_OWNER:?}"
+  exit 0
+fi
+if [[ "${1:-}" == image && "${2:-}" == rm &&
+  "$E2E_FAKE_DOCKER_MODE" == cleanup* &&
+  "${E2E_CLEANUP_KIND:-container}" == image ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_remove_failure ]] || exit 98
+  if [[ "$E2E_FAKE_DOCKER_MODE" == cleanup_retag_race ]]; then
+    [[ -e "${E2E_FAKE_DOCKER_STATE:?}.retagged" &&
+      "${3:-}" == "sha256:${E2E_CLEANUP_ID:?}" ]] ||
+      exit 98
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == container && "${2:-}" == ls &&
+  "$E2E_FAKE_DOCKER_MODE" == coordinator* ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != coordinator_list_failure ]] || exit 98
+  [[ "$E2E_FAKE_DOCKER_MODE" != coordinator_not_found ]] || exit 0
+  if [[ "$E2E_FAKE_DOCKER_MODE" == coordinator_post_list_failure &&
+    -e "${E2E_FAKE_DOCKER_STATE:?}.removed" ]]; then
+    exit 98
+  fi
+  [[ ! -e "${E2E_FAKE_DOCKER_STATE:?}.removed" ]] || exit 0
+  printf '%s\n' "${E2E_COORDINATOR_ID:?}"
+  exit 0
+fi
+if [[ "${1:-}" == rm && "${2:-}" == -f &&
+  "${E2E_CLEANUP_KIND:-container}" == container ]]; then
+  [[ "$E2E_FAKE_DOCKER_MODE" != cleanup_remove_failure ]] || exit 98
+  [[ "$E2E_FAKE_DOCKER_MODE" != coordinator_remove_failure ]] || exit 98
+  if [[ "$E2E_FAKE_DOCKER_MODE" == coordinator* ]]; then
+    touch "${E2E_FAKE_DOCKER_STATE:?}.removed"
+  fi
   exit 0
 fi
 exit 97
@@ -346,10 +653,181 @@ assert_fail_fast "$tmpdir/missing.license" phase5 \
 assert_fail_fast "$readable_license" invalid \
   'HAPPYLEARN_E2E_GROUP must be all, phase5, phase5-mobile, recovery, or resources'
 
+run_resource_evidence_probe() {
+  local mutation="$1"
+  local expected_status="$2"
+  local evidence="$tmpdir/resource-${mutation}.evidence"
+  local status=0
+  cat >"$evidence" <<'EVIDENCE'
+resource_evidence_version=1
+owned_samples=true
+saw_browser=true
+saw_backup=true
+saw_heavy=true
+saw_worker=true
+worker_heavy_overlap=false
+configured_limits_complete=true
+peak_configured_cpu=2.000
+peak_configured_memory_mib=4096.000
+peak_live_cpu_percent=200.000
+peak_live_memory_mib=4096.000
+peak_browser_cpu_percent=10.000
+peak_browser_memory_mib=256.000
+oom_killed=false
+max_restart_count=0
+EVIDENCE
+  case "$mutation" in
+    safe) ;;
+    unowned)
+      sed -i.bak 's/^owned_samples=true$/owned_samples=false/' "$evidence"
+      ;;
+    missing_browser)
+      sed -i.bak 's/^saw_browser=true$/saw_browser=false/' "$evidence"
+      ;;
+    missing_backup)
+      sed -i.bak 's/^saw_backup=true$/saw_backup=false/' "$evidence"
+      ;;
+    missing_heavy)
+      sed -i.bak 's/^saw_heavy=true$/saw_heavy=false/' "$evidence"
+      ;;
+    missing_worker)
+      sed -i.bak 's/^saw_worker=true$/saw_worker=false/' "$evidence"
+      ;;
+    overlap)
+      sed -i.bak \
+        's/^worker_heavy_overlap=false$/worker_heavy_overlap=true/' \
+        "$evidence"
+      ;;
+    unbounded)
+      sed -i.bak \
+        's/^configured_limits_complete=true$/configured_limits_complete=false/' \
+        "$evidence"
+      ;;
+    configured_cpu)
+      sed -i.bak \
+        's/^peak_configured_cpu=2.000$/peak_configured_cpu=2.001/' \
+        "$evidence"
+      ;;
+    configured_memory)
+      sed -i.bak \
+        's/^peak_configured_memory_mib=4096.000$/peak_configured_memory_mib=4096.001/' \
+        "$evidence"
+      ;;
+    live_cpu)
+      sed -i.bak \
+        's/^peak_live_cpu_percent=200.000$/peak_live_cpu_percent=200.001/' \
+        "$evidence"
+      ;;
+    live_memory)
+      sed -i.bak \
+        's/^peak_live_memory_mib=4096.000$/peak_live_memory_mib=4096.001/' \
+        "$evidence"
+      ;;
+    browser_memory)
+      sed -i.bak \
+        's/^peak_browser_memory_mib=256.000$/peak_browser_memory_mib=0.000/' \
+        "$evidence"
+      ;;
+    oom)
+      sed -i.bak 's/^oom_killed=false$/oom_killed=true/' "$evidence"
+      ;;
+    restart)
+      sed -i.bak 's/^max_restart_count=0$/max_restart_count=1/' "$evidence"
+      ;;
+    *) fail "unknown resource evidence mutation: $mutation" ;;
+  esac
+  rm -f "${evidence}.bak"
+  chmod 0600 "$evidence"
+  PATH="$tmpdir/bin:$PATH" \
+    E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
+    E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+    E2E_FAKE_DOCKER_MODE=unexpected \
+    HAPPYLEARN_PHASE5_RESOURCE_CONTRACT=1 \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=resources \
+    "$target" --resource-contract-probe "$evidence" \
+      >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "resource evidence mutation $mutation returned $status, expected $expected_status"
+  [[ ! -e "$tmpdir/docker-called" ]] ||
+    fail "resource evidence mutation $mutation unexpectedly reached Docker"
+}
+
+run_resource_evidence_probe safe 0
+for mutation in \
+  unowned missing_browser missing_backup missing_heavy missing_worker overlap \
+  unbounded configured_cpu configured_memory live_cpu live_memory oom restart; do
+  run_resource_evidence_probe "$mutation" 1
+done
+run_resource_evidence_probe browser_memory 1
+
+run_resource_status_probe() {
+  local browser_status="$1"
+  local backup_status="$2"
+  local monitor_status="$3"
+  local expected_status="$4"
+  local status=0
+  PATH="$tmpdir/bin:$PATH" \
+    E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
+    E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+    E2E_FAKE_DOCKER_MODE=unexpected \
+    HAPPYLEARN_PHASE5_RESOURCE_STATUS_CONTRACT=1 \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=resources \
+    "$target" --resource-status-contract-probe \
+      "$browser_status" "$backup_status" "$monitor_status" \
+      >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "resource status probe returned $status, expected $expected_status"
+}
+
+run_resource_status_probe 0 0 0 0
+run_resource_status_probe 5 0 0 5
+run_resource_status_probe 0 6 7 6
+run_resource_status_probe 0 0 8 8
+
+run_resource_identity_probe() {
+  local mode="$1"
+  local expected_status="$2"
+  local resource_id
+  local status=0
+  resource_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  : >"$tmpdir/docker.log"
+  PATH="$tmpdir/bin:$PATH" \
+    E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
+    E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+    E2E_FAKE_DOCKER_MODE="$mode" \
+    E2E_RESOURCE_NAME=phase5-resource-canary \
+    E2E_RESOURCE_ID="$resource_id" \
+    E2E_RESOURCE_PROJECT=happylearn-phase5-live-a1b2c3d4e5f6 \
+    E2E_RESOURCE_OWNER=a1b2c3d4e5f6 \
+    E2E_RESOURCE_SERVICE=worker \
+    HAPPYLEARN_PHASE5_RESOURCE_IDENTITY_CONTRACT=1 \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=resources \
+    "$target" --resource-identity-contract-probe \
+      phase5-resource-canary "$resource_id" \
+      happylearn-phase5-live-a1b2c3d4e5f6 a1b2c3d4e5f6 worker \
+      >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "resource identity probe $mode returned $status, expected $expected_status"
+}
+
+run_resource_identity_probe resource_identity_safe 0
+for mode in \
+  resource_identity_not_found resource_identity_list_failure \
+  resource_identity_inspect_failure resource_identity_id \
+  resource_identity_project resource_identity_owner resource_identity_service \
+  resource_identity_unbounded resource_identity_memory_unbounded \
+  resource_identity_oom resource_identity_restart; do
+  run_resource_identity_probe "$mode" 1
+done
+
 run_audit_probe() {
   local mode="$1"
   local expected_status="$2"
-  local status=0
+  local status=0 user_file=access_key password_file=secret_key
+  local kms_file=kms_master_key config_file=config.env
   : >"$tmpdir/docker.log"
   case "$mode" in
     safe)
@@ -388,6 +866,26 @@ run_audit_probe() {
         docker create --name phase5-contract-canary \
           alpine:3.22.1 phase5-e2e-secret-marker >/dev/null
       ;;
+    aistor_defaults|aistor_user_mutation|aistor_password_mutation|\
+      aistor_kms_mutation|aistor_config_mutation|aistor_empty_mutation)
+      case "$mode" in
+        aistor_user_mutation) user_file=/access_key ;;
+        aistor_password_mutation) password_file=changed-secret-key ;;
+        aistor_kms_mutation) kms_file=/kms_master_key ;;
+        aistor_config_mutation) config_file=changed.env ;;
+        aistor_empty_mutation) config_file='' ;;
+      esac
+      PATH="$tmpdir/bin:$PATH" \
+        E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+        E2E_FAKE_DOCKER_MODE="$mode" \
+        E2E_FAKE_DOCKER_STATE="$tmpdir/canary-state" \
+        docker create --name phase5-contract-canary \
+          -e "MINIO_ROOT_USER_FILE=$user_file" \
+          -e "MINIO_ROOT_PASSWORD_FILE=$password_file" \
+          -e "MINIO_KMS_SECRET_KEY_FILE=$kms_file" \
+          -e "MINIO_CONFIG_ENV_FILE=$config_file" \
+          alpine:3.22.1 sleep 30 >/dev/null
+      ;;
   esac
   PATH="$tmpdir/bin:$PATH" \
     E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
@@ -412,39 +910,113 @@ run_audit_probe safe 0
 run_audit_probe env_file 1
 run_audit_probe secret_env 1
 run_audit_probe literal_argv 1
+run_audit_probe aistor_defaults 0
+run_audit_probe aistor_user_mutation 1
+run_audit_probe aistor_password_mutation 1
+run_audit_probe aistor_kms_mutation 1
+run_audit_probe aistor_config_mutation 1
+run_audit_probe aistor_empty_mutation 1
 
 run_cleanup_probe() {
   local mode="$1"
-  local expect_removed="$2"
+  local expected_status="$2"
+  local expect_removed="$3"
+  local cleanup_id='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   local status=0
   : >"$tmpdir/docker.log"
   PATH="$tmpdir/bin:$PATH" \
     E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
     E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
     E2E_FAKE_DOCKER_MODE="$mode" \
-    E2E_CLEANUP_ID=phase5-owned-id \
+    E2E_CLEANUP_NAME=phase5-cleanup-canary \
+    E2E_CLEANUP_ID="$cleanup_id" \
     E2E_CLEANUP_PROJECT=happylearn-phase5-live-a1b2c3d4e5f6 \
     E2E_CLEANUP_OWNER=a1b2c3d4e5f6 \
     HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
     HAPPYLEARN_E2E_GROUP=phase5 \
     "$target" --cleanup-container-ownership-probe \
-      phase5-cleanup-canary phase5-owned-id \
+      phase5-cleanup-canary "$cleanup_id" \
       happylearn-phase5-live-a1b2c3d4e5f6 a1b2c3d4e5f6 \
       >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
-  [[ "$status" -eq 0 ]] ||
-    fail "cleanup ownership probe $mode returned $status"
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "cleanup ownership probe $mode returned $status, expected $expected_status"
   if [[ "$expect_removed" == yes ]]; then
-    grep -Fq 'rm -f phase5-owned-id' "$tmpdir/docker.log" ||
+    grep -Fq "rm -f $cleanup_id" "$tmpdir/docker.log" ||
       fail 'owned cleanup probe did not remove the exact recorded ID'
   elif grep -Fq 'rm -f' "$tmpdir/docker.log"; then
     fail 'collision cleanup probe removed an unowned container'
   fi
 }
 
-run_cleanup_probe cleanup_owned yes
-run_cleanup_probe cleanup_collision no
+run_cleanup_probe cleanup_owned 0 yes
+run_cleanup_probe cleanup_collision 3 no
+
+run_cleanup_failure_probe() {
+  local mode="$1"
+  local expected_status="$2"
+  local expect_removed="$3"
+  local original_status="${4:-0}"
+  local cleanup_kind="${5:-container}"
+  local cleanup_id='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+  local cleanup_name=phase5-cleanup-failure-canary
+  local removal_fragment
+  local status=0
+  case "$cleanup_kind" in
+    container) removal_fragment="rm -f $cleanup_id" ;;
+    network) removal_fragment="network rm $cleanup_id" ;;
+    volume) removal_fragment="volume rm $cleanup_name" ;;
+    image) removal_fragment="image rm sha256:$cleanup_id" ;;
+    *) fail "unknown cleanup kind: $cleanup_kind" ;;
+  esac
+  : >"$tmpdir/docker.log"
+  rm -f "$tmpdir/cleanup-state.retagged"
+  PATH="$tmpdir/bin:$PATH" \
+    E2E_UNEXPECTED_DOCKER_CALL="$tmpdir/docker-called" \
+    E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+    E2E_FAKE_DOCKER_MODE="$mode" \
+    E2E_FAKE_DOCKER_STATE="$tmpdir/cleanup-state" \
+    E2E_CLEANUP_NAME="$cleanup_name" \
+    E2E_CLEANUP_ID="$cleanup_id" \
+    E2E_CLEANUP_PROJECT=happylearn-phase5-live-a1b2c3d4e5f6 \
+    E2E_CLEANUP_OWNER=a1b2c3d4e5f6 \
+    E2E_CLEANUP_KIND="$cleanup_kind" \
+    HAPPYLEARN_PHASE5_CLEANUP_FAILURE_CONTRACT=1 \
+    HAPPYLEARN_PHASE5_CLEANUP_KIND="$cleanup_kind" \
+    HAPPYLEARN_PHASE5_CLEANUP_ORIGINAL_STATUS="$original_status" \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=phase5 \
+    "$target" --cleanup-failure-contract-probe \
+      "$cleanup_name" "$cleanup_id" \
+      happylearn-phase5-live-a1b2c3d4e5f6 a1b2c3d4e5f6 \
+      >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
+  if [[ "$status" -ne "$expected_status" ]]; then
+    tail -n 160 "$tmpdir/stderr" >&2
+    sed -n '1,80p' "$tmpdir/docker.log" >&2
+    fail "cleanup failure probe $mode returned $status, expected $expected_status"
+  fi
+  if [[ "$expect_removed" == yes ]]; then
+    grep -Fq "$removal_fragment" "$tmpdir/docker.log" ||
+      fail "cleanup failure probe $cleanup_kind/$mode skipped exact removal"
+  elif grep -Fq "$removal_fragment" "$tmpdir/docker.log"; then
+    fail "cleanup failure probe $cleanup_kind/$mode removed an unowned or uncertain resource"
+  fi
+}
+
+for cleanup_kind in container network volume image; do
+  run_cleanup_failure_probe cleanup_owned 0 yes 0 "$cleanup_kind"
+  run_cleanup_failure_probe cleanup_not_found 0 no 0 "$cleanup_kind"
+  run_cleanup_failure_probe cleanup_inspect_failure 1 no 0 "$cleanup_kind"
+  run_cleanup_failure_probe cleanup_remove_failure 1 yes 0 "$cleanup_kind"
+  run_cleanup_failure_probe cleanup_collision 1 no 0 "$cleanup_kind"
+done
+run_cleanup_failure_probe cleanup_retag_race 0 yes 0 image
+run_cleanup_failure_probe cleanup_remove_failure 42 yes 42
 
 run_coordinator_one_shot_probe() {
+  local docker_mode="${1:-coordinator}"
+  local coordinator_mode="${2:-audit}"
+  local expected_status="${3:-0}"
+  local expected_ledger="${4:-empty}"
   local record="$tmpdir/coordinator-one-shots"
   local one_shot_id='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
   local project='happylearn-phase5-live-a1b2c3d4e5f6'
@@ -454,31 +1026,49 @@ run_coordinator_one_shot_probe() {
   chmod 0600 "$record"
   printf '%s\n' PATH=/usr/bin >"$tmpdir/coordinator-state.env"
   printf '%s\n' safe >"$tmpdir/coordinator-state.cmd"
+  rm -f "$tmpdir/coordinator-state.removed"
   : >"$tmpdir/docker.log"
   PATH="$tmpdir/bin:$PATH" \
     E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
-    E2E_FAKE_DOCKER_MODE=coordinator \
+    E2E_FAKE_DOCKER_MODE="$docker_mode" \
     E2E_FAKE_DOCKER_STATE="$tmpdir/coordinator-state" \
     E2E_COORDINATOR_ID="$one_shot_id" \
     E2E_COORDINATOR_PROJECT="$project" \
     E2E_COORDINATOR_OWNER="$owner" \
     HAPPYLEARN_PHASE5_COORDINATOR_CONTRACT=1 \
+    HAPPYLEARN_PHASE5_COORDINATOR_MODE="$coordinator_mode" \
     HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
     HAPPYLEARN_E2E_GROUP=recovery \
     "$target" --coordinator-one-shot-probe \
       "$record" "$project" "$owner" \
       >"$tmpdir/stdout" 2>"$tmpdir/stderr" || status=$?
-  [[ "$status" -eq 0 && ! -s "$record" ]] ||
-    fail "coordinator one-shot probe returned $status or retained its ledger"
-  grep -Fq \
-    'rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
-    "$tmpdir/docker.log" ||
-    fail 'coordinator one-shot probe did not remove the exact audited ID'
-  grep -Fq '{{json .Config.Env}}' "$tmpdir/docker.log" ||
-    fail 'coordinator one-shot probe skipped runtime metadata audit'
+  [[ "$status" -eq "$expected_status" ]] ||
+    fail "coordinator probe $docker_mode/$coordinator_mode returned $status"
+  if [[ "$expected_ledger" == empty ]]; then
+    [[ ! -s "$record" ]] ||
+      fail "coordinator probe $docker_mode retained a completed ledger"
+  else
+    grep -Fxq "$one_shot_id" "$record" ||
+      fail "coordinator probe $docker_mode advanced an uncertain ledger"
+  fi
+  if [[ "$docker_mode" == coordinator ]]; then
+    grep -Fq \
+      'rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+      "$tmpdir/docker.log" ||
+      fail 'coordinator one-shot probe did not remove the exact audited ID'
+    grep -Fq '{{json .Config.Env}}' "$tmpdir/docker.log" ||
+      fail 'coordinator one-shot probe skipped runtime metadata audit'
+  fi
 }
 
 run_coordinator_one_shot_probe
+run_coordinator_one_shot_probe coordinator_not_found cleanup 0 empty
+run_coordinator_one_shot_probe coordinator_not_found audit 1 retained
+run_coordinator_one_shot_probe coordinator_list_failure cleanup 1 retained
+run_coordinator_one_shot_probe coordinator_inspect_failure cleanup 1 retained
+run_coordinator_one_shot_probe coordinator_remove_failure cleanup 1 retained
+run_coordinator_one_shot_probe coordinator_post_list_failure cleanup 1 retained
+run_coordinator_one_shot_probe coordinator_collision cleanup 1 retained
 
 run_signal_probe() {
   local ready_file="$tmpdir/signal.ready"
@@ -529,6 +1119,59 @@ run_signal_probe() {
 }
 
 run_signal_probe
+
+run_ownership_window_signal_probe() {
+  local mode="$1"
+  local ready_file="$tmpdir/${mode}.ready"
+  local child_pid_file="$tmpdir/${mode}-child.pid"
+  local child_pid signal_status=0 attempt child_alive=false
+  : >"$tmpdir/docker.log"
+  PATH="$tmpdir/bin:$PATH" \
+    E2E_FAKE_DOCKER_LOG="$tmpdir/docker.log" \
+    E2E_FAKE_DOCKER_MODE="$mode" \
+    E2E_FAKE_DOCKER_STATE="$tmpdir/${mode}-state" \
+    E2E_SIGNAL_READY_FILE="$ready_file" \
+    E2E_SIGNAL_CHILD_PID_FILE="$child_pid_file" \
+    HAPPYLEARN_PHASE5_OWNERSHIP_SIGNAL_CONTRACT=1 \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$readable_license" \
+    HAPPYLEARN_E2E_GROUP=phase5 \
+    "$target" --ownership-signal-contract-probe \
+      "$ready_file" "$child_pid_file" \
+      >"$tmpdir/${mode}.stdout" 2>"$tmpdir/${mode}.stderr" &
+  signal_target_pid=$!
+  for attempt in $(seq 1 100); do
+    [[ -f "$ready_file" && -f "$child_pid_file" ]] && break
+    kill -0 "$signal_target_pid" 2>/dev/null ||
+      fail "ownership signal probe $mode exited before resource creation"
+    sleep 0.05
+  done
+  [[ -f "$ready_file" && -f "$child_pid_file" ]] ||
+    fail "ownership signal probe $mode did not become ready"
+  child_pid="$(<"$child_pid_file")"
+  [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] ||
+    fail "ownership signal probe $mode exposed an invalid Docker child PID"
+  kill -TERM "$signal_target_pid"
+  if wait "$signal_target_pid"; then
+    signal_status=0
+  else
+    signal_status=$?
+  fi
+  signal_target_pid=''
+  kill -0 "$child_pid" 2>/dev/null && child_alive=true
+  [[ "$signal_status" == 143 && "$child_alive" == false ]] ||
+    fail "ownership signal probe $mode status=$signal_status child_alive=$child_alive"
+  if [[ "$mode" == ownership_signal ]]; then
+    grep -Fq \
+      'network rm ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+      "$tmpdir/docker.log" ||
+      fail 'ownership signal probe did not remove the exact owned network ID'
+  elif grep -Fq 'network rm' "$tmpdir/docker.log"; then
+    fail 'ownership signal probe removed an external collision network'
+  fi
+}
+
+run_ownership_window_signal_probe ownership_signal
+run_ownership_window_signal_probe ownership_signal_collision
 
 mkdir -m 0700 "$tmpdir/live-root"
 HAPPYLEARN_BACKUP_LIVE_ROOT="$tmpdir/live-root" \
