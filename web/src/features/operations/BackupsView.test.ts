@@ -277,6 +277,22 @@ describe('BackupsView', () => {
     expect(document.activeElement).toBe(notice.element)
   })
 
+  it('creates a portable idempotency key when randomUUID is unavailable', async () => {
+    const getRandomValues = vi.fn((target: Uint8Array) => {
+      target.set(Array.from({ length: 16 }, (_, index) => index))
+      return target
+    })
+    vi.stubGlobal('crypto', { getRandomValues })
+    const wrapper = mountBackups()
+    await flushPromises()
+    await wrapper.get('[data-testid="queue-open"]').trigger('click')
+    await wrapper.get('[data-testid="queue-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(queueBackup).toHaveBeenCalledWith('00010203-0405-4607-8809-0a0b0c0d0e0f')
+    expect(getRandomValues).toHaveBeenCalledOnce()
+  })
+
   it('renders an explicit empty state and retryable focused load errors', async () => {
     vi.mocked(listBackups).mockResolvedValueOnce({ items: [], next: null })
     const empty = mountBackups()

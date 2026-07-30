@@ -1317,9 +1317,16 @@ build_images() {
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
     -t "$app_image" "$repo_root"
   record_owned_image "$app_image"
-  docker_bounded 1200 build -f "$repo_root/Dockerfile.worker" \
-    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
-    -t "$worker_image" "$repo_root"
+  if [[ "$e2e_group" == all ]]; then
+    docker_bounded 1200 build -f "$repo_root/Dockerfile.worker" \
+      --no-cache-filter runtime \
+      --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+      -t "$worker_image" "$repo_root"
+  else
+    docker_bounded 1200 build -f "$repo_root/Dockerfile.worker" \
+      --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+      -t "$worker_image" "$repo_root"
+  fi
   record_owned_image "$worker_image"
   docker_bounded 1200 build -f "$repo_root/Dockerfile.backup" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
@@ -1781,7 +1788,7 @@ INSERT INTO operational_alerts(
   consecutive_failures,consecutive_successes,version
 ) VALUES (
   '54000000-0000-4000-8000-000000000001',
-  'phase5-e2e-open-backup-alert','backup','warning','open',
+  'phase5_e2e_open_backup_alert','backup','warning','open',
   clock_timestamp()-interval '10 minutes',clock_timestamp()-interval '1 minute',
   7200,3600,'Phase 5 deterministic backup freshness warning',
   'phase5-e2e-seed',3,0,1
@@ -1843,6 +1850,27 @@ SQL
     psql --username happylearn --dbname happylearn \
       --no-psqlrc --set ON_ERROR_STOP=1 \
       --command "$(<"$seed_sql_file")"
+}
+
+reopen_phase5_browser_alert() {
+  local remaining
+  docker_bounded 120 exec "$postgres" \
+    psql --username happylearn --dbname happylearn \
+      --no-psqlrc --set ON_ERROR_STOP=1 --command "
+UPDATE operational_alerts
+SET state='open',acknowledged_by=NULL,acknowledged_at=NULL,resolved_at=NULL,
+    consecutive_failures=3,consecutive_successes=0,version=version+1
+WHERE id='54000000-0000-4000-8000-000000000001';"
+  docker_capture_bounded remaining 120 exec "$postgres" \
+    psql --username happylearn --dbname happylearn \
+      --no-psqlrc --quiet --tuples-only --no-align \
+      --set ON_ERROR_STOP=1 --command \
+      "SELECT count(*) FROM operational_alerts
+       WHERE id='54000000-0000-4000-8000-000000000001'
+         AND state='open' AND acknowledged_by IS NULL
+         AND acknowledged_at IS NULL AND resolved_at IS NULL
+         AND consecutive_failures>=2;"
+  [[ "$remaining" == 1 ]]
 }
 
 remove_phase5_browser_backup_seed() {
@@ -2876,6 +2904,8 @@ case "$e2e_group" in
   all)
     status=0
     run_all_desktop || status="$(preserve_first_failure "$status" "$?")"
+    reopen_phase5_browser_alert ||
+      status="$(preserve_first_failure "$status" "$?")"
     run_all_mobile || status="$(preserve_first_failure "$status" "$?")"
     remove_phase5_browser_backup_seed ||
       status="$(preserve_first_failure "$status" "$?")"

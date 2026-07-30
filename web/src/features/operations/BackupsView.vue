@@ -8,6 +8,7 @@ import {
 } from 'vue'
 import { APIError } from '../../api/client'
 import { useSessionStore } from '../../stores/session'
+import { uuidV4 } from '../../utils/uuid'
 import {
   listBackups,
   queueBackup,
@@ -216,7 +217,7 @@ function closeQueueDialog() {
 
 async function submitQueue() {
   if (queueing.value) return
-  if (!queueKey) queueKey = crypto.randomUUID()
+  if (!queueKey) queueKey = uuidV4()
   queueing.value = true
   queueError.value = ''
   queueRequestId.value = ''

@@ -318,6 +318,11 @@ fi
 require_literal "$target" 'run_phase5_desktop'
 require_literal "$target" 'tests/e2e/operations.spec.ts tests/e2e/backup-restore.spec.ts'
 require_literal "$target" '--project=chromium'
+require_literal "$target" 'if [[ "$e2e_group" == all ]]; then'
+require_literal "$target" '--no-cache-filter runtime'
+if grep -Fq -- 'worker_build_cache_args' "$target"; then
+  fail 'worker cache refresh depended on a Bash 3.2-unsafe empty array'
+fi
 require_literal "$target" 'run_phase5_mobile'
 require_literal "$target" '--project=mobile --grep @phase5-mobile'
 require_literal "$target" 'run_all_desktop'
@@ -330,6 +335,10 @@ require_literal "$target" 'run_restore_proof'
 require_literal "$target" 'phase5-restore-verify.sh'
 require_literal "$target" 'seed_phase5_browser_data'
 require_literal "$target" 'INSERT INTO operational_alerts'
+require_literal "$target" "'phase5_e2e_open_backup_alert'"
+if grep -Fq -- 'phase5-e2e-open-backup-alert' "$target"; then
+  fail 'Phase 5 alert seed used a client-rejected public identifier'
+fi
 require_literal "$target" "'open'"
 require_literal "$target" 'INSERT INTO backup_runs'
 require_literal "$target" "'succeeded'"
@@ -464,6 +473,19 @@ require_literal "$target" 'AWS_SECRET_ACCESS_KEY'
 require_literal "$target" 'HAPPYLEARN_DATABASE_URL'
 require_literal "$target" \
   '{{json .Config.Env}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}'
+
+all_group_block="$(sed -n '/^  all)$/,/^    ;;$/p' "$target")"
+desktop_line="$(grep -n 'run_all_desktop' <<<"$all_group_block" | cut -d: -f1)"
+reopen_line="$(
+  grep -n 'reopen_phase5_browser_alert' <<<"$all_group_block" | cut -d: -f1
+)"
+mobile_line="$(grep -n 'run_all_mobile' <<<"$all_group_block" | cut -d: -f1)"
+[[ "$desktop_line" =~ ^[0-9]+$ &&
+  "$reopen_line" =~ ^[0-9]+$ &&
+  "$mobile_line" =~ ^[0-9]+$ &&
+  "$desktop_line" -lt "$reopen_line" &&
+  "$reopen_line" -lt "$mobile_line" ]] ||
+  fail 'all group did not restore its deterministic alert between viewports'
 
 require_literal "$target" 'trap early_cleanup EXIT'
 require_literal "$target" 'trap cleanup EXIT'

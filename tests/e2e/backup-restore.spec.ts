@@ -1,4 +1,4 @@
-import { expect, test, type APIResponse } from '@playwright/test'
+import { expect, test, type APIResponse, type Response } from '@playwright/test'
 import { csrfHeader, login } from './helpers'
 
 const adminPassword = process.env.E2E_ADMIN_PASSWORD
@@ -24,8 +24,11 @@ test.beforeAll(() => {
   if (!adminPassword) throw new Error('Phase 5 E2E admin credentials are required.')
 })
 
-async function responseJSON<T>(response: APIResponse): Promise<T> {
-  await expect(response).toBeOK()
+async function responseJSON<T>(response: APIResponse | Response): Promise<T> {
+  expect(
+    response.ok(),
+    `request failed with ${response.status()} ${response.statusText()}`,
+  ).toBe(true)
   return response.json() as Promise<T>
 }
 

@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { expect, test, type APIResponse, type Locator } from '@playwright/test'
+import {
+  expect,
+  test,
+  type APIResponse,
+  type Locator,
+  type Response,
+} from '@playwright/test'
 import {
   changePassword,
   createStudentAPI,
@@ -41,6 +47,13 @@ type AlertEnvelope = {
   }
 }
 
+type AlertListEnvelope = {
+  data: Array<{
+    id: string
+    state: string
+  }>
+}
+
 test.beforeAll(() => {
   if (!adminPassword || !studentPassword || !studentNewPassword) {
     throw new Error('Phase 5 E2E admin and student credentials are required.')
@@ -61,8 +74,11 @@ function expectSecretFreeKeys(value: unknown): void {
   }
 }
 
-async function responseJSON<T>(response: APIResponse): Promise<T> {
-  await expect(response).toBeOK()
+async function responseJSON<T>(response: APIResponse | Response): Promise<T> {
+  expect(
+    response.ok(),
+    `request failed with ${response.status()} ${response.statusText()}`,
+  ).toBe(true)
   return response.json() as Promise<T>
 }
 
@@ -116,9 +132,9 @@ test('@phase5 teacher manages operations without exposing secrets', async ({ pag
   await expect(page.getByText(new RegExp(`^版本 ${updatedSettings.data.version} ·`))).toBeVisible()
 
   await page.goto('/admin/audit')
-  await page.getByLabel('操作').fill('operations.settings_updated')
-  await page.getByLabel('目标类型').fill('system_settings')
-  await page.getByLabel('结果').selectOption('succeeded')
+  await page.getByTestId('audit-action').fill('operations.settings_updated')
+  await page.getByTestId('audit-target-type').fill('system_settings')
+  await page.getByTestId('audit-outcome').selectOption('succeeded')
   const auditResponse = page.waitForResponse((response) => {
     const url = new URL(response.url())
     return response.request().method() === 'GET'
@@ -144,7 +160,9 @@ test('@phase5 teacher manages operations without exposing secrets', async ({ pag
       && url.searchParams.get('state') === 'open'
   })
   await page.getByRole('button', { name: '应用筛选' }).click()
-  expectSecretFreeKeys(await (await filteredAlerts).json())
+  const openAlerts = await responseJSON<AlertListEnvelope>(await filteredAlerts)
+  expectSecretFreeKeys(openAlerts)
+  expect(openAlerts.data.some((alert) => alert.state === 'open')).toBe(true)
   const alertCard = page.getByTestId('alert-card').first()
   await expect(alertCard).toBeVisible()
   const alertID = await alertCard.getAttribute('data-id')
