@@ -83,6 +83,7 @@ func TestProductionHTTPAndRunnerWiringKeepsSafeSeams(t *testing.T) {
 		"runnerLogs.ai",
 		"runnerLogs.alert",
 		"runnerLogs.webhook",
+		"runnerLogs.retention",
 		"runnerLogs.loginLimiter",
 		"runnerLogs.progressLimiter",
 		"runnerLogs.searchLimiter",

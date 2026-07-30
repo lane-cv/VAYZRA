@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target="$repo_root/scripts/collect-host-metrics.sh"
+compose="$repo_root/deploy/compose.dev.yml"
+development_metrics_bearer="$repo_root/deploy/fixtures/development-metrics-bearer-do-not-use-in-production"
+development_host_hmac="$repo_root/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production"
 path_helper="$repo_root/scripts/host-metrics-path.sh"
 uid_target="$repo_root/scripts/host-metrics_uid_contract_test.sh"
 live_target="$repo_root/scripts/host-metrics_live_test.sh"
@@ -16,6 +19,14 @@ fail() {
 
 [[ -f "$target" ]] || fail "collector script is missing"
 [[ -x "$target" ]] || fail "collector script is not executable"
+[[ -f "$compose" ]] || fail "development Compose file is missing"
+[[ -f "$development_metrics_bearer" && -f "$development_host_hmac" ]] ||
+  fail "development-only monitoring secret fixtures are missing"
+for development_fixture in \
+  "$development_metrics_bearer" "$development_host_hmac"; do
+  grep -Fq 'do-not-use-in-production' "$development_fixture" ||
+    fail "development monitoring fixture is not explicitly non-production"
+done
 [[ -f "$path_helper" ]] || fail "backup path validator is missing"
 [[ -f "$uid_target" && -x "$uid_target" ]] ||
   fail "cross-UID backup path contract is missing or not executable"
@@ -45,11 +56,33 @@ require_literal '--connect-timeout'
 require_literal '--max-time'
 require_literal '64 * 1024'
 require_literal 'caddy app worker postgres redis minio'
-require_literal 'postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance'
+require_literal 'app-secrets-init postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance'
 require_literal 'host-sampler'
 require_literal 'head -c "$((MAX_FILE_BYTES + 1))"'
 require_literal 'source "$ROOT/scripts/host-metrics-path.sh"'
 require_literal 'validate_host_metrics_backup_path "$backup_path"'
+require_literal '[[ -n "$secret_file" && -n "$backup_path" && -f "$compose_file" ]] || die'
+
+require_compose_literal() {
+  grep -Fq -- "$1" "$compose" ||
+    fail "development Compose missing host-metrics wiring: $1"
+}
+
+require_compose_literal 'HAPPYLEARN_INTERNAL_LISTEN: ":9090"'
+require_compose_literal 'HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer'
+require_compose_literal 'HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac'
+require_compose_literal '"127.0.0.1:9090:9090"'
+require_compose_literal '  app-secrets-init:'
+require_compose_literal 'source: metrics_bearer_secret'
+require_compose_literal 'target: /source/metrics-bearer'
+require_compose_literal 'source: host_metrics_hmac_secret'
+require_compose_literal 'target: /source/host-metrics-hmac'
+require_compose_literal 'chown 10001:10001 "/secrets/.$${name}.new"'
+require_compose_literal 'chmod 0400 "/secrets/.$${name}.new"'
+require_compose_literal 'test "$(stat -c '"'"'%u:%g:%a'"'"' "/secrets/$${name}")" = '"'"'10001:10001:400'"'"''
+require_compose_literal 'app_secrets:/run/secrets:ro'
+require_compose_literal 'app-secrets-init:'
+require_compose_literal 'condition: service_completed_successfully'
 
 grep -Fq 'HOST_METRICS_BACKUP_RUNTIME_UID=10003' "$path_helper" ||
   fail "fixed backup runtime UID changed"
@@ -89,6 +122,209 @@ fi
 
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/host-metrics-contract.XXXXXX")"
 trap 'rm -rf "$fixture_root"' EXIT
+license_file="$fixture_root/minio.license"
+metrics_bearer_file="$fixture_root/metrics-bearer"
+host_hmac_file="$fixture_root/host-hmac-compose"
+printf '%s\n' 'development-license-fixture' >"$license_file"
+printf '%s\n' 'development-metrics-bearer-fixture' >"$metrics_bearer_file"
+printf '%s\n' 'development-host-hmac-fixture' >"$host_hmac_file"
+chmod 0600 "$license_file" "$metrics_bearer_file" "$host_hmac_file"
+
+render_monitoring_compose() {
+  local source="$1"
+  local destination="$2"
+  env \
+    HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file" \
+    HAPPYLEARN_METRICS_BEARER_SECRET_FILE="$metrics_bearer_file" \
+    HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE="$host_hmac_file" \
+    docker compose --profile '*' -f "$source" config --format json \
+      >"$destination"
+}
+
+validate_monitoring_compose() {
+  jq -e \
+    --arg metrics_source "$metrics_bearer_file" \
+    --arg hmac_source "$host_hmac_file" '
+    any(.services.app.ports[]?;
+      .host_ip == "127.0.0.1" and
+      (.published | tostring) == "9090" and
+      (.target | tostring) == "9090") and
+    .services.app.environment.HAPPYLEARN_INTERNAL_LISTEN == ":9090" and
+    .services.app.environment.HAPPYLEARN_METRICS_BEARER_SECRET_FILE ==
+      "/run/secrets/metrics-bearer" and
+    .services.app.environment.HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE ==
+      "/run/secrets/host-metrics-hmac" and
+    ((.services.app.secrets // []) | length) == 0 and
+    .services["app-secrets-init"].user == "0:0" and
+    .services["app-secrets-init"].network_mode == "none" and
+    .services["app-secrets-init"].restart == "no" and
+    (.services["app-secrets-init"].cap_drop | index("ALL")) != null and
+    (.services["app-secrets-init"].cap_add | sort) ==
+      ["CHOWN","DAC_OVERRIDE","FOWNER"] and
+    any(.services["app-secrets-init"].secrets[]?;
+      .source == "metrics_bearer_secret" and
+      .target == "/source/metrics-bearer") and
+    any(.services["app-secrets-init"].secrets[]?;
+      .source == "host_metrics_hmac_secret" and
+      .target == "/source/host-metrics-hmac") and
+    any(.services["app-secrets-init"].volumes[]?;
+      .type == "volume" and .source == "app_secrets" and
+      .target == "/secrets" and
+      ((has("read_only") | not) or .read_only == false)) and
+    any(.services.app.volumes[]?;
+      .type == "volume" and .source == "app_secrets" and
+      .target == "/run/secrets" and .read_only == true) and
+    .services.app.depends_on["app-secrets-init"].condition ==
+      "service_completed_successfully" and
+    any(.services["app-secrets-init"].command[]?;
+      contains("cp \"/source/$${name}\" \"/secrets/.$${name}.new\"")) and
+    any(.services["app-secrets-init"].command[]?;
+      contains("chown 10001:10001 \"/secrets/.$${name}.new\"")) and
+    any(.services["app-secrets-init"].command[]?;
+      contains("chmod 0400 \"/secrets/.$${name}.new\"")) and
+    any(.services["app-secrets-init"].command[]?;
+      contains("10001:10001:400")) and
+    .secrets.metrics_bearer_secret.file == $metrics_source and
+    .secrets.host_metrics_hmac_secret.file == $hmac_source
+  ' "$1" >/dev/null
+}
+
+resolved_compose="$fixture_root/compose.json"
+render_monitoring_compose "$compose" "$resolved_compose" ||
+  fail "development Compose host-metrics wiring does not render"
+validate_monitoring_compose "$resolved_compose" ||
+  fail "development Compose host-metrics wiring is incomplete"
+
+default_compose="$fixture_root/compose-default.json"
+env -u HAPPYLEARN_METRICS_BEARER_SECRET_FILE \
+  -u HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE \
+  HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file" \
+  docker compose --profile '*' -f "$compose" config --format json \
+    >"$default_compose" ||
+  fail "development Compose monitoring defaults do not render"
+jq -e \
+  --arg metrics_source "$development_metrics_bearer" \
+  --arg hmac_source "$development_host_hmac" '
+    .secrets.metrics_bearer_secret.file == $metrics_source and
+    .secrets.host_metrics_hmac_secret.file == $hmac_source
+  ' "$default_compose" >/dev/null ||
+  fail "development Compose defaults are not fixed development-only fixtures"
+
+remove_exact_line() {
+  local source="$1"
+  local line="$2"
+  local destination="$3"
+  awk -v exact="$line" '$0 != exact' "$source" >"$destination"
+}
+
+remove_secret_mount() {
+  local source="$1"
+  local secret="$2"
+  local destination="$3"
+  awk -v marker="      - source: $secret" '
+    skip > 0 { skip--; next }
+    $0 == marker { skip=1; next }
+    { print }
+  ' "$source" >"$destination"
+}
+
+remove_dependency() {
+  local source="$1"
+  local destination="$2"
+  awk '
+    skip > 0 { skip--; next }
+    $0 == "      app-secrets-init:" { skip=1; next }
+    { print }
+  ' "$source" >"$destination"
+}
+
+remove_app_secret_volume() {
+  local source="$1"
+  local destination="$2"
+  awk '
+    held != "" {
+      if (held == "    volumes:" &&
+          $0 == "      - app_secrets:/run/secrets:ro") {
+        held = ""
+        next
+      }
+      print held
+      held = ""
+    }
+    $0 == "    volumes:" {
+      held = $0
+      next
+    }
+    { print }
+    END {
+      if (held != "") {
+        print held
+      }
+    }
+  ' "$source" >"$destination"
+}
+
+for mutation in \
+  'port|      - "127.0.0.1:9090:9090"' \
+  'metrics_env|      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer' \
+  'host_env|      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac'; do
+  name="${mutation%%|*}"
+  line="${mutation#*|}"
+  mutated="$fixture_root/compose-$name.yml"
+  mutated_json="$fixture_root/compose-$name.json"
+  remove_exact_line "$compose" "$line" "$mutated"
+  render_monitoring_compose "$mutated" "$mutated_json" ||
+    fail "development Compose mutation did not render: $name"
+  if validate_monitoring_compose "$mutated_json"; then
+    fail "development Compose mutation was accepted: $name"
+  fi
+done
+
+for secret in metrics_bearer_secret host_metrics_hmac_secret; do
+  mutated="$fixture_root/compose-mount-$secret.yml"
+  mutated_json="$fixture_root/compose-mount-$secret.json"
+  remove_secret_mount "$compose" "$secret" "$mutated"
+  render_monitoring_compose "$mutated" "$mutated_json" ||
+    fail "development Compose secret mutation did not render: $secret"
+  if validate_monitoring_compose "$mutated_json"; then
+    fail "development Compose secret mutation was accepted: $secret"
+  fi
+done
+
+for mutation in \
+  'copy|          cp "/source/$${name}" "/secrets/.$${name}.new"' \
+  'owner|          chown 10001:10001 "/secrets/.$${name}.new"' \
+  'mode|          chmod 0400 "/secrets/.$${name}.new"'; do
+  name="${mutation%%|*}"
+  line="${mutation#*|}"
+  mutated="$fixture_root/compose-$name.yml"
+  mutated_json="$fixture_root/compose-$name.json"
+  remove_exact_line "$compose" "$line" "$mutated"
+  render_monitoring_compose "$mutated" "$mutated_json" ||
+    fail "development Compose init-copy mutation did not render: $name"
+  if validate_monitoring_compose "$mutated_json"; then
+    fail "development Compose init-copy mutation was accepted: $name"
+  fi
+done
+
+mutated="$fixture_root/compose-app-volume.yml"
+mutated_json="$fixture_root/compose-app-volume.json"
+remove_app_secret_volume "$compose" "$mutated"
+render_monitoring_compose "$mutated" "$mutated_json" ||
+  fail "development Compose app secret-volume mutation did not render"
+if validate_monitoring_compose "$mutated_json"; then
+  fail "development Compose app secret-volume mutation was accepted"
+fi
+
+mutated="$fixture_root/compose-dependency.yml"
+mutated_json="$fixture_root/compose-dependency.json"
+remove_dependency "$compose" "$mutated"
+render_monitoring_compose "$mutated" "$mutated_json" ||
+  fail "development Compose dependency mutation did not render"
+if validate_monitoring_compose "$mutated_json"; then
+  fail "development Compose dependency mutation was accepted"
+fi
+
 fake_bin="$fixture_root/bin"
 mkdir -p "$fake_bin"
 command_log="$fixture_root/commands.log"
@@ -129,7 +365,7 @@ if [[ "$*" == *" ps --format json"* ]]; then
       printf '%s\n' '[{"ID":"unknown-id","Service":"customer-prod-db","State":"running","Health":"healthy","Command":"normal-command"}]'
       ;;
     *)
-      printf '%s\n' '[{"ID":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Service":"backup","State":"exited","Health":"","Command":"/app/backup","Publishers":[]},{"ID":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","Service":"redis","State":"exited","Health":"","Command":"redis-server","Publishers":[]},{"ID":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Service":"app","State":"running","Health":"healthy","RestartCount":3,"Command":"/app/server","Publishers":[]}]'
+      printf '%s\n' '[{"ID":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Service":"backup","State":"exited","Health":"","Command":"/app/backup","Publishers":[]},{"ID":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","Service":"redis","State":"exited","Health":"","Command":"redis-server","Publishers":[]},{"ID":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","Service":"app-secrets-init","State":"exited","Health":"","Command":"/bin/sh","Publishers":[]},{"ID":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Service":"app","State":"running","Health":"healthy","RestartCount":3,"Command":"/app/server","Publishers":[]}]'
       ;;
   esac
   exit 0
@@ -274,6 +510,7 @@ jq -e '
   .compose == [
     {"service":"backup","state":"exited","health":"","restarts":null},
     {"service":"redis","state":"exited","health":"","restarts":null},
+    {"service":"app-secrets-init","state":"exited","health":"","restarts":null},
     {"service":"app","state":"running","health":"healthy","restarts":3}
   ] and
   .stats == [

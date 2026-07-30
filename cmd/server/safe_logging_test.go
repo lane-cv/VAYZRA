@@ -30,6 +30,7 @@ func TestProductionRunnerLogsAreNonNilSafeCallbacks(t *testing.T) {
 		{"ai.runner", logs.ai},
 		{"operations.alert", logs.alert},
 		{"operations.webhook", logs.webhook},
+		{"operations.retention", logs.retention},
 		{"redis.login", logs.loginLimiter},
 		{"redis.progress", logs.progressLimiter},
 		{"redis.search", logs.searchLimiter},

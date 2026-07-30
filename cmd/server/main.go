@@ -286,6 +286,7 @@ type applicationDependencies struct {
 	startAlertRunner              func(*pgxpool.Pool) func()
 	startAlertRunnerWithWebhook   func(*pgxpool.Pool, bool) func()
 	startWebhookRunner            func(*pgxpool.Pool, operations.WebhookTestSender) (func(), error)
+	startRetention                func(*pgxpool.Pool) (func(), error)
 	newOperations                 func(*pgxpool.Pool) operationsRuntime
 	newAdminOperations            func(*pgxpool.Pool, operationsRuntime) operations.HTTPService
 	newAdminOperationsWithWebhook func(
@@ -324,6 +325,7 @@ type productionRunnerLogs struct {
 	ai                  func(string)
 	alert               func(string)
 	webhook             func(string)
+	retention           func(string)
 	loginLimiter        func(string)
 	progressLimiter     func(string)
 	searchLimiter       func(string)
@@ -337,6 +339,7 @@ func newProductionRunnerLogs(logger safelog.Logger) productionRunnerLogs {
 		ai:              safeCategoryLogger(logger, "ai.runner"),
 		alert:           safeCategoryLogger(logger, "operations.alert"),
 		webhook:         safeCategoryLogger(logger, "operations.webhook"),
+		retention:       safeCategoryLogger(logger, "operations.retention"),
 		loginLimiter:    safeCategoryLogger(logger, "redis.login"),
 		progressLimiter: safeCategoryLogger(logger, "redis.progress"),
 		searchLimiter:   safeCategoryLogger(logger, "redis.search"),
@@ -447,6 +450,12 @@ func buildProductionApplicationWithLog(
 				pool,
 				sender,
 				runnerLogs.webhook,
+			)
+		},
+		startRetention: func(pool *pgxpool.Pool) (func(), error) {
+			return newProductionRetentionSchedulerWithLog(
+				pool,
+				runnerLogs.retention,
 			)
 		},
 		newOperations: func(pool *pgxpool.Pool) operationsRuntime {
@@ -847,6 +856,18 @@ func buildApplicationRuntime(
 			closeOtherResources()
 		}
 	}
+	if deps.startRetention != nil {
+		stopRetention, startErr := deps.startRetention(pool)
+		if startErr != nil || stopRetention == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize operations retention")
+		}
+		closeOtherResources := closeResources
+		closeResources = func() {
+			stopRetention()
+			closeOtherResources()
+		}
+	}
 	var internalHandler http.Handler
 	if deps.newInternal != nil {
 		internalHandler, err = deps.newInternal(pool, redisClient, cfg)
@@ -1217,6 +1238,59 @@ func newProductionWebhookRunnerWithLog(
 			LogCategory:     logCategory,
 		},
 	)
+}
+
+func newProductionRetentionSchedulerWithLog(
+	pool *pgxpool.Pool,
+	logCategory func(string),
+) (func(), error) {
+	if pool == nil {
+		return nil, operations.ErrInvalid
+	}
+	settings := operations.NewPostgresStore(pool)
+	stop, err := startProductionRetentionScheduler(
+		settings,
+		operations.NewPostgresRetentionRunner(pool),
+		time.Now,
+		logCategory,
+	)
+	if err != nil {
+		closeCtx, cancel := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+		_ = settings.Close(closeCtx)
+		cancel()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			stop()
+			closeCtx, cancel := context.WithTimeout(
+				context.Background(),
+				2*time.Second,
+			)
+			_ = settings.Close(closeCtx)
+			cancel()
+		})
+	}, nil
+}
+
+func startProductionRetentionScheduler(
+	settings operations.SettingsStore,
+	runner operations.RetentionRunner,
+	clock func() time.Time,
+	logCategory func(string),
+) (func(), error) {
+	return operations.StartRetentionScheduler(operations.RetentionScheduler{
+		Settings:    settings,
+		Runner:      runner,
+		Clock:       clock,
+		Interval:    operations.DefaultRetentionInterval,
+		RunTimeout:  operations.DefaultRetentionRunTimeout,
+		LogCategory: logCategory,
+	})
 }
 
 func newProductionInternalHandler(

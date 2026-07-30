@@ -555,6 +555,153 @@ func TestAlertRunnerInitializationFailureClosesOperationsAndPool(t *testing.T) {
 	}
 }
 
+func TestProductionApplicationStartsAndStopsRetentionBeforeOperationsAndPool(
+	t *testing.T,
+) {
+	var events []string
+	gate := &serverOperationsRuntime{events: &events}
+	handler, closeResources, err := buildApplication(
+		context.Background(),
+		config.Config{},
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) {
+				return nil, nil
+			},
+			migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) {
+				return serverAdminAuth{}, nil
+			},
+			newOperations:      func(*pgxpool.Pool) operationsRuntime { return gate },
+			newAdminOperations: newServerAdminOperations,
+			startRetention: func(*pgxpool.Pool) (func(), error) {
+				events = append(events, "retention_start")
+				return func() {
+					events = append(events, "retention_stop")
+				}, nil
+			},
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			close: func(*pgxpool.Pool) {
+				events = append(events, "pool_close")
+			},
+		},
+	)
+	if err != nil || handler == nil || closeResources == nil {
+		t.Fatalf(
+			"handler=%v cleanup_present=%t err=%v",
+			handler,
+			closeResources != nil,
+			err,
+		)
+	}
+	closeResources()
+	if got := strings.Join(events, ","); got !=
+		"retention_start,retention_stop,operations_close,pool_close" {
+		t.Fatalf("lifecycle=%s", got)
+	}
+}
+
+func TestRetentionInitializationFailureClosesOperationsAndPool(t *testing.T) {
+	for name, startRetention := range map[string]func(
+		*pgxpool.Pool,
+	) (func(), error){
+		"error": func(*pgxpool.Pool) (func(), error) {
+			return nil, errors.New("private retention detail")
+		},
+		"nil stopper": func(*pgxpool.Pool) (func(), error) {
+			return nil, nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var events []string
+			gate := &serverOperationsRuntime{events: &events}
+			handler, closeResources, err := buildApplication(
+				context.Background(),
+				config.Config{},
+				applicationDependencies{
+					open: func(
+						context.Context,
+						string,
+					) (*pgxpool.Pool, error) {
+						return nil, nil
+					},
+					migrate: func(
+						context.Context,
+						*pgxpool.Pool,
+					) error {
+						return nil
+					},
+					newAuth: func(
+						*pgxpool.Pool,
+					) (auth.HTTPService, error) {
+						return serverAdminAuth{}, nil
+					},
+					newOperations: func(*pgxpool.Pool) operationsRuntime {
+						return gate
+					},
+					newAdminOperations: newServerAdminOperations,
+					startRetention:     startRetention,
+					requireOperations:  true,
+					ready: func(
+						*pgxpool.Pool,
+					) func(context.Context) error {
+						return func(context.Context) error { return nil }
+					},
+					close: func(*pgxpool.Pool) {
+						events = append(events, "pool_close")
+					},
+				},
+			)
+			if handler != nil || closeResources != nil || err == nil ||
+				err.Error() != "initialize operations retention" ||
+				strings.Contains(err.Error(), "private") {
+				t.Fatalf(
+					"handler=%v cleanup_present=%t err=%v",
+					handler,
+					closeResources != nil,
+					err,
+				)
+			}
+			if got := strings.Join(events, ","); got !=
+				"operations_close,pool_close" {
+				t.Fatalf("lifecycle=%s", got)
+			}
+		})
+	}
+}
+
+func TestProductionRetentionHelperWiresFixedCategoryLogger(t *testing.T) {
+	secret := "postgres://private-user:private-password@private-host/database"
+	logged := make(chan string, 1)
+	stop, err := startProductionRetentionScheduler(
+		&serverRetentionSettingsStore{err: errors.New(secret)},
+		&serverRetentionRunner{},
+		time.Now,
+		func(category string) {
+			logged <- category
+		},
+	)
+	if err != nil || stop == nil {
+		t.Fatalf("stop nil=%t err=%v", stop == nil, err)
+	}
+	select {
+	case category := <-logged:
+		if category != "settings_read_failed" ||
+			strings.Contains(category, secret) {
+			t.Fatalf("category=%q", category)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retention scheduler did not report startup failure")
+	}
+	stop()
+
+	if got, err := newProductionRetentionSchedulerWithLog(nil, nil); got != nil || !errors.Is(err, operations.ErrInvalid) {
+		t.Fatalf("nil-pool stop nil=%t err=%v", got == nil, err)
+	}
+}
+
 func TestProductionApplicationWiresAdminBackups(t *testing.T) {
 	var events []string
 	gate := &serverOperationsRuntime{events: &events}
@@ -758,3 +905,33 @@ func TestOperationalGateClosesOnRedisInitializationFailures(t *testing.T) {
 }
 
 var _ operationsRuntime = (*serverOperationsRuntime)(nil)
+
+type serverRetentionSettingsStore struct {
+	err error
+}
+
+func (store *serverRetentionSettingsStore) GetSettings(
+	context.Context,
+) (operations.Settings, error) {
+	return operations.Settings{
+		OperationalSampleRetentionDays: 7,
+	}, store.err
+}
+
+func (*serverRetentionSettingsStore) UpdateSettings(
+	context.Context,
+	operations.Principal,
+	operations.Settings,
+) (operations.Settings, error) {
+	return operations.Settings{}, nil
+}
+
+type serverRetentionRunner struct{}
+
+func (*serverRetentionRunner) RunOnce(
+	context.Context,
+	time.Time,
+	int,
+) (operations.RetentionResult, error) {
+	return operations.RetentionResult{}, nil
+}

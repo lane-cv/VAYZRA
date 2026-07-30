@@ -6,7 +6,7 @@ source "$ROOT/scripts/host-metrics-path.sh"
 INTERNAL_ENDPOINT='http://127.0.0.1:9090/internal/host-samples'
 MAX_FILE_BYTES=$((64 * 1024))
 monitored_service_allowlist=(caddy app worker postgres redis minio)
-auxiliary_service_allowlist=(postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance)
+auxiliary_service_allowlist=(app-secrets-init postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance)
 
 die() {
   printf '%s\n' 'host metrics collection failed' >&2

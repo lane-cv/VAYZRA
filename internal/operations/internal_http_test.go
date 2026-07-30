@@ -114,6 +114,9 @@ func TestInternalMetricsRequiresExactBearerAndUsesPrometheusHeaders(t *testing.T
 			if result.Code != http.StatusNotFound || result.Body.String() != "404 page not found\n" {
 				t.Fatalf("status=%d body=%q", result.Code, result.Body.String())
 			}
+			if got := result.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control=%q", got)
+			}
 		})
 	}
 
@@ -152,6 +155,9 @@ func TestInternalMetricsFailsClosedWithoutLeakingProviderErrors(t *testing.T) {
 		strings.Contains(result.Body.String(), "secret") ||
 		strings.Contains(result.Body.String(), "database") {
 		t.Fatalf("status=%d body=%q", result.Code, result.Body.String())
+	}
+	if got := result.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control=%q", got)
 	}
 }
 
@@ -207,6 +213,9 @@ func TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay(t *tes
 	handler.ServeHTTP(replayResult, replay)
 	if replayResult.Code != http.StatusNotFound || len(sink.batches) != 1 {
 		t.Fatalf("status=%d batches=%d", replayResult.Code, len(sink.batches))
+	}
+	if got := replayResult.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control=%q", got)
 	}
 }
 

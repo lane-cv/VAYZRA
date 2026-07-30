@@ -123,6 +123,56 @@ services:
     mem_limit: 512m
     cpus: 0.3
 
+  app-secrets-init:
+    logging: *default-logging
+    image: debian:12.12-slim
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/timeout
+      - --foreground
+      - --kill-after=5s
+      - 30s
+      - /bin/sh
+      - -eu
+      - -c
+    command:
+      - |
+        for name in metrics-bearer host-metrics-hmac; do
+          test -f "/source/$${name}"
+        done
+        for name in metrics-bearer host-metrics-hmac; do
+          rm -f "/secrets/.$${name}.new"
+          cp "/source/$${name}" "/secrets/.$${name}.new"
+          chown 10001:10001 "/secrets/.$${name}.new"
+          chmod 0400 "/secrets/.$${name}.new"
+        done
+        for name in metrics-bearer host-metrics-hmac; do
+          mv -f "/secrets/.$${name}.new" "/secrets/$${name}"
+          test "$(stat -c '%u:%g:%a' "/secrets/$${name}")" = '10001:10001:400'
+        done
+        chown 10001:10001 /secrets
+        chmod 0500 /secrets
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - app_secrets:/secrets:rw
+    secrets:
+      - source: metrics_bearer_secret
+        target: /source/metrics-bearer
+      - source: host_metrics_hmac_secret
+        target: /source/host-metrics-hmac
+    network_mode: "none"
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.05
+
   app:
     logging: *default-logging
     build:
@@ -132,10 +182,13 @@ services:
     environment:
       HAPPYLEARN_ENV: development
       HAPPYLEARN_LISTEN: ":8080"
+      HAPPYLEARN_INTERNAL_LISTEN: ":9090"
       HAPPYLEARN_DATABASE_URL: postgres://happylearn:happylearn_dev@postgres:5432/happylearn?sslmode=disable
       HAPPYLEARN_REDIS_URL: redis://redis:6379/0
       HAPPYLEARN_LOGIN_THROTTLE_SECRET: development-only-app-secret-at-least-32-bytes
       HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer
+      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac
       HAPPYLEARN_AI_MASTER_KEY: ${HAPPYLEARN_AI_MASTER_KEY:-}
       HAPPYLEARN_AI_MASTER_KEY_VERSION: ${HAPPYLEARN_AI_MASTER_KEY_VERSION:-1}
       HAPPYLEARN_AI_BUSINESS_TIMEZONE: ${HAPPYLEARN_AI_BUSINESS_TIMEZONE:-Asia/Shanghai}
@@ -149,6 +202,9 @@ services:
       HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
     ports:
       - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - app_secrets:/run/secrets:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=0700
@@ -159,6 +215,8 @@ services:
     mem_limit: 256m
     cpus: 0.2
     depends_on:
+      app-secrets-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -371,10 +429,15 @@ volumes:
   minio_data:
   postgres_tls:
   backup_secrets:
+  app_secrets:
 
 secrets:
   aistor_license:
     file: ${HAPPYLEARN_AISTOR_LICENSE_FILE:?set HAPPYLEARN_AISTOR_LICENSE_FILE to the downloaded AIStor Free minio.license path}
+  metrics_bearer_secret:
+    file: ${HAPPYLEARN_METRICS_BEARER_SECRET_FILE:-./fixtures/development-metrics-bearer-do-not-use-in-production}
+  host_metrics_hmac_secret:
+    file: ${HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE:-./fixtures/development-host-metrics-hmac-do-not-use-in-production}
 
 x-happylearn-backup-secret-files:
   required:

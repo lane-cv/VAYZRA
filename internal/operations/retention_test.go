@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -483,6 +484,104 @@ FROM backup`,
 		t.Fatalf("result=%+v want=%+v", result, want)
 	}
 	assertRetentionTableCounts(t, pool, 0)
+}
+
+func TestPostgresRetentionRunnerKeepsDeliveriesForOpenAndAcknowledgedAlerts(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	pool, runner := migratedRetentionRunner(t)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	old := now.AddDate(0, 0, -metadataRetentionDays).Add(-time.Second)
+	if _, err := pool.Exec(ctx, `
+WITH identity AS (
+  SELECT gen_random_uuid() AS id
+), acknowledged_user AS (
+  INSERT INTO users(
+    id,username,display_name,role,status,password_hash,must_change_password
+  )
+  SELECT
+    id,'retention_history_'||replace(id::text,'-',''),
+    'Retention History Student','student','active','hash',false
+  FROM identity
+  RETURNING id
+), open_alert AS (
+  INSERT INTO operational_alerts(
+    dedupe_key,category,severity,state,first_observed_at,last_observed_at,
+    current_value,threshold_value,summary
+  )
+  VALUES(
+    'retention-history-open','backup','warning','open',$1,$1,
+    1,2,'open retention history'
+  )
+  RETURNING id
+), acknowledged_alert AS (
+  INSERT INTO operational_alerts(
+    dedupe_key,category,severity,state,first_observed_at,last_observed_at,
+    acknowledged_by,acknowledged_at,current_value,threshold_value,summary
+  )
+  SELECT
+    'retention-history-ack','backup','warning','acknowledged',
+    $1,$1,id,$1,1,2,'acknowledged retention history'
+  FROM acknowledged_user
+  RETURNING id,state
+), resolved_alert AS (
+  INSERT INTO operational_alerts(
+    dedupe_key,category,severity,state,first_observed_at,last_observed_at,
+    resolved_at,current_value,threshold_value,summary
+  )
+  VALUES(
+    'retention-history-resolved','backup','warning','resolved',$1,$1,$1,
+    1,2,'resolved retention history'
+  )
+  RETURNING id
+), alerts AS (
+  SELECT id FROM open_alert
+  UNION ALL
+  SELECT id FROM acknowledged_alert
+  UNION ALL
+  SELECT id FROM resolved_alert
+)
+INSERT INTO alert_deliveries(
+  alert_id,attempt,destination,outcome,started_at,finished_at
+)
+SELECT id,1,'webhook','failed',$1,$1
+FROM alerts`,
+		old,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runner.RunOnce(ctx, now, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AlertDeliveries != 1 || result.Alerts != 1 {
+		t.Fatalf("result=%+v want one resolved alert and delivery", result)
+	}
+	var states []string
+	rows, err := pool.Query(ctx, `
+SELECT alert.state
+FROM alert_deliveries AS delivery
+JOIN operational_alerts AS alert ON alert.id=delivery.alert_id
+ORDER BY alert.state`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var state string
+		if err := rows.Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(states, ","); got != "acknowledged,open" {
+		t.Fatalf("remaining delivery parent states=%s", got)
+	}
 }
 
 func TestPostgresRetentionRunnerReturnsZeroForClosedPool(t *testing.T) {

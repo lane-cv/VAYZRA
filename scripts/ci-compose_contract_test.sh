@@ -40,6 +40,7 @@ assert_expected_services() {
   local label="$2"
   local expected_services='[
     "app",
+    "app-secrets-init",
     "backup",
     "backup-secrets-init",
     "backup-storage-init",

@@ -241,6 +241,7 @@ var serviceOrderSorted = []string{"app", "caddy", "minio", "postgres", "redis", 
 
 var auxiliaryServiceOrderSorted = []string{
 	"acceptance",
+	"app-secrets-init",
 	"backup",
 	"backup-secrets-init",
 	"backup-storage-init",

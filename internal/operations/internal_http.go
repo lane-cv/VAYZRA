@@ -129,6 +129,7 @@ func NewInternalHandler(cfg InternalHTTPConfig) (http.Handler, error) {
 }
 
 func (h *internalHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/internal/metrics":
 		h.serveMetrics(w, r)

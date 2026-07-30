@@ -210,23 +210,30 @@ WHERE samples.id=expired.id`
 
 const deleteExpiredAlertDeliveriesSQL = `
 WITH expired AS (
-  SELECT id
-  FROM alert_deliveries
-  WHERE finished_at < $1
+  SELECT delivery.id
+  FROM alert_deliveries AS delivery
+  JOIN operational_alerts AS alert ON alert.id=delivery.alert_id
+  WHERE alert.state='resolved'
+    AND delivery.finished_at < $1
     AND (
       (
-        event_id IS NULL
-        AND delivery_state IS NULL
-        AND outcome IN ('succeeded','failed','cancelled')
+        delivery.event_id IS NULL
+        AND delivery.delivery_state IS NULL
+        AND delivery.outcome IN ('succeeded','failed','cancelled')
       )
       OR (
-        event_id IS NOT NULL
-        AND delivery_state IN ('succeeded','failed','cancelled')
+        delivery.event_id IS NOT NULL
+        AND delivery.delivery_state IN ('succeeded','failed','cancelled')
       )
     )
-  ORDER BY finished_at,alert_id,attempt,destination,id
+  ORDER BY
+    delivery.finished_at,
+    delivery.alert_id,
+    delivery.attempt,
+    delivery.destination,
+    delivery.id
   LIMIT $2
-  FOR UPDATE SKIP LOCKED
+  FOR UPDATE OF delivery SKIP LOCKED
 )
 DELETE FROM alert_deliveries AS deliveries
 USING expired

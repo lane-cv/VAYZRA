@@ -204,6 +204,7 @@ func TestParseBytesRoundsFractionalDockerUnitsUpWithoutOverflow(t *testing.T) {
 
 func TestPayloadAcceptsOnlyFixedAuxiliaryComposeServices(t *testing.T) {
 	for _, service := range []string{
+		"app-secrets-init",
 		"postgres-tls-init",
 		"minio-data-init",
 		"backup-storage-init",
