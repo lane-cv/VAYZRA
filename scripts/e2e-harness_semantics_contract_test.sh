@@ -29,9 +29,11 @@ grep -Fq -- '--read-only --user 1000:1000' "$phase2"
 grep -Fq 'runner_init=' "$phase2"
 
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 semantics_nonce="$(date +%s)-$RANDOM"
 trap 'rm -rf "$tmpdir"' EXIT
-mkdir -p "$tmpdir/bin"
+mkdir -p "$tmpdir/bin" "$tmpdir/runtime-tmp"
+export TMPDIR="$tmpdir/runtime-tmp"
 license="$tmpdir/dummy-license"
 : > "$license"
 
@@ -76,7 +78,11 @@ case "${1:-}" in
     exit 1
     ;;
   logs)
-    printf '%s\n' 'Authorization: Bearer fake-secret' 'body=fake private body'
+    if [[ "$scenario" == phase4_diagnostic ]]; then
+      printf '%s\n' 'Authorization: Bearer fake-secret' 'body=fake private body'
+    else
+      printf '%s\n' 'unknown_nonsecret_diagnostic=omitted'
+    fi
     ;;
   rm)
     shift; [[ "${1:-}" == -f ]] && shift
