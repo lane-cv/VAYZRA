@@ -4,7 +4,7 @@ export LC_ALL=C
 umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-TARGET="$ROOT/scripts/phase5-restore-verify.sh"
+TARGET="${PHASE5_RESTORE_CONTRACT_TARGET:-$ROOT/scripts/phase5-restore-verify.sh}"
 MAKEFILE="$ROOT/Makefile"
 BACKUP_ID='11111111-1111-4111-8111-111111111111'
 SNAPSHOT_ID='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -606,7 +606,7 @@ create_resource() {
     "$name" == "$project-"* &&
     "$owner" =~ ^[a-f0-9]{64}$ &&
     "$backup" == "$PHASE5_FAKE_BACKUP_ID" &&
-    "$type" =~ ^(postgres|aistor|aistor-license|network)$ ]] ||
+    "$type" =~ ^(postgres|aistor|aistor-license|secrets|network)$ ]] ||
     exit 64
   file="$(resource_file "$kind" "$name")"
   [[ ! -e "$file" ]] || exit 1
@@ -803,28 +803,24 @@ case "$kind" in
     ;;
 esac
 
-case "$kind" in
-  postgres|aistor|app|restore-check)
-    env_file="$(arg_after --env-file "$@")" || exit 64
-    [[ -f "$env_file" && ! -L "$env_file" ]] || exit 64
-    ;;
-esac
+[[ "$*" != *'--env-file'* ]] || exit 64
 
 if [[ "$*" == *'--detach'* ]]; then
   case "$kind" in
     postgres)
-      [[ "$*" == *'--tmpfs /var/run/postgresql:rw,noexec,nosuid,size=8m'* ]] ||
+      [[ "$*" == *'--tmpfs /var/run/postgresql:rw,noexec,nosuid,size=8m'* &&
+        "$*" == *'volume-subpath=postgres,readonly'* &&
+        "$*" == *'set -a; . /run/restore-secrets/runtime.env; set +a; exec /usr/local/bin/docker-entrypoint.sh postgres'* ]] ||
         exit 71
-      grep -Fxq 'POSTGRES_USER=happylearn' "$env_file" || exit 71
-      grep -Eq '^POSTGRES_PASSWORD=[a-f0-9]{64}$' "$env_file" || exit 71
       printf '%064d\n' 1
       exit 0
       ;;
     aistor)
       [[ "$*" == *'dst=/minio-license,readonly'* &&
-        "$*" != *'type=bind,src='*'minio.license'* ]] ||
+        "$*" != *'type=bind,src='*'minio.license'* &&
+        "$*" == *'volume-subpath=aistor,readonly'* &&
+        "$*" == *'set -a; . /run/restore-secrets/runtime.env; set +a; exec minio server'* ]] ||
         exit 71
-      grep -Eq '^MINIO_ROOT_PASSWORD=[a-f0-9]{64}$' "$env_file" || exit 71
       printf '%064d\n' 1
       exit 0
       ;;
@@ -834,8 +830,8 @@ if [[ "$*" == *'--detach'* ]]; then
       ;;
     app)
       grep -Fq 'PHASE5_RESTORE_SESSIONS_REVOKED' "$log" || exit 71
-      grep -Eq '^HAPPYLEARN_LOGIN_THROTTLE_SECRET=[a-f0-9]{64}$' \
-        "$env_file" ||
+      [[ "$*" == *'volume-subpath=app,readonly'* &&
+        "$*" == *'set -a; . /run/restore-secrets/runtime.env; set +a; exec /app/happylearn'* ]] ||
         exit 71
       if [[ "$mode" == cleanup_notfound ]]; then
         rm -f "$container_file"
@@ -855,6 +851,8 @@ case "$kind" in
     [[ "$mode" != nonempty_aistor ]] || exit 72
     ;;
   volume-probe-aistor-license)
+    ;;
+  volume-probe-secrets)
     ;;
   restic-check)
     [[ "$*" == *' restic --no-cache check --read-data'* &&
@@ -992,16 +990,38 @@ case "$kind" in
       "$*" != *'FOWNER'* ]] ||
       exit 64
     ;;
+  secret-init)
+    [[ "$*" == *'--network none'* &&
+      "$*" == *'--read-only'* &&
+      "$*" == *'--user 0:0'* &&
+      "$*" == *'--cap-drop ALL'* &&
+      "$*" == *'--cap-add CHOWN'* &&
+      "$*" == *'--cap-add DAC_READ_SEARCH'* &&
+      "$*" == *'dst=/secret-source,readonly'* &&
+      "$*" == *'dst=/secret-target'* &&
+      "$*" == *'PHASE5_RESTORE_SECRET_INIT'* &&
+      "$*" == *'chmod 0400'* &&
+      "$*" == *'chmod 0500'* ]] ||
+      exit 64
+    ;;
   postgres-restore)
-    [[ "$*" == *' pg_restore '* ]] || exit 64
+    [[ "$*" == *'volume-subpath=client,readonly'* &&
+      "$*" == *'PGPASSFILE=/run/restore-secrets/pgpass'* &&
+      "$*" == *' pg_restore '* ]] ||
+      exit 64
     ;;
   revoke-sessions)
+    [[ "$*" == *'volume-subpath=client,readonly'* &&
+      "$*" == *'PGPASSFILE=/run/restore-secrets/pgpass'* ]] ||
+      exit 64
     sql="$(arg_after --command "$@")" || exit 64
     [[ "$sql" == "BEGIN; UPDATE sessions "*"restore_verification"*"UPDATE operational_modes "*"mode='normal'"*"owner_id=NULL"*"lease_token_hash=NULL"*"lease_expires_at=NULL"*"entered_at=NULL"*"version=version+1"*"WHERE singleton_id=true; COMMIT; SELECT 'PHASE5_RESTORE_SESSIONS_REVOKED';" ]] ||
       exit 64
     ;;
   restore-check)
-    [[ "$*" == *"/app/happylearn-backup restore-check --backup-id ${PHASE5_FAKE_BACKUP_ID} --report-file /work/restore-check.report"* ]] ||
+    [[ "$*" == *'volume-subpath=restore-check,readonly'* &&
+      "$*" == *'set -a; . /run/restore-secrets/runtime.env; set +a; exec /app/happylearn-backup restore-check --backup-id "$1" --report-file /work/restore-check.report'* &&
+      "$*" == *"restore-check ${PHASE5_FAKE_BACKUP_ID}"* ]] ||
       exit 64
     report_mount=''
     manifest_mount=''
@@ -1043,7 +1063,6 @@ case "$kind" in
       [[ "$observed_manifest_sha256" == "$PHASE5_FAKE_MANIFEST_SHA256" ]] ||
         exit 64
     fi
-    grep -Fxq 'HAPPYLEARN_MINIO_USE_TLS=false' "$env_file" || exit 64
     active=0
     missing=0
     unexpected=0
@@ -1416,6 +1435,67 @@ fi
 
 test -x "$TARGET" || fail 'restore harness is absent'
 bash -n "$TARGET"
+assert_secret_transport_contract() {
+  local candidate="$1"
+  if grep -Fq -- '--env-file' "$candidate"; then
+    fail 'restore secret entered Docker configured environment'
+  fi
+  for literal in \
+    'SECRET_VOLUME="$PROJECT-secrets"' \
+    'create_volume "$SECRET_VOLUME" secrets' \
+    'assert_new_empty_volume "$SECRET_VOLUME" secrets' \
+    'initialize_secret_volume' \
+    '"$PROJECT-secret-init" secret-init' \
+    '--network none' \
+    '--read-only' \
+    '--user 0:0' \
+    '--cap-drop ALL' \
+    '--cap-add CHOWN' \
+    'type=bind,src=$CONTROL_DIRECTORY,dst=/secret-source,readonly' \
+    'type=volume,src=$SECRET_VOLUME,dst=/secret-target' \
+    'chmod 0400' \
+    'PHASE5_RESTORE_SECRET_INIT' \
+    'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=postgres,readonly' \
+    'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=aistor,readonly' \
+    'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=app,readonly' \
+    'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=client,readonly' \
+    'type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=restore-check,readonly' \
+    'set -a; . /run/restore-secrets/runtime.env; set +a; exec'; do
+    grep -Fq -- "$literal" "$candidate" ||
+      fail "restore secret transport omitted: $literal"
+  done
+}
+assert_secret_transport_contract "$TARGET"
+if [[ "${PHASE5_CONTRACT_SECRET_TRANSPORT_SELF_TEST:-}" == true ]]; then
+  exit 0
+fi
+run_secret_transport_mutant() {
+  local name="$1"
+  local expression="$2"
+  local expected_failure="$3"
+  local mutant="$CONTRACT_TEMP_ROOT/phase5-restore-$name.sh"
+  local stdout="$CONTRACT_TEMP_ROOT/phase5-restore-$name.stdout"
+  local stderr="$CONTRACT_TEMP_ROOT/phase5-restore-$name.stderr"
+  sed "$expression" "$TARGET" >"$mutant"
+  chmod 0700 "$mutant"
+  cmp -s "$TARGET" "$mutant" &&
+    fail "restore secret transport mutant was not applied: $name"
+  if PHASE5_RESTORE_CONTRACT_TARGET="$mutant" \
+    PHASE5_CONTRACT_SECRET_TRANSPORT_SELF_TEST=true \
+    bash "$0" >"$stdout" 2>"$stderr"; then
+    fail "restore secret transport mutant survived: $name"
+  fi
+  grep -Fq "$expected_failure" "$stderr" ||
+    fail "restore secret transport mutant failed for the wrong reason: $name"
+}
+run_secret_transport_mutant \
+  env-file \
+  's@--mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=app,readonly"@--env-file "$APP_ENV_FILE"@' \
+  'restore secret entered Docker configured environment'
+run_secret_transport_mutant \
+  writable-app-secret \
+  's@volume-subpath=app,readonly@volume-subpath=app@' \
+  'restore secret transport omitted: type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=app,readonly'
 if grep -Eq \
   '^[[:space:]]*trap[[:space:]]+cleanup_contract[[:space:]]+EXIT[[:space:]]+HUP' \
   "$0"; then
@@ -2124,6 +2204,59 @@ if grep -Fq "$SECRET_MARKER" "$success_fixture/docker.log" ||
   grep -Fq "$TEACHER_CREDENTIAL_SECRET" "$success_fixture/docker.log"; then
   fail 'restore secret appeared in Docker argv'
 fi
+if grep -Fq -- '--env-file' "$success_fixture/docker.log"; then
+  fail 'restore secret entered Docker configured environment at runtime'
+fi
+grep -Fq 'restore-kind=secret-init' "$success_fixture/docker.log" ||
+  fail 'restore secrets were not copied through a dedicated init container'
+grep -Fq -- '--network none --read-only --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH --security-opt no-new-privileges:true' \
+  "$success_fixture/docker.log" ||
+  fail 'restore secret init isolation or capabilities are not minimal'
+grep -Fq -- \
+  "type=bind,src=$success_fixture/" \
+  "$success_fixture/docker.log" ||
+  fail 'restore secret init source mount was absent'
+grep -Fq -- 'dst=/secret-source,readonly' "$success_fixture/docker.log" ||
+  fail 'restore secret init source was not mounted read-only'
+grep -Fq -- 'dst=/secret-target' "$success_fixture/docker.log" ||
+  fail 'restore secret init target volume was absent'
+grep -Fq 'install_secret /secret-source/postgres.env' \
+  "$success_fixture/docker.log" ||
+  fail 'PostgreSQL secret was not installed into its consumer directory'
+grep -Fq '/secret-target/postgres/runtime.env 0:0' \
+  "$success_fixture/docker.log" ||
+  fail 'PostgreSQL secret ownership was not root-only'
+grep -Fq '/secret-target/aistor/runtime.env 1000:0' \
+  "$success_fixture/docker.log" ||
+  fail 'AIStor secret ownership did not match its runtime UID'
+grep -Fq '/secret-target/app/runtime.env 10001:10001' \
+  "$success_fixture/docker.log" ||
+  fail 'app secret ownership did not match its runtime UID'
+grep -Fq 'chmod 0400 "$target"' "$success_fixture/docker.log" ||
+  fail 'restore secret files were not made owner-readable only'
+grep -Fq 'PHASE5_RESTORE_SECRET_INIT' "$success_fixture/docker.log" ||
+  fail 'restore secret init did not publish its completion marker'
+for secret_subpath in postgres aistor app restore-check; do
+  grep -Fq "volume-subpath=$secret_subpath,readonly" \
+    "$success_fixture/docker.log" ||
+    fail "$secret_subpath did not consume a read-only secret subpath"
+done
+grep -Fq 'volume-subpath=client,readonly' \
+  "$success_fixture/docker.log" ||
+  fail 'database clients did not consume the read-only client secret subpath'
+grep -Fq 'PGPASSFILE=/run/restore-secrets/pgpass' \
+  "$success_fixture/docker.log" ||
+  fail 'database clients did not use the fixed pgpass path'
+for secret_consumer in \
+  '/usr/local/bin/docker-entrypoint.sh postgres' \
+  'minio server /data --license /minio-license/minio.license' \
+  '/app/happylearn' \
+  '/app/happylearn-backup restore-check'; do
+  grep -Fq \
+    "set -a; . /run/restore-secrets/runtime.env; set +a; exec $secret_consumer" \
+    "$success_fixture/docker.log" ||
+    fail "secret consumer did not source its fixed file before exec: $secret_consumer"
+done
 success_credential="$success_fixture/restore-probe-teacher.json"
 credential_path_count="$(
   grep -Fc "$success_credential" "$success_fixture/docker.log" ||
@@ -2415,15 +2548,18 @@ do
       "volumes|$ledger_project-postgres|postgres" \
       "volumes|$ledger_project-aistor|aistor" \
       "volumes|$ledger_project-aistor-license|aistor-license" \
+      "volumes|$ledger_project-secrets|secrets" \
       "containers|$ledger_project-volume-probe-postgres|volume-probe-postgres" \
       "containers|$ledger_project-volume-probe-aistor|volume-probe-aistor" \
       "containers|$ledger_project-volume-probe-aistor-license|volume-probe-aistor-license" \
+      "containers|$ledger_project-volume-probe-secrets|volume-probe-secrets" \
       "containers|$ledger_project-restic-check|restic-check" \
       "containers|$ledger_project-restic-select|restic-select" \
       "containers|$ledger_project-restic-restore|restic-restore" \
       "containers|$ledger_project-restore-ownership|restore-ownership" \
       "containers|$ledger_project-object-restore|object-restore" \
       "containers|$ledger_project-aistor-license-init|aistor-license-init" \
+      "containers|$ledger_project-secret-init|secret-init" \
       "containers|$ledger_project-postgres|postgres" \
       "containers|$ledger_project-postgres-restore|postgres-restore" \
       "containers|$ledger_project-aistor|aistor" \
@@ -2434,9 +2570,9 @@ do
       "containers|$ledger_project-restore-http-probe|restore-http-probe" \
       >"$ledger_expected"
     cmp -s "$ledger_path" "$ledger_expected" ||
-      fail 'successful cleanup ledger was not the exact 21-line contract'
-    [[ "$(wc -l <"$ledger_path" | tr -d '[:space:]')" == 21 &&
-      "$(sort "$ledger_path" | uniq | wc -l | tr -d '[:space:]')" == 21 &&
+      fail 'successful cleanup ledger was not the exact 24-line contract'
+    [[ "$(wc -l <"$ledger_path" | tr -d '[:space:]')" == 24 &&
+      "$(sort "$ledger_path" | uniq | wc -l | tr -d '[:space:]')" == 24 &&
       "$(wc -c <"$ledger_path" | tr -d '[:space:]')" -le 4096 ]] ||
       fail 'successful cleanup ledger line, uniqueness, or size bound failed'
   fi
@@ -2533,7 +2669,7 @@ cleanup_project="$(
     "$cleanup_fixture/docker.log" |
     head -n1
 )"
-for resource in app redis aistor postgres; do
+for resource in app redis aistor postgres secret-init; do
   cleanup_container_id="$(fake_resource_identity "$cleanup_project-$resource")"
   grep -Fq "docker rm --force $cleanup_container_id" \
     "$cleanup_fixture/docker.log" ||
@@ -2545,6 +2681,9 @@ grep -Fq "docker volume rm $cleanup_project-postgres" \
 grep -Fq "docker volume rm $cleanup_project-aistor" \
   "$cleanup_fixture/docker.log" ||
   fail 'cleanup did not attempt volume removal'
+grep -Fq "docker volume rm $cleanup_project-secrets" \
+  "$cleanup_fixture/docker.log" ||
+  fail 'cleanup did not attempt secret volume removal'
 cleanup_network_id="$(fake_resource_identity "$cleanup_project-network")"
 grep -Fq "docker network rm $cleanup_network_id" \
   "$cleanup_fixture/docker.log" ||

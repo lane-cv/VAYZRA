@@ -38,6 +38,7 @@ NETWORK_NAME=''
 POSTGRES_VOLUME=''
 AISTOR_VOLUME=''
 AISTOR_LICENSE_VOLUME=''
+SECRET_VOLUME=''
 POSTGRES_CONTAINER=''
 AISTOR_CONTAINER=''
 REDIS_CONTAINER=''
@@ -54,6 +55,7 @@ NETWORK_CREATED=false
 POSTGRES_VOLUME_CREATED=false
 AISTOR_VOLUME_CREATED=false
 AISTOR_LICENSE_VOLUME_CREATED=false
+SECRET_VOLUME_CREATED=false
 HOST_UID=''
 HOST_GID=''
 ACTIVE_EXTERNAL_PID=''
@@ -331,6 +333,7 @@ initialize_identity() {
   POSTGRES_VOLUME="$PROJECT-postgres"
   AISTOR_VOLUME="$PROJECT-aistor"
   AISTOR_LICENSE_VOLUME="$PROJECT-aistor-license"
+  SECRET_VOLUME="$PROJECT-secrets"
   POSTGRES_CONTAINER="$PROJECT-postgres"
   AISTOR_CONTAINER="$PROJECT-aistor"
   REDIS_CONTAINER="$PROJECT-redis"
@@ -392,7 +395,7 @@ initialize_workspace() {
     'HAPPYLEARN_DATABASE_USER=happylearn' \
     'HAPPYLEARN_DATABASE_NAME=happylearn' \
     'HAPPYLEARN_DATABASE_SSLMODE=disable' \
-    'PGPASSFILE=/run/secrets/pgpass' \
+    'PGPASSFILE=/run/restore-secrets/pgpass' \
     'HAPPYLEARN_MINIO_ENDPOINT=minio:9000' \
     'HAPPYLEARN_MINIO_USE_TLS=false' \
     "HAPPYLEARN_MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" \
@@ -1187,6 +1190,7 @@ expected_resource_name() {
     volumes:postgres) printf '%s-postgres' "$project" ;;
     volumes:aistor) printf '%s-aistor' "$project" ;;
     volumes:aistor-license) printf '%s-aistor-license' "$project" ;;
+    volumes:secrets) printf '%s-secrets' "$project" ;;
     networks:network) printf '%s-network' "$project" ;;
     containers:volume-probe-postgres)
       printf '%s-volume-probe-postgres' "$project"
@@ -1197,6 +1201,9 @@ expected_resource_name() {
     containers:volume-probe-aistor-license)
       printf '%s-volume-probe-aistor-license' "$project"
       ;;
+    containers:volume-probe-secrets)
+      printf '%s-volume-probe-secrets' "$project"
+      ;;
     containers:restic-check) printf '%s-restic-check' "$project" ;;
     containers:restic-select) printf '%s-restic-select' "$project" ;;
     containers:restic-restore) printf '%s-restic-restore' "$project" ;;
@@ -1205,6 +1212,7 @@ expected_resource_name() {
     containers:aistor-license-init)
       printf '%s-aistor-license-init' "$project"
       ;;
+    containers:secret-init) printf '%s-secret-init' "$project" ;;
     containers:postgres) printf '%s-postgres' "$project" ;;
     containers:postgres-restore) printf '%s-postgres-restore' "$project" ;;
     containers:aistor) printf '%s-aistor' "$project" ;;
@@ -1233,14 +1241,17 @@ valid_observed_resource() {
     return 1
   case "$class:$kind" in
     volumes:postgres | volumes:aistor | volumes:aistor-license | \
+      volumes:secrets | \
       networks:network | \
       containers:volume-probe-postgres | \
       containers:volume-probe-aistor | \
       containers:volume-probe-aistor-license | \
+      containers:volume-probe-secrets | \
       containers:restic-check | containers:restic-select | \
       containers:restic-restore | containers:restore-ownership | \
       containers:object-restore | \
-      containers:aistor-license-init | containers:postgres | \
+      containers:aistor-license-init | containers:secret-init | \
+      containers:postgres | \
       containers:postgres-restore | containers:aistor | containers:redis | \
       containers:revoke-sessions | containers:app | \
       containers:restore-check | containers:restore-http-probe) ;;
@@ -1361,6 +1372,7 @@ create_volume() {
     postgres) POSTGRES_VOLUME_CREATED=true ;;
     aistor) AISTOR_VOLUME_CREATED=true ;;
     aistor-license) AISTOR_LICENSE_VOLUME_CREATED=true ;;
+    secrets) SECRET_VOLUME_CREATED=true ;;
     *) return 1 ;;
   esac
   current_resource_matches volumes "$name" "$kind"
@@ -1653,6 +1665,62 @@ initialize_aistor_license() {
     >/dev/null
 }
 
+initialize_secret_volume() {
+  run_named_container \
+    "$PROJECT-secret-init" secret-init \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_READ_SEARCH \
+    --security-opt no-new-privileges:true \
+    --mount "type=bind,src=$CONTROL_DIRECTORY,dst=/secret-source,readonly" \
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/secret-target" \
+    --entrypoint /usr/bin/timeout \
+    "$BACKUP_IMAGE" \
+    --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
+    /bin/sh -ceu '
+      host_uid="$1"
+      host_gid="$2"
+      install_secret() {
+        source="$1"
+        target="$2"
+        owner="$3"
+        cp "$source" "$target"
+        chown "$owner" "$target"
+        chmod 0400 "$target"
+        test "$(stat -c %u:%g:%a "$target")" = "${owner}:400"
+      }
+      for consumer in postgres aistor app client restore-check; do
+        mkdir "/secret-target/$consumer"
+      done
+      install_secret /secret-source/postgres.env \
+        /secret-target/postgres/runtime.env 0:0
+      install_secret /secret-source/aistor.env \
+        /secret-target/aistor/runtime.env 1000:0
+      install_secret /secret-source/app.env \
+        /secret-target/app/runtime.env 10001:10001
+      install_secret /secret-source/pgpass \
+        /secret-target/client/pgpass "$host_uid:$host_gid"
+      install_secret /secret-source/restore-check.env \
+        /secret-target/restore-check/runtime.env "$host_uid:$host_gid"
+      install_secret /secret-source/pgpass \
+        /secret-target/restore-check/pgpass "$host_uid:$host_gid"
+      chown 0:0 /secret-target/postgres
+      chown 1000:0 /secret-target/aistor
+      chown 10001:10001 /secret-target/app
+      chown "$host_uid:$host_gid" \
+        /secret-target/client /secret-target/restore-check
+      chmod 0500 /secret-target \
+        /secret-target/postgres /secret-target/aistor \
+        /secret-target/app /secret-target/client \
+        /secret-target/restore-check
+      printf "%s\n" PHASE5_RESTORE_SECRET_INIT
+    ' restore-secret-init "$HOST_UID" "$HOST_GID" \
+    >/dev/null
+}
+
 start_postgres() {
   run_named_container \
     "$POSTGRES_CONTAINER" postgres \
@@ -1663,8 +1731,11 @@ start_postgres() {
     --tmpfs /tmp:rw,noexec,nosuid,size=32m \
     --tmpfs /var/run/postgresql:rw,noexec,nosuid,size=8m \
     --mount "type=volume,src=$POSTGRES_VOLUME,dst=/var/lib/postgresql" \
-    --env-file "$CONTROL_DIRECTORY/postgres.env" \
-    "$POSTGRES_IMAGE" >/dev/null
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=postgres,readonly" \
+    --entrypoint /bin/sh \
+    "$POSTGRES_IMAGE" -ceu \
+    'set -a; . /run/restore-secrets/runtime.env; set +a; exec /usr/local/bin/docker-entrypoint.sh postgres' \
+    >/dev/null
   poll_until "$READY_TIMEOUT_SECONDS" \
     docker exec "$POSTGRES_CONTAINER" \
     pg_isready -U happylearn -d happylearn >/dev/null
@@ -1677,12 +1748,12 @@ restore_database() {
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
     --mount "type=bind,src=$RESTORE_DIRECTORY/database.dump,dst=/restore/database.dump,readonly" \
-    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=client,readonly" \
     --env PGHOST=postgres \
     --env PGPORT=5432 \
     --env PGUSER=happylearn \
     --env PGDATABASE=happylearn \
-    --env PGPASSFILE=/run/secrets/pgpass \
+    --env PGPASSFILE=/run/restore-secrets/pgpass \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
@@ -1701,9 +1772,11 @@ start_dependencies() {
     --tmpfs /tmp:rw,noexec,nosuid,size=16m \
     --mount "type=volume,src=$AISTOR_VOLUME,dst=/data" \
     --mount "type=volume,src=$AISTOR_LICENSE_VOLUME,dst=/minio-license,readonly" \
-    --env-file "$CONTROL_DIRECTORY/aistor.env" \
-    "$AISTOR_IMAGE" \
-    minio server /data --license /minio-license/minio.license >/dev/null
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=aistor,readonly" \
+    --entrypoint /bin/sh \
+    "$AISTOR_IMAGE" -ceu \
+    'set -a; . /run/restore-secrets/runtime.env; set +a; exec minio server /data --license /minio-license/minio.license' \
+    >/dev/null
   run_named_container \
     "$REDIS_CONTAINER" redis \
     --detach \
@@ -1724,12 +1797,12 @@ revoke_restored_sessions() {
     --network "$NETWORK_NAME" \
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
-    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=client,readonly" \
     --env PGHOST=postgres \
     --env PGPORT=5432 \
     --env PGUSER=happylearn \
     --env PGDATABASE=happylearn \
-    --env PGPASSFILE=/run/secrets/pgpass \
+    --env PGPASSFILE=/run/restore-secrets/pgpass \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
@@ -1747,8 +1820,11 @@ start_restored_app() {
     --user 10001:10001 \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-    --env-file "$CONTROL_DIRECTORY/app.env" \
-    "$APP_IMAGE" >/dev/null
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=app,readonly" \
+    --entrypoint /bin/sh \
+    "$APP_IMAGE" -ceu \
+    'set -a; . /run/restore-secrets/runtime.env; set +a; exec /app/happylearn' \
+    >/dev/null
 }
 
 wait_for_restored_app() {
@@ -1774,15 +1850,14 @@ run_restore_check() {
     --read-only \
     --user "$HOST_UID:$HOST_GID" \
     --mount "type=bind,src=$CHECK_OUTPUT_DIRECTORY,dst=/work" \
-    --mount "type=bind,src=$CONTROL_DIRECTORY/pgpass,dst=/run/secrets/pgpass,readonly" \
+    --mount "type=volume,src=$SECRET_VOLUME,dst=/run/restore-secrets,volume-subpath=restore-check,readonly" \
     --mount "type=bind,src=$RESTORED_MANIFEST,dst=/run/restore/manifest.json,readonly" \
-    --env-file "$CONTROL_DIRECTORY/restore-check.env" \
     --entrypoint /usr/bin/timeout \
     "$BACKUP_IMAGE" \
     --foreground --kill-after=10s "${EXTERNAL_TIMEOUT_SECONDS}s" \
-    /app/happylearn-backup restore-check \
-    --backup-id "$BACKUP_ID" \
-    --report-file /work/restore-check.report \
+    /bin/sh -ceu \
+    'set -a; . /run/restore-secrets/runtime.env; set +a; exec /app/happylearn-backup restore-check --backup-id "$1" --report-file /work/restore-check.report' \
+    restore-check "$BACKUP_ID" \
     >/dev/null
 }
 
@@ -2055,14 +2130,17 @@ $PROJECT-postgres-restore|postgres-restore
 $PROJECT-postgres|postgres
 $PROJECT-object-restore|object-restore
 $PROJECT-aistor-license-init|aistor-license-init
+$PROJECT-secret-init|secret-init
 $PROJECT-restore-ownership|restore-ownership
 $PROJECT-restic-restore|restic-restore
 $PROJECT-restic-select|restic-select
 $PROJECT-restic-check|restic-check
 $PROJECT-volume-probe-aistor|volume-probe-aistor
 $PROJECT-volume-probe-aistor-license|volume-probe-aistor-license
+$PROJECT-volume-probe-secrets|volume-probe-secrets
 $PROJECT-volume-probe-postgres|volume-probe-postgres
 EOF
+  cleanup_volume "$SECRET_VOLUME" secrets || status=1
   cleanup_volume "$AISTOR_LICENSE_VOLUME" aistor-license || status=1
   cleanup_volume "$AISTOR_VOLUME" aistor || status=1
   cleanup_volume "$POSTGRES_VOLUME" postgres || status=1
@@ -2099,15 +2177,18 @@ cleanup_ledger_valid() {
     "volumes|$POSTGRES_VOLUME|postgres" \
     "volumes|$AISTOR_VOLUME|aistor" \
     "volumes|$AISTOR_LICENSE_VOLUME|aistor-license" \
+    "volumes|$SECRET_VOLUME|secrets" \
     "containers|$PROJECT-volume-probe-postgres|volume-probe-postgres" \
     "containers|$PROJECT-volume-probe-aistor|volume-probe-aistor" \
     "containers|$PROJECT-volume-probe-aistor-license|volume-probe-aistor-license" \
+    "containers|$PROJECT-volume-probe-secrets|volume-probe-secrets" \
     "containers|$PROJECT-restic-check|restic-check" \
     "containers|$PROJECT-restic-select|restic-select" \
     "containers|$PROJECT-restic-restore|restic-restore" \
     "containers|$PROJECT-restore-ownership|restore-ownership" \
     "containers|$PROJECT-object-restore|object-restore" \
     "containers|$PROJECT-aistor-license-init|aistor-license-init" \
+    "containers|$PROJECT-secret-init|secret-init" \
     "containers|$PROJECT-postgres|postgres" \
     "containers|$PROJECT-postgres-restore|postgres-restore" \
     "containers|$PROJECT-aistor|aistor" \
@@ -2253,9 +2334,11 @@ main() {
   create_volume "$POSTGRES_VOLUME" postgres
   create_volume "$AISTOR_VOLUME" aistor
   create_volume "$AISTOR_LICENSE_VOLUME" aistor-license
+  create_volume "$SECRET_VOLUME" secrets
   assert_new_empty_volume "$POSTGRES_VOLUME" postgres
   assert_new_empty_volume "$AISTOR_VOLUME" aistor
   assert_new_empty_volume "$AISTOR_LICENSE_VOLUME" aistor-license
+  assert_new_empty_volume "$SECRET_VOLUME" secrets
 
   repository_check
   local selection snapshot_id selection_extra
@@ -2269,6 +2352,7 @@ main() {
   restore_snapshot "$snapshot_id"
   restore_object_data
   initialize_aistor_license
+  initialize_secret_volume
   start_postgres
   restore_database
   start_dependencies
