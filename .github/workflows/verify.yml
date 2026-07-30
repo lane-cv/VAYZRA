@@ -133,3 +133,31 @@ jobs:
           path: test-results/phase3/containers.log
           if-no-files-found: ignore
           retention-days: 7
+
+  phase5-e2e:
+    runs-on: ubuntu-24.04
+    needs: verify
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Configure disposable AIStor license
+        env:
+          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
+        run: |
+          test -n "$AISTOR_LICENSE"
+          umask 077
+          license_file="$RUNNER_TEMP/minio.license"
+          printf '%s' "$AISTOR_LICENSE" > "$license_file"
+          sudo chgrp 0 "$license_file"
+          chmod 0440 "$license_file"
+          printf 'HAPPYLEARN_AISTOR_LICENSE_FILE=%s\n' "$license_file" >> "$GITHUB_ENV"
+      - name: Run isolated Phase 5 acceptance
+        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5
+      - name: Upload sanitized Phase 5 failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: phase5-failure-${{ github.run_id }}
+          path: test-results/phase5/containers.log
+          if-no-files-found: ignore
+          retention-days: 7

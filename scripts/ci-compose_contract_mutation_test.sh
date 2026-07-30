@@ -78,6 +78,37 @@ remove_first_exact() {
   ' "$source" >"$destination"
 }
 
+mutate_in_job() {
+  local source="$1"
+  local destination="$2"
+  local job_header="$3"
+  local needle="$4"
+  local replacement="$5"
+
+  JOB_HEADER="$job_header" NEEDLE="$needle" REPLACEMENT="$replacement" awk '
+    $0 == ENVIRON["JOB_HEADER"] {
+      in_job = 1
+    }
+    in_job && $0 != ENVIRON["JOB_HEADER"] &&
+      $0 ~ /^  [^[:space:]][^:]*:$/ {
+      in_job = 0
+    }
+    in_job && $0 == ENVIRON["NEEDLE"] && !mutated {
+      if (ENVIRON["REPLACEMENT"] != "") {
+        print ENVIRON["REPLACEMENT"]
+      }
+      mutated = 1
+      next
+    }
+    { print }
+    END {
+      if (!mutated) {
+        exit 1
+      }
+    }
+  ' "$source" >"$destination"
+}
+
 insert_after_first() {
   local source="$1"
   local destination="$2"
@@ -181,19 +212,19 @@ step_if_false="$tmp_dir/step-if-false.yml"
 insert_after "$source_workflow" "$step_if_false" "$ordinary_go_step" \
   '        if: false'
 expect_rejected "step-if-false" "$step_if_false" \
-  "repository Go test steps must be standalone"
+  "workflow conditions must be exactly four failure uploads/reports and one cleanup"
 
 step_continue_on_error="$tmp_dir/step-continue-on-error.yml"
 insert_after "$source_workflow" "$step_continue_on_error" "$ordinary_go_step" \
   '        continue-on-error: true'
 expect_rejected "step-continue-on-error" "$step_continue_on_error" \
-  "repository Go test steps must be standalone"
+  "workflow step contains a noncanonical key"
 
 step_working_directory="$tmp_dir/step-working-directory.yml"
 insert_after "$source_workflow" "$step_working_directory" "$ordinary_go_step" \
   '        working-directory: web'
 expect_rejected "step-working-directory" "$step_working_directory" \
-  "repository Go test steps must be standalone"
+  "workflow step contains a noncanonical key"
 
 verify_defaults="$tmp_dir/verify-defaults.yml"
 insert_after "$source_workflow" "$verify_defaults" '  verify:' \
@@ -235,19 +266,19 @@ root_defaults="$tmp_dir/root-defaults.yml"
 insert_before "$source_workflow" "$root_defaults" 'jobs:' \
   $'defaults:\n  run:\n    working-directory: web\n'
 expect_rejected "root-defaults" "$root_defaults" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 root_quoted_defaults="$tmp_dir/root-quoted-defaults.yml"
 insert_before "$source_workflow" "$root_quoted_defaults" 'jobs:' \
   $'"defaults":\n  "run":\n    "working-directory": internal/aiqa\n'
 expect_rejected "root-quoted-defaults" "$root_quoted_defaults" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 root_flow_defaults="$tmp_dir/root-flow-defaults.yml"
 insert_before "$source_workflow" "$root_flow_defaults" 'jobs:' \
   $'"defaults": {"run": {"working-directory": "internal/aiqa"}}\n'
 expect_rejected "root-flow-defaults" "$root_flow_defaults" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 verify_goflags="$tmp_dir/verify-goflags.yml"
 insert_after "$source_workflow" "$verify_goflags" '  verify:' \
@@ -265,13 +296,13 @@ root_goflags="$tmp_dir/root-goflags.yml"
 insert_before "$source_workflow" "$root_goflags" 'jobs:' \
   $'env:\n  GOFLAGS: "-run=^$"\n'
 expect_rejected "root-goflags" "$root_goflags" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 root_inline_quoted_goflags="$tmp_dir/root-inline-quoted-goflags.yml"
 insert_before "$source_workflow" "$root_inline_quoted_goflags" 'jobs:' \
   $'env: {"GOFLAGS": "-run=^$"}\n'
 expect_rejected "root-inline-quoted-goflags" "$root_inline_quoted_goflags" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 verify_quoted_defaults="$tmp_dir/verify-quoted-defaults.yml"
 insert_after "$source_workflow" "$verify_quoted_defaults" '  verify:' \
@@ -295,12 +326,13 @@ root_quoted_parent_env="$tmp_dir/root-quoted-parent-env.yml"
 insert_before "$source_workflow" "$root_quoted_parent_env" 'jobs:' \
   $'"env": {"GOFLAGS": "-run=^$"}\n'
 expect_rejected "root-quoted-parent-env" "$root_quoted_parent_env" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
 
 github_env_injection="$tmp_dir/github-env-injection.yml"
 insert_before "$source_workflow" "$github_env_injection" "$ordinary_go_step" \
   '      - run: echo "GOFLAGS=-run=^$" >> "$GITHUB_ENV"'
-expect_accepted "github-env-injection" "$github_env_injection"
+expect_rejected "github-env-injection" "$github_env_injection" \
+  "workflow may write GITHUB_ENV only in hardened license steps"
 
 verify_defaults_merge="$tmp_dir/verify-defaults-merge.yml"
 insert_after "$source_workflow" "$verify_defaults_merge" '  verify:' \
@@ -318,6 +350,115 @@ root_defaults_merge="$tmp_dir/root-defaults-merge.yml"
 insert_before "$source_workflow" "$root_defaults_merge" 'jobs:' \
   $'<<: {"defaults": {"run": {"working-directory": "internal/aiqa"}}}\n'
 expect_rejected "root-defaults-merge" "$root_defaults_merge" \
-  "workflow contains a noncanonical top-level key"
+  "workflow permissions must be exactly contents: read"
+
+root_permission_escalation="$tmp_dir/root-permission-escalation.yml"
+remove_first_exact "$source_workflow" "$root_permission_escalation" \
+  '  contents: read'
+insert_after "$root_permission_escalation" \
+  "$tmp_dir/root-permission-escalation-final.yml" 'permissions:' \
+  '  contents: write'
+expect_rejected "root-permission-escalation" \
+  "$tmp_dir/root-permission-escalation-final.yml" \
+  "workflow permissions must be exactly contents: read"
+
+unknown_job="$tmp_dir/unknown-job.yml"
+insert_before "$source_workflow" "$unknown_job" '  phase5-e2e:' \
+  $'  surprise-e2e:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 1\n    steps:\n      - run: true'
+expect_rejected "unknown-job" "$unknown_job" \
+  "workflow jobs must be exactly verify, phase2-e2e, phase3-e2e, and phase5-e2e"
+
+phase5_job_permission="$tmp_dir/phase5-job-permission.yml"
+insert_after "$source_workflow" "$phase5_job_permission" '  phase5-e2e:' \
+  $'    permissions:\n      contents: write'
+expect_rejected "phase5-job-permission" "$phase5_job_permission" \
+  "phase5-e2e job contains a noncanonical top-level key"
+
+phase5_missing_needs="$tmp_dir/phase5-missing-needs.yml"
+mutate_in_job "$source_workflow" "$phase5_missing_needs" '  phase5-e2e:' \
+  '    needs: verify' ''
+expect_rejected "phase5-missing-needs" "$phase5_missing_needs" \
+  "phase5-e2e job canonical keys are incomplete or duplicated"
+
+phase5_wrong_runner="$tmp_dir/phase5-wrong-runner.yml"
+mutate_in_job "$source_workflow" "$phase5_wrong_runner" '  phase5-e2e:' \
+  '    runs-on: ubuntu-24.04' '    runs-on: ubuntu-latest'
+expect_rejected "phase5-wrong-runner" "$phase5_wrong_runner" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
+
+phase5_wrong_timeout="$tmp_dir/phase5-wrong-timeout.yml"
+mutate_in_job "$source_workflow" "$phase5_wrong_timeout" '  phase5-e2e:' \
+  '    timeout-minutes: 120' '    timeout-minutes: 121'
+expect_rejected "phase5-wrong-timeout" "$phase5_wrong_timeout" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
+
+phase5_unpinned_checkout="$tmp_dir/phase5-unpinned-checkout.yml"
+mutate_in_job "$source_workflow" "$phase5_unpinned_checkout" '  phase5-e2e:' \
+  '      - uses: actions/checkout@v6.0.2' \
+  '      - uses: actions/checkout@main'
+expect_rejected "phase5-unpinned-checkout" "$phase5_unpinned_checkout" \
+  "workflow action is not allowlisted and pinned"
+
+phase5_unknown_action="$tmp_dir/phase5-unknown-action.yml"
+mutate_in_job "$source_workflow" "$phase5_unknown_action" '  phase5-e2e:' \
+  '      - uses: actions/checkout@v6.0.2' \
+  '      - uses: third-party/unknown@v1.0.0'
+expect_rejected "phase5-unknown-action" "$phase5_unknown_action" \
+  "workflow action is not allowlisted and pinned"
+
+phase5_wrong_group="$tmp_dir/phase5-wrong-group.yml"
+mutate_in_job "$source_workflow" "$phase5_wrong_group" '  phase5-e2e:' \
+  '        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5' \
+  '        run: HAPPYLEARN_E2E_GROUP=phase5 make e2e-phase5'
+expect_rejected "phase5-wrong-group" "$phase5_wrong_group" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
+
+phase5_skipped_test="$tmp_dir/phase5-skipped-test.yml"
+insert_after "$source_workflow" "$phase5_skipped_test" \
+  '        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5' \
+  '        if: false'
+expect_rejected "phase5-skipped-test" "$phase5_skipped_test" \
+  "workflow conditions must be exactly four failure uploads/reports and one cleanup"
+
+phase5_continue_on_error="$tmp_dir/phase5-continue-on-error.yml"
+insert_after "$source_workflow" "$phase5_continue_on_error" \
+  '        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5' \
+  '        continue-on-error: true'
+expect_rejected "phase5-continue-on-error" "$phase5_continue_on_error" \
+  "workflow step contains a noncanonical key"
+
+phase5_shell_override="$tmp_dir/phase5-shell-override.yml"
+insert_after "$source_workflow" "$phase5_shell_override" \
+  '        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5' \
+  '        shell: bash'
+expect_rejected "phase5-shell-override" "$phase5_shell_override" \
+  "workflow step contains a noncanonical key"
+
+phase5_secret_print="$tmp_dir/phase5-secret-print.yml"
+insert_before "$source_workflow" "$phase5_secret_print" \
+  '      - name: Run isolated Phase 5 acceptance' \
+  '      - run: printenv'
+expect_rejected "phase5-secret-print" "$phase5_secret_print" \
+  "workflow contains a secret-printing diagnostic step"
+
+phase5_wrong_artifact_path="$tmp_dir/phase5-wrong-artifact-path.yml"
+mutate_in_job "$source_workflow" "$phase5_wrong_artifact_path" \
+  '  phase5-e2e:' '          path: test-results/phase5/containers.log' \
+  '          path: test-results/phase5'
+expect_rejected "phase5-wrong-artifact-path" "$phase5_wrong_artifact_path" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
+
+phase5_artifact_wildcard="$tmp_dir/phase5-artifact-wildcard.yml"
+mutate_in_job "$source_workflow" "$phase5_artifact_wildcard" \
+  '  phase5-e2e:' '          path: test-results/phase5/containers.log' \
+  '          path: test-results/phase5/*'
+expect_rejected "phase5-artifact-wildcard" "$phase5_artifact_wildcard" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
+
+phase5_wrong_retention="$tmp_dir/phase5-wrong-retention.yml"
+mutate_in_job "$source_workflow" "$phase5_wrong_retention" '  phase5-e2e:' \
+  '          retention-days: 7' '          retention-days: 30'
+expect_rejected "phase5-wrong-retention" "$phase5_wrong_retention" \
+  "phase5-e2e job must match the closed acceptance and artifact contract"
 
 echo "CI Compose workflow mutation contract: PASS"

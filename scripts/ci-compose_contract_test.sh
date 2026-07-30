@@ -190,6 +190,49 @@ verify_job_end="$(
 )"
 test -n "$verify_job_end" || fail "verify job has no following job boundary"
 
+phase5_job_line="$(exact_line '  phase5-e2e:')"
+phase5_job_end="$(
+  awk -v job_line="$phase5_job_line" '
+    NR > job_line && /^  [^[:space:]][^:]*:$/ {
+      print NR - 1
+      found = 1
+      exit
+    }
+    END {
+      if (!found) {
+        print NR
+      }
+    }
+  ' "$workflow"
+)"
+test -n "$phase5_job_end" || fail "phase5-e2e job boundary is invalid"
+
+jobs="$(
+  awk '
+    $0 == "jobs:" {
+      in_jobs = 1
+      next
+    }
+    in_jobs && /^  [a-z0-9][a-z0-9-]*:$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:$/, "", job)
+      print job
+    }
+  ' "$workflow"
+)"
+expected_jobs=$'verify\nphase2-e2e\nphase3-e2e\nphase5-e2e'
+test "$jobs" = "$expected_jobs" ||
+  fail "workflow jobs must be exactly verify, phase2-e2e, phase3-e2e, and phase5-e2e"
+
+permissions_line="$(exact_line 'permissions:')"
+jobs_line="$(exact_line 'jobs:')"
+permissions_block="$(
+  sed -n "${permissions_line},$((jobs_line - 1))p" "$workflow"
+)"
+test "$permissions_block" = $'permissions:\n  contents: read' ||
+  fail "workflow permissions must be exactly contents: read"
+
 license_permission_violation="$(
   awk '
     $0 == "          printf \047%s\047 \"\$AISTOR_LICENSE\" > \"\$license_file\"" {
@@ -222,8 +265,8 @@ license_permission_violation="$(
       }
     }
     END {
-      if (!failed && configured != 3) {
-        print "workflow must configure exactly three hardened AIStor license files"
+      if (!failed && configured != 4) {
+        print "workflow must configure exactly four hardened AIStor license files"
       }
     }
   ' "$workflow"
@@ -276,6 +319,200 @@ workflow_structure_violation="$(
   ' "$workflow"
 )"
 test -z "$workflow_structure_violation" || fail "$workflow_structure_violation"
+
+all_job_structure_violation="$(
+  awk '
+    $0 == "jobs:" {
+      in_jobs = 1
+      next
+    }
+    !in_jobs {
+      next
+    }
+    /^  [^[:space:]]/ {
+      if ($0 == "  verify:" ||
+          $0 == "  phase2-e2e:" ||
+          $0 == "  phase3-e2e:" ||
+          $0 == "  phase5-e2e:") {
+        job = $0
+        sub(/^  /, "", job)
+        sub(/:$/, "", job)
+        job_count[job]++
+        next
+      }
+      print "workflow contains a noncanonical job key at line " NR
+      failed = 1
+      exit
+    }
+
+    job != "" && /^    [^[:space:]]/ {
+      allowed = $0 ~ /^    (runs-on|timeout-minutes|steps):/
+      if (job != "verify") {
+        allowed = allowed || $0 ~ /^    needs:/
+      }
+      if (!allowed) {
+        print job " job contains a noncanonical top-level key at line " NR
+        failed = 1
+        exit
+      }
+      key = $0
+      sub(/^    /, "", key)
+      sub(/:.*/, "", key)
+      key_count[job SUBSEP key]++
+    }
+
+    END {
+      if (failed) {
+        exit
+      }
+      for (candidate in job_count) {
+        if (job_count[candidate] != 1 ||
+            key_count[candidate SUBSEP "runs-on"] != 1 ||
+            key_count[candidate SUBSEP "timeout-minutes"] != 1 ||
+            key_count[candidate SUBSEP "steps"] != 1 ||
+            (candidate == "verify" &&
+             key_count[candidate SUBSEP "needs"] != 0) ||
+            (candidate != "verify" &&
+             key_count[candidate SUBSEP "needs"] != 1)) {
+          print candidate " job canonical keys are incomplete or duplicated"
+          exit
+        }
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$all_job_structure_violation" ||
+  fail "$all_job_structure_violation"
+
+step_structure_violation="$(
+  awk '
+    /^      - / {
+      if ($0 !~ /^      - (name|uses|run):/) {
+        print "workflow step starts with a noncanonical key at line " NR
+        exit
+      }
+      in_step = 1
+      next
+    }
+    in_step && /^        [^[:space:]]/ {
+      if ($0 !~ /^        (name|uses|with|env|run|if):/) {
+        print "workflow step contains a noncanonical key at line " NR
+        exit
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$step_structure_violation" || fail "$step_structure_violation"
+
+action_violation="$(
+  awk '
+    /^[[:space:]]+(uses:|- uses:)[[:space:]]*/ {
+      action = $0
+      sub(/^[[:space:]]+(- )?uses:[[:space:]]*/, "", action)
+      if (action != "actions/checkout@v6.0.2" &&
+          action != "pnpm/action-setup@v6.0.8" &&
+          action != "actions/setup-node@v6.4.0" &&
+          action != "actions/setup-go@v6.4.0" &&
+          action != "actions/upload-artifact@v4.6.2") {
+        print "workflow action is not allowlisted and pinned at line " NR
+        exit
+      }
+      action_count[action]++
+    }
+    END {
+      if (action_count["actions/checkout@v6.0.2"] != 4 ||
+          action_count["pnpm/action-setup@v6.0.8"] != 1 ||
+          action_count["actions/setup-node@v6.4.0"] != 1 ||
+          action_count["actions/setup-go@v6.4.0"] != 1 ||
+          action_count["actions/upload-artifact@v4.6.2"] != 3) {
+        print "workflow action counts do not match the closed allowlist"
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$action_violation" || fail "$action_violation"
+
+if_lines="$(
+  grep -nE '^[[:space:]]*("?if"?|'\''if'\''):' "$workflow" || true
+)"
+if_values="$(
+  sed -n 's/^[[:space:]]*if:[[:space:]]*//p' "$workflow"
+)"
+unexpected_if_value="$(
+  printf '%s\n' "$if_values" | grep -Ev '^(failure|always)\(\)$' || true
+)"
+test -z "$unexpected_if_value" ||
+  fail "workflow conditions must be exactly four failure uploads/reports and one cleanup"
+test "$(printf '%s\n' "$if_values" | grep -Fxc 'failure()')" -eq 4 &&
+  test "$(printf '%s\n' "$if_values" | grep -Fxc 'always()')" -eq 1 ||
+  fail "workflow conditions must be exactly four failure uploads/reports and one cleanup"
+test "$(printf '%s\n' "$if_lines" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 5 ||
+  fail "workflow contains a quoted, duplicated, or malformed condition key"
+
+forbidden_workflow_control="$(
+  rg -n \
+    'continue-on-error|working-directory|(^|[{"'\'',[:space:]])shell["'\'']?[[:space:]]*:' \
+    "$workflow" || true
+)"
+test -z "$forbidden_workflow_control" ||
+  fail "workflow contains a skipped-test or shell-override control"
+
+github_env_violation="$(
+  awk '
+    index($0, "$GITHUB_ENV") &&
+      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"" {
+      print NR
+      exit
+    }
+  ' "$workflow"
+)"
+test -z "$github_env_violation" ||
+  fail "workflow may write GITHUB_ENV only in hardened license steps"
+
+secret_print_violation="$(
+  awk '
+    BEGIN { IGNORECASE = 1 }
+    /printenv|set[[:space:]]+-x|tojson[[:space:]]*\([[:space:]]*secrets|cat[^#]*license|docker[[:space:]]+(container[[:space:]]+)?inspect/ {
+      print NR
+      exit
+    }
+    /(echo|printf)[^#]*(AISTOR_LICENSE|secrets\.)/ &&
+      $0 != "          printf \047%s\047 \"\$AISTOR_LICENSE\" > \"\$license_file\"" &&
+      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"" {
+      print NR
+      exit
+    }
+  ' "$workflow"
+)"
+test -z "$secret_print_violation" ||
+  fail "workflow contains a secret-printing diagnostic step"
+
+secret_context_violation="$(
+  awk '
+    index($0, "secrets.") &&
+      $0 != "          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}" {
+      print NR
+      exit
+    }
+    $0 == "          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}" {
+      count++
+    }
+    END {
+      if (count != 4) {
+        print "count"
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$secret_context_violation" ||
+  fail "workflow secret context must contain only four AIStor license bindings"
+
+phase5_job="$(
+  sed -n "${phase5_job_line},${phase5_job_end}p" "$workflow"
+)"
+expected_phase5_job=$'  phase5-e2e:\n    runs-on: ubuntu-24.04\n    needs: verify\n    timeout-minutes: 120\n    steps:\n      - uses: actions/checkout@v6.0.2\n      - name: Configure disposable AIStor license\n        env:\n          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}\n        run: |\n          test -n "$AISTOR_LICENSE"\n          umask 077\n          license_file="$RUNNER_TEMP/minio.license"\n          printf \x27%s\x27 "$AISTOR_LICENSE" > "$license_file"\n          sudo chgrp 0 "$license_file"\n          chmod 0440 "$license_file"\n          printf \x27HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\x27 "$license_file" >> "$GITHUB_ENV"\n      - name: Run isolated Phase 5 acceptance\n        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5\n      - name: Upload sanitized Phase 5 failure evidence\n        if: failure()\n        uses: actions/upload-artifact@v4.6.2\n        with:\n          name: phase5-failure-${{ github.run_id }}\n          path: test-results/phase5/containers.log\n          if-no-files-found: ignore\n          retention-days: 7'
+test "$phase5_job" = "$expected_phase5_job" ||
+  fail "phase5-e2e job must match the closed acceptance and artifact contract"
 
 startup_name_line="$(exact_line_between '      - name: Start private integration dependencies' "$verify_job_line" "$verify_job_end")"
 startup_run_line="$(exact_line_between '        run: docker compose -p happylearn-ci -f deploy/compose.dev.yml -f deploy/compose.ci.yml up -d --wait --wait-timeout 120 postgres redis minio' "$verify_job_line" "$verify_job_end")"
