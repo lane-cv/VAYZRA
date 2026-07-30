@@ -8,7 +8,16 @@ supervisor_dockerfile="$repo_root/Dockerfile.e2e-worker"
 fake_provider="$repo_root/cmd/fake-ai-provider/main.go"
 makefile="$repo_root/Makefile"
 package_json="$repo_root/package.json"
+playwright_config="$repo_root/playwright.config.ts"
 source "$repo_root/scripts/e2e-harness-lib.sh"
+
+reject_fixed_pattern() {
+  local pattern="$1" file="$2"
+  if grep -Fq -- "$pattern" "$file"; then
+    echo "forbidden pattern in $file: $pattern" >&2
+    return 1
+  fi
+}
 
 test -f "$script"
 test -f "$supervisor"
@@ -62,6 +71,13 @@ grep -Fq 'case "$e2e_group" in' "$script"
 grep -Fq 'all|phase4)' "$script"
 grep -Fq 'tests/e2e/ai-questions.spec.ts tests/e2e/ai-admin.spec.ts tests/e2e/ai-privacy.spec.ts' "$script"
 grep -Fq -- '--grep @phase4-mobile' "$script"
+grep -Fq -- '--project=mobile --grep @phase4-mobile' "$script"
+reject_fixed_pattern '--project=phase4-mobile' "$script"
+grep -Fq "name: 'mobile'" "$playwright_config"
+grep -Fq 'grepInvert: /@phase4-mobile|@phase5-mobile/' "$playwright_config"
+grep -Fq 'grep: /@phase4-mobile|@phase5-mobile/' "$playwright_config"
+test "$(grep -Fc '@phase4-mobile|@phase5-mobile' "$playwright_config")" -eq 2
+reject_fixed_pattern "name: 'phase4-mobile'" "$playwright_config"
 grep -Fq 'test_status=0' "$script"
 grep -Fq 'preserve_first_failure' "$script"
 for phase in phase1 phase2 phase3 phase4; do
