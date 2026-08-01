@@ -9,6 +9,10 @@ node_modules
 web/node_modules
 web/dist
 tests
+!tests/
+tests/*
+!tests/integration/
+!tests/integration/**
 coverage
 playwright-report
 test-results

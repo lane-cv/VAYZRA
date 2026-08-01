@@ -541,6 +541,8 @@ require_literal "$target" '--name "$backup" --network "$network"'
 require_literal "$target" '--read-only --user 10003:0 --cap-drop ALL'
 require_literal "$target" '--name "$browser_runner" --network "$network"'
 require_literal "$target" '--read-only --user 1000:1000 --shm-size 384m'
+require_literal "$target" \
+  '--read-only --user 1000:1000 --shm-size 384m --memory 896m --cpus .4'
 require_literal "$target" '--cap-drop ALL --security-opt no-new-privileges'
 if grep -Eq -- \
   '(^|[[:space:]])(--privileged|--network[=[:space:]]+host|--network host)([[:space:]]|$)|(^|[[:space:]])(-p|--publish)([=[:space:]]|$)' \
@@ -657,6 +659,7 @@ require_literal "$target" \
 require_literal "$target" \
   '{{.State.OOMKilled}}|{{.RestartCount}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}'
 require_literal "$target" 'resource_is_backup_activity'
+require_literal "$target" 'resource_worker_backup_overlap_now'
 require_literal "$target" 'worker_backup_overlap'
 require_literal "$target" 'browser_included'
 require_literal "$target" 'configured_limits_complete'
@@ -675,6 +678,7 @@ require_literal "$target" 'saw_backup'
 require_literal "$target" 'saw_heavy'
 require_literal "$target" 'saw_worker'
 require_literal "$target" 'resource_monitor_retry()'
+require_literal "$target" 'resource_monitor_stats()'
 require_literal "$target" 'for attempt in 1 2 3; do'
 require_literal "$target" '((attempt == 3)) || sleep 1'
 require_literal "$target" 'resource monitor failed: category=%s'
@@ -749,6 +753,11 @@ fi
 resource_monitor_block="$(
   sed -n '/^monitor_resource_workloads()/,/^}/p' "$target"
 )"
+resource_monitor_stats_source="$(
+  sed -n '/^resource_monitor_stats()/,/^}/p' "$target"
+)"
+[[ -n "$resource_monitor_stats_source" ]] ||
+  fail 'resource stats live-roster helper is absent'
 backup_activity_source="$(
   sed -n '/^resource_is_backup_activity()/,/^}/p' "$target"
 )"
@@ -905,6 +914,41 @@ contract_cleanup() {
   rm -rf "$tmpdir"
 }
 trap contract_cleanup EXIT
+
+(
+  eval "$resource_monitor_stats_source"
+  stale_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  core_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  stats_calls="$tmpdir/resource-stats-live-roster.calls"
+  install -m 0600 /dev/null "$stats_calls"
+  sleep() { :; }
+  docker_capture_bounded() {
+    local output_variable="$1" deadline="$2"
+    shift 2
+    [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || return 97
+    case "$1 $2" in
+      'container ls')
+        case "$*" in
+          *"id=${core_id}"*) printf -v "$output_variable" '%s' "$core_id" ;;
+          *"id=${stale_id}"*) printf -v "$output_variable" '%s' '' ;;
+          *) return 96 ;;
+        esac
+        ;;
+      'stats --no-stream')
+        printf '%s\n' "$*" >>"$stats_calls"
+        [[ "$*" == *"$core_id"* && "$*" != *"$stale_id"* ]] || return 95
+        printf -v "$output_variable" '%s' '1.00%|64MiB / 1GiB'
+        ;;
+      *) return 94 ;;
+    esac
+  }
+  resource_monitor_stats observed 30 "$core_id" "$stale_id" ||
+    fail 'resource stats rejected a container that exited after enumeration'
+  [[ "$observed" == '1.00%|64MiB / 1GiB' ]] ||
+    fail 'resource stats did not preserve the live core sample'
+  [[ "$(wc -l <"$stats_calls" | tr -d ' ')" == 1 ]] ||
+    fail 'resource stats retried an already stale aggregate roster'
+)
 
 backup_finalize_source="$(
   sed -n '/^finalize_backup_proof()/,/^}/p' "$target"

@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y jq nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY cmd cmd
+COPY internal internal
+COPY db db
+COPY deploy deploy
+COPY scripts scripts
+COPY tests/integration tests/integration
+COPY Dockerfile.backup ./
+COPY Makefile package.json ./
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    install -d -m 0755 /opt/happylearn \
+    && go test -c -o /opt/happylearn/cmd-backup.test ./cmd/backup \
+    && go test -c -o /opt/happylearn/cmd-worker.test ./cmd/worker \
+    && go test -c -o /opt/happylearn/internal-backup.test ./internal/backup \
+    && go test -c -o /opt/happylearn/internal-operations.test ./internal/operations
+
+RUN HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE=all \
+      bash scripts/phase5-backup_contract_test.sh \
+      > /tmp/phase5-backup-contract.log \
+    && install -d -m 0755 /opt/happylearn \
+    && grep '^PHASE5_FAILURE_EVIDENCE ' \
+      /tmp/phase5-backup-contract.log \
+      > /opt/happylearn/phase5-backup-failure.evidence \
+    && test "$(wc -l < /opt/happylearn/phase5-backup-failure.evidence)" = 6 \
+    && chmod 0444 /opt/happylearn/phase5-backup-failure.evidence \
+    && install -m 0555 scripts/read-phase5-backup-failure-evidence.sh \
+      /usr/local/bin/phase5-backup-failure-probe \
+    && rm -f /tmp/phase5-backup-contract.log
+
+RUN useradd --uid 65532 --no-create-home --shell /usr/sbin/nologin probe \
+    && chmod -R a=rX /src /go/pkg/mod
+
+USER 65532:65532

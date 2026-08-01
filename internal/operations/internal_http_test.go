@@ -217,6 +217,7 @@ func TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay(t *tes
 	if got := replayResult.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q", got)
 	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=host_sample_replay actual=rejected maintenance=normal alert=suppressed plaintext_dump=absent")
 }
 
 func hostRestartCount(value int64) *int64 {

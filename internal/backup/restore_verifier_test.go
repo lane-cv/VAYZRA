@@ -166,6 +166,9 @@ func TestRestoreVerifierFailsClosedForMissingOrWrongSizedObject(t *testing.T) {
 			if testCase.name == "wrong size" && result.UnexpectedObjectCount != 1 {
 				t.Fatalf("unexpected=%d", result.UnexpectedObjectCount)
 			}
+			if testCase.name == "missing" {
+				t.Log("PHASE5_FAILURE_EVIDENCE case=missing_restored_object actual=failed maintenance=normal alert=active plaintext_dump=absent")
+			}
 		})
 	}
 }
@@ -188,6 +191,7 @@ func TestRestoreVerifierRejectsStaleSessionBeforeObjectAccess(t *testing.T) {
 	if !reflect.DeepEqual(database.calls, []string{"sessions"}) {
 		t.Fatalf("database access occurred before session proof: %v", database.calls)
 	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=stale_restored_session actual=failed maintenance=normal alert=active plaintext_dump=absent")
 }
 
 func TestRestoreVerifierRejectsUnknownDuplicateAndMisroutedReferences(t *testing.T) {

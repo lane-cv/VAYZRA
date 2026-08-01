@@ -8,7 +8,7 @@ export async function login(page: Page, username: string, password: string) {
   await page.getByLabel('账号').fill(username)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
-  await expect(page).not.toHaveURL(/login/)
+  await expect(page).not.toHaveURL(/login/, { timeout: 15_000 })
 }
 
 export async function changePassword(page: Page, currentPassword: string, newPassword: string) {

@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
 source "$script_dir/e2e-harness-lib.sh"
 
 readonly CONTRACT_MODE_VARIABLE='HAPPYLEARN_PHASE5_FAILURE_MATRIX_CONTRACT'
@@ -11,7 +12,7 @@ readonly CASE_DEADLINE_VARIABLE='HAPPYLEARN_PHASE5_FAILURE_MATRIX_CASE_DEADLINE_
 readonly CASE_SHIM_MOUNT=/run/happylearn-e2e-shims
 readonly SANITIZER="$script_dir/sanitize-e2e-artifacts.sh"
 readonly PUBLISHER="$script_dir/publish-e2e-diagnostics.sh"
-readonly LIVE_CASE_IMAGE='alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1'
+readonly PRODUCTION_PROBE_DOCKERFILE="$repo_root/deploy/Dockerfile.phase5-failure-probe"
 readonly LIVE_OWNER_LABEL='io.happylearn.phase5.failure-matrix-owner'
 readonly LIVE_PROJECT_LABEL='io.happylearn.phase5.failure-matrix-project'
 readonly LIVE_CASE_LABEL='io.happylearn.phase5.failure-matrix-case'
@@ -48,6 +49,8 @@ ACTIVE_CONTAINER_ID=''
 ACTIVE_CONTAINER_NAME=''
 ACTIVE_NETWORK_ID=''
 ACTIVE_NETWORK_NAME=''
+PRODUCTION_PROBE_IMAGE=''
+PRODUCTION_PROBE_IMAGE_ID=''
 
 fail() {
   printf 'phase 5 failure matrix: %s\n' "$1" >&2
@@ -264,6 +267,10 @@ cleanup_active_case() {
     -n "$LIVE_ROOT" ]]; then
     cleanup_live_root || cleanup_status=$?
   fi
+  if [[ "$CONTRACT_MODE" == false &&
+    -n "$PRODUCTION_PROBE_IMAGE" ]]; then
+    cleanup_production_probe_image || cleanup_status=$?
+  fi
   return "$cleanup_status"
 }
 
@@ -401,6 +408,46 @@ cleanup_live_root() {
   LIVE_ROOT=''
 }
 
+cleanup_production_probe_image() {
+  local observed_id
+  [[ "$PRODUCTION_PROBE_IMAGE" =~ ^happylearn-phase5-failure-probe:[0-9a-f]{16}$ ]] ||
+    return 1
+  observed_id="$(
+    run_bounded 30 docker image inspect \
+      "$PRODUCTION_PROBE_IMAGE" --format '{{.Id}}' 2>/dev/null
+  )" || {
+    PRODUCTION_PROBE_IMAGE=''
+    PRODUCTION_PROBE_IMAGE_ID=''
+    return 0
+  }
+  [[ "$observed_id" == sha256:* ]] || return 1
+  if [[ -n "$PRODUCTION_PROBE_IMAGE_ID" &&
+    "$observed_id" != "$PRODUCTION_PROBE_IMAGE_ID" ]]; then
+    return 1
+  fi
+  run_bounded 60 docker image rm \
+    "$PRODUCTION_PROBE_IMAGE" >/dev/null || return 1
+  PRODUCTION_PROBE_IMAGE=''
+  PRODUCTION_PROBE_IMAGE_ID=''
+}
+
+build_production_probe_image() {
+  [[ -f "$PRODUCTION_PROBE_DOCKERFILE" &&
+    "$LIVE_OWNER" =~ ^[0-9a-f]{16}$ ]] ||
+    return 1
+  PRODUCTION_PROBE_IMAGE="happylearn-phase5-failure-probe:$LIVE_OWNER"
+  run_bounded 900 docker build \
+    --file "$PRODUCTION_PROBE_DOCKERFILE" \
+    --tag "$PRODUCTION_PROBE_IMAGE" \
+    "$repo_root" >/dev/null ||
+    return 1
+  PRODUCTION_PROBE_IMAGE_ID="$(
+    run_bounded 30 docker image inspect \
+      "$PRODUCTION_PROBE_IMAGE" --format '{{.Id}}'
+  )" || return 1
+  [[ "$PRODUCTION_PROBE_IMAGE_ID" == sha256:* ]]
+}
+
 docker_inventory_empty() {
   local owner="$1"
   local project="$2"
@@ -494,265 +541,123 @@ cleanup_live_active_case() {
   return "$cleanup_status"
 }
 
-live_case_shim_exit_code() {
+production_probe_for_case() {
   case "$1" in
-    database_dump_failure) printf '21' ;;
-    object_store_stop_failure) printf '22' ;;
-    snapshot_failure) printf '23' ;;
-    object_store_restart_failure) printf '24' ;;
-    repository_integrity_failure) printf '25' ;;
-    retention_failure) printf '26' ;;
-    wrong_repository_secret) printf '27' ;;
-    tampered_pack) printf '28' ;;
-    missing_restored_object) printf '29' ;;
-    stale_restored_session) printf '30' ;;
-    remote_outage) printf '31' ;;
-    webhook_private_target) printf '41' ;;
-    host_sample_replay) printf '42' ;;
-    drain_timeout | webhook_timeout) printf '124' ;;
+    drain_timeout)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    database_dump_failure)
+      printf 'go|%s|%s' ./internal/backup TestExecutorSnapshotReportsExactExternalCommandFailureStage/pg-dump-exit ;;
+    object_store_stop_failure)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    snapshot_failure)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    object_store_restart_failure)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    repository_integrity_failure)
+      printf 'go|%s|%s' ./internal/backup TestExecutorVerifyRejectsWrongRunSnapshotTagHashAndManifest/wrong_exact_snapshot ;;
+    wrong_repository_secret | tampered_pack)
+      printf 'go|%s|%s' ./internal/backup "TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError/$1" ;;
+    remote_outage)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    retention_failure)
+      printf 'shell|%s|%s' "$1" "phase5-backup-contract/$1" ;;
+    missing_restored_object)
+      printf 'go|%s|%s' ./internal/backup TestRestoreVerifierFailsClosedForMissingOrWrongSizedObject/missing ;;
+    stale_restored_session)
+      printf 'go|%s|%s' ./internal/backup TestRestoreVerifierRejectsStaleSessionBeforeObjectAccess ;;
+    webhook_private_target)
+      printf 'go|%s|%s' ./internal/operations TestWebhookSenderRejectsInitiallyPrivateTarget ;;
+    webhook_timeout)
+      printf 'go|%s|%s' ./internal/operations TestWebhookSenderRejectsDNSRebindingResponseOverflowAndTimeout/total_timeout ;;
+    host_sample_replay)
+      printf 'go|%s|%s' ./internal/operations TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay ;;
     *) return 1 ;;
   esac
 }
 
-install_live_case_command_shim() {
-  local case_name="$1"
-  local shim_directory="$2"
-  local shim="$shim_directory/inject"
-  local exit_code
-  [[ "$shim_directory" == \
-    "$LIVE_ROOT/cases/$ACTIVE_CASE_PROJECT/shims" &&
-    "$case_name" == "$ACTIVE_CASE_NAME" &&
-    -d "$shim_directory" &&
-    ! -L "$shim_directory" ]] ||
-    return 1
-  exit_code="$(live_case_shim_exit_code "$case_name")" || return 1
-  if [[ "$exit_code" == 124 ]]; then
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'set -eu' \
-      'exec sleep 60' >"$shim"
-  else
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'set -eu' \
-      "exit $exit_code" >"$shim"
-  fi
-  chmod 0700 "$shim"
-  [[ -f "$shim" &&
-    ! -L "$shim" &&
-    "$(portable_mode "$shim")" == 700 &&
-    "$(portable_owner "$shim")" == "$(id -u)" ]]
-}
-
-live_case_program() {
-  cat <<'LIVE_CASE_PROGRAM'
-set -eu
-case_name="$1"
-shim=/run/happylearn-e2e-shims/inject
-dump=/tmp/phase5-database.dump
-maintenance=backup
-cleanup_case() {
-  rm -f "$dump"
-}
-trap cleanup_case EXIT HUP INT TERM
-[ -x "$shim" ]
-
-case "$case_name" in
-  drain_timeout | webhook_timeout)
-    set +e
-    timeout -s TERM 1 "$shim" 2>/dev/null
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 124 ] ||
-      [ "$injection_status" -eq 137 ] ||
-      [ "$injection_status" -eq 143 ]
-    actual=failed
-    ;;
-  database_dump_failure)
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 21 ]
-    actual=failed
-    ;;
-  object_store_stop_failure)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 22 ]
-    actual=failed
-    ;;
-  snapshot_failure)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 23 ]
-    actual=failed
-    ;;
-  object_store_restart_failure)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 24 ]
-    actual=failed
-    ;;
-  repository_integrity_failure)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 25 ]
-    actual=failed
-    ;;
-  retention_failure)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 26 ]
-    actual=failed
-    ;;
-  wrong_repository_secret)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 27 ]
-    actual=failed
-    ;;
-  tampered_pack)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 28 ]
-    actual=failed
-    ;;
-  missing_restored_object)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 29 ]
-    actual=failed
-    ;;
-  stale_restored_session)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 30 ]
-    actual=failed
-    ;;
-  remote_outage)
-    : >"$dump"
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 31 ]
-    actual=degraded
-    ;;
-  webhook_private_target)
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 41 ]
-    actual=rejected
-    ;;
-  host_sample_replay)
-    set +e
-    "$shim"
-    injection_status=$?
-    set -e
-    [ "$injection_status" -eq 42 ]
-    actual=rejected
-    ;;
-  *)
-    exit 64
-    ;;
-esac
-
-rm -f "$dump"
-maintenance=normal
-[ ! -e "$dump" ]
-case "$actual" in
-  failed | degraded) alert=active ;;
-  rejected) alert=suppressed ;;
-  *) exit 65 ;;
-esac
-pending=/evidence/report.pending
-report=/evidence/report
-printf \
-  'evidence_version=1\ncase=%s\nactual=%s\nmaintenance=%s\nalert=%s\nplaintext_dump=absent\n' \
-  "$case_name" "$actual" "$maintenance" "$alert" >"$pending"
-chmod 0600 "$pending"
-mv "$pending" "$report"
-trap - EXIT HUP INT TERM
-LIVE_CASE_PROGRAM
-}
-
-create_live_case_resources() {
+create_production_probe_container() {
   local case_name="$1"
   local case_project="$2"
-  local shim_directory="$3"
-  local evidence_directory="$4"
-  local suffix="${case_project##*-}"
-  local program
-  [[ "$evidence_directory" == \
-    "$LIVE_ROOT/cases/$case_project/raw" &&
-    -d "$evidence_directory" &&
-    ! -L "$evidence_directory" ]] ||
+  local probe_kind="$3"
+  local probe_target="$4"
+  local test_pattern="$5"
+  local suffix="${case_project##*-}" test_binary=''
+  [[ "$probe_kind" =~ ^(go|shell)$ &&
+    "$test_pattern" =~ ^[A-Za-z0-9_/-]+$ &&
+    -n "$PRODUCTION_PROBE_IMAGE" ]] ||
     return 1
-  ACTIVE_NETWORK_NAME="hl-p5fm-${case_name//_/-}-${suffix:0:8}"
+  if [[ "$probe_kind" == go ]]; then
+    [[ "$probe_target" =~ ^\./(cmd|internal)/[a-z0-9-]+$ ]] || return 1
+    test_binary="${probe_target#./}"
+    test_binary="/opt/happylearn/${test_binary//\//-}.test"
+  else
+    [[ "$probe_target" == "$case_name" ]] || return 1
+  fi
   ACTIVE_CONTAINER_NAME="happylearn_phase5_${case_name}_${suffix:0:8}"
-  ACTIVE_NETWORK_ID="$(
-    docker network create \
-      --internal \
-      --label "$LIVE_OWNER_LABEL=$LIVE_OWNER" \
-      --label "$LIVE_PROJECT_LABEL=$case_project" \
-      "$ACTIVE_NETWORK_NAME"
-  )" || return 1
-  [[ -n "$ACTIVE_NETWORK_ID" &&
-    "$(inspect_live_network "$ACTIVE_NETWORK_ID")" == \
-    "$LIVE_OWNER|$case_project|$ACTIVE_NETWORK_NAME" ]] ||
-    return 1
-  program="$(live_case_program)" || return 1
+  local command=("$test_binary" -test.v -test.run "^${test_pattern}$")
+  if [[ "$probe_kind" == shell ]]; then
+    command=(phase5-backup-failure-probe "$probe_target")
+  fi
   ACTIVE_CONTAINER_ID="$(
     docker create \
       --name "$ACTIVE_CONTAINER_NAME" \
       --label "$LIVE_OWNER_LABEL=$LIVE_OWNER" \
       --label "$LIVE_PROJECT_LABEL=$case_project" \
       --label "$LIVE_CASE_LABEL=$case_name" \
-      --network "$ACTIVE_NETWORK_ID" \
+      --network none \
       --read-only \
       --cap-drop ALL \
       --security-opt no-new-privileges:true \
-      --memory 64m \
-      --cpus 0.25 \
-      --pids-limit 32 \
-      --user 0:0 \
-      --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64k,mode=0700 \
-      --mount "type=bind,source=$shim_directory,target=$CASE_SHIM_MOUNT,readonly" \
-      --mount "type=bind,source=$evidence_directory,target=/evidence" \
-      "$LIVE_CASE_IMAGE" \
-      /bin/sh -ceu "$program" sh "$case_name"
+      --memory 512m \
+      --cpus 0.5 \
+      --pids-limit 128 \
+      --user 65532:65532 \
+      --env HOME=/tmp/home \
+      --env GOCACHE=/tmp/go-build \
+      --tmpfs /tmp:rw,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=0700 \
+      --mount "type=bind,source=$repo_root,target=/src,readonly" \
+      --workdir /src \
+      "$PRODUCTION_PROBE_IMAGE" \
+      "${command[@]}"
   )" || return 1
   [[ -n "$ACTIVE_CONTAINER_ID" ]]
+}
+
+run_production_probe() {
+  local container_id="$1"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ||
+    "$container_id" =~ ^container-happylearn_phase5_[a-z0-9_]+_[0-9a-f]{8}$ ]] ||
+    return 1
+  exec docker start -a "$container_id"
+}
+
+parse_production_probe_output() {
+  local probe_log="$1"
+  local report="$2"
+  local case_name="$3"
+  local marker marker_count observed_case actual maintenance alert plaintext
+  [[ -f "$probe_log" && ! -L "$probe_log" &&
+    "$case_name" == "$ACTIVE_CASE_NAME" ]] ||
+    return 1
+  marker_count="$(grep -c 'PHASE5_FAILURE_EVIDENCE ' "$probe_log" || true)"
+  [[ "$marker_count" == 1 ]] || return 1
+  marker="$(
+    sed -n 's/^.*PHASE5_FAILURE_EVIDENCE /PHASE5_FAILURE_EVIDENCE /p' \
+      "$probe_log"
+  )"
+  [[ "$marker" =~ ^PHASE5_FAILURE_EVIDENCE\ case=([a-z][a-z0-9_]{0,63})\ actual=(failed|degraded|rejected)\ maintenance=(normal|backup)\ alert=(active|suppressed)\ plaintext_dump=(absent|present)$ ]] ||
+    return 1
+  observed_case="${BASH_REMATCH[1]}"
+  actual="${BASH_REMATCH[2]}"
+  maintenance="${BASH_REMATCH[3]}"
+  alert="${BASH_REMATCH[4]}"
+  plaintext="${BASH_REMATCH[5]}"
+  [[ "$observed_case" == "$case_name" ]] || return 1
+  printf \
+    'evidence_version=1\ncase=%s\nactual=%s\nmaintenance=%s\nalert=%s\nplaintext_dump=%s\n' \
+    "$case_name" "$actual" "$maintenance" "$alert" "$plaintext" \
+    >"$report"
+  chmod 0600 "$report"
 }
 
 parse_live_case_evidence() {
@@ -831,8 +736,9 @@ run_live_case() {
   local case_name="$1"
   local expected_state="$2"
   local case_project="$3"
-  local case_root shim_directory raw_directory published_directory
+  local case_root raw_directory published_directory probe_log
   local started finished duration trace_id deadline injection_status=0
+  local probe probe_kind probe_target test_pattern
   local identity owner project observed_case status exit_code name
   LIVE_ACTUAL_STATE=''
   ACTIVE_CASE_NAME="$case_name"
@@ -844,26 +750,49 @@ run_live_case() {
   ACTIVE_NETWORK_ID=''
   ACTIVE_NETWORK_NAME=''
   case_root="$LIVE_ROOT/cases/$case_project"
-  shim_directory="$case_root/shims"
   raw_directory="$case_root/raw"
   published_directory="$case_root/published"
+  probe_log="$raw_directory/production-probe.log"
   mkdir -m 0700 \
-    "$case_root" "$shim_directory" "$raw_directory" "$published_directory"
-  install_live_case_command_shim "$case_name" "$shim_directory"
+    "$case_root" "$raw_directory" "$published_directory"
   started="$(contract_milliseconds)" || return 1
-  create_live_case_resources \
-    "$case_name" "$case_project" "$shim_directory" "$raw_directory"
+  probe="$(production_probe_for_case "$case_name")" || return 1
+  IFS='|' read -r probe_kind probe_target test_pattern <<<"$probe"
+  if ! create_production_probe_container \
+    "$case_name" "$case_project" "$probe_kind" "$probe_target" "$test_pattern"; then
+    printf \
+      'phase 5 failure matrix: probe container creation failed case=%s kind=%s target=%s pattern=%s\n' \
+      "$case_name" "$probe_kind" "$probe_target" "$test_pattern" >&2
+    return 1
+  fi
   deadline="$(bounded_seconds "$CASE_DEADLINE_SECONDS")" || return 1
-  if run_bounded "$deadline" docker start -a "$ACTIVE_CONTAINER_ID" \
-    >/dev/null; then
+  if run_bounded "$deadline" run_production_probe \
+    "$ACTIVE_CONTAINER_ID" >"$probe_log" 2>&1; then
     injection_status=0
   else
     injection_status=$?
   fi
-  [[ "$injection_status" == 0 ]] || return 1
+  if [[ "$injection_status" != 0 ]]; then
+    printf 'phase 5 failure matrix: probe failed case=%s status=%s\n' \
+      "$case_name" "$injection_status" >&2
+    sed -n '1,240p' "$probe_log" >&2
+    return 1
+  fi
   identity="$(inspect_live_container "$ACTIVE_CONTAINER_ID")" || return 1
   IFS='|' read -r owner project observed_case status exit_code name \
     <<<"$identity"
+  if [[ "$owner" != "$LIVE_OWNER" ||
+    "$project" != "$case_project" ||
+    "$observed_case" != "$case_name" ||
+    "$status" != exited ||
+    "$exit_code" != 0 ||
+    "$name" != "/$ACTIVE_CONTAINER_NAME" ]]; then
+    printf \
+      'phase 5 failure matrix: probe identity/status mismatch case=%s status=%s exit=%s\n' \
+      "$case_name" "$status" "$exit_code" >&2
+    sed -n '1,240p' "$probe_log" >&2
+    return 1
+  fi
   [[ "$owner" == "$LIVE_OWNER" &&
     "$project" == "$case_project" &&
     "$observed_case" == "$case_name" &&
@@ -871,10 +800,19 @@ run_live_case() {
     "$exit_code" == 0 &&
     "$name" == "/$ACTIVE_CONTAINER_NAME" ]] ||
     return 1
+  grep -Fq -- "--- PASS: $test_pattern " "$probe_log" || return 1
+  if ! parse_production_probe_output \
+    "$probe_log" "$raw_directory/report" "$case_name"; then
+    printf 'phase 5 failure matrix: invalid probe evidence case=%s\n' \
+      "$case_name" >&2
+    sed -n '1,240p' "$probe_log" >&2
+    return 1
+  fi
   chmod 0600 "$raw_directory/report"
   parse_live_case_evidence \
     "$raw_directory/report" "$case_name" "$expected_state"
   rm -f "$raw_directory/report"
+  rm -f "$probe_log"
   sanitize_and_publish_live_case \
     "$raw_directory" "$published_directory" \
     "$ACTIVE_CONTAINER_NAME" "$exit_code"
@@ -895,20 +833,12 @@ run_live_case() {
 }
 
 run_live_matrix() {
-  local nonce entry case_name expected_state case_project image_id temp_base
+  local nonce entry case_name expected_state case_project temp_base
   [[ -x "$SANITIZER" && -x "$PUBLISHER" ]] ||
     fail 'live failure-matrix artifact dependencies are absent' ||
     return 1
   command -v docker >/dev/null 2>&1 ||
     fail 'Docker CLI is required for the live failure matrix' ||
-    return 1
-  image_id="$(
-    docker image inspect "$LIVE_CASE_IMAGE" --format '{{.Id}}'
-  )" ||
-    fail 'pinned live failure-matrix image is absent' ||
-    return 1
-  [[ "$image_id" == sha256:* ]] ||
-    fail 'pinned live failure-matrix image identity is invalid' ||
     return 1
   temp_base="${TMPDIR:-/tmp}"
   temp_base="${temp_base%/}"
@@ -920,6 +850,9 @@ run_live_matrix() {
   live_root_is_safe "$LIVE_ROOT" || return 1
   mkdir -m 0700 "$LIVE_ROOT/cases"
   LIVE_OWNER="$(run_nonce)" || return 1
+  build_production_probe_image ||
+    fail 'production failure-probe image build failed' ||
+    return 1
   nonce="$(run_nonce)" || return 1
   for entry in "${FAILURE_MATRIX[@]}"; do
     case_name="${entry%%:*}"

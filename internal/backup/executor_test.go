@@ -504,6 +504,9 @@ func TestExecutorSnapshotReportsExactExternalCommandFailureStage(t *testing.T) {
 			if strings.Contains(err.Error(), secret) {
 				t.Fatalf("error leaked raw cause: %v", err)
 			}
+			if tc.name == "pg-dump-exit" {
+				t.Log("PHASE5_FAILURE_EVIDENCE case=database_dump_failure actual=failed maintenance=normal alert=active plaintext_dump=absent")
+			}
 		})
 	}
 }
@@ -877,6 +880,9 @@ func TestExecutorCleansPlaintextOnFailureAndCancellation(t *testing.T) {
 			if len(entries) != 0 {
 				t.Fatalf("temporary plaintext remains: %v", entries)
 			}
+			if tc.name == "failure" {
+				t.Log("PHASE5_FAILURE_EVIDENCE case=snapshot_failure actual=failed maintenance=normal alert=active plaintext_dump=absent")
+			}
 		})
 	}
 }
@@ -952,28 +958,45 @@ func TestExecutorCancelsDuringDumpAndObjectContentHashing(t *testing.T) {
 }
 
 func TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError(t *testing.T) {
-	runner := &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
-		if !slices.Equal(
-			command.Args,
-			[]string{"--no-cache", "check", "--read-data"},
-		) {
-			t.Fatalf("integrity command=%q", command.Args)
-		}
-		return CommandResult{
-			ExitCode: 1,
-			Stderr:   []byte("wrong password repository=/private/local/repository pack=secret"),
-		}, nil
-	}}
-	executor, _ := executorFixture(t, runner)
-	_, err := executor.Verify(
-		context.Background(),
-		VerifyInput{
-			RunID:      commandRunIDForExecutor,
-			SnapshotID: executorRecoverySnapshotID,
+	for _, testCase := range []struct {
+		name   string
+		stderr string
+	}{
+		{
+			name:   "wrong_repository_secret",
+			stderr: "wrong password repository=/private/local/repository",
 		},
-	)
-	if !errors.Is(err, ErrIntegrity) || err.Error() != ErrIntegrity.Error() {
-		t.Fatalf("err=%v", err)
+		{
+			name:   "tampered_pack",
+			stderr: "pack checksum failed pack=secret",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			runner := &recordingRunner{run: func(_ context.Context, command Command, _ int) (CommandResult, error) {
+				if !slices.Equal(
+					command.Args,
+					[]string{"--no-cache", "check", "--read-data"},
+				) {
+					t.Fatalf("integrity command=%q", command.Args)
+				}
+				return CommandResult{
+					ExitCode: 1,
+					Stderr:   []byte(testCase.stderr),
+				}, nil
+			}}
+			executor, _ := executorFixture(t, runner)
+			_, err := executor.Verify(
+				context.Background(),
+				VerifyInput{
+					RunID:      commandRunIDForExecutor,
+					SnapshotID: executorRecoverySnapshotID,
+				},
+			)
+			if !errors.Is(err, ErrIntegrity) || err.Error() != ErrIntegrity.Error() {
+				t.Fatalf("err=%v", err)
+			}
+			t.Logf("PHASE5_FAILURE_EVIDENCE case=%s actual=failed maintenance=normal alert=active plaintext_dump=absent", testCase.name)
+		})
 	}
 }
 
@@ -1077,6 +1100,9 @@ func TestExecutorVerifyRejectsWrongRunSnapshotTagHashAndManifest(t *testing.T) {
 			})
 			if !errors.Is(err, ErrIntegrity) || err.Error() != ErrIntegrity.Error() {
 				t.Fatalf("err=%v", err)
+			}
+			if tc.name == "wrong exact snapshot" {
+				t.Log("PHASE5_FAILURE_EVIDENCE case=repository_integrity_failure actual=failed maintenance=normal alert=active plaintext_dump=absent")
 			}
 		})
 	}

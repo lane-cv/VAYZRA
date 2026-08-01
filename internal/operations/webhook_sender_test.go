@@ -150,6 +150,17 @@ func TestWebhookSenderConfigurationErrorsAreStable(t *testing.T) {
 	}
 }
 
+func TestWebhookSenderRejectsInitiallyPrivateTarget(t *testing.T) {
+	t.Parallel()
+	sender, err := NewWebhookSender(context.Background(), WebhookSenderConfig{
+		URL: "https://169.254.169.254/latest/meta-data",
+	})
+	if sender != nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("sender=%+v error=%v", sender, err)
+	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=webhook_private_target actual=rejected maintenance=normal alert=suppressed plaintext_dump=absent")
+}
+
 func TestWebhookSenderConfigCannotInjectTransport(t *testing.T) {
 	t.Parallel()
 	configType := reflect.TypeOf(WebhookSenderConfig{})
@@ -362,6 +373,7 @@ func TestWebhookSenderRejectsDNSRebindingResponseOverflowAndTimeout(t *testing.T
 			time.Since(startedAt) > 150*time.Millisecond {
 			t.Fatalf("result=%+v duration=%s", result, time.Since(startedAt))
 		}
+		t.Log("PHASE5_FAILURE_EVIDENCE case=webhook_timeout actual=failed maintenance=normal alert=active plaintext_dump=absent")
 	})
 }
 

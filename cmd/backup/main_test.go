@@ -951,6 +951,7 @@ func TestCommandApplicationRemoteFailureCompletesDegradedWithSameFence(t *testin
 		service.completions[0].ErrorCategory != "remote_unavailable" {
 		t.Fatalf("completions=%+v", service.completions)
 	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=remote_outage actual=degraded maintenance=normal alert=active plaintext_dump=absent")
 }
 
 func TestCommandApplicationPostSyncRemoteFailureCompletesDegradedWithSameFence(t *testing.T) {

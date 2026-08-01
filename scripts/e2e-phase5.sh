@@ -2100,7 +2100,7 @@ run_browser_command() {
   docker_bounded "$timeout" run --rm --name "$browser_runner" --network "$network" \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
-    --read-only --user 1000:1000 --shm-size 384m --memory 1024m --cpus .5 \
+    --read-only --user 1000:1000 --shm-size 384m --memory 896m --cpus .4 \
     --cap-drop ALL --security-opt no-new-privileges \
     --tmpfs /tmp:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
     -v "$runner_volume:/workspace" -v "$fixture_volume:/fixtures:ro" \
@@ -2789,6 +2789,43 @@ resource_monitor_capture() {
     docker_capture_bounded "$output_variable" "$seconds" "$@"
 }
 
+resource_monitor_stats() {
+  local output_variable="${1:?output variable required}"
+  local seconds="${2:?deadline required}"
+  shift 2
+  local ids=("$@") live_ids=()
+  local attempt id listing listing_failed
+  ((${#ids[@]} > 0)) || {
+    printf -v "$output_variable" '%s' ''
+    return 0
+  }
+  for attempt in 1 2 3; do
+    live_ids=()
+    listing_failed=false
+    for id in "${ids[@]}"; do
+      if ! docker_capture_bounded listing 15 container ls --quiet --no-trunc \
+        --filter "id=${id}"; then
+        listing_failed=true
+        break
+      fi
+      [[ -z "$listing" ]] || live_ids+=("$id")
+    done
+    if [[ "$listing_failed" == false ]]; then
+      if ((${#live_ids[@]} == 0)); then
+        printf -v "$output_variable" '%s' ''
+        return 0
+      fi
+      if docker_capture_bounded "$output_variable" "$seconds" stats \
+        --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' \
+        "${live_ids[@]}"; then
+        return 0
+      fi
+    fi
+    ((attempt == 3)) || sleep 1
+  done
+  return 1
+}
+
 resource_monitor_failure() {
   local category="${1:?failure category required}"
   case "$category" in
@@ -2821,6 +2858,28 @@ resource_is_backup_activity() {
   return 1
 }
 
+resource_worker_backup_overlap_now() {
+  local snapshot name service oneoff extra
+  local worker_running=false backup_running=false
+  resource_monitor_capture snapshot 15 ps \
+    --filter "label=com.docker.compose.project=${live_project}" \
+    --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --format '{{.Names}}|{{.Label "com.docker.compose.service"}}|{{.Label "com.docker.compose.oneoff"}}' ||
+    return 2
+  while IFS='|' read -r name service oneoff extra; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ ^[A-Za-z0-9_.-]+$ &&
+      "$service" =~ ^(postgres|redis|minio|app|worker|backup|backup-storage-init|backup-secrets-init)?$ &&
+      "$oneoff" =~ ^(True|False)?$ && -z "$extra" ]] ||
+      return 2
+    [[ "$service" == worker ]] && worker_running=true
+    if resource_is_backup_activity "/$name" "$service" "$oneoff"; then
+      backup_running=true
+    fi
+  done <<<"$snapshot"
+  [[ "$worker_running" == true && "$backup_running" == true ]]
+}
+
 monitor_resource_workloads() {
   local browser_pid="${1:?browser pid required}"
   local backup_pid="${2:?backup pid required}"
@@ -2840,7 +2899,7 @@ monitor_resource_workloads() {
   local command worker_running heavy_running backup_activity_running browser_id
   local configured_cpu configured_memory stats sample live_cpu live_memory
   local browser_stats browser_sample browser_cpu browser_memory
-  local aggregate_container
+  local aggregate_container overlap_status
   local aggregate_ids=()
   install -m 0600 /dev/null "$evidence"
   while kill -0 "$browser_pid" 2>/dev/null ||
@@ -2985,7 +3044,16 @@ monitor_resource_workloads() {
     done <<<"$listing"
     if [[ "$worker_running" == true &&
       "$backup_activity_running" == true ]]; then
-      worker_backup_overlap=true
+      overlap_status=0
+      resource_worker_backup_overlap_now || overlap_status=$?
+      case "$overlap_status" in
+        0) worker_backup_overlap=true ;;
+        1) ;;
+        *)
+          resource_monitor_failure listing
+          return 1
+          ;;
+      esac
     fi
     peak_configured_cpu="$(
       awk -v old="$peak_configured_cpu" -v new="$configured_cpu" \
@@ -2996,9 +3064,7 @@ monitor_resource_workloads() {
         'BEGIN { printf "%.3f", (new > old ? new : old) }'
     )"
     if ((${#aggregate_ids[@]} > 0)); then
-      resource_monitor_capture stats 30 stats --no-stream \
-        --format '{{.CPUPerc}}|{{.MemUsage}}' \
-        "${aggregate_ids[@]}" || {
+      resource_monitor_stats stats 30 "${aggregate_ids[@]}" || {
         resource_monitor_failure production_stats
         return 1
       }
@@ -3080,6 +3146,7 @@ run_resource_sample() {
   local report="$artifact_dir/resource-samples.tsv"
   local temporary="$tmpdir/resource-evidence"
   local browser_status=0 backup_status=0 monitor_status=0 finalize_status=0
+  local validation_status=0
   local child_status_file status=0
   for child_status_file in \
     "$resource_browser_status_file" "$resource_backup_status_file"; do
@@ -3114,7 +3181,12 @@ run_resource_sample() {
       "$finalize_status" >&2
     return "$status"
   fi
-  validate_resource_evidence "$temporary" || return $?
+  validate_resource_evidence "$temporary" || validation_status=$?
+  if ((validation_status != 0)); then
+    printf 'resource evidence validation failed:\n' >&2
+    sed -n '1,40p' "$temporary" >&2
+    return "$validation_status"
+  fi
   install -m 0600 "$temporary" "$report" || return $?
 }
 

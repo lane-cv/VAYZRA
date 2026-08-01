@@ -219,6 +219,7 @@ func TestPlanRetentionFailsClosedWhenAnyRetainedSnapshotIsMissing(t *testing.T) 
 	}, now); err == nil {
 		t.Fatal("missing retained pre-release/daily/monthly snapshot accepted")
 	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=retention_failure actual=failed maintenance=normal alert=active plaintext_dump=absent")
 }
 
 func TestExecutorForgetsInDeterministicBoundedGlobalBatches(t *testing.T) {

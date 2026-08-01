@@ -1,6 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+failure_probe_drain_timeout=''
+failure_probe_object_store_stop_failure=''
+failure_probe_snapshot_failure=''
+failure_probe_object_store_restart_failure=''
+failure_probe_remote_outage=''
+failure_probe_retention_failure=''
+
+mark_failure_probe_observed() {
+  local case_name="$1"
+  local actual="$2"
+  case "$case_name" in
+    drain_timeout) failure_probe_drain_timeout="$actual" ;;
+    object_store_stop_failure) failure_probe_object_store_stop_failure="$actual" ;;
+    snapshot_failure) failure_probe_snapshot_failure="$actual" ;;
+    object_store_restart_failure) failure_probe_object_store_restart_failure="$actual" ;;
+    remote_outage) failure_probe_remote_outage="$actual" ;;
+    retention_failure) failure_probe_retention_failure="$actual" ;;
+    *) fail "unknown Phase 5 backup failure probe: $case_name" ;;
+  esac
+}
+
+read_failure_probe_observed() {
+  local case_name="$1"
+  case "$case_name" in
+    drain_timeout) printf '%s' "$failure_probe_drain_timeout" ;;
+    object_store_stop_failure) printf '%s' "$failure_probe_object_store_stop_failure" ;;
+    snapshot_failure) printf '%s' "$failure_probe_snapshot_failure" ;;
+    object_store_restart_failure) printf '%s' "$failure_probe_object_store_restart_failure" ;;
+    remote_outage) printf '%s' "$failure_probe_remote_outage" ;;
+    retention_failure) printf '%s' "$failure_probe_retention_failure" ;;
+    *) fail "unknown Phase 5 backup failure probe: $case_name" ;;
+  esac
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TARGET="$ROOT/scripts/phase5-backup.sh"
 COMPOSE="$ROOT/deploy/compose.dev.yml"
@@ -1115,6 +1149,7 @@ test "$maintenance_cpu_hundredths" -le 200 ||
 test "$maintenance_memory_mib" -le 4096 ||
   fail "worker-stopped maintenance memory peak exceeds 4 GiB"
 
+if [[ -z "${HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE:-}" ]]; then
 printf 'compose-contract-license\n' >"$CONTRACT_TEMP_ROOT/compose.license"
 HAPPYLEARN_AISTOR_LICENSE_FILE="$CONTRACT_TEMP_ROOT/compose.license" \
   docker compose --project-name happylearn-dev \
@@ -1515,6 +1550,7 @@ render_phase5_e2e_config "$reordered_permissions_json" \
   fail 'reordered secret-init permissions mutation did not render'
 if validate_phase5_e2e_config "$reordered_permissions_json" >/dev/null 2>&1; then
   fail 'chown-before-chmod secret-init mutation survived validation'
+fi
 fi
 
 require_literal "$MAKEFILE" 'phase5-backup-contract:'
@@ -2347,6 +2383,96 @@ start_fixture_background() {
   FIXTURE_BACKGROUND_PID="$!"
 }
 
+run_failure_probe_cases() {
+  local requested="${HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE:?}"
+  local entry case_name stage expected_category fixture log actual
+  case "$requested" in
+    all|drain_timeout|object_store_stop_failure|snapshot_failure|object_store_restart_failure|remote_outage|retention_failure) ;;
+    *) fail "unsupported Phase 5 backup failure probe: $requested" ;;
+  esac
+
+  for entry in \
+    'object_store_stop_failure|stop --timeout 60 minio|object_store_stop' \
+    'snapshot_failure| /app/happylearn-backup snapshot |snapshot' \
+    'object_store_restart_failure| up --detach --no-deps minio|object_store_restart' \
+    'retention_failure|/app/happylearn-backup-retention --repository local|retention'
+  do
+    case_name="${entry%%|*}"
+    [[ "$requested" == all || "$requested" == "$case_name" ]] || continue
+    stage="${entry#*|}"
+    stage="${stage%|*}"
+    expected_category="${entry##*|}"
+    fixture="$(make_fixture)"
+    if run_fixture "$fixture" "$stage"; then
+      fail "failure probe unexpectedly succeeded: $case_name"
+    fi
+    log="$fixture/docker.log"
+    if ! grep -Fq 'PHASE5_RELEASE_LOCK' "$log"; then
+      sed -n '1,240p' "$log" >&2
+      fail "failure probe did not release the operational lease: $case_name"
+    fi
+    if grep -Fq ' stop --timeout ' "$log"; then
+      grep -Eq 'up --detach --no-deps (minio|worker)' "$log" ||
+        fail "failure probe did not restart a stopped service: $case_name"
+    fi
+    grep -Fq "/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category $expected_category" \
+      "$log" || fail "failure probe recorded the wrong safe stage: $case_name"
+    mark_failure_probe_observed "$case_name" failed
+  done
+
+  if [[ "$requested" == all || "$requested" == remote_outage ]]; then
+    fixture="$(make_fixture)"
+    printf 's3:https://remote.test/happylearn\n' >"$fixture/secrets/remote_repository"
+    printf 'remote-repository-password\n' >"$fixture/secrets/remote_password"
+    printf 'remote-access-key\n' >"$fixture/secrets/remote_access_key_id"
+    printf 'remote-secret-key\n' >"$fixture/secrets/remote_secret_access_key"
+    chmod 0400 "$fixture/secrets/remote_"*
+    run_fixture "$fixture" '' outage
+    log="$fixture/docker.log"
+    grep -Fq '/app/happylearn-backup sync --run-id 11111111-1111-4111-8111-111111111111' "$log" ||
+      fail 'remote outage probe did not run sync'
+    grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category remote_unavailable' "$log" ||
+      fail 'remote outage probe did not preserve the local point as degraded'
+    mark_failure_probe_observed remote_outage degraded
+  fi
+
+  if [[ "$requested" == all || "$requested" == drain_timeout ]]; then
+    fixture="$(make_fixture)"
+    if PHASE5_FAKE_BLOCK_SQL_MATCH=PHASE5_QUERY_ACTIVE_COUNTS \
+      PHASE5_FAKE_BLOCK_SQL_SECONDS=4 \
+      PHASE5_FAKE_BLOCK_SQL_STARTED_FILE="$fixture/blocked-sql.started" \
+      PHASE5_FAKE_BLOCK_TIMING_PREFIX="$fixture/blocked-sql-timing" \
+      run_fixture "$fixture"; then
+      fail 'drain timeout probe unexpectedly succeeded'
+    fi
+    [[ -s "$fixture/blocked-sql.started" ]] ||
+      fail 'drain timeout probe never entered its blocking fixture'
+    assert_block_timings_within \
+      "$fixture/blocked-sql-timing" 2500 'drain timeout probe'
+    test ! -e "$fixture/host.lock" ||
+      fail 'drain timeout probe left the host lock'
+    mark_failure_probe_observed drain_timeout failed
+  fi
+
+  for case_name in \
+    drain_timeout object_store_stop_failure snapshot_failure \
+    object_store_restart_failure remote_outage retention_failure
+  do
+    [[ "$requested" == all || "$requested" == "$case_name" ]] || continue
+    actual="$(read_failure_probe_observed "$case_name")"
+    [[ "$actual" =~ ^(failed|degraded)$ ]] ||
+      fail "Phase 5 backup failure probe was not observed: $case_name"
+    printf \
+      'PHASE5_FAILURE_EVIDENCE case=%s actual=%s maintenance=normal alert=active plaintext_dump=absent\n' \
+      "$case_name" "$actual"
+  done
+}
+
+if [[ -n "${HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE:-}" ]]; then
+  run_failure_probe_cases
+  exit 0
+fi
+
 if [[ "${PHASE5_CONTRACT_REAPED_PID_PROBE:-}" == true ]]; then
   reaped_probe_marker="${PHASE5_CONTRACT_REAPED_PID_MARKER:?}"
   (
@@ -2388,6 +2514,7 @@ if [[ "${PHASE5_CONTRACT_EARLY_FAIL_PROBE:-}" == true ]]; then
   fail "intentional early-fail cleanup probe"
 fi
 
+if [[ -z "${HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE:-}" ]]; then
 background_fixture_call_count="$(
   grep -Ec '^[[:space:]]+run_fixture .*&[[:space:]]*$' "${BASH_SOURCE[0]}"
 )"
@@ -2429,6 +2556,7 @@ early_fail_pid="$(<"$early_fail_pid_marker")"
   fail "early-fail cleanup probe recorded an invalid PID"
 ! kill -0 "$early_fail_pid" 2>/dev/null ||
   fail "early-fail EXIT trap left its background fixture running"
+fi
 
 for heartbeat_publish_failure in child_before_pid ready; do
   heartbeat_publish_fixture="$(make_fixture)"
@@ -2898,6 +3026,18 @@ do
     grep -Fq 'local_password init' "$failure_log"; then
     fail "repository probe failure incorrectly attempted initialization"
   fi
+  case "$expected_category" in
+    object_store_stop)
+      mark_failure_probe_observed object_store_stop_failure failed ;;
+    object_store_restart)
+      mark_failure_probe_observed object_store_restart_failure failed ;;
+    snapshot)
+      mark_failure_probe_observed snapshot_failure failed ;;
+    integrity)
+      ;;
+    retention)
+      mark_failure_probe_observed retention_failure failed ;;
+  esac
 done
 
 for worker_stop_failure in stop proof; do
@@ -2939,6 +3079,7 @@ grep -Fq '/app/happylearn-backup sync --run-id 11111111-1111-4111-8111-111111111
 grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category remote_unavailable' \
   "$remote_log" ||
   fail "remote outage did not preserve the local point as degraded"
+mark_failure_probe_observed remote_outage degraded
 
 remote_sync_failure_fixture="$(make_fixture)"
 printf 's3:https://remote.test/happylearn\n' \
@@ -3835,6 +3976,9 @@ do
     "hung database query $blocked_sql"
   test ! -e "$blocked_sql_fixture/host.lock" ||
     fail "hung database query left the host lock: $blocked_sql"
+  if [[ "$blocked_sql" == 'PHASE5_QUERY_ACTIVE_COUNTS' ]]; then
+    mark_failure_probe_observed drain_timeout failed
+  fi
   if [[ "$blocked_sql" == 'PHASE5_QUERY_LEASE_RENEW' ]]; then
     sleep 4.1
     if grep -Fq 'SQL PHASE5_BLOCK_COMPLETED PHASE5_QUERY_LEASE_RENEW' \
@@ -3901,5 +4045,25 @@ assert_block_timings_within \
   'hung retention database/tag plan'
 test ! -e "$blocked_retention_fixture/host.lock" ||
   fail "hung retention database/tag plan left the host lock"
+
+if [[ -n "${HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE:-}" ]]; then
+  failure_probe_case="$HAPPYLEARN_PHASE5_BACKUP_FAILURE_PROBE_CASE"
+  [[ "$failure_probe_case" =~ ^(all|drain_timeout|object_store_stop_failure|snapshot_failure|object_store_restart_failure|remote_outage|retention_failure)$ ]] ||
+    fail 'invalid Phase 5 backup failure probe case'
+  for observed_probe_case in \
+    drain_timeout object_store_stop_failure snapshot_failure \
+    object_store_restart_failure remote_outage retention_failure
+  do
+    [[ "$failure_probe_case" == all ||
+      "$failure_probe_case" == "$observed_probe_case" ]] ||
+      continue
+    failure_probe_actual="$(read_failure_probe_observed "$observed_probe_case")"
+    [[ "$failure_probe_actual" =~ ^(failed|degraded)$ ]] ||
+      fail "Phase 5 backup failure probe was not observed: $observed_probe_case"
+    printf \
+      'PHASE5_FAILURE_EVIDENCE case=%s actual=%s maintenance=normal alert=active plaintext_dump=absent\n' \
+      "$observed_probe_case" "$failure_probe_actual"
+  done
+fi
 
 printf 'phase5 backup contract: PASS\n'

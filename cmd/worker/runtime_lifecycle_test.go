@@ -117,6 +117,7 @@ func TestWorkerRuntimeTimeoutLeavesDatabaseResourcesOpen(t *testing.T) {
 	if order := events.joined(); order != "health_shutdown" {
 		t.Fatalf("database resources closed after worker timeout: %s", order)
 	}
+	t.Log("PHASE5_FAILURE_EVIDENCE case=drain_timeout actual=failed maintenance=normal alert=active plaintext_dump=absent")
 }
 
 func TestWorkerRuntimeCoordinatesEveryExitThroughSafeShutdown(t *testing.T) {

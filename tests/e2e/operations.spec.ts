@@ -57,6 +57,10 @@ const infrastructureKeys = [
 ]
 const forbiddenOperationsField = /authorization|body|content|cookie|credential|object.?key|password|query|repository.?path|secret|token|url/i
 const forbiddenAuditMetadata = /authorization|body|content|cookie|credential|filename|\bip\b|object.?key|password|prompt|query|secret|token|url/i
+const safeAuthorizationThresholdFields = new Set([
+  'authorizationDenialWarningCount',
+  'authorizationDenialCriticalCount',
+])
 
 type SettingsEnvelope = {
   data: Record<string, unknown> & { version: number }
@@ -91,7 +95,9 @@ function expectSecretFreeKeys(value: unknown): void {
   }
   if (!value || typeof value !== 'object') return
   for (const [key, item] of Object.entries(value)) {
-    expect(key).not.toMatch(forbiddenOperationsField)
+    if (!safeAuthorizationThresholdFields.has(key)) {
+      expect(key).not.toMatch(forbiddenOperationsField)
+    }
     expectSecretFreeKeys(item)
   }
 }

@@ -142,6 +142,27 @@ forbid_pattern "$target" \
   'docker[[:space:]]+(system|container|image|network|volume)[[:space:]]+prune'
 forbid_pattern "$target" '(/var/run/docker\.sock|docker\.sock)'
 forbid_pattern "$target" '--emit-contract-summary'
+forbid_pattern "$target" 'live_case_shim_exit_code|live_case_program'
+forbid_pattern "$target" 'actual=(failed|degraded|rejected)'
+forbid_pattern "$target" 'alpine@sha256:'
+
+require_literal "$target" 'production_probe_for_case()'
+require_literal "$target" 'run_production_probe()'
+require_literal "$target" 'parse_production_probe_output()'
+forbid_pattern "$target" 'write_production_probe_evidence'
+require_literal "$target" '-test.run'
+require_literal "$target" '/opt/happylearn/'
+require_literal "$target" 'phase5-backup-failure-probe'
+require_literal "$target" 'source=$repo_root,target=/src,readonly'
+require_literal "$target" '--network none'
+require_literal "$target" 'TestExecutorSnapshotReportsExactExternalCommandFailureStage/pg-dump-exit'
+require_literal "$target" 'TestExecutorVerifyRejectsWrongRunSnapshotTagHashAndManifest/wrong_exact_snapshot'
+require_literal "$target" 'TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError/$1'
+require_literal "$target" 'TestRestoreVerifierFailsClosedForMissingOrWrongSizedObject/missing'
+require_literal "$target" 'TestRestoreVerifierRejectsStaleSessionBeforeObjectAccess'
+require_literal "$target" 'TestWebhookSenderRejectsInitiallyPrivateTarget'
+require_literal "$target" 'TestWebhookSenderRejectsDNSRebindingResponseOverflowAndTimeout/total_timeout'
+require_literal "$target" 'TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay'
 
 # The contract runner uses the same deadline primitive as the future target,
 # but in a separate process. This outer deadline catches a broken case deadline
@@ -227,8 +248,15 @@ case "${1:-}" in
     printf '29.6.1\n'
     ;;
   image)
-    [[ "${2:-}" == inspect ]] || exit 64
-    printf 'sha256:phase5failurematrixfixture\n'
+    case "${2:-}" in
+      inspect) printf 'sha256:phase5failurematrixfixture\n' ;;
+      rm) printf '%s\n' "${3:?}" ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  build)
+    [[ "$*" == *'Dockerfile.phase5-failure-probe'* &&
+      "$*" == *'happylearn-phase5-failure-probe:'* ]] || exit 64
     ;;
   network)
     case "${2:-}" in
@@ -300,7 +328,6 @@ case "${1:-}" in
     project=''
     case_name=''
     name=''
-    evidence=''
     image_seen=false
     while [[ "$#" -gt 0 ]]; do
       case "$1" in
@@ -323,15 +350,12 @@ case "${1:-}" in
           esac
           shift 2
           ;;
-        --network|--security-opt|--memory|--cpus|--pids-limit|--user|--tmpfs)
+        --network|--security-opt|--memory|--cpus|--pids-limit|--user|--tmpfs|--env|--workdir)
           shift 2
           ;;
         --mount)
           value="${2:?}"
-          if [[ "$value" == type=bind,source=*,target=/evidence ]]; then
-            evidence="${value#type=bind,source=}"
-            evidence="${evidence%,target=/evidence}"
-          fi
+          [[ "$value" == type=bind,source=*,target=/src,readonly ]] || exit 64
           shift 2
           ;;
         --read-only)
@@ -341,7 +365,7 @@ case "${1:-}" in
           [[ "${2:-}" == ALL ]] || exit 64
           shift 2
           ;;
-        alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1)
+        happylearn-phase5-failure-probe:*)
           image_seen=true
           shift
           break
@@ -353,16 +377,58 @@ case "${1:-}" in
       -n "$owner" &&
       -n "$project" &&
       -n "$case_name" &&
-      -n "$name" &&
-      -n "$evidence" &&
-      "${*: -1}" == "$case_name" ]] ||
+      -n "$name" ]] ||
       exit 64
+    if [[ "${1:-}" == /opt/happylearn/*.test ]]; then
+      [[ "$*" == *'-test.run'* ]] || exit 64
+    else
+      [[ "${1:-}" == phase5-backup-failure-probe &&
+        "${2:-}" == "$case_name" ]] || exit 64
+    fi
+    test_pattern=''
+    if [[ "${1:-}" == phase5-backup-failure-probe ]]; then
+      test_pattern="phase5-backup-contract/$case_name"
+    else
+      while [[ "$#" -gt 0 ]]; do
+        if [[ "$1" == -test.run ]]; then
+          test_pattern="${2:?}"
+          test_pattern="${test_pattern#^}"
+          test_pattern="${test_pattern%$}"
+          break
+        fi
+        shift
+      done
+    fi
+    [[ "$test_pattern" =~ ^[A-Za-z0-9_/-]+$ ]] || exit 64
+    case "$case_name" in
+      drain_timeout | object_store_stop_failure | snapshot_failure | \
+        object_store_restart_failure | remote_outage | retention_failure)
+        expected_test="phase5-backup-contract/$case_name" ;;
+      database_dump_failure)
+        expected_test='TestExecutorSnapshotReportsExactExternalCommandFailureStage/pg-dump-exit' ;;
+      repository_integrity_failure)
+        expected_test='TestExecutorVerifyRejectsWrongRunSnapshotTagHashAndManifest/wrong_exact_snapshot' ;;
+      wrong_repository_secret | tampered_pack)
+        expected_test="TestExecutorMapsWrongOrTamperedSnapshotToSafeIntegrityError/$case_name" ;;
+      missing_restored_object)
+        expected_test='TestRestoreVerifierFailsClosedForMissingOrWrongSizedObject/missing' ;;
+      stale_restored_session)
+        expected_test='TestRestoreVerifierRejectsStaleSessionBeforeObjectAccess' ;;
+      webhook_private_target)
+        expected_test='TestWebhookSenderRejectsInitiallyPrivateTarget' ;;
+      webhook_timeout)
+        expected_test='TestWebhookSenderRejectsDNSRebindingResponseOverflowAndTimeout/total_timeout' ;;
+      host_sample_replay)
+        expected_test='TestInternalHostSamplesAuthenticatesCanonicalPayloadAndRejectsReplay' ;;
+      *) exit 64 ;;
+    esac
+    [[ "$test_pattern" == "$expected_test" ]] || exit 67
     id="container-$name"
     record="$containers/$id"
     [[ ! -e "$record" ]] || exit 65
     printf \
-      'owner=%s\nproject=%s\ncase=%s\nname=%s\nevidence=%s\nstatus=created\nexit_code=0\n' \
-      "$owner" "$project" "$case_name" "$name" "$evidence" >"$record"
+      'owner=%s\nproject=%s\ncase=%s\nname=%s\ntest=%s\nstatus=created\nexit_code=0\n' \
+      "$owner" "$project" "$case_name" "$name" "$test_pattern" >"$record"
     printf '%s\n' "$id"
     ;;
   start)
@@ -379,34 +445,22 @@ case "${1:-}" in
       printf '%s\n' "$$" >"$root/hang.pid"
       exec sleep 30
     fi
-    case "$case_name" in
-      remote_outage)
-        actual=degraded
-        alert=active
-        ;;
-      webhook_private_target | host_sample_replay)
-        actual=rejected
-        alert=suppressed
-        ;;
-      *)
-        actual=failed
-        alert=active
-        ;;
-    esac
-    maintenance=normal
-    plaintext=absent
-    case "${HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_MUTATION:-}" in
-      terminal) actual=succeeded ;;
-      maintenance) maintenance=backup ;;
-      alert) alert=unknown ;;
-      plaintext) plaintext=present ;;
-      '') ;;
-      *) exit 64 ;;
-    esac
-    report="$(record_value "$record" evidence)/report"
-    printf \
-      'evidence_version=1\ncase=%s\nactual=%s\nmaintenance=%s\nalert=%s\nplaintext_dump=%s\n' \
-      "$case_name" "$actual" "$maintenance" "$alert" "$plaintext" >"$report"
+    if [[ -z "${HAPPYLEARN_PHASE5_FAILURE_MATRIX_FAKE_DOCKER_MUTATION:-}" ]]; then
+      test_pattern="$(record_value "$record" test)"
+      printf '=== RUN   %s\n--- PASS: %s (0.00s)\n' \
+        "$test_pattern" "$test_pattern"
+      case "$case_name" in
+        remote_outage)
+          actual=degraded; alert=active ;;
+        webhook_private_target | host_sample_replay)
+          actual=rejected; alert=suppressed ;;
+        *)
+          actual=failed; alert=active ;;
+      esac
+      printf \
+        'PHASE5_FAILURE_EVIDENCE case=%s actual=%s maintenance=normal alert=%s plaintext_dump=absent\n' \
+        "$case_name" "$actual" "$alert"
+    fi
     write_value "$record" status exited
     ;;
   inspect)
@@ -921,8 +975,8 @@ validate_live_calls() {
     "$start_count" == 15 &&
     "$copy_count" == 0 &&
     "$container_rm_count" == 15 &&
-    "$network_create_count" == 15 &&
-    "$network_rm_count" == 15 ]] ||
+    "$network_create_count" == 0 &&
+    "$network_rm_count" == 0 ]] ||
     fail "live Docker lifecycle was not exact create=$create_count start=$start_count copy=$copy_count container_rm=$container_rm_count network_create=$network_create_count network_rm=$network_rm_count"
 
   : >"$projects"
@@ -936,9 +990,13 @@ validate_live_calls() {
       "$line" == *'--cpus|'* &&
       "$line" == *'--tmpfs|'* &&
       "$line" == *'--mount|'* &&
-      "$line" == *'/run/happylearn-e2e-shims'* &&
-      "$line" == *'alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1'* ]] ||
-      fail 'live case container omitted an isolation control or pinned image'
+      "$line" == *'target=/src\,readonly'* &&
+      "$line" == *'--network|none'* &&
+      "$line" == *'happylearn-phase5-failure-probe:'* ]] ||
+      fail 'live case container omitted a production probe or isolation control'
+    [[ "$line" == *'/opt/happylearn/'*'.test|-test.v|-test.run|'* ||
+      "$line" == *'phase5-backup-failure-probe|'* ]] ||
+      fail 'live case container did not invoke an approved production probe'
     project="$(
       sed -n \
         's/.*io\.happylearn\.phase5\.failure-matrix-project=\([^|]*\).*/\1/p' \
@@ -957,8 +1015,11 @@ validate_live_calls() {
 
 validate_live_candidate() {
   local root="$1"
-  [[ "$(<"$root/status")" == 0 ]] ||
+  if [[ "$(<"$root/status")" != 0 ]]; then
+    sed -n '1,120p' "$root/stderr" >&2
+    sed -n '1,120p' "$root/calls" >&2
     fail "live target exited with status $(<"$root/status")"
+  fi
   validate_summary "$root/stdout" "$root/traces"
   validate_live_calls "$root"
   [[ ! -s "$root/stderr" ]] ||
@@ -977,13 +1038,15 @@ expect_live_rejection() {
   run_live_candidate "$root" "$mutation" "$hang" "$candidate"
   [[ "$(<"$root/status")" != 0 &&
     ! -s "$root/stdout" &&
-    ! -s "$root/stderr" &&
+    ( ! -s "$root/stderr" ||
+      ( "$name" == deadline &&
+        "$(grep -c 'probe failed case=drain_timeout' "$root/stderr" || true)" == 1 ) ) &&
     -z "$(find "$root/containers" -mindepth 1 -maxdepth 1 -print -quit)" &&
     -z "$(find "$root/networks" -mindepth 1 -maxdepth 1 -print -quit)" &&
     "$(grep -c '^create|' "$root/calls" || true)" == 1 &&
     "$(grep -c '^rm|' "$root/calls" || true)" == 1 &&
-    "$(grep -c '^network|create|' "$root/calls" || true)" == 1 &&
-    "$(grep -c '^network|rm|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|create|' "$root/calls" || true)" == 0 &&
+    "$(grep -c '^network|rm|' "$root/calls" || true)" == 0 &&
     ! -e "$unexpected_external_log" ]] ||
     fail "live $name mutation was accepted or left residue"
 }
@@ -1031,8 +1094,8 @@ expect_live_signal_cleanup() {
     -z "$(find "$root/networks" -mindepth 1 -maxdepth 1 -print -quit)" &&
     "$(grep -c '^create|' "$root/calls" || true)" == 1 &&
     "$(grep -c '^rm|' "$root/calls" || true)" == 1 &&
-    "$(grep -c '^network|create|' "$root/calls" || true)" == 1 &&
-    "$(grep -c '^network|rm|' "$root/calls" || true)" == 1 &&
+    "$(grep -c '^network|create|' "$root/calls" || true)" == 0 &&
+    "$(grep -c '^network|rm|' "$root/calls" || true)" == 0 &&
     ! -e "$unexpected_external_log" ]] ||
     fail "live signal cleanup failed status=$signal_status target_alive=$target_alive docker_alive=$docker_alive"
 }
@@ -1149,6 +1212,9 @@ expect_live_rejection deadline '' drain_timeout
 
 sanitizer_mutant_directory="$tmpdir/mutants/live-sanitizer"
 mkdir -m 0700 "$sanitizer_mutant_directory"
+mkdir -m 0700 "$tmpdir/mutants/deploy"
+cp "$repo_root/deploy/Dockerfile.phase5-failure-probe" \
+  "$tmpdir/mutants/deploy/"
 cp \
   "$target" \
   "$harness_lib" \
