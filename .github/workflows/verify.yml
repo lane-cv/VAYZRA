@@ -14,6 +14,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: docker/setup-compose-action@v2
+        with:
+          version: v5.3.0
       - uses: pnpm/action-setup@v6.0.8
         with:
           version: 11.9.0
@@ -84,6 +87,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: docker/setup-compose-action@v2
+        with:
+          version: v5.3.0
       - name: Configure disposable AIStor license
         env:
           AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
@@ -112,6 +118,9 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: docker/setup-compose-action@v2
+        with:
+          version: v5.3.0
       - name: Configure disposable AIStor license
         env:
           AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}
@@ -140,6 +149,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: docker/setup-compose-action@v2
+        with:
+          version: v5.3.0
       - name: Configure disposable AIStor license
         env:
           AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}

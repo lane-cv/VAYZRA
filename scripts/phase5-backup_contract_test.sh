@@ -1307,7 +1307,9 @@ for (const [name, service] of Object.entries(services)) {
   const expectedMounts = allowedMounts.get(name)
   if (!expectedMounts ||
       JSON.stringify(actualMounts) !== JSON.stringify([...expectedMounts].sort())) {
-    fail(`${name} mount allowlist mismatch`)
+    fail(`${name} mount allowlist mismatch: expected ${JSON.stringify(
+      expectedMounts ? [...expectedMounts].sort() : [],
+    )}, actual ${JSON.stringify(actualMounts)}`)
   }
   for (const [key, value] of Object.entries(service.environment || {})) {
     const allowedFileValue = allowedFileKeys.get(`${name}:${key}`)

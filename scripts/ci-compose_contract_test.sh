@@ -410,6 +410,7 @@ action_violation="$(
       action = $0
       sub(/^[[:space:]]+(- )?uses:[[:space:]]*/, "", action)
       if (action != "actions/checkout@v6.0.2" &&
+          action != "docker/setup-compose-action@v2" &&
           action != "pnpm/action-setup@v6.0.8" &&
           action != "actions/setup-node@v6.4.0" &&
           action != "actions/setup-go@v6.4.0" &&
@@ -421,6 +422,7 @@ action_violation="$(
     }
     END {
       if (action_count["actions/checkout@v6.0.2"] != 4 ||
+          action_count["docker/setup-compose-action@v2"] != 4 ||
           action_count["pnpm/action-setup@v6.0.8"] != 1 ||
           action_count["actions/setup-node@v6.4.0"] != 1 ||
           action_count["actions/setup-go@v6.4.0"] != 1 ||
@@ -431,6 +433,30 @@ action_violation="$(
   ' "$workflow"
 )"
 test -z "$action_violation" || fail "$action_violation"
+
+compose_version_violation="$(
+  awk '
+    $0 == "      - uses: docker/setup-compose-action@v2" {
+      getline
+      if ($0 != "        with:") {
+        print "Compose setup action is missing its with block"
+        exit
+      }
+      getline
+      if ($0 != "          version: v5.3.0") {
+        print "Compose setup action is not pinned to v5.3.0"
+        exit
+      }
+      count++
+    }
+    END {
+      if (count != 4) {
+        print "every CI job must pin Docker Compose v5.3.0"
+      }
+    }
+  ' "$workflow"
+)"
+test -z "$compose_version_violation" || fail "$compose_version_violation"
 
 if_lines="$(
   grep -nE '^[[:space:]]*("?if"?|'\''if'\''):' "$workflow" || true
@@ -510,7 +536,7 @@ test -z "$secret_context_violation" ||
 phase5_job="$(
   sed -n "${phase5_job_line},${phase5_job_end}p" "$workflow"
 )"
-expected_phase5_job=$'  phase5-e2e:\n    runs-on: ubuntu-24.04\n    needs: verify\n    timeout-minutes: 120\n    steps:\n      - uses: actions/checkout@v6.0.2\n      - name: Configure disposable AIStor license\n        env:\n          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}\n        run: |\n          test -n "$AISTOR_LICENSE"\n          umask 077\n          license_file="$RUNNER_TEMP/minio.license"\n          printf \x27%s\x27 "$AISTOR_LICENSE" > "$license_file"\n          sudo chgrp 0 "$license_file"\n          chmod 0440 "$license_file"\n          printf \x27HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\x27 "$license_file" >> "$GITHUB_ENV"\n      - name: Run isolated Phase 5 acceptance\n        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5\n      - name: Upload sanitized Phase 5 failure evidence\n        if: failure()\n        uses: actions/upload-artifact@v4.6.2\n        with:\n          name: phase5-failure-${{ github.run_id }}\n          path: test-results/phase5/containers.log\n          if-no-files-found: ignore\n          retention-days: 7'
+expected_phase5_job=$'  phase5-e2e:\n    runs-on: ubuntu-24.04\n    needs: verify\n    timeout-minutes: 120\n    steps:\n      - uses: actions/checkout@v6.0.2\n      - uses: docker/setup-compose-action@v2\n        with:\n          version: v5.3.0\n      - name: Configure disposable AIStor license\n        env:\n          AISTOR_LICENSE: ${{ secrets.HAPPYLEARN_AISTOR_LICENSE }}\n        run: |\n          test -n "$AISTOR_LICENSE"\n          umask 077\n          license_file="$RUNNER_TEMP/minio.license"\n          printf \x27%s\x27 "$AISTOR_LICENSE" > "$license_file"\n          sudo chgrp 0 "$license_file"\n          chmod 0440 "$license_file"\n          printf \x27HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\x27 "$license_file" >> "$GITHUB_ENV"\n      - name: Run isolated Phase 5 acceptance\n        run: HAPPYLEARN_E2E_GROUP=all make e2e-phase5\n      - name: Upload sanitized Phase 5 failure evidence\n        if: failure()\n        uses: actions/upload-artifact@v4.6.2\n        with:\n          name: phase5-failure-${{ github.run_id }}\n          path: test-results/phase5/containers.log\n          if-no-files-found: ignore\n          retention-days: 7'
 test "$phase5_job" = "$expected_phase5_job" ||
   fail "phase5-e2e job must match the closed acceptance and artifact contract"
 
