@@ -1567,6 +1567,7 @@ DOCKERFILE
   chmod 0600 "$secret_source_dir/age-identity"
   HAPPYLEARN_BACKUP_AGE_RECIPIENT="$(
     docker_bounded 60 run --rm --read-only \
+      --user "$(id -u):$(id -g)" \
       --name "$age_recipient_runner" --network none \
       --label "com.docker.compose.project=${live_project}" \
       --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \

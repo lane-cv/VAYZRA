@@ -485,6 +485,7 @@ if grep -Fq -- 'docker_bounded 900 build -f -' "$target"; then
 fi
 require_literal "$target" \
   '--mount "type=bind,src=$secret_source_dir/age-identity,dst=/input/age-identity,readonly"'
+require_literal "$target" '--user "$(id -u):$(id -g)"'
 require_literal "$target" '"$backup_image" -y /input/age-identity'
 if grep -Fq -- 'docker_bounded 60 run --rm --interactive' "$target"; then
   fail 'bounded age recipient derivation cannot depend on background stdin'
