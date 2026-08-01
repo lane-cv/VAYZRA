@@ -56,6 +56,15 @@ type SettingsStore interface {
 	UpdateSettings(context.Context, Principal, Settings) (Settings, error)
 }
 
+type InfrastructureStatusWriter interface {
+	RecordInfrastructureStatus(
+		context.Context,
+		InfrastructureKey,
+		bool,
+		time.Time,
+	) error
+}
+
 type ServiceStore interface {
 	SettingsStore
 	SettingsRejectionAuditor

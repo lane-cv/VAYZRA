@@ -208,13 +208,36 @@ func TestValidateSettingsAcceptsDefaultsAndEveryBoundary(t *testing.T) {
 		"disk warning maximum":               func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 99, 100 },
 		"disk critical minimum":              func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 1, 2 },
 		"disk critical maximum":              func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 99, 100 },
+		"backup filesystem warning minimum": func(s *Settings) {
+			s.BackupFilesystemWarningPercent, s.BackupFilesystemCriticalPercent = 1, 2
+		},
+		"backup filesystem critical maximum": func(s *Settings) {
+			s.BackupFilesystemWarningPercent, s.BackupFilesystemCriticalPercent = 99, 100
+		},
 		"AI warning minimum":                 func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 1, 2 },
 		"AI warning maximum":                 func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 99, 100 },
 		"AI critical minimum":                func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 1, 2 },
 		"AI critical maximum":                func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 99, 100 },
 		"processing queue warning minimum":   func(s *Settings) { s.ProcessingQueueWarning, s.ProcessingQueueCritical = 1, 2 },
 		"processing queue critical minimum":  func(s *Settings) { s.ProcessingQueueWarning, s.ProcessingQueueCritical = 1, 2 },
-		"processing queue unbounded maximum": func(s *Settings) { s.ProcessingQueueWarning, s.ProcessingQueueCritical = 1_000_000, 1_000_001 },
+		"local backup age minimum": func(s *Settings) {
+			s.LocalBackupAgeWarningHours, s.LocalBackupAgeCriticalHours = 1, 2
+		},
+		"local backup age int32 maximum": func(s *Settings) {
+			s.LocalBackupAgeWarningHours, s.LocalBackupAgeCriticalHours = 2_147_483_646, 2_147_483_647
+		},
+		"processing queue int32 maximum": func(s *Settings) {
+			s.ProcessingQueueWarning, s.ProcessingQueueCritical = 2_147_483_646, 2_147_483_647
+		},
+		"processing failure int32 maximum": func(s *Settings) {
+			s.ProcessingFailureWarningCount, s.ProcessingFailureCriticalCount = 2_147_483_646, 2_147_483_647
+		},
+		"login failure int32 maximum": func(s *Settings) {
+			s.LoginFailureWarningCount, s.LoginFailureCriticalCount = 2_147_483_646, 2_147_483_647
+		},
+		"authorization denial int32 maximum": func(s *Settings) {
+			s.AuthorizationDenialWarningCount, s.AuthorizationDenialCriticalCount = 2_147_483_646, 2_147_483_647
+		},
 	}
 	if err := ValidateSettings(defaults); err != nil {
 		t.Fatalf("defaults rejected: %v", err)
@@ -254,6 +277,18 @@ func TestValidateSettingsRejectsEveryOutOfRangeValue(t *testing.T) {
 		"disk warning above":           func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 100, 101 },
 		"disk critical equal warning":  func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 50, 50 },
 		"disk critical above":          func(s *Settings) { s.DiskWarningPercent, s.DiskCriticalPercent = 99, 101 },
+		"backup filesystem warning below": func(s *Settings) {
+			s.BackupFilesystemWarningPercent = 0
+		},
+		"backup filesystem warning above": func(s *Settings) {
+			s.BackupFilesystemWarningPercent, s.BackupFilesystemCriticalPercent = 100, 101
+		},
+		"backup filesystem critical equal": func(s *Settings) {
+			s.BackupFilesystemWarningPercent, s.BackupFilesystemCriticalPercent = 50, 50
+		},
+		"backup filesystem critical above": func(s *Settings) {
+			s.BackupFilesystemWarningPercent, s.BackupFilesystemCriticalPercent = 99, 101
+		},
 		"AI warning below":             func(s *Settings) { s.AIErrorWarningPercent = 0 },
 		"AI warning above":             func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 100, 101 },
 		"AI critical equal warning":    func(s *Settings) { s.AIErrorWarningPercent, s.AIErrorCriticalPercent = 50, 50 },
@@ -261,6 +296,39 @@ func TestValidateSettingsRejectsEveryOutOfRangeValue(t *testing.T) {
 		"queue warning below":          func(s *Settings) { s.ProcessingQueueWarning = 0 },
 		"queue critical equal warning": func(s *Settings) { s.ProcessingQueueWarning, s.ProcessingQueueCritical = 20, 20 },
 		"queue critical below warning": func(s *Settings) { s.ProcessingQueueWarning, s.ProcessingQueueCritical = 20, 19 },
+		"queue critical above int32":   func(s *Settings) { s.ProcessingQueueCritical = 2_147_483_648 },
+		"local age warning below":      func(s *Settings) { s.LocalBackupAgeWarningHours = 0 },
+		"local age critical equal":     func(s *Settings) { s.LocalBackupAgeCriticalHours = s.LocalBackupAgeWarningHours },
+		"local age critical above int32": func(s *Settings) {
+			s.LocalBackupAgeCriticalHours = 2_147_483_648
+		},
+		"processing failure warning below": func(s *Settings) {
+			s.ProcessingFailureWarningCount = 0
+		},
+		"processing failure critical equal": func(s *Settings) {
+			s.ProcessingFailureCriticalCount = s.ProcessingFailureWarningCount
+		},
+		"processing failure critical above int32": func(s *Settings) {
+			s.ProcessingFailureCriticalCount = 2_147_483_648
+		},
+		"login failure warning below": func(s *Settings) {
+			s.LoginFailureWarningCount = 0
+		},
+		"login failure critical equal": func(s *Settings) {
+			s.LoginFailureCriticalCount = s.LoginFailureWarningCount
+		},
+		"login failure critical above int32": func(s *Settings) {
+			s.LoginFailureCriticalCount = 2_147_483_648
+		},
+		"authorization denial warning below": func(s *Settings) {
+			s.AuthorizationDenialWarningCount = 0
+		},
+		"authorization denial critical equal": func(s *Settings) {
+			s.AuthorizationDenialCriticalCount = s.AuthorizationDenialWarningCount
+		},
+		"authorization denial critical above int32": func(s *Settings) {
+			s.AuthorizationDenialCriticalCount = 2_147_483_648
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -308,15 +376,63 @@ func TestSettingsServiceAuditsOnlyAuthenticatedHighRiskRejections(t *testing.T) 
 		mutate func(*Settings)
 		reason string
 	}{
-		"soft delete retention": {func(s *Settings) { s.SoftDeleteRetentionDays = 29 }, "retention"},
-		"audit retention":       {func(s *Settings) { s.AuditRetentionDays = 364 }, "retention"},
-		"sample retention":      {func(s *Settings) { s.OperationalSampleRetentionDays = 0 }, "retention"},
-		"backup hour":           {func(s *Settings) { s.BackupHour = 24 }, "backup_schedule"},
-		"backup minute":         {func(s *Settings) { s.BackupMinute = 60 }, "backup_schedule"},
-		"backup timezone":       {func(s *Settings) { s.BackupTimezone = "UTC" }, "backup_schedule"},
-		"disk threshold":        {func(s *Settings) { s.DiskCriticalPercent = s.DiskWarningPercent }, "threshold"},
-		"AI threshold":          {func(s *Settings) { s.AIErrorCriticalPercent = s.AIErrorWarningPercent }, "threshold"},
-		"queue threshold":       {func(s *Settings) { s.ProcessingQueueCritical = s.ProcessingQueueWarning }, "threshold"},
+		"soft delete retention": {
+			func(s *Settings) { s.SoftDeleteRetentionDays = 29 }, "retention",
+		},
+		"audit retention": {
+			func(s *Settings) { s.AuditRetentionDays = 364 }, "retention",
+		},
+		"sample retention": {
+			func(s *Settings) { s.OperationalSampleRetentionDays = 0 }, "retention",
+		},
+		"backup hour": {
+			func(s *Settings) { s.BackupHour = 24 }, "backup_schedule",
+		},
+		"backup minute": {
+			func(s *Settings) { s.BackupMinute = 60 }, "backup_schedule",
+		},
+		"backup timezone": {
+			func(s *Settings) { s.BackupTimezone = "UTC" }, "backup_schedule",
+		},
+		"disk threshold": {
+			func(s *Settings) { s.DiskCriticalPercent = s.DiskWarningPercent }, "threshold",
+		},
+		"backup filesystem threshold": {
+			func(s *Settings) {
+				s.BackupFilesystemCriticalPercent = s.BackupFilesystemWarningPercent
+			},
+			"threshold",
+		},
+		"local backup age threshold": {
+			func(s *Settings) {
+				s.LocalBackupAgeCriticalHours = s.LocalBackupAgeWarningHours
+			},
+			"threshold",
+		},
+		"AI threshold": {
+			func(s *Settings) { s.AIErrorCriticalPercent = s.AIErrorWarningPercent }, "threshold",
+		},
+		"queue threshold": {
+			func(s *Settings) { s.ProcessingQueueCritical = s.ProcessingQueueWarning }, "threshold",
+		},
+		"processing failure threshold": {
+			func(s *Settings) {
+				s.ProcessingFailureCriticalCount = s.ProcessingFailureWarningCount
+			},
+			"threshold",
+		},
+		"login failure threshold": {
+			func(s *Settings) {
+				s.LoginFailureCriticalCount = s.LoginFailureWarningCount
+			},
+			"threshold",
+		},
+		"authorization denial threshold": {
+			func(s *Settings) {
+				s.AuthorizationDenialCriticalCount = s.AuthorizationDenialWarningCount
+			},
+			"threshold",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := &fakeStore{settings: validSettings()}
@@ -385,21 +501,51 @@ func TestPostgresSettingsDefaultsConflictAuditAndRollback(t *testing.T) {
 		settings.BackupTimezone != want.BackupTimezone ||
 		settings.DiskWarningPercent != want.DiskWarningPercent ||
 		settings.DiskCriticalPercent != want.DiskCriticalPercent ||
+		settings.BackupFilesystemWarningPercent != want.BackupFilesystemWarningPercent ||
+		settings.BackupFilesystemCriticalPercent != want.BackupFilesystemCriticalPercent ||
+		settings.LocalBackupAgeWarningHours != want.LocalBackupAgeWarningHours ||
+		settings.LocalBackupAgeCriticalHours != want.LocalBackupAgeCriticalHours ||
 		settings.AIErrorWarningPercent != want.AIErrorWarningPercent ||
 		settings.AIErrorCriticalPercent != want.AIErrorCriticalPercent ||
 		settings.ProcessingQueueWarning != want.ProcessingQueueWarning ||
 		settings.ProcessingQueueCritical != want.ProcessingQueueCritical ||
+		settings.ProcessingFailureWarningCount != want.ProcessingFailureWarningCount ||
+		settings.ProcessingFailureCriticalCount != want.ProcessingFailureCriticalCount ||
+		settings.LoginFailureWarningCount != want.LoginFailureWarningCount ||
+		settings.LoginFailureCriticalCount != want.LoginFailureCriticalCount ||
+		settings.AuthorizationDenialWarningCount != want.AuthorizationDenialWarningCount ||
+		settings.AuthorizationDenialCriticalCount != want.AuthorizationDenialCriticalCount ||
 		settings.UpdatedBy != uuid.Nil || settings.UpdatedAt.IsZero() {
 		t.Fatalf("unexpected defaults: %#v", settings)
 	}
 
 	settings.SiteName = "Vayzra 学习"
+	settings.BackupFilesystemWarningPercent = 76
+	settings.BackupFilesystemCriticalPercent = 91
+	settings.LocalBackupAgeWarningHours = 26
+	settings.LocalBackupAgeCriticalHours = 31
+	settings.ProcessingFailureWarningCount = 6
+	settings.ProcessingFailureCriticalCount = 21
+	settings.LoginFailureWarningCount = 21
+	settings.LoginFailureCriticalCount = 101
+	settings.AuthorizationDenialWarningCount = 51
+	settings.AuthorizationDenialCriticalCount = 201
 	updated, err := service.UpdateSettings(ctx, admin, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.Version != settings.Version+1 || updated.UpdatedBy != admin.User.ID ||
-		updated.SiteName != "Vayzra 学习" || updated.UpdatedAt.IsZero() {
+		updated.SiteName != "Vayzra 学习" || updated.UpdatedAt.IsZero() ||
+		updated.BackupFilesystemWarningPercent != 76 ||
+		updated.BackupFilesystemCriticalPercent != 91 ||
+		updated.LocalBackupAgeWarningHours != 26 ||
+		updated.LocalBackupAgeCriticalHours != 31 ||
+		updated.ProcessingFailureWarningCount != 6 ||
+		updated.ProcessingFailureCriticalCount != 21 ||
+		updated.LoginFailureWarningCount != 21 ||
+		updated.LoginFailureCriticalCount != 101 ||
+		updated.AuthorizationDenialWarningCount != 51 ||
+		updated.AuthorizationDenialCriticalCount != 201 {
 		t.Fatalf("updated=%#v", updated)
 	}
 	if _, err := service.UpdateSettings(ctx, admin, settings); !errors.Is(err, ErrConflict) {
@@ -2119,10 +2265,20 @@ func validSettings() Settings {
 		BackupTimezone:                 "Asia/Shanghai",
 		DiskWarningPercent:             75,
 		DiskCriticalPercent:            90,
+		BackupFilesystemWarningPercent: 75,
+		BackupFilesystemCriticalPercent: 90,
+		LocalBackupAgeWarningHours:     25,
+		LocalBackupAgeCriticalHours:    30,
 		AIErrorWarningPercent:          10,
 		AIErrorCriticalPercent:         25,
 		ProcessingQueueWarning:         20,
 		ProcessingQueueCritical:        100,
+		ProcessingFailureWarningCount:  5,
+		ProcessingFailureCriticalCount: 20,
+		LoginFailureWarningCount:       20,
+		LoginFailureCriticalCount:      100,
+		AuthorizationDenialWarningCount: 50,
+		AuthorizationDenialCriticalCount: 200,
 	}
 }
 

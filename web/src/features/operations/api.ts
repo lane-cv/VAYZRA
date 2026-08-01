@@ -22,6 +22,7 @@ import type {
   OperationsDashboard,
   OperationsDataState,
   OperationsSettings,
+  OperationsSettingsUpdate,
   RecoveryState,
   RestoreVerification,
 } from './types'
@@ -76,10 +77,21 @@ function parseSettings(value: unknown): OperationsSettings {
     backupTimezone: timezone,
     diskWarningPercent: settingsInteger(source.diskWarningPercent),
     diskCriticalPercent: settingsInteger(source.diskCriticalPercent),
+    backupFilesystemWarningPercent: settingsInteger(source.backupFilesystemWarningPercent),
+    backupFilesystemCriticalPercent: settingsInteger(source.backupFilesystemCriticalPercent),
+    localBackupAgeWarningHours: settingsInteger(source.localBackupAgeWarningHours),
+    localBackupAgeCriticalHours: settingsInteger(source.localBackupAgeCriticalHours),
     aiErrorWarningPercent: settingsInteger(source.aiErrorWarningPercent),
     aiErrorCriticalPercent: settingsInteger(source.aiErrorCriticalPercent),
     processingQueueWarning: settingsInteger(source.processingQueueWarning),
     processingQueueCritical: settingsInteger(source.processingQueueCritical),
+    processingFailureWarningCount: settingsInteger(source.processingFailureWarningCount),
+    processingFailureCriticalCount: settingsInteger(source.processingFailureCriticalCount),
+    loginFailureWarningCount: settingsInteger(source.loginFailureWarningCount),
+    loginFailureCriticalCount: settingsInteger(source.loginFailureCriticalCount),
+    authorizationDenialWarningCount: settingsInteger(source.authorizationDenialWarningCount),
+    authorizationDenialCriticalCount: settingsInteger(source.authorizationDenialCriticalCount),
+    infrastructure: parseInfrastructure(source.infrastructure),
     updatedAt: settingsString(source.updatedAt),
   }
   if (
@@ -101,22 +113,73 @@ function parseSettings(value: unknown): OperationsSettings {
     || result.diskWarningPercent > 99
     || result.diskCriticalPercent <= result.diskWarningPercent
     || result.diskCriticalPercent > 100
+    || result.backupFilesystemWarningPercent < 1
+    || result.backupFilesystemWarningPercent > 99
+    || result.backupFilesystemCriticalPercent <= result.backupFilesystemWarningPercent
+    || result.backupFilesystemCriticalPercent > 100
+    || !validCountThresholdPair(result.localBackupAgeWarningHours, result.localBackupAgeCriticalHours)
     || result.aiErrorWarningPercent < 1
     || result.aiErrorWarningPercent > 99
     || result.aiErrorCriticalPercent <= result.aiErrorWarningPercent
     || result.aiErrorCriticalPercent > 100
-    || result.processingQueueWarning < 1
-    || result.processingQueueCritical <= result.processingQueueWarning
+    || !validCountThresholdPair(result.processingQueueWarning, result.processingQueueCritical)
+    || !validCountThresholdPair(result.processingFailureWarningCount, result.processingFailureCriticalCount)
+    || !validCountThresholdPair(result.loginFailureWarningCount, result.loginFailureCriticalCount)
+    || !validCountThresholdPair(result.authorizationDenialWarningCount, result.authorizationDenialCriticalCount)
     || !validTimestamp(result.updatedAt)
   ) throw invalidResponse()
   return result
+}
+
+const infrastructureKeys = [
+  'application_database',
+  'redis_security',
+  'object_store',
+  'ai_encryption',
+  'internal_metrics',
+  'host_metrics_ingestion',
+  'alert_webhook',
+  'local_backup',
+  'remote_backup',
+] as const
+
+function parseInfrastructure(value: unknown): OperationsSettings['infrastructure'] {
+  if (!Array.isArray(value) || value.length !== infrastructureKeys.length) throw invalidResponse()
+  return value.map((item, index) => {
+    const source = record(item)
+    const keys = Object.keys(source)
+    if (
+      keys.length !== 3
+      || !keys.includes('key')
+      || !keys.includes('configured')
+      || !keys.includes('lastValidatedAt')
+      || source.key !== infrastructureKeys[index]
+      || typeof source.configured !== 'boolean'
+      || (source.lastValidatedAt !== null && (
+        typeof source.lastValidatedAt !== 'string'
+        || !validTimestamp(source.lastValidatedAt)
+      ))
+    ) throw invalidResponse()
+    return {
+      key: infrastructureKeys[index],
+      configured: source.configured,
+      lastValidatedAt: source.lastValidatedAt,
+    }
+  })
+}
+
+function validCountThresholdPair(warning: number, critical: number): boolean {
+  return warning >= 1
+    && warning <= 2_147_483_646
+    && critical > warning
+    && critical <= 2_147_483_647
 }
 
 export async function readSettings(signal?: AbortSignal): Promise<OperationsSettings> {
   return parseSettings(await request<unknown>('/admin/operations/settings', { signal }))
 }
 
-export async function saveSettings(value: OperationsSettings): Promise<OperationsSettings> {
+export async function saveSettings(value: OperationsSettingsUpdate): Promise<OperationsSettings> {
   return parseSettings(await request<unknown>('/admin/operations/settings', {
     method: 'PUT',
     json: value,

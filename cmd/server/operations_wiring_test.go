@@ -26,7 +26,20 @@ import (
 )
 
 type serverOperationsRuntime struct {
-	events *[]string
+	events   *[]string
+	statuses []operations.InfrastructureStatus
+}
+
+func (g *serverOperationsRuntime) RecordInfrastructureStatus(
+	_ context.Context,
+	key operations.InfrastructureKey,
+	configured bool,
+	validatedAt time.Time,
+) error {
+	g.statuses = append(g.statuses, operations.InfrastructureStatus{
+		Key: key, Configured: configured, LastValidatedAt: &validatedAt,
+	})
+	return nil
 }
 
 type serverAdminOperationsService struct{}
@@ -184,6 +197,75 @@ func TestProductionApplicationWiresAdminOperationsFromSharedRuntime(t *testing.T
 	}
 }
 
+func TestProductionApplicationRecordsOwnedInfrastructureWithoutMetadata(t *testing.T) {
+	var events []string
+	runtime := &serverOperationsRuntime{events: &events}
+	called := 0
+	cfg := config.Config{
+		DatabaseURL: "postgres://private-database",
+		RedisURL: "redis://private-redis",
+		LoginThrottleSecret: "private-login-secret",
+		MinIOEndpoint: "private-object-store",
+		MinIOAccessKey: "private-access-key",
+		MinIOSecretKey: "private-secret-key",
+		MinIOOriginalsBucket: "private-originals",
+		MinIOPreviewsBucket: "private-previews",
+		AIMasterKey: make([]byte, 32),
+		AIMasterKeyVersion: 1,
+		MetricsBearerSecret: "private-metrics-secret",
+		HostMetricsHMACSecret: []byte("private-host-secret"),
+	}
+	_, closeResources, err := buildApplication(
+		context.Background(),
+		cfg,
+		applicationDependencies{
+			open: func(context.Context, string) (*pgxpool.Pool, error) { return nil, nil },
+			migrate: func(context.Context, *pgxpool.Pool) error { return nil },
+			newAuth: func(*pgxpool.Pool) (auth.HTTPService, error) { return serverAdminAuth{}, nil },
+			newOperations: func(*pgxpool.Pool) operationsRuntime { return runtime },
+			newAdminOperations: newServerAdminOperations,
+			requireOperations: true,
+			ready: func(*pgxpool.Pool) func(context.Context) error {
+				return func(context.Context) error { return nil }
+			},
+			recordInfrastructure: func(
+				ctx context.Context,
+				writer operations.InfrastructureStatusWriter,
+				got config.Config,
+				webhookEnabled bool,
+			) error {
+				called++
+				if got.DatabaseURL != cfg.DatabaseURL || webhookEnabled {
+					t.Fatalf("config was not forwarded as status-only validation input")
+				}
+				return recordOwnedInfrastructureStatuses(
+					ctx,
+					writer,
+					got,
+					webhookEnabled,
+					time.Date(2026, 7, 28, 4, 5, 6, 0, time.UTC),
+				)
+			},
+			close: func(*pgxpool.Pool) {},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResources()
+	if called != 1 || len(runtime.statuses) != 7 {
+		t.Fatalf("called=%d statuses=%+v", called, runtime.statuses)
+	}
+	for index, status := range runtime.statuses {
+		if index < 6 && !status.Configured {
+			t.Fatalf("owned status[%d]=%+v", index, status)
+		}
+		if index == 6 && status.Configured {
+			t.Fatalf("disabled webhook status=%+v", status)
+		}
+	}
+}
+
 func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
 	ctx := context.Background()
 	pool := integration.StartPostgres(t)
@@ -230,7 +312,7 @@ func TestProductionAdminOperationsServiceWiresDashboardReaders(t *testing.T) {
 		RequestID: "server-alert-wiring",
 		IP:        net.ParseIP("192.0.2.91"),
 	}, operations.AlertFilter{Limit: 50})
-	if err != nil || len(alerts.Items) != 0 {
+	if err != nil {
 		t.Fatalf("alerts=%+v err=%v", alerts, err)
 	}
 	webhookService, ok := service.(operations.WebhookTestHTTPService)

@@ -1280,7 +1280,7 @@ run_tampered_supervisor_case() {
   local fixture outer_pid workspace identity_path supervisor_pid
   local direct_pid descendant_pid status=0
   local heartbeat_before heartbeat_after
-  local started_seconds="$SECONDS" duration_seconds
+  local cleanup_started cleanup_finished cleanup_duration
   local direct_alive=false descendant_alive=false failed=false
 
   fixture="$(make_fixture)"
@@ -1316,6 +1316,8 @@ run_tampered_supervisor_case() {
     fail "$mode exposed an invalid process identity"
   /bin/ln "$identity_path" \
     "${identity_path}.injected-hardlink"
+  cleanup_started="$(contract_time_milliseconds)" ||
+    fail "$mode monotonic cleanup clock is unavailable"
   if [[ "$mode" == supervisor_identity_term ]]; then
     kill -TERM "$outer_pid"
   fi
@@ -1325,7 +1327,9 @@ run_tampered_supervisor_case() {
     status=$?
   fi
   ACTIVE_FIXTURE_PID=''
-  duration_seconds=$((SECONDS - started_seconds))
+  cleanup_finished="$(contract_time_milliseconds)" ||
+    fail "$mode monotonic cleanup clock failed"
+  cleanup_duration=$((cleanup_finished - cleanup_started))
 
   heartbeat_before="$(
     wc -c <"$fixture/supervisor.heartbeat" |
@@ -1339,7 +1343,8 @@ run_tampered_supervisor_case() {
   kill -0 "$direct_pid" 2>/dev/null && direct_alive=true
   kill -0 "$descendant_pid" 2>/dev/null && descendant_alive=true
   [[ "$status" -eq "$expected_status" ]] || failed=true
-  [[ "$duration_seconds" -lt 15 ]] || failed=true
+  [[ "$cleanup_duration" -lt "$TIMEOUT_CONTRACT_LIMIT_MILLISECONDS" ]] ||
+    failed=true
   [[ "$heartbeat_after" -eq "$heartbeat_before" ]] || failed=true
   [[ "$direct_alive" == false && "$descendant_alive" == false ]] ||
     failed=true
@@ -1355,7 +1360,7 @@ run_tampered_supervisor_case() {
   wait_for_pid_absent "$direct_pid" || failed=true
   wait_for_pid_absent "$descendant_pid" || failed=true
   [[ "$failed" == false ]] ||
-    fail "$mode failed bounded cleanup after identity tampering (status=$status duration=${duration_seconds}s heartbeat=${heartbeat_before}:${heartbeat_after} direct_alive=$direct_alive descendant_alive=$descendant_alive)"
+    fail "$mode failed bounded cleanup after identity tampering (status=$status cleanup_duration=${cleanup_duration}ms heartbeat=${heartbeat_before}:${heartbeat_after} direct_alive=$direct_alive descendant_alive=$descendant_alive)"
 }
 
 run_timeout_contract_case() {

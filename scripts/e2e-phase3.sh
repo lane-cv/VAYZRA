@@ -47,6 +47,7 @@ case "$e2e_group" in
   *) echo "HAPPYLEARN_E2E_GROUP must be all or phase3" >&2; exit 2 ;;
 esac
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 admin_user="$(id -u):$(id -g)"
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
@@ -93,7 +94,9 @@ cleanup() {
   rm -rf "$tmpdir" || true
   exit "$exit_status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 install -d -m 0700 "$artifact_dir" || true
 docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0 \

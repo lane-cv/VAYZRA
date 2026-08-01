@@ -311,6 +311,12 @@ type applicationDependencies struct {
 	newProviderTestLimiter func(*redis.Client, config.Config) redisx.ProviderTestRateLimiter
 	closeRedis             func(*redis.Client)
 	newInternal            func(*pgxpool.Pool, *redis.Client, config.Config) (http.Handler, error)
+	recordInfrastructure   func(
+		context.Context,
+		operations.InfrastructureStatusWriter,
+		config.Config,
+		bool,
+	) error
 }
 
 type operationsRuntime interface {
@@ -503,6 +509,20 @@ func buildProductionApplicationWithLog(
 		},
 		closeRedis:  func(client *redis.Client) { _ = client.Close() },
 		newInternal: newProductionInternalHandler,
+		recordInfrastructure: func(
+			ctx context.Context,
+			writer operations.InfrastructureStatusWriter,
+			cfg config.Config,
+			webhookEnabled bool,
+		) error {
+			return recordOwnedInfrastructureStatuses(
+				ctx,
+				writer,
+				cfg,
+				webhookEnabled,
+				time.Now(),
+			)
+		},
 	})
 }
 
@@ -880,6 +900,23 @@ func buildApplicationRuntime(
 				httpx.SafeRecoverer(deps.logger)(internalHandler),
 			),
 		)
+	}
+	if deps.recordInfrastructure != nil {
+		writer, ok := operationalGate.(operations.InfrastructureStatusWriter)
+		if !ok {
+			closeResources()
+			return nil, nil, errors.New("initialize infrastructure status")
+		}
+		webhookEnabled := webhookSender != nil && webhookSender.Enabled()
+		if err := deps.recordInfrastructure(
+			ctx,
+			writer,
+			cfg,
+			webhookEnabled,
+		); err != nil {
+			closeResources()
+			return nil, nil, errors.New("initialize infrastructure status")
+		}
 	}
 	return &applicationRuntime{
 		Public:   publicOnlyHandlerWithLog(handler, deps.logger),

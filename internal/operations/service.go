@@ -216,12 +216,14 @@ func highRiskSettingsReason(settings Settings) string {
 		settings.BackupTimezone != "Asia/Shanghai" {
 		return "backup_schedule"
 	}
-	if settings.DiskWarningPercent < 1 || settings.DiskWarningPercent > 99 ||
-		settings.DiskCriticalPercent <= settings.DiskWarningPercent || settings.DiskCriticalPercent > 100 ||
-		settings.AIErrorWarningPercent < 1 || settings.AIErrorWarningPercent > 99 ||
-		settings.AIErrorCriticalPercent <= settings.AIErrorWarningPercent || settings.AIErrorCriticalPercent > 100 ||
-		settings.ProcessingQueueWarning < 1 ||
-		settings.ProcessingQueueCritical <= settings.ProcessingQueueWarning {
+	if !validPercentThresholdPair(settings.DiskWarningPercent, settings.DiskCriticalPercent) ||
+		!validPercentThresholdPair(settings.BackupFilesystemWarningPercent, settings.BackupFilesystemCriticalPercent) ||
+		!validCountThresholdPair(settings.LocalBackupAgeWarningHours, settings.LocalBackupAgeCriticalHours) ||
+		!validPercentThresholdPair(settings.AIErrorWarningPercent, settings.AIErrorCriticalPercent) ||
+		!validCountThresholdPair(settings.ProcessingQueueWarning, settings.ProcessingQueueCritical) ||
+		!validCountThresholdPair(settings.ProcessingFailureWarningCount, settings.ProcessingFailureCriticalCount) ||
+		!validCountThresholdPair(settings.LoginFailureWarningCount, settings.LoginFailureCriticalCount) ||
+		!validCountThresholdPair(settings.AuthorizationDenialWarningCount, settings.AuthorizationDenialCriticalCount) {
 		return "threshold"
 	}
 	return ""

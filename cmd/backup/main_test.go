@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/backup"
+	"happylearn.local/app/internal/operations"
 )
 
 const (
@@ -328,6 +329,7 @@ func (service *workflowServiceFixture) AddArtifact(
 
 type workflowExecutorFixture struct {
 	snapshotResult backup.SnapshotResult
+	snapshotErr    error
 	snapshotCalls  int
 	verified       []backup.VerifyInput
 	remote         bool
@@ -336,12 +338,104 @@ type workflowExecutorFixture struct {
 	syncErr        error
 }
 
+func (executor *workflowExecutorFixture) LocalConfigured() (bool, error) {
+	return executor.snapshotErr == nil, executor.snapshotErr
+}
+
+type backupStatusWriterFixture struct {
+	statuses []operations.InfrastructureStatus
+}
+
+func (writer *backupStatusWriterFixture) RecordInfrastructureStatus(
+	_ context.Context,
+	key operations.InfrastructureKey,
+	configured bool,
+	validatedAt time.Time,
+) error {
+	writer.statuses = append(writer.statuses, operations.InfrastructureStatus{
+		Key: key, Configured: configured, LastValidatedAt: &validatedAt,
+	})
+	return nil
+}
+
+func TestBackupConfigurationStatusRecordsLocalAndPartialRemoteSafely(t *testing.T) {
+	validatedAt := time.Date(2026, 7, 28, 4, 5, 6, 0, time.UTC)
+	partialRemote := errors.New("partial remote configuration")
+	writer := &backupStatusWriterFixture{}
+	validator := &workflowExecutorFixture{remoteErr: partialRemote}
+	err := recordBackupInfrastructureStatuses(
+		context.Background(),
+		writer,
+		validator,
+		validatedAt,
+	)
+	if !errors.Is(err, partialRemote) || len(writer.statuses) != 2 {
+		t.Fatalf("err=%v statuses=%+v", err, writer.statuses)
+	}
+	if writer.statuses[0].Key != operations.InfrastructureLocalBackup ||
+		!writer.statuses[0].Configured ||
+		writer.statuses[1].Key != operations.InfrastructureRemoteBackup ||
+		writer.statuses[1].Configured {
+		t.Fatalf("statuses=%+v", writer.statuses)
+	}
+}
+
+type snapshotExitSecrets map[backup.SecretName]string
+
+func (secrets snapshotExitSecrets) Read(
+	name backup.SecretName,
+) (string, error) {
+	value, ok := secrets[name]
+	if !ok {
+		return "", backup.ErrSecretUnavailable
+	}
+	return value, nil
+}
+
+type snapshotExitRunner struct {
+	code   int
+	secret string
+}
+
+func (runner snapshotExitRunner) Run(
+	_ context.Context,
+	command backup.Command,
+) (backup.CommandResult, error) {
+	switch filepath.Base(command.Executable) {
+	case "pg_dump":
+		if err := os.WriteFile(
+			command.StdoutFile,
+			[]byte("PGDMP"),
+			0o600,
+		); err != nil {
+			return backup.CommandResult{}, err
+		}
+		return backup.CommandResult{ExitCode: 0}, nil
+	case "age":
+		if err := os.WriteFile(
+			command.StdoutFile,
+			[]byte("age-encrypted"),
+			0o600,
+		); err != nil {
+			return backup.CommandResult{}, err
+		}
+		return backup.CommandResult{ExitCode: 0}, nil
+	case "restic":
+		return backup.CommandResult{
+			ExitCode: runner.code,
+			Stderr:   []byte(runner.secret),
+		}, nil
+	default:
+		return backup.CommandResult{}, errors.New("unexpected executable")
+	}
+}
+
 func (executor *workflowExecutorFixture) Snapshot(
 	context.Context,
 	backup.SnapshotInput,
 ) (backup.SnapshotResult, error) {
 	executor.snapshotCalls++
-	return executor.snapshotResult, nil
+	return executor.snapshotResult, executor.snapshotErr
 }
 
 func (executor *workflowExecutorFixture) Verify(
@@ -514,6 +608,271 @@ func TestCommandApplicationFencesEveryMutationWithClaimedOwnerAndGeneration(t *t
 	}
 	if states.state != nil {
 		t.Fatalf("terminal state file remains: %+v", states.state)
+	}
+}
+
+func TestCommandApplicationLogsOneSpecificSnapshotCategoryPerFailure(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		category  string
+		configure func(
+			*commandApplication,
+			*workflowServiceFixture,
+			*workflowExecutorFixture,
+			*memoryWorkflowStates,
+		)
+	}{
+		{
+			name: "resume", category: "resume",
+			configure: func(
+				application *commandApplication,
+				_ *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				_ *memoryWorkflowStates,
+			) {
+				application.service = nil
+			},
+		},
+		{
+			name:     "transition-snapshotting",
+			category: "transition_snapshotting",
+			configure: func(
+				_ *commandApplication,
+				service *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				states *memoryWorkflowStates,
+			) {
+				service.state = backup.StateDraining
+				service.transitionResponseLossAt = 1
+				states.state.State = backup.StateDraining
+			},
+		},
+		{
+			name:     "state-save-snapshotting",
+			category: "state_save_snapshotting",
+			configure: func(
+				_ *commandApplication,
+				service *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				states *memoryWorkflowStates,
+			) {
+				service.state = backup.StateDraining
+				states.state.State = backup.StateDraining
+				states.failSaveAt = 1
+			},
+		},
+		{
+			name: "migration-version", category: "migration_version",
+			configure: func(
+				application *commandApplication,
+				_ *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				_ *memoryWorkflowStates,
+			) {
+				application.migrationVersion = func(
+					context.Context,
+				) (int64, error) {
+					return 0, errors.New("migration-version-secret")
+				}
+			},
+		},
+		{
+			name: "executor-stage", category: "work_root",
+			configure: func(
+				application *commandApplication,
+				_ *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				_ *memoryWorkflowStates,
+			) {
+				application.executor = &backup.Executor{}
+			},
+		},
+		{
+			name: "result-validation", category: "result_validation",
+			configure: func(
+				_ *commandApplication,
+				_ *workflowServiceFixture,
+				executor *workflowExecutorFixture,
+				_ *memoryWorkflowStates,
+			) {
+				executor.snapshotResult = backup.SnapshotResult{}
+			},
+		},
+		{
+			name:     "transition-encrypting",
+			category: "transition_encrypting",
+			configure: func(
+				_ *commandApplication,
+				service *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				_ *memoryWorkflowStates,
+			) {
+				service.transitionResponseLossAt = 1
+			},
+		},
+		{
+			name:     "state-save-encrypting",
+			category: "state_save_encrypting",
+			configure: func(
+				_ *commandApplication,
+				_ *workflowServiceFixture,
+				_ *workflowExecutorFixture,
+				states *memoryWorkflowStates,
+			) {
+				states.failSaveAt = 1
+			},
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			runID := uuid.MustParse(commandRunID)
+			owner := uuid.New()
+			now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+			service := &workflowServiceFixture{
+				runID: runID, owner: owner, generation: 4,
+				state: backup.StateSnapshotting, leaseActive: true,
+			}
+			executor := &workflowExecutorFixture{
+				snapshotResult: commandSnapshotResult(t, now),
+			}
+			states := &memoryWorkflowStates{state: &workflowState{
+				RunID: runID, OwnerID: owner, LeaseGeneration: 4,
+				State: backup.StateSnapshotting,
+			}}
+			application := &commandApplication{
+				service: service, executor: executor, states: states,
+				newOwner: uuid.New,
+				migrationVersion: func(context.Context) (int64, error) {
+					return 20, nil
+				},
+				now: func() time.Time { return now },
+			}
+			scenario.configure(application, service, executor, states)
+			var failures []struct {
+				category  string
+				status    int
+				hasStatus bool
+			}
+			application.logSnapshotCategory = func(
+				category string,
+				status int,
+				hasStatus bool,
+			) {
+				failures = append(failures, struct {
+					category  string
+					status    int
+					hasStatus bool
+				}{
+					category: category, status: status,
+					hasStatus: hasStatus,
+				})
+			}
+
+			if err := application.Snapshot(
+				context.Background(),
+				runID,
+			); err == nil {
+				t.Fatal("snapshot unexpectedly succeeded")
+			}
+			if len(failures) != 1 ||
+				failures[0].category != scenario.category ||
+				failures[0].hasStatus ||
+				failures[0].status != 0 {
+				t.Fatalf(
+					"failures=%+v want category=%q without status",
+					failures,
+					scenario.category,
+				)
+			}
+		})
+	}
+}
+
+func TestCommandApplicationForwardsSafeSnapshotExitCode(t *testing.T) {
+	const secret = "snapshot-command-stderr-secret"
+	runID := uuid.MustParse(commandRunID)
+	owner := uuid.New()
+	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+	workRoot := t.TempDir()
+	objectRoot := t.TempDir()
+	if err := os.Chmod(workRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(objectRoot, "object"),
+		[]byte("object"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := backup.NewExecutor(backup.ExecutorConfig{
+		Runner: snapshotExitRunner{code: 37, secret: secret},
+		Secrets: snapshotExitSecrets{
+			backup.SecretDatabasePassword: "database-password",
+			backup.SecretLocalRepository:  "/repository",
+			backup.SecretLocalPassword:    "repository-password",
+		},
+		WorkRoot:          workRoot,
+		ObjectRoot:        objectRoot,
+		DatabaseHost:      "postgres",
+		DatabasePort:      "5432",
+		DatabaseUser:      "happylearn",
+		DatabaseName:      "happylearn",
+		DatabaseSSLMode:   "require",
+		AgeRecipient:      "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp5m40h",
+		EncryptionKeyID:   "key-2026-07",
+		Now:               func() time.Time { return now },
+		MaxPlaintextBytes: 16 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &workflowServiceFixture{
+		runID: runID, owner: owner, generation: 4,
+		state: backup.StateSnapshotting, leaseActive: true,
+	}
+	states := &memoryWorkflowStates{state: &workflowState{
+		RunID: runID, OwnerID: owner, LeaseGeneration: 4,
+		State: backup.StateSnapshotting,
+	}}
+	application := &commandApplication{
+		service: service, executor: &executor, states: states,
+		newOwner: uuid.New,
+		migrationVersion: func(context.Context) (int64, error) {
+			return 20, nil
+		},
+		now: func() time.Time { return now },
+	}
+	var category string
+	var status int
+	var hasStatus bool
+	application.logSnapshotCategory = func(
+		actualCategory string,
+		actualStatus int,
+		actualHasStatus bool,
+	) {
+		category = actualCategory
+		status = actualStatus
+		hasStatus = actualHasStatus
+	}
+
+	if err := application.Snapshot(
+		context.Background(),
+		runID,
+	); !errors.Is(err, errWorkflowUnavailable) {
+		t.Fatalf("snapshot error=%v", err)
+	}
+	if category != "restic_exit" ||
+		status != 37 ||
+		!hasStatus {
+		t.Fatalf(
+			"category=%q status=%d present=%t",
+			category,
+			status,
+			hasStatus,
+		)
+	}
+	if strings.Contains(category, secret) {
+		t.Fatalf("category leaked secret: %q", category)
 	}
 }
 

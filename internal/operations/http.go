@@ -431,74 +431,136 @@ func (h *AdminHandler) principal(w http.ResponseWriter, r *http.Request) (Princi
 }
 
 type settingsDTO struct {
-	Version                        int64     `json:"version"`
-	SiteName                       string    `json:"siteName"`
-	SiteAnnouncement               string    `json:"siteAnnouncement"`
-	SoftDeleteRetentionDays        int       `json:"softDeleteRetentionDays"`
-	AuditRetentionDays             int       `json:"auditRetentionDays"`
-	OperationalSampleRetentionDays int       `json:"operationalSampleRetentionDays"`
-	BackupHour                     int       `json:"backupHour"`
-	BackupMinute                   int       `json:"backupMinute"`
-	BackupTimezone                 string    `json:"backupTimezone"`
-	DiskWarningPercent             int       `json:"diskWarningPercent"`
-	DiskCriticalPercent            int       `json:"diskCriticalPercent"`
-	AIErrorWarningPercent          int       `json:"aiErrorWarningPercent"`
-	AIErrorCriticalPercent         int       `json:"aiErrorCriticalPercent"`
-	ProcessingQueueWarning         int       `json:"processingQueueWarning"`
-	ProcessingQueueCritical        int       `json:"processingQueueCritical"`
-	UpdatedAt                      time.Time `json:"updatedAt"`
+	Version                          int64     `json:"version"`
+	SiteName                         string    `json:"siteName"`
+	SiteAnnouncement                 string    `json:"siteAnnouncement"`
+	SoftDeleteRetentionDays          int       `json:"softDeleteRetentionDays"`
+	AuditRetentionDays               int       `json:"auditRetentionDays"`
+	OperationalSampleRetentionDays   int       `json:"operationalSampleRetentionDays"`
+	BackupHour                       int       `json:"backupHour"`
+	BackupMinute                     int       `json:"backupMinute"`
+	BackupTimezone                   string    `json:"backupTimezone"`
+	DiskWarningPercent               int       `json:"diskWarningPercent"`
+	DiskCriticalPercent              int       `json:"diskCriticalPercent"`
+	BackupFilesystemWarningPercent   int       `json:"backupFilesystemWarningPercent"`
+	BackupFilesystemCriticalPercent  int       `json:"backupFilesystemCriticalPercent"`
+	LocalBackupAgeWarningHours       int       `json:"localBackupAgeWarningHours"`
+	LocalBackupAgeCriticalHours      int       `json:"localBackupAgeCriticalHours"`
+	AIErrorWarningPercent            int       `json:"aiErrorWarningPercent"`
+	AIErrorCriticalPercent           int       `json:"aiErrorCriticalPercent"`
+	ProcessingQueueWarning           int       `json:"processingQueueWarning"`
+	ProcessingQueueCritical          int       `json:"processingQueueCritical"`
+	ProcessingFailureWarningCount    int       `json:"processingFailureWarningCount"`
+	ProcessingFailureCriticalCount   int       `json:"processingFailureCriticalCount"`
+	LoginFailureWarningCount         int       `json:"loginFailureWarningCount"`
+	LoginFailureCriticalCount        int       `json:"loginFailureCriticalCount"`
+	AuthorizationDenialWarningCount  int       `json:"authorizationDenialWarningCount"`
+	AuthorizationDenialCriticalCount int       `json:"authorizationDenialCriticalCount"`
+	Infrastructure                   []infrastructureStatusDTO `json:"infrastructure"`
+	UpdatedAt                        time.Time                 `json:"updatedAt"`
+}
+
+type infrastructureStatusDTO struct {
+	Key             string     `json:"key"`
+	Configured      bool       `json:"configured"`
+	LastValidatedAt *time.Time `json:"lastValidatedAt"`
 }
 
 func settingsView(settings Settings) settingsDTO {
+	statuses := NormalizeInfrastructureStatuses(settings.Infrastructure)
+	infrastructure := make([]infrastructureStatusDTO, len(statuses))
+	for index, status := range statuses {
+		infrastructure[index] = infrastructureStatusDTO{
+			Key:             infrastructureStorageKey(status.Key),
+			Configured:      status.Configured,
+			LastValidatedAt: status.LastValidatedAt,
+		}
+	}
 	return settingsDTO{
-		Version:                        settings.Version,
-		SiteName:                       settings.SiteName,
-		SiteAnnouncement:               settings.SiteAnnouncement,
-		SoftDeleteRetentionDays:        settings.SoftDeleteRetentionDays,
-		AuditRetentionDays:             settings.AuditRetentionDays,
-		OperationalSampleRetentionDays: settings.OperationalSampleRetentionDays,
-		BackupHour:                     settings.BackupHour,
-		BackupMinute:                   settings.BackupMinute,
-		BackupTimezone:                 settings.BackupTimezone,
-		DiskWarningPercent:             settings.DiskWarningPercent,
-		DiskCriticalPercent:            settings.DiskCriticalPercent,
-		AIErrorWarningPercent:          settings.AIErrorWarningPercent,
-		AIErrorCriticalPercent:         settings.AIErrorCriticalPercent,
-		ProcessingQueueWarning:         settings.ProcessingQueueWarning,
-		ProcessingQueueCritical:        settings.ProcessingQueueCritical,
-		UpdatedAt:                      settings.UpdatedAt.UTC(),
+		Version:                          settings.Version,
+		SiteName:                         settings.SiteName,
+		SiteAnnouncement:                 settings.SiteAnnouncement,
+		SoftDeleteRetentionDays:          settings.SoftDeleteRetentionDays,
+		AuditRetentionDays:               settings.AuditRetentionDays,
+		OperationalSampleRetentionDays:   settings.OperationalSampleRetentionDays,
+		BackupHour:                       settings.BackupHour,
+		BackupMinute:                     settings.BackupMinute,
+		BackupTimezone:                   settings.BackupTimezone,
+		DiskWarningPercent:               settings.DiskWarningPercent,
+		DiskCriticalPercent:              settings.DiskCriticalPercent,
+		BackupFilesystemWarningPercent:   settings.BackupFilesystemWarningPercent,
+		BackupFilesystemCriticalPercent:  settings.BackupFilesystemCriticalPercent,
+		LocalBackupAgeWarningHours:       settings.LocalBackupAgeWarningHours,
+		LocalBackupAgeCriticalHours:      settings.LocalBackupAgeCriticalHours,
+		AIErrorWarningPercent:            settings.AIErrorWarningPercent,
+		AIErrorCriticalPercent:           settings.AIErrorCriticalPercent,
+		ProcessingQueueWarning:           settings.ProcessingQueueWarning,
+		ProcessingQueueCritical:          settings.ProcessingQueueCritical,
+		ProcessingFailureWarningCount:    settings.ProcessingFailureWarningCount,
+		ProcessingFailureCriticalCount:   settings.ProcessingFailureCriticalCount,
+		LoginFailureWarningCount:         settings.LoginFailureWarningCount,
+		LoginFailureCriticalCount:        settings.LoginFailureCriticalCount,
+		AuthorizationDenialWarningCount:  settings.AuthorizationDenialWarningCount,
+		AuthorizationDenialCriticalCount: settings.AuthorizationDenialCriticalCount,
+		Infrastructure:                   infrastructure,
+		UpdatedAt:                        settings.UpdatedAt.UTC(),
 	}
 }
 
 type settingsRequest struct {
-	Version                        *int64          `json:"version"`
-	SiteName                       *string         `json:"siteName"`
-	SiteAnnouncement               *string         `json:"siteAnnouncement"`
-	SoftDeleteRetentionDays        *int            `json:"softDeleteRetentionDays"`
-	AuditRetentionDays             *int            `json:"auditRetentionDays"`
-	OperationalSampleRetentionDays *int            `json:"operationalSampleRetentionDays"`
-	BackupHour                     *int            `json:"backupHour"`
-	BackupMinute                   *int            `json:"backupMinute"`
-	BackupTimezone                 *string         `json:"backupTimezone"`
-	DiskWarningPercent             *int            `json:"diskWarningPercent"`
-	DiskCriticalPercent            *int            `json:"diskCriticalPercent"`
-	AIErrorWarningPercent          *int            `json:"aiErrorWarningPercent"`
-	AIErrorCriticalPercent         *int            `json:"aiErrorCriticalPercent"`
-	ProcessingQueueWarning         *int            `json:"processingQueueWarning"`
-	ProcessingQueueCritical        *int            `json:"processingQueueCritical"`
-	UpdatedAt                      json.RawMessage `json:"updatedAt"`
+	Version                          *int64          `json:"version"`
+	SiteName                         *string         `json:"siteName"`
+	SiteAnnouncement                 *string         `json:"siteAnnouncement"`
+	SoftDeleteRetentionDays          *int            `json:"softDeleteRetentionDays"`
+	AuditRetentionDays               *int            `json:"auditRetentionDays"`
+	OperationalSampleRetentionDays   *int            `json:"operationalSampleRetentionDays"`
+	BackupHour                       *int            `json:"backupHour"`
+	BackupMinute                     *int            `json:"backupMinute"`
+	BackupTimezone                   *string         `json:"backupTimezone"`
+	DiskWarningPercent               *int            `json:"diskWarningPercent"`
+	DiskCriticalPercent              *int            `json:"diskCriticalPercent"`
+	BackupFilesystemWarningPercent   *int            `json:"backupFilesystemWarningPercent"`
+	BackupFilesystemCriticalPercent  *int            `json:"backupFilesystemCriticalPercent"`
+	LocalBackupAgeWarningHours       *int            `json:"localBackupAgeWarningHours"`
+	LocalBackupAgeCriticalHours      *int            `json:"localBackupAgeCriticalHours"`
+	AIErrorWarningPercent            *int            `json:"aiErrorWarningPercent"`
+	AIErrorCriticalPercent           *int            `json:"aiErrorCriticalPercent"`
+	ProcessingQueueWarning           *int            `json:"processingQueueWarning"`
+	ProcessingQueueCritical          *int            `json:"processingQueueCritical"`
+	ProcessingFailureWarningCount    *int            `json:"processingFailureWarningCount"`
+	ProcessingFailureCriticalCount   *int            `json:"processingFailureCriticalCount"`
+	LoginFailureWarningCount         *int            `json:"loginFailureWarningCount"`
+	LoginFailureCriticalCount        *int            `json:"loginFailureCriticalCount"`
+	AuthorizationDenialWarningCount  *int            `json:"authorizationDenialWarningCount"`
+	AuthorizationDenialCriticalCount *int            `json:"authorizationDenialCriticalCount"`
 }
 
 var settingsJSONFields = map[string]struct{}{
-	"version": {}, "siteName": {}, "siteAnnouncement": {},
-	"softDeleteRetentionDays": {}, "auditRetentionDays": {},
-	"operationalSampleRetentionDays": {},
-	"backupHour":                     {}, "backupMinute": {},
-	"backupTimezone":     {},
-	"diskWarningPercent": {}, "diskCriticalPercent": {},
-	"aiErrorWarningPercent": {}, "aiErrorCriticalPercent": {},
-	"processingQueueWarning": {}, "processingQueueCritical": {},
-	"updatedAt": {},
+	"version":                          {},
+	"siteName":                         {},
+	"siteAnnouncement":                 {},
+	"softDeleteRetentionDays":          {},
+	"auditRetentionDays":               {},
+	"operationalSampleRetentionDays":   {},
+	"backupHour":                       {},
+	"backupMinute":                     {},
+	"backupTimezone":                   {},
+	"diskWarningPercent":               {},
+	"diskCriticalPercent":              {},
+	"backupFilesystemWarningPercent":   {},
+	"backupFilesystemCriticalPercent":  {},
+	"localBackupAgeWarningHours":       {},
+	"localBackupAgeCriticalHours":      {},
+	"aiErrorWarningPercent":            {},
+	"aiErrorCriticalPercent":           {},
+	"processingQueueWarning":           {},
+	"processingQueueCritical":          {},
+	"processingFailureWarningCount":    {},
+	"processingFailureCriticalCount":   {},
+	"loginFailureWarningCount":         {},
+	"loginFailureCriticalCount":        {},
+	"authorizationDenialWarningCount":  {},
+	"authorizationDenialCriticalCount": {},
 }
 
 func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
@@ -536,36 +598,42 @@ func decodeSettings(w http.ResponseWriter, r *http.Request) (Settings, bool) {
 		input.OperationalSampleRetentionDays == nil || input.BackupHour == nil ||
 		input.BackupMinute == nil || input.BackupTimezone == nil ||
 		input.DiskWarningPercent == nil || input.DiskCriticalPercent == nil ||
+		input.BackupFilesystemWarningPercent == nil || input.BackupFilesystemCriticalPercent == nil ||
+		input.LocalBackupAgeWarningHours == nil || input.LocalBackupAgeCriticalHours == nil ||
 		input.AIErrorWarningPercent == nil || input.AIErrorCriticalPercent == nil ||
-		input.ProcessingQueueWarning == nil || input.ProcessingQueueCritical == nil {
+		input.ProcessingQueueWarning == nil || input.ProcessingQueueCritical == nil ||
+		input.ProcessingFailureWarningCount == nil || input.ProcessingFailureCriticalCount == nil ||
+		input.LoginFailureWarningCount == nil || input.LoginFailureCriticalCount == nil ||
+		input.AuthorizationDenialWarningCount == nil || input.AuthorizationDenialCriticalCount == nil {
 		operationsInvalid(w, r, "settings_invalid")
 		return Settings{}, false
 	}
-	if len(input.UpdatedAt) != 0 {
-		var updatedAt time.Time
-		if bytes.Equal(bytes.TrimSpace(input.UpdatedAt), []byte("null")) ||
-			json.Unmarshal(input.UpdatedAt, &updatedAt) != nil ||
-			updatedAt.IsZero() {
-			operationsInvalid(w, r, "settings_invalid")
-			return Settings{}, false
-		}
-	}
 	return Settings{
-		Version:                        *input.Version,
-		SiteName:                       *input.SiteName,
-		SiteAnnouncement:               *input.SiteAnnouncement,
-		SoftDeleteRetentionDays:        *input.SoftDeleteRetentionDays,
-		AuditRetentionDays:             *input.AuditRetentionDays,
-		OperationalSampleRetentionDays: *input.OperationalSampleRetentionDays,
-		BackupHour:                     *input.BackupHour,
-		BackupMinute:                   *input.BackupMinute,
-		BackupTimezone:                 *input.BackupTimezone,
-		DiskWarningPercent:             *input.DiskWarningPercent,
-		DiskCriticalPercent:            *input.DiskCriticalPercent,
-		AIErrorWarningPercent:          *input.AIErrorWarningPercent,
-		AIErrorCriticalPercent:         *input.AIErrorCriticalPercent,
-		ProcessingQueueWarning:         *input.ProcessingQueueWarning,
-		ProcessingQueueCritical:        *input.ProcessingQueueCritical,
+		Version:                          *input.Version,
+		SiteName:                         *input.SiteName,
+		SiteAnnouncement:                 *input.SiteAnnouncement,
+		SoftDeleteRetentionDays:          *input.SoftDeleteRetentionDays,
+		AuditRetentionDays:               *input.AuditRetentionDays,
+		OperationalSampleRetentionDays:   *input.OperationalSampleRetentionDays,
+		BackupHour:                       *input.BackupHour,
+		BackupMinute:                     *input.BackupMinute,
+		BackupTimezone:                   *input.BackupTimezone,
+		DiskWarningPercent:               *input.DiskWarningPercent,
+		DiskCriticalPercent:              *input.DiskCriticalPercent,
+		BackupFilesystemWarningPercent:   *input.BackupFilesystemWarningPercent,
+		BackupFilesystemCriticalPercent:  *input.BackupFilesystemCriticalPercent,
+		LocalBackupAgeWarningHours:       *input.LocalBackupAgeWarningHours,
+		LocalBackupAgeCriticalHours:      *input.LocalBackupAgeCriticalHours,
+		AIErrorWarningPercent:            *input.AIErrorWarningPercent,
+		AIErrorCriticalPercent:           *input.AIErrorCriticalPercent,
+		ProcessingQueueWarning:           *input.ProcessingQueueWarning,
+		ProcessingQueueCritical:          *input.ProcessingQueueCritical,
+		ProcessingFailureWarningCount:    *input.ProcessingFailureWarningCount,
+		ProcessingFailureCriticalCount:   *input.ProcessingFailureCriticalCount,
+		LoginFailureWarningCount:         *input.LoginFailureWarningCount,
+		LoginFailureCriticalCount:        *input.LoginFailureCriticalCount,
+		AuthorizationDenialWarningCount:  *input.AuthorizationDenialWarningCount,
+		AuthorizationDenialCriticalCount: *input.AuthorizationDenialCriticalCount,
 	}, true
 }
 

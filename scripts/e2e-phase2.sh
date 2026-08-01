@@ -41,6 +41,7 @@ student_new_password="Phase2 Changed ${nonce}!"
 artifact_dir="${E2E_ARTIFACT_DIR:-$PWD/test-results/phase2}"
 artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 admin_user="$(id -u):$(id -g)"
 temporary_containers=("$data_init" "$runner_init" "$admin_init" "$fixture_runner" "$artifact_init" "$install_runner" "$e2e_runner")
 service_containers=("$app" "$worker" "$minio" "$redis" "$postgres")
@@ -87,7 +88,9 @@ cleanup() {
   rm -rf "$tmpdir" || true
   exit "$original_status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 install -d -m 0700 "$artifact_dir" || true
 docker_bounded 120 run --rm --name "$artifact_init" --network none --read-only --user 0:0 \

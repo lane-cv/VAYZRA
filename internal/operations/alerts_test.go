@@ -11,10 +11,20 @@ func TestDefaultAlertRulesCoverApprovedThresholds(t *testing.T) {
 	settings := validSettings()
 	settings.DiskWarningPercent = 76
 	settings.DiskCriticalPercent = 91
+	settings.BackupFilesystemWarningPercent = 77
+	settings.BackupFilesystemCriticalPercent = 92
+	settings.LocalBackupAgeWarningHours = 26
+	settings.LocalBackupAgeCriticalHours = 31
 	settings.AIErrorWarningPercent = 11
 	settings.AIErrorCriticalPercent = 26
 	settings.ProcessingQueueWarning = 21
 	settings.ProcessingQueueCritical = 101
+	settings.ProcessingFailureWarningCount = 6
+	settings.ProcessingFailureCriticalCount = 21
+	settings.LoginFailureWarningCount = 22
+	settings.LoginFailureCriticalCount = 102
+	settings.AuthorizationDenialWarningCount = 52
+	settings.AuthorizationDenialCriticalCount = 202
 
 	rules, err := DefaultAlertRules(settings)
 	if err != nil {
@@ -33,14 +43,14 @@ func TestDefaultAlertRulesCoverApprovedThresholds(t *testing.T) {
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 		"filesystem_backup_usage": {
-			category: "storage", warning: 76, critical: 91,
+			category: "storage", warning: 77, critical: 92,
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 		"backup_local_age": {
-			category: "backup", warning: 25 * 60 * 60, critical: 30 * 60 * 60,
+			category: "backup", warning: 26 * 60 * 60, critical: 31 * 60 * 60,
 			direction: DirectionAbove, minimumSamples: 1,
 		},
-		"backup_remote_replication": {
+		AlertKeyBackupRemoteSync: {
 			category: "backup", warning: 1, critical: -1,
 			direction: DirectionBelow, minimumSamples: 1,
 		},
@@ -53,15 +63,15 @@ func TestDefaultAlertRulesCoverApprovedThresholds(t *testing.T) {
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 		"processing_failures": {
-			category: "processing", warning: 5, critical: 20,
+			category: "processing", warning: 6, critical: 21,
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 		"login_failures": {
-			category: "security", warning: 20, critical: 100,
+			category: "security", warning: 22, critical: 102,
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 		"authorization_denials": {
-			category: "security", warning: 50, critical: 200,
+			category: "security", warning: 52, critical: 202,
 			direction: DirectionAbove, minimumSamples: 1,
 		},
 	}
@@ -95,7 +105,7 @@ func TestClassifyAlertEvaluationHandlesAvailabilityMinimumsAndDirections(t *test
 		Warning: 10, Critical: 25, Direction: DirectionAbove, MinimumSamples: 20,
 	}
 	below := Rule{
-		DedupeKey: "backup_remote_replication", Category: "backup",
+		DedupeKey: AlertKeyBackupRemoteSync, Category: "backup",
 		Summary: "Remote backup replication",
 		Warning: 1, Critical: -1, Direction: DirectionBelow, MinimumSamples: 1,
 	}
@@ -275,7 +285,7 @@ func TestBuildAlertEvaluationsMapsEveryDefaultSeries(t *testing.T) {
 		"filesystem_root_usage":     80,
 		"filesystem_backup_usage":   81,
 		"backup_local_age":          26 * 60 * 60,
-		"backup_remote_replication": 0,
+		AlertKeyBackupRemoteSync: 0,
 		"ai_error_rate":             28,
 		"processing_queue_depth":    22,
 		"processing_failures":       6,
@@ -319,9 +329,9 @@ func TestBuildAlertEvaluationsTreatsMissingAndStaleAsUnavailable(t *testing.T) {
 	for _, evaluation := range evaluations {
 		if strings.HasPrefix(
 			evaluation.Rule.DedupeKey,
-			"backup_remote_replication",
+			AlertKeyBackupRemoteSync,
 		) {
-			if evaluation.Rule.DedupeKey != "backup_remote_replication" ||
+			if evaluation.Rule.DedupeKey != AlertKeyBackupRemoteSync ||
 				evaluation.Available {
 				t.Fatalf("remote unknown evaluation=%+v", evaluation)
 			}
@@ -464,7 +474,7 @@ func TestBuildAlertEvaluationsRemoteReplicationTriState(t *testing.T) {
 	}
 	var remote Rule
 	for _, rule := range rules {
-		if rule.DedupeKey == "backup_remote_replication" {
+		if rule.DedupeKey == AlertKeyBackupRemoteSync {
 			remote = rule
 			break
 		}

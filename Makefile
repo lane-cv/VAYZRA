@@ -3,7 +3,7 @@ PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-phase5 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract phase5-operations-docs-contract host-sampler host-metrics-contract host-metrics-live host-metrics
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-phase5 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract phase5-restore-live-contract phase5-failure-matrix-contract phase5-operations-docs-contract host-sampler host-metrics-contract host-metrics-uid-contract host-metrics-live host-metrics
 
 BACKUP_TRIGGER ?= manual
 
@@ -58,6 +58,12 @@ e2e-contracts:
 	bash scripts/e2e-phase5_contract_test.sh
 	bash scripts/e2e-harness_semantics_contract_test.sh
 	bash scripts/e2e-artifact-sanitization_contract_test.sh
+	bash scripts/phase5-backup_contract_test.sh
+	bash scripts/phase5-restore_contract_test.sh
+	bash scripts/phase5-restore_live_contract_test.sh
+	bash scripts/e2e-phase5_failure_matrix_contract_test.sh
+	bash scripts/host-metrics_contract_test.sh
+	bash scripts/host-metrics_uid_contract_test.sh
 	bash scripts/phase5-operations-docs_contract_test.sh
 
 phase5-backup-contract:
@@ -72,6 +78,12 @@ phase5-backup:
 phase5-restore-contract:
 	bash scripts/phase5-restore_contract_test.sh
 
+phase5-restore-live-contract:
+	bash scripts/phase5-restore_live_contract_test.sh
+
+phase5-failure-matrix-contract:
+	bash scripts/e2e-phase5_failure_matrix_contract_test.sh
+
 phase5-operations-docs-contract:
 	bash scripts/phase5-operations-docs_contract_test.sh
 
@@ -81,6 +93,9 @@ host-sampler:
 
 host-metrics-contract:
 	bash scripts/host-metrics_contract_test.sh
+
+host-metrics-uid-contract:
+	bash scripts/host-metrics_uid_contract_test.sh
 
 host-metrics-live:
 	bash scripts/host-metrics_live_test.sh

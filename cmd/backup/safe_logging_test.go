@@ -103,6 +103,52 @@ func TestProductionRestoreCheckLogsOnlyFixedFailureCategory(t *testing.T) {
 	}
 }
 
+func TestProductionSnapshotLoggerUsesSeparateFixedEvent(t *testing.T) {
+	const secret = "snapshot-category-secret"
+	t.Run("child-exit", func(t *testing.T) {
+		var output bytes.Buffer
+		logger, err := safelog.New(&output, time.Now, secret)
+		if err != nil {
+			t.Fatalf("safelog.New: %v", err)
+		}
+		application := &commandApplication{}
+		configureProductionApplicationLogging(application, logger)
+		application.recordSnapshotCommandFailure("restic_exit", 37)
+
+		records := decodeBackupSafeLogs(t, output.Bytes())
+		if len(records) != 1 ||
+			records[0]["event"] != "backup.snapshot" ||
+			records[0]["category"] != "restic_exit" ||
+			records[0]["status"] != float64(37) {
+			t.Fatalf("records = %#v", records)
+		}
+		if bytes.Contains(output.Bytes(), []byte(secret)) {
+			t.Fatalf("snapshot diagnostic leaked secret in %q", output.Bytes())
+		}
+	})
+
+	t.Run("application-failure", func(t *testing.T) {
+		var output bytes.Buffer
+		logger, err := safelog.New(&output, time.Now, secret)
+		if err != nil {
+			t.Fatalf("safelog.New: %v", err)
+		}
+		application := &commandApplication{}
+		configureProductionApplicationLogging(application, logger)
+		application.recordSnapshotFailure("resume")
+
+		records := decodeBackupSafeLogs(t, output.Bytes())
+		if len(records) != 1 ||
+			records[0]["event"] != "backup.snapshot" ||
+			records[0]["category"] != "resume" {
+			t.Fatalf("records = %#v", records)
+		}
+		if _, present := records[0]["status"]; present {
+			t.Fatalf("application failure exposed status: %#v", records[0])
+		}
+	})
+}
+
 func decodeBackupSafeLogs(t *testing.T, output []byte) []map[string]any {
 	t.Helper()
 	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})

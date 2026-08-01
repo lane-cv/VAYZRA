@@ -131,14 +131,7 @@ func productionProgramFactoriesWithLog(logger safelog.Logger) programFactories {
 			getenv func(string) string,
 		) (commandActions, func(), error) {
 			application, closeApplication, err := newProductionActions(ctx, getenv)
-			if application != nil {
-				application.logCategory = func(category string) {
-					logger.Error("backup.remote_sync", safelog.Field{
-						Name:  "category",
-						Value: category,
-					})
-				}
-			}
+			configureProductionApplicationLogging(application, logger)
 			return application, closeApplication, err
 		},
 		runRestoreCheck: func(
@@ -157,6 +150,44 @@ func productionProgramFactoriesWithLog(logger safelog.Logger) programFactories {
 		},
 		runRestoreHTTPProbe: runProductionRestoreHTTPProbe,
 		runRestoreRecord:    runProductionRestoreRecord,
+	}
+}
+
+func configureProductionApplicationLogging(
+	application *commandApplication,
+	logger safelog.Logger,
+) {
+	if application == nil {
+		return
+	}
+	application.logRemoteSyncCategory = func(category string) {
+		logger.Error("backup.remote_sync", safelog.Field{
+			Name:  "category",
+			Value: category,
+		})
+	}
+	application.logSnapshotCategory = func(
+		category string,
+		status int,
+		hasStatus bool,
+	) {
+		category = safeSnapshotLogCategory(category)
+		status, hasStatus = safeSnapshotLogStatus(
+			category,
+			status,
+			hasStatus,
+		)
+		fields := []safelog.Field{{
+			Name:  "category",
+			Value: category,
+		}}
+		if hasStatus {
+			fields = append(fields, safelog.Field{
+				Name:  "status",
+				Value: status,
+			})
+		}
+		logger.Error("backup.snapshot", fields...)
 	}
 }
 

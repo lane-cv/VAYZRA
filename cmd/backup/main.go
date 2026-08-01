@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"happylearn.local/app/internal/backup"
+	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/safelog"
 )
@@ -220,6 +221,50 @@ type backupWorkflowExecutor interface {
 	Sync(context.Context, backup.SyncInput) (string, error)
 }
 
+type backupConfigurationValidator interface {
+	LocalConfigured() (bool, error)
+	RemoteConfigured() (bool, error)
+}
+
+func recordBackupInfrastructureStatuses(
+	ctx context.Context,
+	writer operations.InfrastructureStatusWriter,
+	validator backupConfigurationValidator,
+	validatedAt time.Time,
+) error {
+	if ctx == nil || writer == nil || validator == nil || validatedAt.IsZero() {
+		return errWorkflowUnavailable
+	}
+	localConfigured, localErr := validator.LocalConfigured()
+	remoteConfigured, remoteErr := validator.RemoteConfigured()
+	if localErr != nil {
+		localConfigured = false
+	}
+	if remoteErr != nil {
+		remoteConfigured = false
+	}
+	if err := writer.RecordInfrastructureStatus(
+		ctx,
+		operations.InfrastructureLocalBackup,
+		localConfigured,
+		validatedAt,
+	); err != nil {
+		return err
+	}
+	if err := writer.RecordInfrastructureStatus(
+		ctx,
+		operations.InfrastructureRemoteBackup,
+		remoteConfigured,
+		validatedAt,
+	); err != nil {
+		return err
+	}
+	if localErr != nil {
+		return localErr
+	}
+	return remoteErr
+}
+
 type workflowStates interface {
 	Load(uuid.UUID) (workflowState, error)
 	Save(workflowState) error
@@ -245,13 +290,14 @@ type workflowState struct {
 }
 
 type commandApplication struct {
-	service          backupWorkflowService
-	executor         backupWorkflowExecutor
-	states           workflowStates
-	newOwner         func() uuid.UUID
-	migrationVersion func(context.Context) (int64, error)
-	now              func() time.Time
-	logCategory      func(string)
+	service               backupWorkflowService
+	executor              backupWorkflowExecutor
+	states                workflowStates
+	newOwner              func() uuid.UUID
+	migrationVersion      func(context.Context) (int64, error)
+	now                   func() time.Time
+	logRemoteSyncCategory func(string)
+	logSnapshotCategory   func(string, int, bool)
 }
 
 func (application *commandApplication) Prepare(
@@ -314,24 +360,29 @@ func (application *commandApplication) Snapshot(
 ) error {
 	state, terminal, err := application.resume(ctx, runID)
 	if err != nil || terminal {
+		application.recordSnapshotFailure("resume")
 		return errWorkflowUnavailable
 	}
 	switch state.State {
 	case backup.StateDraining:
 		if err := application.transition(ctx, &state, backup.StateSnapshotting); err != nil {
+			application.recordSnapshotFailure("transition_snapshotting")
 			return err
 		}
 		if err := application.states.Save(state); err != nil {
+			application.recordSnapshotFailure("state_save_snapshotting")
 			return errWorkflowState
 		}
 	case backup.StateSnapshotting:
 	case backup.StateEncrypting:
 		return nil
 	default:
+		application.recordSnapshotFailure("resume")
 		return errWorkflowUnavailable
 	}
 	migrationVersion, err := application.migrationVersion(ctx)
 	if err != nil || migrationVersion < 1 {
+		application.recordSnapshotFailure("migration_version")
 		return errWorkflowUnavailable
 	}
 	result, err := application.executor.Snapshot(ctx, backup.SnapshotInput{
@@ -339,6 +390,7 @@ func (application *commandApplication) Snapshot(
 		DatabaseMigrationVersion: migrationVersion,
 	})
 	if err != nil {
+		application.recordSnapshotExecutorFailure(err)
 		return errWorkflowUnavailable
 	}
 	manifestBytes, manifestErr := backup.MarshalManifest(result.Manifest)
@@ -351,6 +403,7 @@ func (application *commandApplication) Snapshot(
 		result.LocalSnapshotID == "" ||
 		result.LogicalBytes < 0 ||
 		result.StoredBytes < 0 {
+		application.recordSnapshotFailure("result_validation")
 		return errWorkflowUnavailable
 	}
 	logicalBytes := result.LogicalBytes
@@ -375,9 +428,14 @@ func (application *commandApplication) Snapshot(
 		backup.StateEncrypting,
 		&state.Evidence,
 	); err != nil {
+		application.recordSnapshotFailure("transition_encrypting")
 		return err
 	}
-	return application.states.Save(state)
+	if err := application.states.Save(state); err != nil {
+		application.recordSnapshotFailure("state_save_encrypting")
+		return err
+	}
+	return nil
 }
 
 func (application *commandApplication) Verify(
@@ -478,8 +536,10 @@ func (application *commandApplication) Sync(
 		},
 	)
 	if syncErr != nil {
-		if application.logCategory != nil {
-			application.logCategory(backup.RemoteSyncFailureStage(syncErr))
+		if application.logRemoteSyncCategory != nil {
+			application.logRemoteSyncCategory(
+				backup.RemoteSyncFailureStage(syncErr),
+			)
 		}
 		if errors.Is(syncErr, backup.ErrCancelled) {
 			return errWorkflowUnavailable
@@ -521,6 +581,106 @@ func (application *commandApplication) Sync(
 		return errWorkflowUnavailable
 	}
 	return application.states.Save(state)
+}
+
+func (application *commandApplication) recordSnapshotFailure(category string) {
+	application.emitSnapshotFailure(category, 0, false)
+}
+
+func (application *commandApplication) recordSnapshotExecutorFailure(err error) {
+	category := backup.SnapshotFailureStage(err)
+	if status, ok := backup.SnapshotFailureExitCode(err); ok {
+		application.recordSnapshotCommandFailure(category, status)
+		return
+	}
+	application.recordSnapshotFailure(category)
+}
+
+func (application *commandApplication) recordSnapshotCommandFailure(
+	category string,
+	status int,
+) {
+	application.emitSnapshotFailure(category, status, true)
+}
+
+func (application *commandApplication) emitSnapshotFailure(
+	category string,
+	status int,
+	hasStatus bool,
+) {
+	if application == nil || application.logSnapshotCategory == nil {
+		return
+	}
+	category = safeSnapshotLogCategory(category)
+	status, hasStatus = safeSnapshotLogStatus(
+		category,
+		status,
+		hasStatus,
+	)
+	application.logSnapshotCategory(category, status, hasStatus)
+}
+
+func safeSnapshotLogStatus(
+	category string,
+	status int,
+	hasStatus bool,
+) (int, bool) {
+	if !hasStatus {
+		return 0, false
+	}
+	switch category {
+	case "pg_dump_exit", "age_exit", "restic_exit":
+	default:
+		return 0, false
+	}
+	if status < 1 || status > 255 {
+		return -1, true
+	}
+	return status, true
+}
+
+func safeSnapshotLogCategory(category string) string {
+	switch category {
+	case "resume",
+		"transition_snapshotting",
+		"state_save_snapshotting",
+		"migration_version",
+		"result_validation",
+		"transition_encrypting",
+		"state_save_encrypting",
+		"input",
+		"work_root",
+		"object_root",
+		"secrets",
+		"work_dir",
+		"pg_dump_run",
+		"pg_dump_exit",
+		"dump_hash",
+		"object_walk",
+		"object_symlink",
+		"object_nonregular",
+		"object_lstat",
+		"object_open",
+		"object_identity_changed",
+		"object_read",
+		"object_close",
+		"object_size_changed",
+		"object_capacity",
+		"manifest",
+		"recovery_bundle",
+		"age_run",
+		"age_exit",
+		"restic_run",
+		"restic_exit",
+		"restic_summary",
+		"capacity",
+		"cleanup",
+		"cancelled",
+		"unknown":
+		return category
+	default:
+		return "unknown"
+	}
 }
 
 func (application *commandApplication) addArtifacts(
@@ -1214,6 +1374,15 @@ func newProductionActions(
 		MaxPlaintextBytes: maxPlaintextBytes,
 	})
 	if err != nil {
+		pool.Close()
+		return nil, func() {}, errWorkflowUnavailable
+	}
+	if err := recordBackupInfrastructureStatuses(
+		ctx,
+		operations.NewPostgresStore(pool),
+		&executor,
+		time.Now(),
+	); err != nil {
 		pool.Close()
 		return nil, func() {}, errWorkflowUnavailable
 	}

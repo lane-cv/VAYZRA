@@ -317,6 +317,9 @@ func (executor Executor) ForgetRetentionSnapshots(
 func (executor Executor) retentionRepositoryEnvironment(
 	repository Repository,
 ) ([]string, error) {
+	if err := secureDirectory(executor.config.WorkRoot); err != nil {
+		return nil, ErrRetention
+	}
 	switch repository {
 	case RepositoryLocal:
 		location, err := executor.config.Secrets.Read(SecretLocalRepository)
@@ -329,6 +332,7 @@ func (executor Executor) retentionRepositoryEnvironment(
 		}
 		return []string{
 			"LC_ALL=C",
+			"TMPDIR=" + executor.config.WorkRoot,
 			"RESTIC_REPOSITORY=" + location,
 			"RESTIC_PASSWORD=" + password,
 		}, nil
@@ -339,6 +343,7 @@ func (executor Executor) retentionRepositoryEnvironment(
 		}
 		return []string{
 			"LC_ALL=C",
+			"TMPDIR=" + executor.config.WorkRoot,
 			"RESTIC_REPOSITORY=" + remote.repository,
 			"RESTIC_PASSWORD=" + remote.password,
 			"AWS_ACCESS_KEY_ID=" + remote.accessKey,

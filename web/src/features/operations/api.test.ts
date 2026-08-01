@@ -4,7 +4,19 @@ import {
   readSettings,
   saveSettings,
 } from './api'
-import type { OperationsSettings } from './types'
+import type { OperationsSettings, OperationsSettingsUpdate } from './types'
+
+const infrastructure: OperationsSettings['infrastructure'] = [
+  { key: 'application_database', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'redis_security', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'object_store', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'ai_encryption', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'internal_metrics', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'host_metrics_ingestion', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'alert_webhook', configured: false, lastValidatedAt: '2026-07-28T01:01:01Z' },
+  { key: 'local_backup', configured: true, lastValidatedAt: '2026-07-28T01:01:02Z' },
+  { key: 'remote_backup', configured: false, lastValidatedAt: null },
+]
 
 const settings: OperationsSettings = {
   version: 7,
@@ -18,12 +30,27 @@ const settings: OperationsSettings = {
   backupTimezone: 'Asia/Shanghai',
   diskWarningPercent: 75,
   diskCriticalPercent: 90,
+  backupFilesystemWarningPercent: 75,
+  backupFilesystemCriticalPercent: 90,
+  localBackupAgeWarningHours: 25,
+  localBackupAgeCriticalHours: 30,
   aiErrorWarningPercent: 10,
   aiErrorCriticalPercent: 25,
   processingQueueWarning: 20,
   processingQueueCritical: 50,
+  processingFailureWarningCount: 5,
+  processingFailureCriticalCount: 20,
+  loginFailureWarningCount: 20,
+  loginFailureCriticalCount: 100,
+  authorizationDenialWarningCount: 50,
+  authorizationDenialCriticalCount: 200,
+  infrastructure,
   updatedAt: '2026-07-28T01:02:03Z',
 }
+
+const update: OperationsSettingsUpdate = Object.fromEntries(
+  Object.entries(settings).filter(([key]) => key !== 'infrastructure' && key !== 'updatedAt'),
+) as OperationsSettingsUpdate
 
 describe('operations API', () => {
   beforeEach(() => {
@@ -33,13 +60,15 @@ describe('operations API', () => {
 
   afterEach(() => vi.unstubAllGlobals())
 
-  it('reads the exact 16-field settings DTO from the canonical URL', async () => {
+  it('reads the exact safe settings DTO and stable infrastructure rows from the canonical URL', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
       data: { ...settings, ignoredServerField: 'must-not-escape-the-parser' },
     })))
 
     await expect(readSettings()).resolves.toStrictEqual(settings)
-    expect(Object.keys(await readSettingsFrom(settings))).toHaveLength(16)
+    expect(Object.keys(await readSettingsFrom(settings))).toHaveLength(27)
+    expect((await readSettingsFrom(settings)).infrastructure).toStrictEqual(infrastructure)
+    expect(Object.keys(infrastructure[0])).toStrictEqual(['key', 'configured', 'lastValidatedAt'])
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/operations/settings')
   })
 
@@ -49,6 +78,24 @@ describe('operations API', () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: partial })))
 
     await expect(readSettings()).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
+  it('rejects missing, reordered, duplicated, unknown, and metadata-bearing infrastructure rows', async () => {
+    const invalidInfrastructure: unknown[] = [
+      infrastructure.slice(0, -1),
+      [...infrastructure].reverse(),
+      [...infrastructure.slice(0, -1), infrastructure[0]],
+      infrastructure.map((row, index) => index === 0 ? { ...row, key: 'database_url' } : row),
+      infrastructure.map((row, index) => index === 0 ? { ...row, configured: 'yes' } : row),
+      infrastructure.map((row, index) => index === 0 ? { ...row, lastValidatedAt: 'not-a-time' } : row),
+      infrastructure.map((row, index) => index === 0 ? { ...row, source: '/run/secrets/database' } : row),
+    ]
+    for (const value of invalidInfrastructure) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...settings, infrastructure: value },
+      })))
+      await expect(readSettings()).rejects.toMatchObject({ code: 'invalid_response' })
+    }
   })
 
   it('rejects settings responses outside every server constraint', async () => {
@@ -68,12 +115,28 @@ describe('operations API', () => {
       ['disk warning', { diskWarningPercent: 100 }],
       ['disk threshold order', { diskWarningPercent: 90, diskCriticalPercent: 90 }],
       ['disk critical ceiling', { diskCriticalPercent: 101 }],
+      ['backup filesystem warning', { backupFilesystemWarningPercent: 0 }],
+      ['backup filesystem threshold order', { backupFilesystemWarningPercent: 90, backupFilesystemCriticalPercent: 90 }],
+      ['backup filesystem critical ceiling', { backupFilesystemCriticalPercent: 101 }],
+      ['local backup age warning', { localBackupAgeWarningHours: 0 }],
+      ['local backup age threshold order', { localBackupAgeWarningHours: 30, localBackupAgeCriticalHours: 30 }],
+      ['local backup age int32 ceiling', { localBackupAgeCriticalHours: 2_147_483_648 }],
       ['AI warning', { aiErrorWarningPercent: 0 }],
       ['AI threshold order', { aiErrorWarningPercent: 25, aiErrorCriticalPercent: 25 }],
       ['AI critical ceiling', { aiErrorCriticalPercent: 101 }],
       ['queue warning', { processingQueueWarning: 0 }],
       ['queue threshold order', { processingQueueWarning: 50, processingQueueCritical: 50 }],
       ['unsafe queue integer', { processingQueueCritical: Number.MAX_SAFE_INTEGER + 1 }],
+      ['queue int32 ceiling', { processingQueueCritical: 2_147_483_648 }],
+      ['processing failure warning', { processingFailureWarningCount: 0 }],
+      ['processing failure threshold order', { processingFailureWarningCount: 20, processingFailureCriticalCount: 20 }],
+      ['processing failure int32 ceiling', { processingFailureCriticalCount: 2_147_483_648 }],
+      ['login failure warning', { loginFailureWarningCount: 0 }],
+      ['login failure threshold order', { loginFailureWarningCount: 100, loginFailureCriticalCount: 100 }],
+      ['login failure int32 ceiling', { loginFailureCriticalCount: 2_147_483_648 }],
+      ['authorization denial warning', { authorizationDenialWarningCount: 0 }],
+      ['authorization denial threshold order', { authorizationDenialWarningCount: 200, authorizationDenialCriticalCount: 200 }],
+      ['authorization denial int32 ceiling', { authorizationDenialCriticalCount: 2_147_483_648 }],
     ]
     for (const [label, override] of invalid) {
       vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
@@ -159,14 +222,16 @@ describe('operations API', () => {
     })
   })
 
-  it('saves the complete settings object including updatedAt with PUT', async () => {
+  it('saves only the separate editable update shape with PUT', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: settings })))
 
-    await expect(saveSettings(settings)).resolves.toStrictEqual(settings)
+    await expect(saveSettings(update)).resolves.toStrictEqual(settings)
     const [url, init] = vi.mocked(fetch).mock.calls[0]
     expect(url).toBe('/api/v1/admin/operations/settings')
     expect(init?.method).toBe('PUT')
-    expect(JSON.parse(String(init?.body))).toStrictEqual(settings)
+    expect(JSON.parse(String(init?.body))).toStrictEqual(update)
+    expect(String(init?.body)).not.toContain('infrastructure')
+    expect(String(init?.body)).not.toContain('updatedAt')
   })
 
   it('serializes only non-empty audit filters in stable server order', async () => {

@@ -485,6 +485,7 @@ test('provider failures, cancellation, retry, busy, attachment, context, and quo
     expect(busyResponse.status()).toBe(409)
     expect((await busyResponse.json()).error.code).toBe('AI_BUSY')
     await apiJSON(page, 'POST', `/api/v1/student/ai/runs/${busy.run.id}/cancel`, {})
+    await waitForRunStatus(page, busy.run.id, 'cancelled')
 
     await setAIProcessingHeld(page, true)
     try {

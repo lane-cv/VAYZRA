@@ -195,9 +195,26 @@ func TestPostgresLoadAlertEvaluationsUsesLatestSettingsAndSamples(t *testing.T) 
 	if err := NewPostgresSampleStore(pool).InsertSamples(ctx, now, samples); err != nil {
 		t.Fatal(err)
 	}
+	before, err := store.LoadAlertEvaluations(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, evaluation := range before {
+		if evaluation.Rule.DedupeKey == "filesystem_backup_usage" &&
+			(evaluation.Rule.Warning != 75 || evaluation.Rule.Critical != 90) {
+			t.Fatalf("initial backup filesystem rule=%+v", evaluation.Rule)
+		}
+	}
 	if _, err := pool.Exec(ctx, `
 UPDATE system_settings
 SET disk_warning_percent=80,disk_critical_percent=95,
+	backup_filesystem_warning_percent=81,backup_filesystem_critical_percent=96,
+	local_backup_age_warning_hours=26,local_backup_age_critical_hours=31,
+	ai_error_warning_percent=11,ai_error_critical_percent=26,
+	processing_queue_warning=21,processing_queue_critical=101,
+	processing_failure_warning_count=6,processing_failure_critical_count=21,
+	login_failure_warning_count=22,login_failure_critical_count=102,
+	authorization_denial_warning_count=52,authorization_denial_critical_count=202,
     version=version+1`); err != nil {
 		t.Fatal(err)
 	}
@@ -208,14 +225,33 @@ SET disk_warning_percent=80,disk_critical_percent=95,
 	if len(evaluations) != 17 {
 		t.Fatalf("evaluations=%d", len(evaluations))
 	}
+	expectedThresholds := map[string][2]float64{
+		"filesystem_root_usage":   {80, 95},
+		"filesystem_backup_usage": {81, 96},
+		"backup_local_age":        {26 * 60 * 60, 31 * 60 * 60},
+		"ai_error_rate":           {11, 26},
+		"processing_queue_depth":  {21, 101},
+		"processing_failures":     {6, 21},
+		"login_failures":          {22, 102},
+		"authorization_denials":   {52, 202},
+	}
 	var root, remote Evaluation
 	for _, evaluation := range evaluations {
+		if thresholds, exists := expectedThresholds[evaluation.Rule.DedupeKey]; exists {
+			if evaluation.Rule.Warning != thresholds[0] || evaluation.Rule.Critical != thresholds[1] {
+				t.Fatalf("key=%s rule=%+v thresholds=%v", evaluation.Rule.DedupeKey, evaluation.Rule, thresholds)
+			}
+			delete(expectedThresholds, evaluation.Rule.DedupeKey)
+		}
 		switch evaluation.Rule.DedupeKey {
 		case "filesystem_root_usage":
 			root = evaluation
-		case "backup_remote_replication":
+		case AlertKeyBackupRemoteSync:
 			remote = evaluation
 		}
+	}
+	if len(expectedThresholds) != 0 {
+		t.Fatalf("missing updated rules=%v", expectedThresholds)
 	}
 	if root.Rule.Warning != 80 || root.Rule.Critical != 95 ||
 		!root.Available || root.Value != 80 {
@@ -262,7 +298,7 @@ TRUNCATE login_events`); err != nil {
 			alert.DedupeKey,
 			"_dependency_unavailable",
 		) ||
-			alert.DedupeKey == "backup_remote_replication_dependency_unavailable" ||
+			alert.DedupeKey == AlertKeyBackupRemoteSyncDependencyUnavailable ||
 			!strings.Contains(alert.Summary, "unavailable") ||
 			alert.CurrentValue != 1 ||
 			alert.ThresholdValue != 1 {

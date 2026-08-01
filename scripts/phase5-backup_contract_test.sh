@@ -10,6 +10,10 @@ LIVE_FIXTURE="$ROOT/scripts/phase5-backup_live_test.sh"
 LIVE_COMPOSE="$ROOT/deploy/compose.backup-live.yml"
 E2E_LIVE_COMPOSE="$ROOT/deploy/compose.phase5-e2e-live.yml"
 RENDER_SECRET_LITERAL='phase5-unmarked-secret-literal'
+# Retention's in-container timeout is wrapped by a host deadline with a
+# deliberate 15-second teardown allowance. With the synthetic one-second
+# timeout below, the observed host process must therefore die within 17.5s.
+RETENTION_HOST_DEATH_LIMIT_MILLISECONDS='17500'
 CONTRACT_TEMP_BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 CONTRACT_TEMP_ROOT="$(
   mktemp -d "$CONTRACT_TEMP_BASE/phase5-backup-contract-root.XXXXXX"
@@ -23,14 +27,14 @@ cleanup_contract() {
   for path in "${ACTIVE_FIXTURE_RELEASE_FILES[@]}"; do
     [[ -n "$path" ]] && touch "$path"
   done
-  if [[ -n "$ACTIVE_FIXTURE_PID" ]] &&
-    command -v terminate_direct_fixture_child >/dev/null 2>&1; then
-    terminate_direct_fixture_child "$ACTIVE_FIXTURE_PID" || true
-  fi
   if command -v wait_for_file >/dev/null 2>&1; then
     for path in "${ACTIVE_FIXTURE_FINISH_FILES[@]}"; do
       [[ -z "$path" ]] || wait_for_file "$path" || true
     done
+  fi
+  if [[ -n "$ACTIVE_FIXTURE_PID" ]] &&
+    command -v terminate_direct_fixture_child >/dev/null 2>&1; then
+    terminate_direct_fixture_child "$ACTIVE_FIXTURE_PID" || true
   fi
   if [[ -d "$CONTRACT_TEMP_ROOT" &&
     "$CONTRACT_TEMP_ROOT" == "$CONTRACT_TEMP_BASE/phase5-backup-contract-root."* ]]; then
@@ -124,6 +128,11 @@ require_literal "$TARGET" 'owner_only_directory "$LIVE_ROOT/runtime-secrets"'
 require_literal "$TARGET" '[[ "$LIVE_ROOT" == "$live_root" ]]'
 require_literal "$TARGET" 'HAPPYLEARN_BACKUP_LIVE_ROOT="$LIVE_ROOT"'
 require_literal "$TARGET" 'export HAPPYLEARN_BACKUP_LIVE_ROOT'
+require_literal "$TARGET" \
+  'LIVE_RUN_ID_FILE="$LIVE_ROOT/coordinator-run-id"'
+require_literal "$TARGET" 'publish_live_run_id'
+require_literal "$TARGET" \
+  'mv -f "$temporary" "$LIVE_RUN_ID_FILE"'
 require_literal "$TARGET" 'SYNC_CONTAINER_NAME'
 require_literal "$TARGET" 'sync_hostname_for_run'
 require_literal "$TARGET" 'io.happylearn.phase5.sync-run'
@@ -159,7 +168,11 @@ test "$lock_line" -lt "$mutation_line" ||
 require_literal "$TARGET" 'prepare --run-id "$RUN_ID"'
 require_literal "$TARGET" 'wait_for_durable_drain'
 require_literal "$TARGET" 'transition_operational_mode backup'
+require_literal "$TARGET" 'stop_and_verify_worker'
+require_literal "$TARGET" 'audit_recorded_live_coordinator_one_shots'
+require_literal "$TARGET" 'restart_worker_service'
 require_literal "$TARGET" 'stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" worker'
+require_literal "$TARGET" 'ps --status running --quiet worker'
 require_literal "$TARGET" 'stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" minio'
 require_literal "$TARGET" 'snapshot --run-id "$RUN_ID"'
 require_literal "$TARGET" 'up --detach --no-deps minio'
@@ -200,7 +213,8 @@ require_literal "$TARGET" "digest(decode('\${LEASE_TOKEN}','hex'),'sha256')"
 require_literal "$TARGET" 'start_lease_heartbeat'
 require_literal "$TARGET" 'assert_lease_heartbeat'
 require_literal "$TARGET" 'SEPARATE_EXTERNAL_GROUP=false'
-require_literal "$TARGET" 'terminate_external_group "$LEASE_HEARTBEAT_PID"'
+require_literal "$TARGET" \
+  '"$LEASE_HEARTBEAT_PID" "$LEASE_HEARTBEAT_IDENTITY"'
 require_literal "$TARGET" '/app/happylearn-backup-retention'
 require_literal "$TARGET" '--repository "$repository" --run-id "$RUN_ID"'
 require_literal "$TARGET" 'DATABASE_QUERY_TIMEOUT_SECONDS='
@@ -218,6 +232,13 @@ require_literal "$TARGET" 'record_live_coordinator_one_shots'
 require_literal "$TARGET" 'cleanup_recorded_live_coordinator_one_shots'
 require_literal "$TARGET" 'terminate_active_external_group'
 require_literal "$TARGET" 'ACTIVE_EXTERNAL_GROUP_PID'
+require_literal "$TARGET" 'prepare_group_owner'
+require_literal "$TARGET" 'commit_group_owner'
+require_literal "$TARGET" 'publish_group_owner_decision'
+require_literal "$TARGET" 'group_owner_decision_matches'
+require_literal "$TARGET" 'UNCERTAIN_EXTERNAL_GROUP_PID'
+require_literal "$TARGET" 'UNCERTAIN_EXTERNAL_GROUP_IDENTITY'
+require_literal "$TARGET" 'EXTERNAL_CLEANUP_UNSAFE'
 require_literal "$TARGET" \
   "readonly EXTERNAL_TERMINATION_GRACE_SECONDS='0.1'"
 require_literal "$TARGET" \
@@ -231,6 +252,600 @@ require_literal "$TARGET" 'verify_backup_mount_ownership'
 forbid_pattern "$TARGET" "FAILURE_CATEGORY='orchestrator'"
 forbid_pattern "$TARGET" 'happylearn-pre-release'
 
+termination_probe_library="$CONTRACT_TEMP_ROOT/phase5-backup-functions.sh"
+[[ "$(tail -n 1 "$TARGET")" == 'main "$@"' ]] ||
+  fail 'phase5 backup entrypoint shape changed'
+sed '$d' "$TARGET" >"$termination_probe_library"
+
+for production_audit_scenario in \
+  running_backup running_init_signal listing_failure inspect_failure safe; do
+  production_audit_log="$CONTRACT_TEMP_ROOT/production-audit-${production_audit_scenario}.log"
+  production_audit_service='backup'
+  production_audit_entry_status=1
+  production_audit_expected_status=1
+  case "$production_audit_scenario" in
+    running_init_signal)
+      production_audit_service='backup-storage-init'
+      production_audit_entry_status=143
+      production_audit_expected_status=143
+      ;;
+    running_backup|inspect_failure) ;;
+    listing_failure|safe) production_audit_service='' ;;
+  esac
+  set +e
+  PHASE5_PRODUCTION_AUDIT_LIBRARY="$termination_probe_library" \
+    PHASE5_PRODUCTION_AUDIT_LOG="$production_audit_log" \
+    PHASE5_PRODUCTION_AUDIT_SCENARIO="$production_audit_scenario" \
+    PHASE5_PRODUCTION_AUDIT_SERVICE="$production_audit_service" \
+    PHASE5_PRODUCTION_AUDIT_ENTRY_STATUS="$production_audit_entry_status" \
+    /bin/bash -c '
+      source "$PHASE5_PRODUCTION_AUDIT_LIBRARY"
+      set +e
+      LIVE_ROOT=""
+      LIVE_ONE_SHOT_RECORD_FILE=""
+      EFFECTIVE_PROJECT=happylearn-dev
+      WORKER_STOP_REQUESTED=true
+      WORKER_STOPPED=true
+      BACKUP_ACTIVITY_AUDITED=false
+      RECOVERY_UNSAFE=false
+      EXTERNAL_CLEANUP_UNSAFE=false
+      UNCERTAIN_EXTERNAL_GROUP_PID=""
+      TERMINAL_RECORDED=true
+      AISTOR_STOPPED=false
+      LEASE_DURABLE=true
+      LOCK_HELD=false
+      CLEANING_UP=false
+      production_audit_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      docker() {
+        printf "docker:%s\n" "$*" >>"$PHASE5_PRODUCTION_AUDIT_LOG"
+        if [[ "${1:-}" == ps ]]; then
+          [[ "$*" == *"label=com.docker.compose.project=${EFFECTIVE_PROJECT}"* &&
+            "$*" == *"label=com.docker.compose.oneoff=True"* &&
+            "$*" == *"label=com.docker.compose.service="* ]] ||
+            return 90
+          [[ "$PHASE5_PRODUCTION_AUDIT_SCENARIO" != listing_failure ]] ||
+            return 71
+          if [[ -n "$PHASE5_PRODUCTION_AUDIT_SERVICE" &&
+            "$*" == *"label=com.docker.compose.service=${PHASE5_PRODUCTION_AUDIT_SERVICE}"* ]]; then
+            printf "%s\n" "$production_audit_id"
+          fi
+          return 0
+        fi
+        if [[ "${1:-}" == container && "${2:-}" == inspect ]]; then
+          [[ "${!#}" == "$production_audit_id" ]] || return 91
+          [[ "$PHASE5_PRODUCTION_AUDIT_SCENARIO" != inspect_failure ]] ||
+            return 72
+          printf "%s|/%s-%s-run-contract|%s|%s|True|true\n" \
+            "$production_audit_id" "$EFFECTIVE_PROJECT" \
+            "$PHASE5_PRODUCTION_AUDIT_SERVICE" "$EFFECTIVE_PROJECT" \
+            "$PHASE5_PRODUCTION_AUDIT_SERVICE"
+          return 0
+        fi
+        return 92
+      }
+      compose() {
+        printf "compose:%s\n" "$*" >>"$PHASE5_PRODUCTION_AUDIT_LOG"
+      }
+      run_guarded_external() {
+        shift
+        "$@"
+      }
+      terminate_active_external_group() { return 0; }
+      restart_aistor_service() { return 0; }
+      record_failure() { return 0; }
+      release_operational_lease() {
+        printf "release:%s\n" "$RECOVERY_UNSAFE" \
+          >>"$PHASE5_PRODUCTION_AUDIT_LOG"
+      }
+      remove_host_lock() { return 0; }
+      safe_log() {
+        printf "safe_log:%s\n" "$*" >>"$PHASE5_PRODUCTION_AUDIT_LOG"
+      }
+      (exit "$PHASE5_PRODUCTION_AUDIT_ENTRY_STATUS")
+      cleanup
+    '
+  production_audit_status=$?
+  set -e
+  [[ "$production_audit_status" -eq "$production_audit_expected_status" ]] ||
+    fail "production audit $production_audit_scenario returned $production_audit_status"
+  if [[ "$production_audit_scenario" == safe ]]; then
+    grep -Fq 'compose:up --detach --no-deps worker' "$production_audit_log" ||
+      fail 'safe production audit did not restart worker'
+    grep -Fxq 'release:false' "$production_audit_log" ||
+      fail 'safe production audit retained fail-closed release mode'
+    for production_audit_exact_service in \
+      backup backup-storage-init backup-secrets-init; do
+      grep -Fq \
+        "docker:ps --quiet --no-trunc --filter label=com.docker.compose.project=happylearn-dev --filter label=com.docker.compose.oneoff=True --filter label=com.docker.compose.service=${production_audit_exact_service}" \
+        "$production_audit_log" ||
+        fail "safe production audit omitted exact $production_audit_exact_service listing"
+    done
+  else
+    if grep -Fq 'compose:up --detach --no-deps worker' \
+      "$production_audit_log"; then
+      fail "production audit $production_audit_scenario restarted worker"
+    fi
+    grep -Fxq 'release:true' "$production_audit_log" ||
+      fail "production audit $production_audit_scenario did not retain fail-closed release mode"
+  fi
+  case "$production_audit_scenario" in
+    running_backup|running_init_signal|inspect_failure)
+      grep -Fq \
+        "docker:container inspect --format {{.Id}}|{{.Name}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.oneoff\"}}|{{.State.Running}} bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+        "$production_audit_log" ||
+        fail "production audit $production_audit_scenario did not inspect the exact candidate"
+      ;;
+  esac
+  if grep -Eq '^docker:(rm|container rm)[[:space:]]' \
+    "$production_audit_log"; then
+    fail "production audit $production_audit_scenario performed broad cleanup"
+  fi
+done
+if [[ "${PHASE5_BACKUP_PRODUCTION_AUDIT_CONTRACT_ONLY:-}" == true ]]; then
+  printf '%s\n' 'phase5 backup production audit contract: PASS'
+  exit 0
+fi
+
+for termination_scenario in stable exited reused leaderless group_signal_fail; do
+  termination_probe_log="$CONTRACT_TEMP_ROOT/termination-${termination_scenario}.log"
+  if ! PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+    PHASE5_TERMINATION_PROBE_LOG="$termination_probe_log" \
+    PHASE5_TERMINATION_PROBE_SCENARIO="$termination_scenario" \
+    /bin/bash -c '
+      source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+      termination_identity=original
+      portable_process_identity() {
+        if [[ "$PHASE5_TERMINATION_PROBE_SCENARIO" == leaderless ||
+          "$termination_identity" == gone ]]; then
+          return 1
+        fi
+        printf "%s" "$termination_identity"
+      }
+      portable_process_group() {
+        printf "%s" 424242
+      }
+      kill() {
+        printf "%s\n" "$*" >>"$PHASE5_TERMINATION_PROBE_LOG"
+        case "$*" in
+          "-TERM -424242")
+            case "$PHASE5_TERMINATION_PROBE_SCENARIO" in
+              exited) termination_identity=gone ;;
+              reused) termination_identity=reused ;;
+              group_signal_fail) return 1 ;;
+            esac
+            return 0
+            ;;
+          "-KILL -424242") return 0 ;;
+          "-0 424242")
+            case "$PHASE5_TERMINATION_PROBE_SCENARIO:$termination_identity" in
+              leaderless:* | exited:gone) return 1 ;;
+              *) return 0 ;;
+            esac
+            ;;
+          "-0 -424242")
+            case "$PHASE5_TERMINATION_PROBE_SCENARIO:$termination_identity" in
+              exited:gone) return 1 ;;
+              *) return 0 ;;
+            esac
+            ;;
+          "-TERM 424242" | "-KILL 424242") return 0 ;;
+        esac
+        return 1
+      }
+      sleep() { return 0; }
+      wait() { return 0; }
+      termination_status=0
+      terminate_external_group 424242 original 0.01 ||
+        termination_status=$?
+      case "$PHASE5_TERMINATION_PROBE_SCENARIO" in
+        stable)
+          [[ "$termination_status" -eq 0 ]]
+          grep -Fxq -- "-TERM -424242" "$PHASE5_TERMINATION_PROBE_LOG"
+          grep -Fxq -- "-KILL -424242" "$PHASE5_TERMINATION_PROBE_LOG"
+          ;;
+        exited)
+          [[ "$termination_status" -eq 0 ]]
+          ! grep -Eq -- "^-KILL([[:space:]]|$)" \
+            "$PHASE5_TERMINATION_PROBE_LOG"
+          ;;
+        reused | leaderless | group_signal_fail)
+          [[ "$termination_status" -ne 0 ]]
+          ! grep -Eq -- "^-(TERM|KILL) 424242$|^-KILL([[:space:]]|$)" \
+            "$PHASE5_TERMINATION_PROBE_LOG"
+          ;;
+      esac
+    '; then
+    fail "external-group ownership probe failed: $termination_scenario"
+  fi
+done
+
+leaderless_probe_child_file="$CONTRACT_TEMP_ROOT/leaderless-probe.child"
+leaderless_probe_signal_log="$CONTRACT_TEMP_ROOT/leaderless-probe.signals"
+if ! PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_LEADERLESS_CHILD_FILE="$leaderless_probe_child_file" \
+  PHASE5_LEADERLESS_SIGNAL_LOG="$leaderless_probe_signal_log" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    leader_pid=""
+    child_pid=""
+    cleanup_leaderless_probe() {
+      trap - EXIT
+      [[ -z "$leader_pid" ]] ||
+        builtin kill -KILL "$leader_pid" 2>/dev/null || true
+      [[ -z "$child_pid" ]] ||
+        builtin kill -KILL "$child_pid" 2>/dev/null || true
+    }
+    trap cleanup_leaderless_probe EXIT
+    set -m
+    (
+      set +m
+      trap "" HUP INT TERM
+      (
+        trap "" HUP INT TERM
+        while :; do
+          sleep 0.05
+        done
+      ) &
+      child_pid="$!"
+      printf "%s\n" "$child_pid" >"$PHASE5_LEADERLESS_CHILD_FILE"
+      wait "$child_pid"
+    ) &
+    leader_pid="$!"
+    set +m
+    attempts=0
+    while [[ ! -s "$PHASE5_LEADERLESS_CHILD_FILE" &&
+      "$attempts" -lt 200 ]]; do
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    [[ -s "$PHASE5_LEADERLESS_CHILD_FILE" ]]
+    read -r child_pid <"$PHASE5_LEADERLESS_CHILD_FILE"
+    [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]
+    expected_identity="$(portable_process_identity "$leader_pid")"
+    [[ "$(portable_process_group "$leader_pid")" == "$leader_pid" ]]
+    [[ "$(portable_process_group "$child_pid")" == "$leader_pid" ]]
+    builtin kill -KILL "$leader_pid"
+    wait "$leader_pid" 2>/dev/null || true
+    ! builtin kill -0 "$leader_pid" 2>/dev/null
+    builtin kill -0 "$child_pid" 2>/dev/null
+    builtin kill -0 "-$leader_pid" 2>/dev/null
+    kill() {
+      printf "%s\n" "$*" >>"$PHASE5_LEADERLESS_SIGNAL_LOG"
+      builtin kill "$@"
+    }
+    termination_status=0
+    terminate_external_group "$leader_pid" "$expected_identity" 0.01 ||
+      termination_status=$?
+    [[ "$termination_status" -ne 0 ]]
+    ! grep -Fxq -- "-TERM -$leader_pid" \
+      "$PHASE5_LEADERLESS_SIGNAL_LOG"
+    ! grep -Fxq -- "-KILL -$leader_pid" \
+      "$PHASE5_LEADERLESS_SIGNAL_LOG"
+    ! grep -Fxq -- "-TERM $leader_pid" \
+      "$PHASE5_LEADERLESS_SIGNAL_LOG"
+    ! grep -Fxq -- "-KILL $leader_pid" \
+      "$PHASE5_LEADERLESS_SIGNAL_LOG"
+    unset -f kill
+    builtin kill -KILL "$child_pid"
+    attempts=0
+    while builtin kill -0 "$child_pid" 2>/dev/null &&
+      [[ "$attempts" -lt 200 ]]; do
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    ! builtin kill -0 "$child_pid" 2>/dev/null
+    child_pid=""
+    leader_pid=""
+  '; then
+  fail 'real leaderless external-group ownership probe failed'
+fi
+
+group_decision_owner="$CONTRACT_TEMP_ROOT/group-decision-owner"
+mkdir "$group_decision_owner"
+chmod 0700 "$group_decision_owner"
+
+leader_loss_release="$CONTRACT_TEMP_ROOT/leader-loss.release"
+leader_loss_witness_file="$CONTRACT_TEMP_ROOT/leader-loss.witness"
+leader_loss_child_file="$CONTRACT_TEMP_ROOT/leader-loss.child"
+leader_loss_pgid_file="$CONTRACT_TEMP_ROOT/leader-loss.pgid"
+leader_loss_signal_log="$CONTRACT_TEMP_ROOT/leader-loss.signals"
+if ! PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_GROUP_DECISION_OWNER="$group_decision_owner" \
+  PHASE5_LEADER_LOSS_RELEASE="$leader_loss_release" \
+  PHASE5_LEADER_LOSS_WITNESS_FILE="$leader_loss_witness_file" \
+  PHASE5_LEADER_LOSS_CHILD_FILE="$leader_loss_child_file" \
+  PHASE5_LEADER_LOSS_PGID_FILE="$leader_loss_pgid_file" \
+  PHASE5_LEADER_LOSS_SIGNAL_LOG="$leader_loss_signal_log" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    safe_log() { :; }
+    LOCK_OWNER_DIRECTORY="$PHASE5_GROUP_DECISION_OWNER"
+    witness_pid=""
+    child_pid=""
+    cleanup_leader_loss_probe() {
+      trap - EXIT
+      touch "$PHASE5_LEADER_LOSS_RELEASE"
+      attempts=0
+      while [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] &&
+        builtin kill -0 "$child_pid" 2>/dev/null &&
+        [[ "$attempts" -lt 500 ]]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+      done
+      if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] &&
+        builtin kill -0 "$child_pid" 2>/dev/null; then
+        builtin kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+    }
+    trap cleanup_leader_loss_probe EXIT
+    kill() {
+      case "${1:-}:${2:-}" in
+        -TERM:-* | -KILL:-*)
+          printf "%s\n" "$*" >>"$PHASE5_LEADER_LOSS_SIGNAL_LOG"
+          ;;
+      esac
+      builtin kill "$@"
+    }
+    set +e
+    run_guarded_external 5 /bin/bash -c '\''
+      trap "" HUP INT TERM
+      witness_pid="$PPID"
+      child_pid="$$"
+      pgid="$(/bin/ps -o pgid= -p "$$" | tr -d "[:space:]")"
+      printf "%s\n" "$witness_pid" >"$1"
+      printf "%s\n" "$child_pid" >"$2"
+      printf "%s\n" "$pgid" >"$3"
+      builtin kill -KILL "$witness_pid"
+      while [[ ! -e "$4" ]]; do
+        sleep 0.01
+      done
+    '\'' phase5-leader-loss \
+      "$PHASE5_LEADER_LOSS_WITNESS_FILE" \
+      "$PHASE5_LEADER_LOSS_CHILD_FILE" \
+      "$PHASE5_LEADER_LOSS_PGID_FILE" \
+      "$PHASE5_LEADER_LOSS_RELEASE"
+    guarded_status=$?
+    set -e
+    read -r witness_pid <"$PHASE5_LEADER_LOSS_WITNESS_FILE"
+    read -r child_pid <"$PHASE5_LEADER_LOSS_CHILD_FILE"
+    read -r observed_pgid <"$PHASE5_LEADER_LOSS_PGID_FILE"
+    if [[ "$guarded_status" -eq 0 ||
+      ! "$witness_pid" =~ ^[1-9][0-9]*$ ||
+      ! "$child_pid" =~ ^[1-9][0-9]*$ ||
+      "$observed_pgid" != "$witness_pid" ]]; then
+      exit 91
+    fi
+    builtin kill -0 "$child_pid" 2>/dev/null || exit 92
+    builtin kill -0 "-$witness_pid" 2>/dev/null || exit 93
+    if [[ "$RECOVERY_UNSAFE" != true ||
+      "$UNCERTAIN_EXTERNAL_GROUP_PID" != "$witness_pid" ||
+      -z "$UNCERTAIN_EXTERNAL_GROUP_IDENTITY" ||
+      "$ACTIVE_EXTERNAL_GROUP_PID" != "$witness_pid" ]]; then
+      exit 94
+    fi
+    [[ ! -s "$PHASE5_LEADER_LOSS_SIGNAL_LOG" ]] || exit 95
+    touch "$PHASE5_LEADER_LOSS_RELEASE"
+    attempts=0
+    while builtin kill -0 "-$witness_pid" 2>/dev/null &&
+      [[ "$attempts" -lt 500 ]]; do
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    if builtin kill -0 "-$witness_pid" 2>/dev/null; then
+      exit 96
+    fi
+    terminate_active_external_group || exit 97
+    [[ -z "$ACTIVE_EXTERNAL_GROUP_PID" &&
+      -z "$ACTIVE_EXTERNAL_GROUP_IDENTITY" &&
+      -z "$ACTIVE_EXTERNAL_GROUP_HANDSHAKE" ]] || exit 98
+    [[ ! -s "$PHASE5_LEADER_LOSS_SIGNAL_LOG" ]] || exit 99
+    child_pid=""
+  '; then
+  fail 'leaderless external descendant was not latched fail-closed'
+fi
+
+if ! PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_GROUP_DECISION_OWNER="$group_decision_owner" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    safe_log() { :; }
+    LOCK_OWNER_DIRECTORY="$PHASE5_GROUP_DECISION_OWNER"
+    start_handshake="$(create_group_owner_handshake)"
+    publish_group_owner_decision "$start_handshake" start
+    ! publish_group_owner_decision "$start_handshake" cancel
+    group_owner_decision_matches "$start_handshake" start
+    ! group_owner_decision_matches "$start_handshake" cancel
+    cleanup_group_owner_handshake "$start_handshake"
+    cancel_handshake="$(create_group_owner_handshake)"
+    publish_group_owner_decision "$cancel_handshake" cancel
+    ! publish_group_owner_decision "$cancel_handshake" start
+    group_owner_decision_matches "$cancel_handshake" cancel
+    ! group_owner_decision_matches "$cancel_handshake" start
+    cleanup_group_owner_handshake "$cancel_handshake"
+
+    stubborn_handshake="$LOCK_OWNER_DIRECTORY/.group-owner.stuck1"
+    mkdir "$stubborn_handshake"
+    chmod 0700 "$stubborn_handshake"
+    valid_group_owner_handshake_directory() { return 1; }
+    terminate_external_group() { return 0; }
+    cleanup_group_owner_handshake() { return 1; }
+    if cancel_or_terminate_group_owner \
+      424242 original "$stubborn_handshake" 0.01; then
+      exit 91
+    fi
+    rmdir "$stubborn_handshake"
+  '; then
+  fail 'group-owner decision or control cleanup contract failed'
+fi
+
+group_registration_marker="$CONTRACT_TEMP_ROOT/group-registration.payload"
+group_precommit_marker="$CONTRACT_TEMP_ROOT/group-precommit.payload"
+group_lease_marker="$CONTRACT_TEMP_ROOT/group-lease.payload"
+if ! PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_GROUP_DECISION_OWNER="$group_decision_owner" \
+  PHASE5_GROUP_REGISTRATION_MARKER="$group_registration_marker" \
+  PHASE5_GROUP_PRECOMMIT_MARKER="$group_precommit_marker" \
+  PHASE5_GROUP_LEASE_MARKER="$group_lease_marker" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    safe_log() { :; }
+    LOCK_OWNER_DIRECTORY="$PHASE5_GROUP_DECISION_OWNER"
+    registration_payload() {
+      printf "%s\n" started >"$PHASE5_GROUP_REGISTRATION_MARKER"
+    }
+    precommit_payload() {
+      printf "%s\n" started >"$PHASE5_GROUP_PRECOMMIT_MARKER"
+    }
+    lease_payload() {
+      printf "%s\n" started >"$PHASE5_GROUP_LEASE_MARKER"
+    }
+
+    handshake="$(create_group_owner_handshake)"
+    set -m
+    (run_external_group_owner "$handshake" registration_payload) &
+    pid="$!"
+    set +m
+    prepare_group_owner "$pid" "$handshake"
+    identity="$CAPTURED_CHILD_IDENTITY"
+    ! commit_group_owner \
+      "$pid" "$identity" "$handshake" "" "$identity" "$handshake"
+    [[ ! -e "$PHASE5_GROUP_REGISTRATION_MARKER" ]]
+    cancel_or_terminate_group_owner "$pid" "$identity" "$handshake"
+    [[ ! -e "$PHASE5_GROUP_REGISTRATION_MARKER" ]]
+
+    handshake="$(create_group_owner_handshake)"
+    set -m
+    (run_external_group_owner "$handshake" precommit_payload) &
+    pid="$!"
+    set +m
+    prepare_group_owner "$pid" "$handshake"
+    ACTIVE_EXTERNAL_GROUP_HANDSHAKE="$handshake"
+    ACTIVE_EXTERNAL_GROUP_IDENTITY="$CAPTURED_CHILD_IDENTITY"
+    ACTIVE_EXTERNAL_GROUP_PID="$pid"
+    terminate_active_external_group
+    [[ -z "$ACTIVE_EXTERNAL_GROUP_PID" &&
+      -z "$ACTIVE_EXTERNAL_GROUP_IDENTITY" &&
+      -z "$ACTIVE_EXTERNAL_GROUP_HANDSHAKE" &&
+      ! -e "$PHASE5_GROUP_PRECOMMIT_MARKER" ]]
+
+    handshake="$(create_group_owner_handshake)"
+    set -m
+    (run_external_group_owner "$handshake" lease_payload) &
+    pid="$!"
+    set +m
+    prepare_group_owner "$pid" "$handshake"
+    LEASE_GROUP_HANDSHAKE="$handshake"
+    LEASE_PROCESS_IDENTITY="$CAPTURED_CHILD_IDENTITY"
+    LEASE_PID="$pid"
+    LEASE_FD_OPEN=false
+    stop_operational_lock_session
+    [[ -z "$LEASE_PID" &&
+      -z "$LEASE_PROCESS_IDENTITY" &&
+      -z "$LEASE_GROUP_HANDSHAKE" &&
+      ! -e "$PHASE5_GROUP_LEASE_MARKER" ]]
+  '; then
+  fail 'group-owner registration or pre-commit cancellation probe failed'
+fi
+
+unsafe_cleanup_log="$CONTRACT_TEMP_ROOT/unsafe-cleanup.log"
+set +e
+PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_UNSAFE_CLEANUP_LOG="$unsafe_cleanup_log" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    ACTIVE_EXTERNAL_GROUP_PID=424242
+    ACTIVE_EXTERNAL_GROUP_IDENTITY=original
+    SEPARATE_EXTERNAL_GROUP=true
+    terminate_external_group() { return 1; }
+    first_termination_status=0
+    terminate_active_external_group || first_termination_status=$?
+    [[ "$first_termination_status" -ne 0 &&
+      -z "$ACTIVE_EXTERNAL_GROUP_PID" &&
+      "$UNCERTAIN_EXTERNAL_GROUP_PID" == 424242 &&
+      "$UNCERTAIN_EXTERNAL_GROUP_IDENTITY" == original &&
+      "$RECOVERY_UNSAFE" == true ]]
+    unsafe_payload() {
+      printf "%s\n" payload >>"$PHASE5_UNSAFE_CLEANUP_LOG"
+    }
+    SEPARATE_EXTERNAL_GROUP=false
+    second_external_status=0
+    run_guarded_external 1 unsafe_payload || second_external_status=$?
+    [[ "$second_external_status" -ne 0 ]]
+    SEPARATE_EXTERNAL_GROUP=true
+    restart_stopped_services() {
+      printf "%s\n" restart >>"$PHASE5_UNSAFE_CLEANUP_LOG"
+    }
+    record_failure() {
+      printf "%s\n" record >>"$PHASE5_UNSAFE_CLEANUP_LOG"
+    }
+    release_operational_lease() {
+      printf "release|%s|%s|%s\n" \
+        "$RECOVERY_UNSAFE" \
+        "$UNCERTAIN_EXTERNAL_GROUP_PID" \
+        "$UNCERTAIN_EXTERNAL_GROUP_IDENTITY" \
+        >>"$PHASE5_UNSAFE_CLEANUP_LOG"
+    }
+    remove_host_lock() { return 0; }
+    safe_log() { :; }
+    set +e
+    false
+    cleanup
+  '
+unsafe_cleanup_status=$?
+set -e
+[[ "$unsafe_cleanup_status" -eq 1 ]] ||
+  fail "unsafe external-group cleanup returned $unsafe_cleanup_status"
+grep -Fxq 'release|true|424242|original' "$unsafe_cleanup_log" ||
+  fail 'unsafe external-group cleanup did not preserve fail-closed state'
+if grep -Eq '^(payload|restart|record)$' "$unsafe_cleanup_log"; then
+  fail 'unsafe external-group cleanup continued normal recovery actions'
+fi
+
+one_shot_cleanup_log="$CONTRACT_TEMP_ROOT/one-shot-cleanup-unsafe.log"
+set +e
+PHASE5_TERMINATION_PROBE_LIBRARY="$termination_probe_library" \
+  PHASE5_ONE_SHOT_CLEANUP_LOG="$one_shot_cleanup_log" \
+  /bin/bash -c '
+    source "$PHASE5_TERMINATION_PROBE_LIBRARY"
+    ACTIVE_EXTERNAL_GROUP_PID=424242
+    ACTIVE_EXTERNAL_GROUP_IDENTITY=original
+    terminate_active_external_group() {
+      ACTIVE_EXTERNAL_GROUP_PID=""
+      ACTIVE_EXTERNAL_GROUP_IDENTITY=""
+      ACTIVE_EXTERNAL_GROUP_HANDSHAKE=""
+      return 0
+    }
+    cleanup_recorded_live_coordinator_one_shots() { return 1; }
+    cleanup_timed_out_external_status=0
+    cleanup_timed_out_external || cleanup_timed_out_external_status=$?
+    [[ "$cleanup_timed_out_external_status" -ne 0 ]]
+    RECOVERY_UNSAFE=true
+    [[ "${EXTERNAL_CLEANUP_UNSAFE:-false}" == true ]]
+    restart_stopped_services() {
+      printf "%s\n" restart >>"$PHASE5_ONE_SHOT_CLEANUP_LOG"
+    }
+    record_failure() {
+      printf "%s\n" record >>"$PHASE5_ONE_SHOT_CLEANUP_LOG"
+    }
+    release_operational_lease() {
+      printf "release|%s\n" "$RECOVERY_UNSAFE" \
+        >>"$PHASE5_ONE_SHOT_CLEANUP_LOG"
+    }
+    remove_host_lock() { return 0; }
+    safe_log() { :; }
+    set +e
+    false
+    cleanup
+  '
+one_shot_cleanup_status=$?
+set -e
+[[ "$one_shot_cleanup_status" -eq 1 ]] ||
+  fail "unsafe one-shot cleanup returned $one_shot_cleanup_status"
+grep -Fxq 'release|true' "$one_shot_cleanup_log" ||
+  fail 'unsafe one-shot cleanup did not preserve release mode'
+if grep -Eq '^(restart|record)$' "$one_shot_cleanup_log"; then
+  fail 'unsafe one-shot cleanup continued normal recovery actions'
+fi
 forbid_pattern "$TARGET" 'set[[:space:]]+-[^[:space:]]*x'
 forbid_pattern "$TARGET" '(^|[;&|[:space:]])(env|printenv)([;&|[:space:]]|$)'
 forbid_pattern "$TARGET" 'docker[[:space:]]+inspect'
@@ -248,6 +863,7 @@ require_literal "$COMPOSE" 'profiles: ["backup"]'
 require_literal "$COMPOSE" 'user: "10003:0"'
 require_literal "$COMPOSE" 'read_only: true'
 require_literal "$COMPOSE" '/work:rw,noexec,nosuid,size=1024m,uid=10003,gid=0,mode=0700'
+require_literal "$COMPOSE" 'TMPDIR: /work'
 require_literal "$COMPOSE" 'cap_drop:'
 require_literal "$COMPOSE" '- ALL'
 require_literal "$COMPOSE" 'minio_data:/source/aistor:ro'
@@ -441,6 +1057,8 @@ grep -Fq 'mem_limit: 768m' <<<"$backup_block" ||
   fail "backup service memory limit is missing"
 grep -Fq 'cpus: 0.4' <<<"$backup_block" ||
   fail "backup service CPU limit is missing"
+grep -Fq 'TMPDIR: /work' <<<"$backup_block" ||
+  fail "backup service must route temporary packs to /work"
 
 for init_service in backup-storage-init backup-secrets-init; do
   init_block="$(
@@ -922,12 +1540,38 @@ assert_before() {
 
 wait_for_file() {
   local path="$1"
+  local maximum_attempts="${2:-500}"
   local attempts=0
-  while [[ ! -f "$path" && "$attempts" -lt 500 ]]; do
+  [[ "$maximum_attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+  while [[ ! -f "$path" && "$attempts" -lt "$maximum_attempts" ]]; do
     sleep 0.01
     attempts=$((attempts + 1))
   done
   [[ -f "$path" ]]
+}
+
+assert_block_timings_within() {
+  local prefix="$1"
+  local maximum_milliseconds="$2"
+  local label="$3"
+  local timing_file elapsed_file elapsed_milliseconds
+  local found=false
+  [[ "$maximum_milliseconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  for timing_file in "$prefix".??????; do
+    [[ -f "$timing_file" && ! -L "$timing_file" ]] || continue
+    found=true
+    elapsed_file="${timing_file}.elapsed"
+    wait_for_file "$elapsed_file" ||
+      fail "$label timing observer did not report process exit"
+    read -r elapsed_milliseconds <"$elapsed_file"
+    [[ "$elapsed_milliseconds" =~ ^[0-9]+$ ]] ||
+      fail "$label timing observer reported an invalid duration"
+    if ((elapsed_milliseconds > maximum_milliseconds)); then
+      fail "$label exceeded its host deadline (${elapsed_milliseconds}ms)"
+    fi
+  done
+  [[ "$found" == true ]] ||
+    fail "$label did not start a process timing observer"
 }
 
 wait_for_process_gone() {
@@ -1015,11 +1659,73 @@ make_fixture() {
   chmod 0400 "$fixture/secrets/"*
   : >"$fixture/docker.log"
   : >"$fixture/coordinator-one-shots"
+  : >"$fixture/coordinator-run-id"
   : >"$fixture/live-one-shots.state"
-  chmod 0600 "$fixture/coordinator-one-shots"
+  chmod 0600 \
+    "$fixture/coordinator-one-shots" "$fixture/coordinator-run-id"
   cat >"$fixture/bin/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
+
+start_block_timing_observer() {
+  local prefix="${PHASE5_FAKE_BLOCK_TIMING_PREFIX:-}"
+  local blocked_pid="$$"
+  local timing_file
+  local attempts=0
+  [[ -n "$prefix" ]] || return 0
+  timing_file="$(mktemp "${prefix}.XXXXXX")"
+  /usr/bin/perl \
+    -MPOSIX=setsid \
+    -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,usleep \
+    -e '
+      use strict;
+      use warnings;
+      my ($pid, $path) = @ARGV;
+      setsid() >= 0 or exit 81;
+      $SIG{HUP} = "IGNORE";
+      $SIG{INT} = "IGNORE";
+      $SIG{TERM} = "IGNORE";
+      sub inspect_process {
+        my ($field) = @_;
+        open my $handle, "-|", "/bin/ps", "-o", "${field}=", "-p", $pid
+          or return "";
+        local $/;
+        my $value = <$handle> // "";
+        close $handle;
+        $value =~ s/^\s+|\s+$//g;
+        return $value;
+      }
+      my $identity = inspect_process("lstart");
+      length $identity or exit 82;
+      my $started = clock_gettime(CLOCK_MONOTONIC);
+      open my $ready, ">", $path or exit 83;
+      chmod 0600, $path or exit 84;
+      print {$ready} "started\n" or exit 85;
+      close $ready or exit 86;
+      while (1) {
+        my $state = inspect_process("stat");
+        my $current_identity = inspect_process("lstart");
+        if (!length($state) || $state =~ /^Z/ ||
+            $current_identity ne $identity) {
+          my $elapsed = int(
+            1000 * (clock_gettime(CLOCK_MONOTONIC) - $started)
+          );
+          open my $finished, ">", "${path}.elapsed" or exit 87;
+          chmod 0600, "${path}.elapsed" or exit 88;
+          print {$finished} "${elapsed}\n" or exit 89;
+          close $finished or exit 90;
+          exit 0;
+        }
+        usleep 10_000;
+      }
+    ' "$blocked_pid" "$timing_file" </dev/null >/dev/null 2>&1 &
+  while [[ ! -s "$timing_file" && "$attempts" -lt 500 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s "$timing_file" ]]
+}
+
 printf '%s\n' "$*" >>"$PHASE5_FAKE_DOCKER_LOG"
 if [[ "${1:-}" == 'ps' ]]; then
   if [[ "$*" == *'label=com.docker.compose.oneoff=True'* &&
@@ -1046,8 +1752,13 @@ if [[ "${1:-}" == 'container' && "${2:-}" == 'inspect' &&
   if [[ -n "${PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE:-}" ]]; then
     live_owner="$PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE"
   fi
-  printf '%s|True|%s\n' \
-    "$HAPPYLEARN_BACKUP_LIVE_PROJECT" "$live_owner"
+  if [[ "$*" == *'.State.Running'* ]]; then
+    printf '%s|True|%s|false\n' \
+      "$HAPPYLEARN_BACKUP_LIVE_PROJECT" "$live_owner"
+  else
+    printf '%s|True|%s\n' \
+      "$HAPPYLEARN_BACKUP_LIVE_PROJECT" "$live_owner"
+  fi
   exit 0
 fi
 if [[ "${1:-}" == 'rm' && "${2:-}" == '--force' ]]; then
@@ -1066,6 +1777,11 @@ if [[ "${1:-}" == 'rm' && "${2:-}" == '--force' ]]; then
   exit 0
 fi
 if [[ "${1:-}" == 'compose' ]]; then
+  if [[ "${PHASE5_FAKE_WORKER_RUNNING_AFTER_STOP:-}" == true &&
+    "$*" == *' ps --status running --quiet worker'* ]]; then
+    printf '%064d\n' 9
+    exit 0
+  fi
   saw_run=false
   saw_remove=false
   for argument in "$@"; do
@@ -1100,7 +1816,7 @@ if [[ -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH:-}" &&
     done
   ) &
   blocked_child_pid="$!"
-  blocked_pgid="$PPID"
+  blocked_pgid="$(/bin/ps -o pgid= -p "$$" | tr -d '[:space:]')"
   [[ "$blocked_pgid" =~ ^[1-9][0-9]*$ ]] || exit 83
   printf '%s\n' "$$" >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID"
   printf '%s\n' "$blocked_child_pid" \
@@ -1108,6 +1824,8 @@ if [[ -n "${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH:-}" &&
   printf '%s\n' "$blocked_pgid" >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PGID"
   trap 'printf "%s\n" TERM >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_TERM_MARKER"' \
     TERM
+  trap 'printf "%s\n" finished >"${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_RELEASE}.finished"' \
+    EXIT
   printf '%s\n' started >"$PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER"
   while kill -0 "$blocked_child_pid" 2>/dev/null; do
     wait "$blocked_child_pid" 2>/dev/null || true
@@ -1200,6 +1918,17 @@ if [[ "$*" == *"/app/happylearn-backup sync --run-id "* &&
 fi
 if [[ -n "${PHASE5_FAKE_DELAY_MATCH:-}" &&
       "$*" == *"$PHASE5_FAKE_DELAY_MATCH"* ]]; then
+  start_block_timing_observer
+  if [[ -n "${PHASE5_FAKE_DELAY_ARM_SQL_FAILURE_FILE:-}" ]]; then
+    printf '%s\n' armed >"$PHASE5_FAKE_DELAY_ARM_SQL_FAILURE_FILE"
+  fi
+  if [[ -n "${PHASE5_FAKE_DELAY_STARTED_FILE:-}" ]]; then
+    (
+      set -C
+      node -e 'process.stdout.write(String(Date.now()) + "\n")' \
+        >"$PHASE5_FAKE_DELAY_STARTED_FILE"
+    ) 2>/dev/null || true
+  fi
   if [[ -n "${PHASE5_FAKE_DELAY_RELEASE_FILE:-}" ]]; then
     printf '%s\n' started >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.started"
     trap 'printf "%s\n" finished >"${PHASE5_FAKE_DELAY_RELEASE_FILE}.finished"' EXIT
@@ -1221,8 +1950,18 @@ if [[ "$*" == *postgres*psql* ]]; then
       (-z "${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}" ||
         -e "$PHASE5_FAKE_BLOCK_SQL_ARM_FILE") ]]; then
       trap '' HUP TERM
+      start_block_timing_observer
+      if [[ -n "${PHASE5_FAKE_BLOCK_SQL_STARTED_FILE:-}" ]]; then
+        (
+          set -C
+          node -e 'process.stdout.write(String(Date.now()) + "\n")' \
+            >"$PHASE5_FAKE_BLOCK_SQL_STARTED_FILE"
+        ) 2>/dev/null || true
+      fi
       if [[ -n "${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}" ]]; then
         printf '%s\n' started >"${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE}.started"
+        trap 'printf "%s\n" finished >"${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE}.finished"' \
+          EXIT
         attempts=0
         while [[ ! -e "$PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE" &&
           "$attempts" -lt 500 ]]; do
@@ -1237,7 +1976,9 @@ if [[ "$*" == *postgres*psql* ]]; then
         "$PHASE5_FAKE_BLOCK_SQL_MATCH" >>"$PHASE5_FAKE_DOCKER_LOG"
     fi
     if [[ -n "${PHASE5_FAKE_FAIL_SQL_MATCH:-}" &&
-      "$line" == *"$PHASE5_FAKE_FAIL_SQL_MATCH"* ]]; then
+      "$line" == *"$PHASE5_FAKE_FAIL_SQL_MATCH"* &&
+      (-z "${PHASE5_FAKE_FAIL_SQL_ARM_FILE:-}" ||
+        -e "$PHASE5_FAKE_FAIL_SQL_ARM_FILE") ]]; then
       exit 72
     fi
     case "$line" in
@@ -1258,6 +1999,7 @@ if [[ "$*" == *postgres*psql* ]]; then
       *PHASE5_HOLD_LOCK*)
         printf '%s\n' 'SQL PHASE5_HOLD_LOCK' >>"$PHASE5_FAKE_DOCKER_LOG"
         if [[ -n "${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}" ]]; then
+          start_block_timing_observer
           sleep "$PHASE5_FAKE_BLOCK_LOCK_SECONDS"
         fi
         printf '%s\n' 'PHASE5_LEASE_LOCKED'
@@ -1333,13 +2075,25 @@ set -euo pipefail
 if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'lstart=' &&
   "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
   if [[ -n "${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE:-}" ]]; then
-    if [[ -f "$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE" ]]; then
-      printf '%s\n' failed \
-        >"${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE}.failed"
-      exit 83
+    fixture="${PHASE5_FAKE_PROCESS_STATE_ROOT:-}"
+    owner_directory=''
+    owner_pid=''
+    if [[ -n "$fixture" && -d "$fixture" && ! -L "$fixture" ]]; then
+      owner_directory="$(readlink "$fixture/host.lock" 2>/dev/null || true)"
+      if [[ "$owner_directory" == "$fixture/host.lock.owner."?????? &&
+        -f "$owner_directory/owner" && ! -L "$owner_directory/owner" ]]; then
+        owner_pid="$(sed -n 's/^pid=//p' "$owner_directory/owner")"
+      fi
     fi
-    printf '%s\n' first \
-      >"$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE"
+    if [[ "$owner_pid" == "$4" ]]; then
+      if [[ -f "$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE" ]]; then
+        printf '%s\n' failed \
+          >"${PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE}.failed"
+        exit 83
+      fi
+      printf '%s\n' first \
+        >"$PHASE5_FAKE_OWNER_IDENTITY_FAIL_AFTER_FIRST_FILE"
+    fi
   fi
   if [[ -n "${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}" &&
     -f "$PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE" &&
@@ -1383,6 +2137,10 @@ if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'ppid=' &&
     printf '%s\n' '1'
   fi
   exit 0
+fi
+if [[ "$#" -eq 4 && "$1" == '-o' && "$2" == 'pgid=' &&
+  "$3" == '-p' && "$4" =~ ^[1-9][0-9]*$ ]]; then
+  exec /bin/ps "$@"
 fi
 exec /bin/ps "$@"
 FAKE_PS
@@ -1508,6 +2266,9 @@ run_fixture() {
   local fail_match="${2:-}"
   local remote_result="${3:-success}"
   local run_response="${4:-queued|scheduled|11111111-1111-4111-8111-111111111111}"
+  local trigger="${5:-scheduled}"
+  [[ "$trigger" =~ ^(scheduled|manual|pre_release)$ ]] ||
+    fail "invalid fixture trigger: $trigger"
   local -a fixture_environment=(
     "PATH=$fixture/bin:$PATH"
     "PHASE5_FAKE_DOCKER_LOG=${PHASE5_FAKE_DOCKER_LOG:-$fixture/docker.log}"
@@ -1520,14 +2281,19 @@ run_fixture() {
     "PHASE5_FAKE_FAIL_MATCH=$fail_match"
     "PHASE5_FAKE_REMOTE_RESULT=$remote_result"
     "PHASE5_FAKE_FAIL_SQL_MATCH=${PHASE5_FAKE_FAIL_SQL_MATCH:-}"
+    "PHASE5_FAKE_FAIL_SQL_ARM_FILE=${PHASE5_FAKE_FAIL_SQL_ARM_FILE:-}"
     "PHASE5_FAKE_BLOCK_SQL_MATCH=${PHASE5_FAKE_BLOCK_SQL_MATCH:-}"
     "PHASE5_FAKE_BLOCK_SQL_SECONDS=${PHASE5_FAKE_BLOCK_SQL_SECONDS:-3}"
     "PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE=${PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE:-}"
     "PHASE5_FAKE_BLOCK_SQL_ARM_FILE=${PHASE5_FAKE_BLOCK_SQL_ARM_FILE:-}"
+    "PHASE5_FAKE_BLOCK_SQL_STARTED_FILE=${PHASE5_FAKE_BLOCK_SQL_STARTED_FILE:-}"
+    "PHASE5_FAKE_BLOCK_TIMING_PREFIX=${PHASE5_FAKE_BLOCK_TIMING_PREFIX:-}"
     "PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE=${PHASE5_FAKE_LEASE_ACQUIRED_RESPONSE-acquired}"
     "PHASE5_FAKE_DELAY_MATCH=${PHASE5_FAKE_DELAY_MATCH:-}"
     "PHASE5_FAKE_DELAY_SECONDS=${PHASE5_FAKE_DELAY_SECONDS:-3}"
     "PHASE5_FAKE_DELAY_RELEASE_FILE=${PHASE5_FAKE_DELAY_RELEASE_FILE:-}"
+    "PHASE5_FAKE_DELAY_STARTED_FILE=${PHASE5_FAKE_DELAY_STARTED_FILE:-}"
+    "PHASE5_FAKE_DELAY_ARM_SQL_FAILURE_FILE=${PHASE5_FAKE_DELAY_ARM_SQL_FAILURE_FILE:-}"
     "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH:-}"
     "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MARKER:-}"
     "PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID=${PHASE5_FAKE_BLOCK_LIVE_COMPOSE_PARENT_PID:-}"
@@ -1538,6 +2304,7 @@ run_fixture() {
     "PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE=${PHASE5_FAKE_LIVE_ONE_SHOT_OWNER_OVERRIDE:-}"
     "PHASE5_FAKE_BLOCK_LOCK_SECONDS=${PHASE5_FAKE_BLOCK_LOCK_SECONDS:-}"
     "PHASE5_FAKE_FAIL_BACKUP_FAIL=${PHASE5_FAKE_FAIL_BACKUP_FAIL:-}"
+    "PHASE5_FAKE_WORKER_RUNNING_AFTER_STOP=${PHASE5_FAKE_WORKER_RUNNING_AFTER_STOP:-}"
     "PHASE5_FAKE_RENEW_OWNER_PID_FILE=${PHASE5_FAKE_RENEW_OWNER_PID_FILE:-}"
     "PHASE5_FAKE_ORPHAN_RENEW_MARKER=${PHASE5_FAKE_ORPHAN_RENEW_MARKER:-}"
     "PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE=${PHASE5_FAKE_REUSED_PROCESS_IDENTITY_PID_FILE:-}"
@@ -1557,17 +2324,19 @@ run_fixture() {
     'HAPPYLEARN_BACKUP_READY_TIMEOUT_SECONDS=2'
     "HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS=${HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS:-1}"
     "HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS=${HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS:-2700}"
-    "HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS=${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-1}"
+    # Ordinary fixture queries still exercise the guarded process-group path.
+    # Give macOS enough scheduling headroom for this process-heavy matrix;
+    # timeout-specific fixtures override this back to one second below.
+    "HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS=${HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS:-2}"
     'HAPPYLEARN_BACKUP_DATABASE_CONNECT_TIMEOUT_SECONDS=1'
     "HAPPYLEARN_BACKUP_LOCK_DIRECTORY=$fixture/host.lock"
   )
-  local -a fixture_command=(
-    "$TARGET" --project happylearn-dev --trigger scheduled
-  )
   if [[ "${PHASE5_FAKE_EXEC_FIXTURE:-}" == true ]]; then
-    exec env "${fixture_environment[@]}" "${fixture_command[@]}"
+    exec env "${fixture_environment[@]}" \
+      "$TARGET" --project happylearn-dev --trigger "$trigger"
   fi
-  env "${fixture_environment[@]}" "${fixture_command[@]}"
+  env "${fixture_environment[@]}" \
+    "$TARGET" --project happylearn-dev --trigger "$trigger"
 }
 
 FIXTURE_BACKGROUND_PID=''
@@ -1604,8 +2373,17 @@ if [[ "${PHASE5_CONTRACT_EARLY_FAIL_PROBE:-}" == true ]]; then
   early_fail_pid="$FIXTURE_BACKGROUND_PID"
   register_active_fixture "$early_fail_pid" "$early_fail_release"
   register_active_fixture_finish "${early_fail_release}.finished"
-  wait_for_file "${early_fail_release}.started" ||
+  if ! wait_for_file "${early_fail_release}.started" 2000; then
+    sed -n '1,200p' "$early_fail_fixture/docker.log" >&2
+    find "$early_fail_fixture" -maxdepth 3 -print >&2
+    if [[ -L "$early_fail_fixture/host.lock" ]]; then
+      early_fail_owner="$(readlink "$early_fail_fixture/host.lock")"
+      sed -n '1,80p' "$early_fail_owner/owner" >&2 || true
+      /bin/ps -o pid=,ppid=,pgid=,stat=,command= \
+        -p "$early_fail_pid" >&2 || true
+    fi
     fail "early-fail cleanup probe did not start its background fixture"
+  fi
   printf '%s\n' "$early_fail_pid" >"$early_fail_pid_marker"
   fail "intentional early-fail cleanup probe"
 fi
@@ -1629,16 +2407,23 @@ fi
 
 early_fail_release="$CONTRACT_TEMP_ROOT/early-fail.release"
 early_fail_pid_marker="$CONTRACT_TEMP_ROOT/early-fail.pid"
+early_fail_probe_log="$CONTRACT_TEMP_ROOT/early-fail.log"
 if PHASE5_CONTRACT_EARLY_FAIL_PROBE=true \
   PHASE5_CONTRACT_EARLY_FAIL_RELEASE="$early_fail_release" \
   PHASE5_CONTRACT_EARLY_FAIL_PID_MARKER="$early_fail_pid_marker" \
-  bash "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+  bash "${BASH_SOURCE[0]}" >"$early_fail_probe_log" 2>&1; then
   fail "early-fail cleanup probe unexpectedly succeeded"
 fi
-[[ -f "$early_fail_release" &&
-  -f "${early_fail_release}.started" &&
-  -f "${early_fail_release}.finished" ]] ||
+if [[ ! -f "$early_fail_release" ||
+  ! -f "${early_fail_release}.started" ||
+  ! -f "${early_fail_release}.finished" ]]; then
+  printf 'phase5 backup contract: early-fail markers release=%s started=%s finished=%s\n' \
+    "$([[ -f "$early_fail_release" ]] && printf present || printf absent)" \
+    "$([[ -f "${early_fail_release}.started" ]] && printf present || printf absent)" \
+    "$([[ -f "${early_fail_release}.finished" ]] && printf present || printf absent)" >&2
+  sed -n '1,240p' "$early_fail_probe_log" >&2
   fail "early-fail EXIT trap did not release and finish its background fixture"
+fi
 early_fail_pid="$(<"$early_fail_pid_marker")"
 [[ "$early_fail_pid" =~ ^[1-9][0-9]*$ ]] ||
   fail "early-fail cleanup probe recorded an invalid PID"
@@ -1661,6 +2446,10 @@ for heartbeat_publish_failure in child_before_pid ready; do
   fi
   if ((SECONDS - heartbeat_publish_started >= 5)); then
     fail "heartbeat $heartbeat_publish_failure publication failure exceeded five seconds"
+  fi
+  if [[ ! -f "$heartbeat_publish_marker" ]]; then
+    sed -n '1,160p' "$heartbeat_publish_fixture/docker.log" >&2
+    fail "heartbeat $heartbeat_publish_failure failure did not publish its PID"
   fi
   heartbeat_publish_pid="$(<"$heartbeat_publish_marker")"
   [[ "$heartbeat_publish_pid" =~ ^[1-9][0-9]*$ ]] ||
@@ -1691,12 +2480,44 @@ if grep -Fq -- "--file $LIVE_COMPOSE" "$success_log" ||
 fi
 test ! -s "$success_fixture/coordinator-one-shots" ||
   fail 'production execution retained a coordinator one-shot'
+test ! -s "$success_fixture/coordinator-run-id" ||
+  fail 'production execution published a live-only coordinator run ID'
 assert_before "$success_log" \
-  'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup prepare --run-id 11111111-1111-4111-8111-111111111111' \
+  'SQL PHASE5_QUERY_ACTIVE_COUNTS' \
   'stop --timeout 60 worker'
+assert_before "$success_log" \
+  'stop --timeout 60 worker' \
+  'ps --status running --quiet worker'
+worker_proof_line="$(
+  grep -nF 'ps --status running --quiet worker' "$success_log" |
+    head -n1 | cut -d: -f1
+)"
+backup_activity_count=0
+while IFS=: read -r activity_line activity_trace; do
+  [[ "$activity_line" =~ ^[0-9]+$ ]] || continue
+  backup_activity_count=$((backup_activity_count + 1))
+  [[ "$worker_proof_line" -lt "$activity_line" ]] ||
+    fail "backup one-shot preceded worker exit proof: $activity_trace"
+done < <(
+  grep -nE \
+    '[[:space:]]run[[:space:]].*(backup-storage-init|backup-secrets-init|[[:space:]]backup([[:space:]]|$))' \
+    "$success_log" || true
+)
+[[ "$backup_activity_count" -ge 8 ]] ||
+  fail 'baseline did not exercise the complete backup one-shot sequence'
+for backup_activity in \
+  'run --rm --no-deps backup-storage-init' \
+  'run --rm --no-deps backup-secrets-init' \
+  'run --rm --no-deps --entrypoint /bin/sh backup -eu -c' \
+  'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup prepare --run-id 11111111-1111-4111-8111-111111111111' \
+  'entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s restic --no-cache --repository-file /run/secrets/local_repository --password-file /run/secrets/local_password cat config'; do
+  assert_before "$success_log" \
+    'ps --status running --quiet worker' \
+    "$backup_activity"
+done
 assert_before "$success_log" 'entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s restic --no-cache --repository-file /run/secrets/local_repository --password-file /run/secrets/local_password cat config' \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup snapshot --run-id 11111111-1111-4111-8111-111111111111'
-assert_before "$success_log" 'stop --timeout' \
+assert_before "$success_log" 'stop --timeout 60 minio' \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup snapshot --run-id 11111111-1111-4111-8111-111111111111'
 assert_before "$success_log" 'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup snapshot --run-id 11111111-1111-4111-8111-111111111111' \
   'up --detach --no-deps minio'
@@ -1710,6 +2531,9 @@ assert_before "$success_log" 'entrypoint /usr/bin/timeout backup --foreground --
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111'
 assert_before "$success_log" \
   'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup-retention --repository local --run-id 11111111-1111-4111-8111-111111111111' \
+  'up --detach --no-deps worker'
+assert_before "$success_log" \
+  'run --rm --no-deps --entrypoint /usr/bin/timeout backup --foreground --kill-after=10s 2700s /app/happylearn-backup finish --run-id 11111111-1111-4111-8111-111111111111' \
   'up --detach --no-deps worker'
 assert_before "$success_log" 'PHASE5_HOLD_LOCK' 'PHASE5_RELEASE_LOCK'
 grep -Fq 'SQL PHASE5_QUERY_LEASE_RENEW' "$success_log" ||
@@ -1742,6 +2566,7 @@ PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH='run --no-deps backup-storage-init' \
   start_fixture_background "$signal_live_fixture"
 signal_live_runner="$FIXTURE_BACKGROUND_PID"
 register_active_fixture "$signal_live_runner" "$signal_live_release"
+register_active_fixture_finish "${signal_live_release}.finished"
 if ! wait_for_file "$signal_live_started"; then
   sed -n '1,120p' "$signal_live_fixture/docker.log" >&2
   fail 'live signal fixture did not block inside Compose run'
@@ -1755,6 +2580,27 @@ signal_live_id="$(<"$signal_live_fixture/live-one-shots.state")"
   "$signal_live_pgid" =~ ^[1-9][0-9]*$ &&
   "$signal_live_id" =~ ^[0-9a-f]{64}$ ]] ||
   fail 'live signal fixture published invalid process/container identity'
+signal_live_witness_group="$(
+  /bin/ps -o pgid= -p "$signal_live_pgid" | tr -d '[:space:]'
+)"
+signal_live_parent_group="$(
+  /bin/ps -o pgid= -p "$signal_live_parent_pid" | tr -d '[:space:]'
+)"
+signal_live_child_group="$(
+  /bin/ps -o pgid= -p "$signal_live_child_pid" | tr -d '[:space:]'
+)"
+if [[ "$signal_live_witness_group" != "$signal_live_pgid" ||
+  "$signal_live_parent_group" != "$signal_live_pgid" ||
+  "$signal_live_child_group" != "$signal_live_pgid" ]]; then
+  printf 'witness=%s witness_group=%s parent_group=%s child_group=%s\n' \
+    "$signal_live_pgid" "$signal_live_witness_group" \
+    "$signal_live_parent_group" \
+    "$signal_live_child_group" >&2
+  /bin/ps -o pid=,ppid=,pgid=,command= \
+    -p "$signal_live_witness_group,$signal_live_pgid,$signal_live_parent_pid,$signal_live_child_pid" \
+    >&2 || true
+  fail 'live signal fixture did not place witness and descendants in one owned group'
+fi
 signal_live_cleanup_started="$SECONDS"
 kill -TERM "$signal_live_runner" ||
   fail 'could not signal the live backup coordinator'
@@ -1788,6 +2634,18 @@ assert_before "$signal_live_fixture/docker.log" \
 assert_before "$signal_live_fixture/docker.log" \
   'container inspect --format' \
   "rm --force $signal_live_id"
+signal_live_last_remove_line="$(
+  grep -nF 'rm --force ' "$signal_live_fixture/docker.log" |
+    tail -n1 | cut -d: -f1
+)"
+signal_live_worker_restart_line="$(
+  grep -nF 'up --detach --no-deps worker' \
+    "$signal_live_fixture/docker.log" | tail -n1 | cut -d: -f1
+)"
+[[ "$signal_live_last_remove_line" =~ ^[0-9]+$ &&
+  "$signal_live_worker_restart_line" =~ ^[0-9]+$ &&
+  "$signal_live_last_remove_line" -lt "$signal_live_worker_restart_line" ]] ||
+  fail 'live TERM cleanup restarted worker before the final one-shot cleanup'
 test ! -e "$signal_live_fixture/host.lock" ||
   fail 'live TERM cleanup left the host lock'
 
@@ -1812,6 +2670,7 @@ PHASE5_FAKE_BLOCK_LIVE_COMPOSE_MATCH='run --no-deps backup-storage-init' \
   start_fixture_background "$signal_owner_fixture"
 signal_owner_runner="$FIXTURE_BACKGROUND_PID"
 register_active_fixture "$signal_owner_runner" "$signal_owner_release"
+register_active_fixture_finish "${signal_owner_release}.finished"
 wait_for_file "$signal_owner_started" ||
   fail 'live owner-mismatch fixture did not block inside Compose run'
 signal_owner_parent_pid="$(<"$signal_owner_parent_pid_file")"
@@ -1844,6 +2703,16 @@ if grep -Fq "rm --force $signal_owner_id" \
   "$signal_owner_fixture/docker.log"; then
   fail 'owner-mismatch cleanup removed an unaudited one-shot'
 fi
+if grep -Fq 'up --detach --no-deps worker' \
+  "$signal_owner_fixture/docker.log"; then
+  fail 'owner-mismatch cleanup restarted worker from uncertain state'
+fi
+transition_count="$(
+  grep -Fc 'SQL PHASE5_QUERY_LEASE_TRANSITION' \
+    "$signal_owner_fixture/docker.log" || true
+)"
+[[ "$transition_count" -ge 2 ]] ||
+  fail 'owner-mismatch cleanup did not retain fail-closed release mode'
 test ! -e "$signal_owner_fixture/host.lock" ||
   fail 'owner-mismatch TERM cleanup left the host lock'
 
@@ -1860,7 +2729,8 @@ chmod 0400 "$live_context_fixture/secrets/remote_"*
 if ! HAPPYLEARN_BACKUP_LIVE_TEST='1' \
   HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
   HAPPYLEARN_BACKUP_LIVE_ROOT="$live_context_fixture" \
-  run_fixture "$live_context_fixture"; then
+  run_fixture "$live_context_fixture" '' success \
+    'queued|manual|33333333-3333-4333-8333-333333333333' manual; then
   fail "strict live execution context was rejected"
 fi
 grep -Fq -- \
@@ -1869,6 +2739,15 @@ grep -Fq -- \
   fail "live execution did not use the unique project and both fixed overrides"
 test -s "$live_context_fixture/coordinator-one-shots" ||
   fail 'live execution did not retain coordinator one-shots for metadata audit'
+assert_before "$live_context_fixture/docker.log" \
+  ' /app/happylearn-backup finish --run-id 33333333-3333-4333-8333-333333333333' \
+  '.State.Running'
+assert_before "$live_context_fixture/docker.log" \
+  '.State.Running' \
+  'up --detach --no-deps worker'
+[[ "$(<"$live_context_fixture/coordinator-run-id")" == \
+  '33333333-3333-4333-8333-333333333333' ]] ||
+  fail 'live execution did not publish the exact selected backup run ID'
 if ! diff -u \
   <(sort -u "$live_context_fixture/live-one-shots.state") \
   <(sort -u "$live_context_fixture/coordinator-one-shots") >/dev/null; then
@@ -1901,6 +2780,43 @@ if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
 fi
 test ! -s "$invalid_live_context_fixture/docker.log" ||
   fail "unsafe live execution context mutated Compose state"
+
+invalid_run_id_handoff_fixture="$(make_fixture)"
+chmod 0644 "$invalid_run_id_handoff_fixture/coordinator-run-id"
+if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$invalid_run_id_handoff_fixture" \
+  run_fixture "$invalid_run_id_handoff_fixture"; then
+  fail 'live context accepted an unsafe coordinator run ID handoff'
+fi
+test ! -s "$invalid_run_id_handoff_fixture/docker.log" ||
+  fail 'unsafe coordinator run ID handoff reached Compose'
+
+nonempty_run_id_handoff_fixture="$(make_fixture)"
+printf '%s\n' '33333333-3333-4333-8333-333333333333' \
+  >"$nonempty_run_id_handoff_fixture/coordinator-run-id"
+if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$nonempty_run_id_handoff_fixture" \
+  run_fixture "$nonempty_run_id_handoff_fixture"; then
+  fail 'live context accepted a stale coordinator run ID handoff'
+fi
+test ! -s "$nonempty_run_id_handoff_fixture/docker.log" ||
+  fail 'stale coordinator run ID handoff reached Compose'
+
+symlink_run_id_handoff_fixture="$(make_fixture)"
+mv "$symlink_run_id_handoff_fixture/coordinator-run-id" \
+  "$symlink_run_id_handoff_fixture/coordinator-run-id.target"
+ln -s "$symlink_run_id_handoff_fixture/coordinator-run-id.target" \
+  "$symlink_run_id_handoff_fixture/coordinator-run-id"
+if HAPPYLEARN_BACKUP_LIVE_TEST='1' \
+  HAPPYLEARN_BACKUP_LIVE_PROJECT='happylearn-phase5-live-012345abcdef' \
+  HAPPYLEARN_BACKUP_LIVE_ROOT="$symlink_run_id_handoff_fixture" \
+  run_fixture "$symlink_run_id_handoff_fixture"; then
+  fail 'live context accepted a symlink coordinator run ID handoff'
+fi
+test ! -s "$symlink_run_id_handoff_fixture/docker.log" ||
+  fail 'symlink coordinator run ID handoff reached Compose'
 
 symlink_live_context_fixture="$(make_fixture)"
 symlink_live_parent="$CONTRACT_TEMP_ROOT/live-parent-link"
@@ -1946,7 +2862,7 @@ test ! -s "$zero_heartbeat_fixture/docker.log" ||
 
 for injected in \
   ' /app/happylearn-backup prepare |internal' \
-  ' stop --timeout |object_store_stop' \
+  'stop --timeout 60 minio|object_store_stop' \
   ' /app/happylearn-backup snapshot |snapshot' \
   ' up --detach --no-deps minio|object_store_restart' \
   'api/v1/health/ready|object_store_restart' \
@@ -1962,8 +2878,10 @@ do
     fail "failure injection unexpectedly succeeded: $stage"
   fi
   failure_log="$failure_fixture/docker.log"
-  grep -Fq 'PHASE5_RELEASE_LOCK' "$failure_log" ||
+  if ! grep -Fq 'PHASE5_RELEASE_LOCK' "$failure_log"; then
+    sed -n '1,240p' "$failure_log" >&2
     fail "failure trap did not release the operational lease: $stage"
+  fi
   if grep -Fq ' stop --timeout ' "$failure_log"; then
     grep -Eq 'up --detach --no-deps (minio|worker)' "$failure_log" ||
       fail "failure trap did not restart a stopped service: $stage"
@@ -1971,10 +2889,41 @@ do
   grep -Fq "/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category $expected_category" \
     "$failure_log" ||
     fail "failure trap recorded the wrong safe stage: $stage"
+  if grep -Fq 'up --detach --no-deps worker' "$failure_log"; then
+    assert_before "$failure_log" \
+      "/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category $expected_category" \
+      'up --detach --no-deps worker'
+  fi
   if [[ "$stage" == 'local_password cat config' ]] &&
     grep -Fq 'local_password init' "$failure_log"; then
     fail "repository probe failure incorrectly attempted initialization"
   fi
+done
+
+for worker_stop_failure in stop proof; do
+  worker_stop_fixture="$(make_fixture)"
+  if [[ "$worker_stop_failure" == stop ]]; then
+    if run_fixture "$worker_stop_fixture" 'stop --timeout 60 worker'; then
+      fail 'failed worker stop was accepted'
+    fi
+  elif PHASE5_FAKE_WORKER_RUNNING_AFTER_STOP=true \
+    run_fixture "$worker_stop_fixture"; then
+    fail 'running worker after stop was accepted'
+  fi
+  worker_stop_log="$worker_stop_fixture/docker.log"
+  grep -Fq 'SQL PHASE5_QUERY_UNPREPARED_FAIL' "$worker_stop_log" ||
+    fail "worker $worker_stop_failure failure was not recorded without a backup one-shot"
+  if grep -Fq '/app/happylearn-backup fail --run-id' "$worker_stop_log"; then
+    fail "worker $worker_stop_failure failure invoked a backup one-shot"
+  fi
+  if grep -Fq 'up --detach --no-deps worker' "$worker_stop_log"; then
+    fail "worker $worker_stop_failure failure restarted worker from uncertain state"
+  fi
+  worker_stop_transition_count="$(
+    grep -Fc 'SQL PHASE5_QUERY_LEASE_TRANSITION' "$worker_stop_log" || true
+  )"
+  [[ "$worker_stop_transition_count" -ge 2 ]] ||
+    fail "worker $worker_stop_failure failure did not retain fail-closed release mode"
 done
 
 remote_fixture="$(make_fixture)"
@@ -2153,8 +3102,16 @@ fi
 test "$(<"$atomic_secret_fixture/secret-volume/local_password")" = \
   'previous-local-password' ||
   fail "secret copy failure destroyed the previous target"
-if grep -Fq 'SQL PHASE5_QUERY_RUN' "$atomic_secret_fixture/docker.log"; then
-  fail "secret copy failure queued a backup run"
+grep -Fq 'SQL PHASE5_QUERY_RUN' "$atomic_secret_fixture/docker.log" ||
+  fail "secret copy failure had no durable queued-run audit record"
+grep -Fq 'PHASE5_RELEASE_LOCK' "$atomic_secret_fixture/docker.log" ||
+  fail "secret copy failure did not release the operational lease"
+grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category internal' \
+  "$atomic_secret_fixture/docker.log" ||
+  fail "secret copy failure recorded the wrong terminal category"
+if grep -Eq '/app/happylearn-backup (prepare|snapshot) --run-id' \
+  "$atomic_secret_fixture/docker.log"; then
+  fail "secret copy failure reached backup execution"
 fi
 
 post_sync_remote_fixture="$(make_fixture)"
@@ -2291,16 +3248,13 @@ fi
 [[ -L "$active_lock_fixture/host.lock" ]] ||
   fail "active lock was not atomically published as a symlink"
 active_lock_owner="$(readlink "$active_lock_fixture/host.lock")"
-active_log_lines_before="$(
-  wc -l <"$active_lock_fixture/docker.log" | tr -d '[:space:]'
-)"
-if run_fixture "$active_lock_fixture"; then
+active_lock_rejected_log="$active_lock_fixture/rejected-run.log"
+: >"$active_lock_rejected_log"
+if PHASE5_FAKE_DOCKER_LOG="$active_lock_rejected_log" \
+  run_fixture "$active_lock_fixture"; then
   fail "active host lock was stolen"
 fi
-active_log_lines_after="$(
-  wc -l <"$active_lock_fixture/docker.log" | tr -d '[:space:]'
-)"
-test "$active_log_lines_before" -eq "$active_log_lines_after" ||
+test ! -s "$active_lock_rejected_log" ||
   fail "active lock rejection accessed Compose"
 [[ -L "$active_lock_fixture/host.lock" &&
   "$(readlink "$active_lock_fixture/host.lock")" == "$active_lock_owner" ]] ||
@@ -2359,7 +3313,13 @@ touch "$stale_lock_release"
 wait_for_file "${stale_lock_release}.finished" ||
   fail "inherited liveness holder did not finish after release"
 clear_active_fixture
-if ! run_fixture "$stale_lock_fixture"; then
+stale_reclaim_attempts=0
+while ! run_fixture "$stale_lock_fixture" &&
+  [[ "$stale_reclaim_attempts" -lt 100 ]]; do
+  sleep 0.01
+  stale_reclaim_attempts=$((stale_reclaim_attempts + 1))
+done
+if [[ "$stale_reclaim_attempts" -ge 100 ]]; then
   fail "verified SIGKILL-stale host lock was not reclaimed"
 fi
 [[ ! -e "$stale_lock_fixture/host.lock" &&
@@ -2471,6 +3431,7 @@ inflight_runner="$FIXTURE_BACKGROUND_PID"
 register_active_fixture \
   "$inflight_runner" "$inflight_external_release" "$inflight_renew_release"
 register_active_fixture_finish "${inflight_external_release}.finished"
+register_active_fixture_finish "${inflight_renew_release}.finished"
 if ! wait_for_file "${inflight_external_release}.started"; then
   fail "in-flight renewal fixture did not reach its external descendant"
 fi
@@ -2698,37 +3659,60 @@ mount_failure_fixture="$(make_fixture)"
 if run_fixture "$mount_failure_fixture" 'backup-storage-init'; then
   fail "backup mount initialization failure was ignored"
 fi
-if grep -Fq 'SQL PHASE5_QUERY_RUN' "$mount_failure_fixture/docker.log"; then
-  fail "backup run was queued before mount initialization succeeded"
-fi
+grep -Fq 'SQL PHASE5_QUERY_RUN' "$mount_failure_fixture/docker.log" ||
+  fail "backup mount initialization ran before a durable run was selected"
+assert_before "$mount_failure_fixture/docker.log" \
+  'ps --status running --quiet worker' \
+  'run --rm --no-deps backup-storage-init'
 
 blocked_advisory_fixture="$(make_fixture)"
-blocked_advisory_started="$SECONDS"
+blocked_advisory_timing_prefix="$blocked_advisory_fixture/blocked-advisory-timing"
 if PHASE5_FAKE_BLOCK_LOCK_SECONDS='5' \
+  PHASE5_FAKE_BLOCK_TIMING_PREFIX="$blocked_advisory_timing_prefix" \
   run_fixture "$blocked_advisory_fixture"; then
   fail "blocked advisory lock was accepted"
 fi
-if ((SECONDS - blocked_advisory_started >= 5)); then
-  fail "blocked advisory lock session was not terminated at its deadline"
-fi
+assert_block_timings_within \
+  "$blocked_advisory_timing_prefix" \
+  2500 \
+  'blocked advisory lock session'
 test ! -e "$blocked_advisory_fixture/host.lock" ||
   fail "blocked advisory lock left the host lock behind"
 
 heartbeat_fixture="$(make_fixture)"
-heartbeat_started="$SECONDS"
+heartbeat_timing_prefix="$heartbeat_fixture/lost-heartbeat-timing"
+heartbeat_failure_arm="$heartbeat_fixture/lost-heartbeat.arm"
 if PHASE5_FAKE_FAIL_SQL_MATCH='PHASE5_QUERY_LEASE_RENEW' \
+  PHASE5_FAKE_FAIL_SQL_ARM_FILE="$heartbeat_failure_arm" \
   PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
   PHASE5_FAKE_DELAY_SECONDS='4' \
+  PHASE5_FAKE_DELAY_ARM_SQL_FAILURE_FILE="$heartbeat_failure_arm" \
+  PHASE5_FAKE_BLOCK_TIMING_PREFIX="$heartbeat_timing_prefix" \
   HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
   run_fixture "$heartbeat_fixture"; then
   fail "lost operational lease heartbeat was ignored"
 fi
-if ((SECONDS - heartbeat_started >= 4)); then
-  fail "lost heartbeat did not terminate the running external action"
-fi
-grep -Fq '/app/happylearn-backup fail --run-id 11111111-1111-4111-8111-111111111111 --category lease_lost' \
+assert_block_timings_within \
+  "$heartbeat_timing_prefix" \
+  2500 \
+  'lost-heartbeat external action'
+grep -Fq 'SQL PHASE5_QUERY_UNPREPARED_FAIL' \
   "$heartbeat_fixture/docker.log" ||
-  fail "lost operational lease heartbeat was not recorded safely"
+  fail "lost operational lease heartbeat was not recorded without a backup one-shot"
+if grep -Fq '/app/happylearn-backup fail --run-id' \
+  "$heartbeat_fixture/docker.log"; then
+  fail 'lost operational lease heartbeat invoked a backup one-shot'
+fi
+if grep -Fq 'up --detach --no-deps worker' \
+  "$heartbeat_fixture/docker.log"; then
+  fail 'lost operational lease heartbeat restarted worker from uncertain state'
+fi
+heartbeat_transition_count="$(
+  grep -Fc 'SQL PHASE5_QUERY_LEASE_TRANSITION' \
+    "$heartbeat_fixture/docker.log" || true
+)"
+[[ "$heartbeat_transition_count" -ge 2 ]] ||
+  fail 'lost operational lease heartbeat did not retain fail-closed release mode'
 
 healthy_heartbeat_fixture="$(make_fixture)"
 if ! PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
@@ -2743,6 +3727,68 @@ healthy_renewals="$(
 )"
 test "$healthy_renewals" -ge 2 ||
   fail "healthy heartbeat did not renew across a long action"
+
+heartbeat_query_timeout_fixture="$(make_fixture)"
+heartbeat_query_timeout_prepare_release="$heartbeat_query_timeout_fixture/prepare.release"
+heartbeat_query_timeout_renew_release="$heartbeat_query_timeout_fixture/renew.release"
+heartbeat_query_timeout_renew_arm="$heartbeat_query_timeout_fixture/renew.arm"
+PHASE5_FAKE_DELAY_MATCH=' /app/happylearn-backup prepare ' \
+  PHASE5_FAKE_DELAY_RELEASE_FILE="$heartbeat_query_timeout_prepare_release" \
+  PHASE5_FAKE_BLOCK_SQL_MATCH='PHASE5_QUERY_LEASE_RENEW' \
+  PHASE5_FAKE_BLOCK_SQL_RELEASE_FILE="$heartbeat_query_timeout_renew_release" \
+  PHASE5_FAKE_BLOCK_SQL_ARM_FILE="$heartbeat_query_timeout_renew_arm" \
+  HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS='0.05' \
+  HAPPYLEARN_BACKUP_DATABASE_QUERY_TIMEOUT_SECONDS='2' \
+  start_fixture_background "$heartbeat_query_timeout_fixture"
+heartbeat_query_timeout_runner="$FIXTURE_BACKGROUND_PID"
+register_active_fixture \
+  "$heartbeat_query_timeout_runner" \
+  "$heartbeat_query_timeout_prepare_release" \
+  "$heartbeat_query_timeout_renew_release"
+register_active_fixture_finish \
+  "${heartbeat_query_timeout_prepare_release}.finished"
+register_active_fixture_finish \
+  "${heartbeat_query_timeout_renew_release}.finished"
+if ! wait_for_file "${heartbeat_query_timeout_prepare_release}.started"; then
+  fail "heartbeat query-timeout fixture did not reach prepare"
+fi
+heartbeat_query_timeout_owner="$(
+  readlink "$heartbeat_query_timeout_fixture/host.lock"
+)"
+heartbeat_query_timeout_pid_file="$heartbeat_query_timeout_owner/heartbeat.pid"
+[[ -f "$heartbeat_query_timeout_pid_file" &&
+  ! -L "$heartbeat_query_timeout_pid_file" ]] ||
+  fail "heartbeat query-timeout fixture did not publish its PID"
+heartbeat_query_timeout_pid="$(<"$heartbeat_query_timeout_pid_file")"
+[[ "$heartbeat_query_timeout_pid" =~ ^[1-9][0-9]*$ ]] ||
+  fail "heartbeat query-timeout fixture published an invalid PID"
+touch "$heartbeat_query_timeout_renew_arm"
+if ! wait_for_file "${heartbeat_query_timeout_renew_release}.started"; then
+  fail "heartbeat query-timeout fixture did not enter renewal"
+fi
+heartbeat_query_timeout_attempts=0
+while kill -0 "-$heartbeat_query_timeout_pid" 2>/dev/null &&
+  [[ "$heartbeat_query_timeout_attempts" -lt 400 ]]; do
+  sleep 0.01
+  heartbeat_query_timeout_attempts=$((heartbeat_query_timeout_attempts + 1))
+done
+if kill -0 "-$heartbeat_query_timeout_pid" 2>/dev/null; then
+  fail "heartbeat query timeout did not terminate its shared process group"
+fi
+touch \
+  "$heartbeat_query_timeout_renew_release" \
+  "$heartbeat_query_timeout_prepare_release"
+if wait "$heartbeat_query_timeout_runner"; then
+  fail "heartbeat query timeout unexpectedly succeeded"
+fi
+wait_for_file "${heartbeat_query_timeout_prepare_release}.finished" ||
+  fail "heartbeat query-timeout prepare descendant did not finish"
+clear_active_fixture
+sleep 0.2
+if grep -Fq 'SQL PHASE5_BLOCK_COMPLETED PHASE5_QUERY_LEASE_RENEW' \
+  "$heartbeat_query_timeout_fixture/docker.log"; then
+  fail "heartbeat query timeout left a renewal descendant"
+fi
 
 unprepared_failure_fixture="$(make_fixture)"
 if PHASE5_FAKE_FAIL_SQL_MATCH='PHASE5_QUERY_ACTIVE_COUNTS' \
@@ -2761,7 +3807,8 @@ for blocked_sql in \
   PHASE5_QUERY_LEASE_RELEASE
 do
   blocked_sql_fixture="$(make_fixture)"
-  blocked_sql_started="$SECONDS"
+  blocked_sql_started_file="$blocked_sql_fixture/blocked-sql.started"
+  blocked_sql_timing_prefix="$blocked_sql_fixture/blocked-sql-timing"
   blocked_sql_heartbeat_interval='1'
   blocked_sql_block_seconds='4'
   if [[ "$blocked_sql" == 'PHASE5_QUERY_LEASE_RENEW' ]]; then
@@ -2774,13 +3821,18 @@ do
   fi
   if PHASE5_FAKE_BLOCK_SQL_MATCH="$blocked_sql" \
     PHASE5_FAKE_BLOCK_SQL_SECONDS="$blocked_sql_block_seconds" \
+    PHASE5_FAKE_BLOCK_SQL_STARTED_FILE="$blocked_sql_started_file" \
+    PHASE5_FAKE_BLOCK_TIMING_PREFIX="$blocked_sql_timing_prefix" \
     HAPPYLEARN_BACKUP_HEARTBEAT_INTERVAL_SECONDS="$blocked_sql_heartbeat_interval" \
     run_fixture "$blocked_sql_fixture"; then
     fail "hung database query was accepted: $blocked_sql"
   fi
-  if ((SECONDS - blocked_sql_started >= blocked_sql_block_seconds)); then
-    fail "hung database query exceeded its host deadline: $blocked_sql"
-  fi
+  [[ -s "$blocked_sql_started_file" ]] ||
+    fail "hung database query never entered its blocking fixture: $blocked_sql"
+  assert_block_timings_within \
+    "$blocked_sql_timing_prefix" \
+    2500 \
+    "hung database query $blocked_sql"
   test ! -e "$blocked_sql_fixture/host.lock" ||
     fail "hung database query left the host lock: $blocked_sql"
   if [[ "$blocked_sql" == 'PHASE5_QUERY_LEASE_RENEW' ]]; then
@@ -2812,29 +3864,41 @@ test "$renewals_before_teardown_wait" -eq "$renewals_after_teardown_wait" ||
   fail "release failure left an orphaned lease heartbeat"
 
 blocked_release_marker_fixture="$(make_fixture)"
-blocked_release_marker_started="$SECONDS"
+blocked_release_marker_started_file="$blocked_release_marker_fixture/blocked-release-marker.started"
+blocked_release_marker_timing_prefix="$blocked_release_marker_fixture/blocked-release-marker-timing"
 if PHASE5_FAKE_BLOCK_SQL_MATCH='PHASE5_RELEASE_LOCK' \
   PHASE5_FAKE_BLOCK_SQL_SECONDS='4' \
+  PHASE5_FAKE_BLOCK_SQL_STARTED_FILE="$blocked_release_marker_started_file" \
+  PHASE5_FAKE_BLOCK_TIMING_PREFIX="$blocked_release_marker_timing_prefix" \
   run_fixture "$blocked_release_marker_fixture"; then
   fail "hung advisory release marker was accepted"
 fi
-if ((SECONDS - blocked_release_marker_started >= 4)); then
-  fail "hung advisory release marker exceeded its host deadline"
-fi
+[[ -s "$blocked_release_marker_started_file" ]] ||
+  fail "hung advisory release marker never entered its blocking fixture"
+assert_block_timings_within \
+  "$blocked_release_marker_timing_prefix" \
+  2500 \
+  'hung advisory release marker'
 test ! -e "$blocked_release_marker_fixture/host.lock" ||
   fail "hung advisory release marker left the host lock"
 
 blocked_retention_fixture="$(make_fixture)"
-blocked_retention_started="$SECONDS"
+blocked_retention_started_file="$blocked_retention_fixture/blocked-retention.started"
+blocked_retention_timing_prefix="$blocked_retention_fixture/blocked-retention-timing"
 if PHASE5_FAKE_DELAY_MATCH='/app/happylearn-backup-retention --repository local' \
   PHASE5_FAKE_DELAY_SECONDS='20' \
+  PHASE5_FAKE_DELAY_STARTED_FILE="$blocked_retention_started_file" \
+  PHASE5_FAKE_BLOCK_TIMING_PREFIX="$blocked_retention_timing_prefix" \
   HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS='1' \
   run_fixture "$blocked_retention_fixture"; then
   fail "hung retention database/tag plan was accepted"
 fi
-if ((SECONDS - blocked_retention_started >= 20)); then
-  fail "hung retention database/tag plan exceeded its host deadline"
-fi
+[[ -s "$blocked_retention_started_file" ]] ||
+  fail "hung retention database/tag plan never entered its blocking fixture"
+assert_block_timings_within \
+  "$blocked_retention_timing_prefix" \
+  "$RETENTION_HOST_DEATH_LIMIT_MILLISECONDS" \
+  'hung retention database/tag plan'
 test ! -e "$blocked_retention_fixture/host.lock" ||
   fail "hung retention database/tag plan left the host lock"
 

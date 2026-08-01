@@ -205,6 +205,13 @@ restore_license_file="$tmpdir/restore-minio.license"
 restore_controller_tmp="$tmpdir/restore-controller-tmp"
 restore_docker_socket=''
 restore_docker_socket_group=''
+restore_host_uid=''
+restore_host_gid=''
+restore_controller_uid=''
+restore_controller_gid=''
+restore_controller_requires_repository_prepare=false
+restore_run_active=false
+restore_active_backup_id=''
 owned_container_ledger="$tmpdir/owned-containers.tsv"
 owned_network_ledger="$tmpdir/owned-networks.tsv"
 owned_volume_ledger="$tmpdir/owned-volumes.tsv"
@@ -216,6 +223,8 @@ image_intent_ledger="$tmpdir/image-intents.tsv"
 host_sample_dockerfile="$tmpdir/Dockerfile.host-sampler"
 seed_sql_file="$tmpdir/phase5-browser-seed.sql"
 coordinator_one_shot_file="$backup_host_root/coordinator-one-shots"
+coordinator_run_id_file="$backup_host_root/coordinator-run-id"
+recovery_backup_id=''
 resource_browser_pid=''
 resource_backup_pid=''
 resource_child_status_file=''
@@ -241,6 +250,7 @@ for ledger in \
   install -m 0600 /dev/null "$ledger"
 done
 install -m 0600 /dev/null "$coordinator_one_shot_file"
+install -m 0600 /dev/null "$coordinator_run_id_file"
 early_cleanup() {
   local exit_status=$?
   trap - EXIT HUP INT TERM
@@ -554,6 +564,11 @@ remove_intended_containers() {
 remove_active_temporary_containers() {
   local name metadata id inspected_name inspected_project inspected_owner extra
   for name in "${temporary_containers[@]}"; do
+    case "$name" in
+      "$restore_controller"|"$restore_repository_handoff")
+        continue
+        ;;
+    esac
     if ! docker_capture_bounded metadata 15 inspect --format \
       '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}' \
       "$name" 2>/dev/null; then
@@ -569,6 +584,118 @@ remove_active_temporary_containers() {
       continue
     docker_bounded 30 rm -f "$id" >/dev/null 2>&1 || true
   done
+}
+
+quiesce_restore_access_containers() {
+  local backup_id="${1:?backup ID required}"
+  local name kind listing labelled_listing id_listing metadata id
+  local inspected_id inspected_name inspected_project inspected_owner
+  local inspected_backup_id inspected_kind inspected_running extra
+  local access_container
+  [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  for access_container in \
+    "$restore_controller|controller" \
+    "$restore_repository_handoff|repository-prepare"; do
+    IFS='|' read -r name kind extra <<<"$access_container"
+    [[ "$name" =~ ^[A-Za-z0-9_.-]+$ &&
+      "$kind" =~ ^(controller|repository-prepare)$ &&
+      -z "$extra" ]] ||
+      return 1
+    docker_capture_bounded listing 15 container ls --all --quiet \
+      --no-trunc --filter "name=^/${name}$" ||
+      return 1
+    docker_capture_bounded labelled_listing 15 container ls --all --quiet \
+      --no-trunc \
+      --filter "label=io.happylearn.phase5.restore-access-backup-id=${backup_id}" \
+      --filter "label=com.docker.compose.project=${live_project}" \
+      --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+      --filter "label=io.happylearn.phase5.restore-access-kind=${kind}" ||
+      return 1
+    [[ -z "$listing" || "$listing" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ -z "$labelled_listing" ||
+      "$labelled_listing" =~ ^[a-f0-9]{64}$ ]] ||
+      return 1
+    if [[ -n "$labelled_listing" ]]; then
+      id="$labelled_listing"
+    elif [[ -n "$listing" ]]; then
+      id="$listing"
+    else
+      continue
+    fi
+    if ! docker_capture_bounded metadata 15 inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "io.happylearn.phase5.restore-access-backup-id"}}|{{index .Config.Labels "io.happylearn.phase5.restore-access-kind"}}|{{.State.Running}}' \
+      "$id"; then
+      docker_capture_bounded id_listing 15 container ls --all --quiet \
+        --no-trunc --filter "id=${id}" ||
+        return 1
+      [[ -z "$id_listing" ]] || return 1
+      docker_capture_bounded listing 15 container ls --all --quiet \
+        --no-trunc --filter "name=^/${name}$" ||
+        return 1
+      [[ -z "$listing" ]] || return 1
+      docker_capture_bounded labelled_listing 15 container ls --all --quiet \
+        --no-trunc \
+        --filter "label=io.happylearn.phase5.restore-access-backup-id=${backup_id}" \
+        --filter "label=com.docker.compose.project=${live_project}" \
+        --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+        --filter "label=io.happylearn.phase5.restore-access-kind=${kind}" ||
+        return 1
+      [[ -z "$labelled_listing" ]] || return 1
+      continue
+    fi
+    IFS='|' read -r inspected_id inspected_name inspected_project \
+      inspected_owner inspected_backup_id inspected_kind inspected_running \
+      extra <<<"$metadata"
+    [[ "$inspected_id" == "$id" &&
+      "$inspected_name" =~ ^/[A-Za-z0-9_.-]+$ &&
+      "$inspected_project" == "$live_project" &&
+      "$inspected_owner" == "$fixture_suffix" &&
+      "$inspected_backup_id" == "$backup_id" &&
+      "$inspected_kind" == "$kind" &&
+      "$inspected_running" =~ ^(true|false)$ &&
+      -z "$extra" ]] ||
+      return 1
+    if [[ "$inspected_running" == true ]]; then
+      docker_bounded 330 stop --time 300 "$id" >/dev/null || true
+    fi
+    docker_capture_bounded id_listing 15 container ls --all --quiet \
+      --no-trunc --filter "id=${id}" ||
+      return 1
+    if [[ -n "$id_listing" ]]; then
+      [[ "$id_listing" == "$id" ]] || return 1
+      docker_bounded 30 rm -f "$id" >/dev/null || return 1
+      docker_capture_bounded id_listing 15 container ls --all --quiet \
+        --no-trunc --filter "id=${id}" ||
+        return 1
+      [[ -z "$id_listing" ]] || return 1
+    fi
+    docker_capture_bounded listing 15 container ls --all --quiet \
+      --no-trunc --filter "name=^/${name}$" ||
+      return 1
+    [[ -z "$listing" ]] || return 1
+    docker_capture_bounded labelled_listing 15 container ls --all --quiet \
+      --no-trunc \
+      --filter "label=io.happylearn.phase5.restore-access-backup-id=${backup_id}" \
+      --filter "label=com.docker.compose.project=${live_project}" \
+      --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+      --filter "label=io.happylearn.phase5.restore-access-kind=${kind}" ||
+      return 1
+    [[ -z "$labelled_listing" ]] || return 1
+  done
+  verify_restore_resources_absent "$backup_id"
+}
+
+recover_active_restore_run() {
+  [[ "$restore_run_active" == true ]] || return 0
+  local backup_id="$restore_active_backup_id"
+  [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  quiesce_restore_access_containers "$backup_id" &&
+    verify_restore_resources_absent "$backup_id" ||
+    return 1
+  restore_run_active=false
+  restore_active_backup_id=''
 }
 
 record_owned_network() {
@@ -873,6 +1000,14 @@ portable_file_owner() {
   fi
 }
 
+portable_file_size() {
+  if stat -f '%z' "$1" >/dev/null 2>&1; then
+    stat -f '%z' "$1"
+  else
+    stat -c '%s' "$1"
+  fi
+}
+
 portable_file_group() {
   if stat -c '%g' "$1" >/dev/null 2>&1; then
     stat -c '%g' "$1"
@@ -892,12 +1027,13 @@ validate_resource_evidence() {
     "$(portable_file_mode "$evidence")" == 600 &&
     "$(portable_file_owner "$evidence")" == "$(id -u)" ]] ||
     return 1
-  [[ "$(wc -l <"$evidence" | tr -d '[:space:]')" == 16 ]] || return 1
+  [[ "$(wc -l <"$evidence" | tr -d '[:space:]')" == 17 ]] || return 1
   while IFS='=' read -r key value; do
     [[ -n "$key" && -n "$value" && "$value" != *'='* ]] || return 1
     case "$key" in
-      resource_evidence_version|owned_samples|saw_browser|saw_backup|\
-        saw_heavy|saw_worker|worker_heavy_overlap|configured_limits_complete|\
+      resource_evidence_version|browser_included|owned_samples|saw_browser|\
+        saw_backup|saw_heavy|saw_worker|worker_backup_overlap|\
+        configured_limits_complete|\
         peak_configured_cpu|\
         peak_configured_memory_mib|peak_live_cpu_percent|\
         peak_live_memory_mib|peak_browser_cpu_percent|\
@@ -906,13 +1042,14 @@ validate_resource_evidence() {
     esac
     [[ "$(grep -Ec "^${key}=" "$evidence")" == 1 ]] || return 1
   done <"$evidence"
-  grep -Fxq 'resource_evidence_version=1' "$evidence" &&
+  grep -Fxq 'resource_evidence_version=2' "$evidence" &&
+    grep -Fxq 'browser_included=true' "$evidence" &&
     grep -Fxq 'owned_samples=true' "$evidence" &&
     grep -Fxq 'saw_browser=true' "$evidence" &&
     grep -Fxq 'saw_backup=true' "$evidence" &&
     grep -Fxq 'saw_heavy=true' "$evidence" &&
     grep -Fxq 'saw_worker=true' "$evidence" &&
-    grep -Fxq 'worker_heavy_overlap=false' "$evidence" &&
+    grep -Fxq 'worker_backup_overlap=false' "$evidence" &&
     grep -Fxq 'configured_limits_complete=true' "$evidence" &&
     grep -Fxq 'oom_killed=false' "$evidence" ||
     return 1
@@ -943,39 +1080,71 @@ validate_resource_evidence() {
     awk -v value="$browser_memory" 'BEGIN { exit !(value > 0) }'
 }
 
+coordinator_one_shot_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    argument|ledger|id|listing|missing|collision|metadata|identity|audit|\
+      removal|residual_listing|residual|ledger_reset) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'coordinator one-shot failed: category=%s\n' "$category" >&2
+}
+
 remove_coordinator_one_shots() {
   local audit_required="${1:?audit mode required}"
   local expected_id listing metadata inspected_id inspected_name inspected_project
   local inspected_oneoff inspected_owner extra removal_status=0
-  [[ "$audit_required" == audit || "$audit_required" == cleanup ]] ||
+  local ledger_mode ledger_owner
+  [[ "$audit_required" == audit || "$audit_required" == cleanup ]] || {
+    coordinator_one_shot_failure argument
     return 1
+  }
+  ledger_mode="$(
+    portable_file_mode "$coordinator_one_shot_file" 2>/dev/null
+  )" || ledger_mode=''
+  ledger_owner="$(
+    portable_file_owner "$coordinator_one_shot_file" 2>/dev/null
+  )" || ledger_owner=''
   [[ -f "$coordinator_one_shot_file" &&
     ! -L "$coordinator_one_shot_file" &&
-    "$(portable_file_mode "$coordinator_one_shot_file")" == 600 &&
-    "$(portable_file_owner "$coordinator_one_shot_file")" == "$(id -u)" ]] ||
+    "$ledger_mode" == 600 &&
+    "$ledger_owner" == "$(id -u)" ]] || {
+    coordinator_one_shot_failure ledger
     return 1
+  }
+  if ! { exec 9<"$coordinator_one_shot_file"; } 2>/dev/null; then
+    coordinator_one_shot_failure ledger
+    return 1
+  fi
   while IFS= read -r expected_id; do
     [[ -n "$expected_id" ]] || continue
     [[ "$expected_id" =~ ^[a-f0-9]{64}$ ]] || {
+      coordinator_one_shot_failure id
       removal_status=1
       continue
     }
     if ! docker_capture_bounded listing 15 container ls --all --quiet \
-      --no-trunc --filter "id=${expected_id}"; then
+      --no-trunc --filter "id=${expected_id}" 2>/dev/null; then
+      coordinator_one_shot_failure listing
       removal_status=1
       continue
     fi
     if [[ -z "$listing" ]]; then
-      [[ "$audit_required" == cleanup ]] || removal_status=1
+      if [[ "$audit_required" == audit ]]; then
+        coordinator_one_shot_failure missing
+        removal_status=1
+      fi
       continue
     fi
     if [[ "$listing" != "$expected_id" ]]; then
+      coordinator_one_shot_failure collision
       removal_status=1
       continue
     fi
     if ! docker_capture_bounded metadata 15 inspect --format \
       '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}' \
       "$expected_id" 2>/dev/null; then
+      coordinator_one_shot_failure metadata
       removal_status=1
       continue
     fi
@@ -987,28 +1156,36 @@ remove_coordinator_one_shots() {
       "$inspected_oneoff" != True ||
       "$inspected_owner" != "$fixture_suffix" ||
       -n "$extra" ]]; then
+      coordinator_one_shot_failure identity
       removal_status=1
       continue
     fi
     if [[ "$audit_required" == audit ]] &&
-      ! audit_container_metadata "$expected_id"; then
+      ! audit_container_metadata "$expected_id" 2>/dev/null; then
+      coordinator_one_shot_failure audit
       removal_status=1
       continue
     fi
-    docker_bounded 30 rm -f "$expected_id" >/dev/null || {
+    docker_bounded 30 rm -f "$expected_id" >/dev/null 2>&1 || {
+      coordinator_one_shot_failure removal
       removal_status=1
       continue
     }
     if ! docker_capture_bounded listing 15 container ls --all --quiet \
-      --no-trunc --filter "id=${expected_id}"; then
+      --no-trunc --filter "id=${expected_id}" 2>/dev/null; then
+      coordinator_one_shot_failure residual_listing
       removal_status=1
     elif [[ -n "$listing" ]]; then
+      coordinator_one_shot_failure residual
       removal_status=1
     fi
-  done <"$coordinator_one_shot_file"
+  done <&9
+  exec 9<&-
   if ((removal_status == 0)); then
-    install -m 0600 /dev/null "$coordinator_one_shot_file" ||
+    install -m 0600 /dev/null "$coordinator_one_shot_file" 2>/dev/null || {
+      coordinator_one_shot_failure ledger_reset
       removal_status=1
+    }
   fi
   return "$removal_status"
 }
@@ -1064,6 +1241,7 @@ cleanup() {
   cancel_resource_workloads || cleanup_status=1
   cancel_bounded_command || cleanup_status=1
   remove_active_temporary_containers || cleanup_status=1
+  recover_active_restore_run || cleanup_status=1
   if ((exit_status != 0)); then diagnostics || true; fi
   if [[ -e "$resource_report" ]]; then
     if [[ -f "$resource_report" &&
@@ -1498,6 +1676,7 @@ initialize_resources() {
     return 2
   }
   rm -f "$artifact_dir/resource-samples.tsv"
+  rm -f "$artifact_dir/backup-id"
   initialize_artifact_directory
   create_owned_network
   local volume compose_volume=''
@@ -1957,8 +2136,7 @@ run_all_mobile() {
     '. /workspace/scripts/e2e-harness-lib.sh; test_status=0; E2E_OUTPUT_DIR=/artifacts/results/phase4-mobile corepack pnpm exec playwright test tests/e2e/ai-questions.spec.ts tests/e2e/ai-admin.spec.ts tests/e2e/ai-privacy.spec.ts --project=mobile --grep @phase4-mobile || test_status="$(preserve_first_failure "$test_status" "$?")"; E2E_OUTPUT_DIR=/artifacts/results/phase5-mobile corepack pnpm exec playwright test tests/e2e/operations.spec.ts --project=mobile --grep @phase5-mobile || test_status="$(preserve_first_failure "$test_status" "$?")"; exit "$test_status"'
 }
 
-run_backup_proof() {
-  local backup_status=0 one_shot_status=0
+run_backup_workflow() {
   HAPPYLEARN_BACKUP_LIVE_TEST=1 \
   HAPPYLEARN_BACKUP_LIVE_PROJECT="$live_project" \
   HAPPYLEARN_BACKUP_LIVE_ROOT="$backup_host_root" \
@@ -1974,17 +2152,102 @@ run_backup_proof() {
   HAPPYLEARN_AISTOR_LICENSE_FILE="$license_file" \
   HAPPYLEARN_PHASE5_E2E_OWNER="$fixture_suffix" \
     run_bounded 3600 bash "$script_dir/phase5-backup.sh" \
-      --project happylearn-dev --trigger manual ||
-    backup_status=$?
+      --project happylearn-dev --trigger manual
+}
+
+backup_finalization_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    one_shot_audit|recovery_evidence) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'backup finalization failed: category=%s\n' "$category" >&2
+}
+
+finalize_backup_proof() {
+  local backup_status="${1:?backup status required}"
+  local one_shot_status=0 recovery_evidence_status=0
+  [[ "$backup_status" =~ ^([0-9]|[1-9][0-9]{1,2})$ &&
+    "$backup_status" -le 255 ]] ||
+    return 2
   remove_coordinator_one_shots audit || one_shot_status=$?
+  if ((one_shot_status != 0)); then
+    backup_finalization_failure one_shot_audit
+  fi
   if ((backup_status != 0)); then return "$backup_status"; fi
   if ((one_shot_status != 0)); then return "$one_shot_status"; fi
-  write_recovery_backup_id
+  write_recovery_backup_id || recovery_evidence_status=$?
+  if ((recovery_evidence_status != 0)); then
+    backup_finalization_failure recovery_evidence
+    return "$recovery_evidence_status"
+  fi
+  return 0
+}
+
+run_backup_proof() {
+  local backup_status=0
+  run_backup_workflow || backup_status=$?
+  finalize_backup_proof "$backup_status"
+}
+
+recovery_evidence_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    invalidate|handoff|query|invalid|write|publish) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'recovery evidence failed: category=%s\n' "$category" >&2
+}
+
+read_coordinator_run_id() {
+  local run_id
+  local handoff_mode handoff_owner handoff_size
+  handoff_mode="$(
+    portable_file_mode "$coordinator_run_id_file" 2>/dev/null
+  )" || handoff_mode=''
+  handoff_owner="$(
+    portable_file_owner "$coordinator_run_id_file" 2>/dev/null
+  )" || handoff_owner=''
+  handoff_size="$(
+    portable_file_size "$coordinator_run_id_file" 2>/dev/null
+  )" || handoff_size=''
+  [[ -f "$coordinator_run_id_file" &&
+    ! -L "$coordinator_run_id_file" &&
+    "$handoff_mode" == 600 &&
+    "$handoff_owner" == "$(id -u)" &&
+    "$handoff_size" == 37 ]] ||
+    return 1
+  if ! { exec 8<"$coordinator_run_id_file"; } 2>/dev/null; then
+    return 1
+  fi
+  if ! IFS= read -r run_id <&8; then
+    exec 8<&-
+    return 1
+  fi
+  exec 8<&-
+  [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  printf '%s\n' "$run_id"
 }
 
 write_recovery_backup_id() {
-  local evidence backup_id local_snapshot_id remote_snapshot_id extra
+  local expected_backup_id evidence
+  local backup_id local_snapshot_id remote_snapshot_id extra
   local temporary="$tmpdir/recovery-backup-id"
+  local staging='' published=''
+  local invalidate_status=0 query_status=0 write_status=0
+  local staging_status=0 install_status=0 move_status=0
+  recovery_backup_id=''
+  rm -f "$artifact_dir/backup-id" 2>/dev/null ||
+    invalidate_status=$?
+  if ((invalidate_status != 0)); then
+    recovery_evidence_failure invalidate
+    return "$invalidate_status"
+  fi
+  expected_backup_id="$(read_coordinator_run_id)" || {
+    recovery_evidence_failure handoff
+    return 1
+  }
   evidence="$(
     docker_bounded 120 exec "$postgres" \
       psql --username happylearn --dbname happylearn \
@@ -1992,22 +2255,67 @@ write_recovery_backup_id() {
         --set ON_ERROR_STOP=1 --command \
         "SELECT id::text || '|' || local_snapshot_id || '|' || remote_snapshot_id
          FROM backup_runs
-         WHERE state='succeeded'
-           AND idempotency_key LIKE 'host-%'
+         WHERE id='${expected_backup_id}'::uuid
+           AND state='succeeded'
            AND local_snapshot_id ~ '^[0-9a-f]{64}$'
            AND remote_snapshot_id ~ '^[0-9a-f]{64}$'
          ORDER BY finished_at DESC,id DESC
-         LIMIT 1;"
-  )"
+         LIMIT 1;" 2>/dev/null
+  )" || query_status=$?
+  if ((query_status != 0)); then
+    recovery_evidence_failure query
+    return "$query_status"
+  fi
   IFS='|' read -r backup_id local_snapshot_id remote_snapshot_id extra \
     <<<"$evidence"
-  [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
+  [[ "$backup_id" == "$expected_backup_id" &&
+    "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
     "$local_snapshot_id" =~ ^[0-9a-f]{64}$ &&
     "$remote_snapshot_id" =~ ^[0-9a-f]{64}$ &&
-    -z "$extra" ]] ||
+    -z "$extra" ]] || {
+    recovery_evidence_failure invalid
     return 1
-  printf '%s\n' "$backup_id" >"$temporary"
-  install -m 0600 "$temporary" "$artifact_dir/backup-id"
+  }
+  printf '%s\n' "$backup_id" 2>/dev/null >"$temporary" ||
+    write_status=$?
+  if ((write_status != 0)); then
+    recovery_evidence_failure write
+    return "$write_status"
+  fi
+  staging="$(
+    mktemp "$artifact_dir/.backup-id.XXXXXX" 2>/dev/null
+  )" || staging_status=$?
+  if ((staging_status != 0)); then
+    recovery_evidence_failure publish
+    return "$staging_status"
+  fi
+  install -m 0600 "$temporary" "$staging" 2>/dev/null ||
+    install_status=$?
+  if ((install_status != 0)); then
+    rm -f "$staging" 2>/dev/null || true
+    recovery_evidence_failure publish
+    return "$install_status"
+  fi
+  mv -f "$staging" "$artifact_dir/backup-id" 2>/dev/null ||
+    move_status=$?
+  if ((move_status != 0)); then
+    rm -f "$staging" 2>/dev/null || true
+    recovery_evidence_failure publish
+    return "$move_status"
+  fi
+  if [[ -f "$artifact_dir/backup-id" &&
+    ! -L "$artifact_dir/backup-id" &&
+    "$(portable_file_mode "$artifact_dir/backup-id" 2>/dev/null)" == 600 &&
+    "$(portable_file_owner "$artifact_dir/backup-id" 2>/dev/null)" == "$(id -u)" &&
+    "$(portable_file_size "$artifact_dir/backup-id" 2>/dev/null)" == 37 ]] &&
+    IFS= read -r published <"$artifact_dir/backup-id" 2>/dev/null &&
+    [[ "$published" == "$backup_id" ]]; then
+    recovery_backup_id="$backup_id"
+    return 0
+  fi
+  rm -f "$artifact_dir/backup-id" 2>/dev/null || true
+  recovery_evidence_failure publish
+  return 1
 }
 
 resolve_restore_docker_socket() {
@@ -2029,8 +2337,33 @@ resolve_restore_docker_socket() {
   [[ "$restore_docker_socket_group" =~ ^[0-9]+$ ]]
 }
 
+resolve_restore_controller_identity() {
+  restore_host_uid="$(id -u)" || return 1
+  restore_host_gid="$(id -g)" || return 1
+  [[ "$restore_host_uid" =~ ^[0-9]+$ &&
+    "$restore_host_gid" =~ ^[0-9]+$ ]] ||
+    return 1
+  restore_controller_uid="$restore_host_uid"
+  restore_controller_gid="$restore_host_gid"
+  restore_controller_requires_repository_prepare=false
+  case "$(uname -s)" in
+    Darwin)
+      restore_controller_uid=0
+      restore_controller_gid=0
+      ;;
+    Linux)
+      [[ "$restore_host_uid" != 0 ]] || return 1
+      restore_controller_requires_repository_prepare=true
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 prepare_restore_repository_access() {
-  local host_uid host_gid
+  local backup_id="${1:?backup ID required}"
+  local host_uid host_gid handoff_status=0
+  [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
   host_uid="$(id -u)"
   host_gid="$(id -g)"
   [[ "$host_uid" =~ ^[0-9]+$ && "$host_gid" =~ ^[0-9]+$ ]] ||
@@ -2038,6 +2371,8 @@ prepare_restore_repository_access() {
   docker_bounded 300 run --rm --name "$restore_repository_handoff" \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --label "io.happylearn.phase5.restore-access-backup-id=${backup_id}" \
+    --label "io.happylearn.phase5.restore-access-kind=repository-prepare" \
     --network none --read-only --user 0:0 --cap-drop ALL \
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
     --security-opt no-new-privileges --memory 128m --cpus .1 \
@@ -2061,7 +2396,9 @@ prepare_restore_repository_access() {
       test "$(stat -c "%u:%g:%a" /repository)" = "$uid:$gid:700"
       repository_find_empty ! -user "$uid" -print -quit
       repository_find_empty ! -group "$gid" -print -quit
-    ' handoff "$host_uid" "$host_gid"
+    ' handoff "$host_uid" "$host_gid" ||
+    handoff_status=$?
+  ((handoff_status == 0)) || return "$handoff_status"
   [[ "$(portable_file_owner "$backup_host_root/repository")" == "$host_uid" &&
     "$(portable_file_mode "$backup_host_root/repository")" == 700 ]]
 }
@@ -2093,25 +2430,48 @@ verify_restore_resources_absent() {
     esac
     [[ -z "$resources" ]] || return 1
   done
+  docker_capture_bounded resources 15 container ls --all --quiet \
+    --filter \
+    "label=io.happylearn.phase5.restore-access-backup-id=${backup_id}" ||
+    return 1
+  [[ -z "$resources" ]]
 }
 
 run_restore_proof() {
   local backup_id_file="$artifact_dir/backup-id"
-  local backup_id controller_status=0 report_file
+  local backup_id preflight_status=0 controller_status=0 quiesce_status=0
+  local resource_status=0 report_file
+  [[ "$recovery_backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
   [[ -f "$backup_id_file" && ! -L "$backup_id_file" ]] || return 1
   backup_id="$(<"$backup_id_file")"
   [[ "$backup_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
     return 1
-  resolve_restore_docker_socket
-  prepare_restore_repository_access
-  docker_bounded 3600 run --rm --name "$restore_controller" \
+  [[ "$backup_id" == "$recovery_backup_id" ]] || return 1
+  resolve_restore_docker_socket || preflight_status=$?
+  if ((preflight_status == 0)); then
+    resolve_restore_controller_identity || preflight_status=$?
+  fi
+  if ((preflight_status == 0)); then
+    restore_active_backup_id="$backup_id"
+    restore_run_active=true
+    if [[ "$restore_controller_requires_repository_prepare" == true ]]; then
+      prepare_restore_repository_access "$backup_id" ||
+        preflight_status=$?
+    fi
+  fi
+  if ((preflight_status == 0)); then
+    docker_bounded 3600 run --rm --name "$restore_controller" \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
-    --network none --read-only --user "$(id -u):$(id -g)" \
+    --label "io.happylearn.phase5.restore-access-backup-id=${backup_id}" \
+    --label "io.happylearn.phase5.restore-access-kind=controller" \
+    --network none --read-only \
+    --user "$restore_controller_uid:$restore_controller_gid" \
     --group-add "$restore_docker_socket_group" \
     --cap-drop ALL --security-opt no-new-privileges \
     --memory 256m --memory-swap 256m --cpus .2 --pids-limit 128 \
-    --tmpfs "/tmp:rw,noexec,nosuid,size=16m,uid=$(id -u),gid=$(id -g),mode=0700" \
+    --tmpfs "/tmp:rw,noexec,nosuid,size=16m,uid=$restore_controller_uid,gid=$restore_controller_gid,mode=0700" \
     --mount "type=bind,src=$restore_docker_socket,dst=/var/run/docker.sock" \
     --mount "type=bind,src=$repo_root,dst=$repo_root,readonly" \
     --mount "type=bind,src=$backup_host_root/repository,dst=$backup_host_root/repository" \
@@ -2136,13 +2496,29 @@ run_restore_proof() {
     --entrypoint /bin/bash "$restore_controller_image" -ceu \
     'exec /bin/bash "$RESTORE_SCRIPT" --backup-id "$BACKUP_ID"' ||
     controller_status=$?
-  verify_restore_resources_absent "$backup_id" || return 1
+  fi
+  if [[ "$restore_run_active" == true ]]; then
+    quiesce_restore_access_containers "$backup_id" ||
+      quiesce_status=$?
+    if ((quiesce_status == 0)); then
+      verify_restore_resources_absent "$backup_id" ||
+        resource_status=$?
+      if ((resource_status == 0)); then
+        restore_run_active=false
+        restore_active_backup_id=''
+      fi
+    fi
+  fi
+  ((preflight_status == 0)) || return "$preflight_status"
   ((controller_status == 0)) || return "$controller_status"
+  ((quiesce_status == 0)) || return "$quiesce_status"
+  ((resource_status == 0)) || return "$resource_status"
   report_file="$restore_report_dir/restore-${backup_id}.json"
   [[ -f "$report_file" &&
     ! -L "$report_file" &&
     "$(portable_file_mode "$report_file")" == 600 &&
-    "$(portable_file_owner "$report_file")" == "$(id -u)" ]]
+    "$(portable_file_owner "$report_file")" == "$restore_host_uid" &&
+    "$(portable_file_group "$report_file")" == "$restore_host_gid" ]]
 }
 
 run_resource_browser_load() {
@@ -2424,12 +2800,33 @@ resource_monitor_failure() {
   printf 'resource monitor failed: category=%s\n' "$category" >&2
 }
 
+resource_is_backup_activity() {
+  local container_name="${1:?container name required}"
+  local service="${2-}"
+  local oneoff="${3-}"
+  [[ "$container_name" == /* &&
+    "$service" =~ ^(backup|backup-storage-init|backup-secrets-init)?$ &&
+    "$oneoff" =~ ^(True)?$ ]] ||
+    return 1
+  case "$service" in
+    backup|backup-storage-init|backup-secrets-init) return 0 ;;
+  esac
+  [[ "$container_name" == "/$backup" ]] && return 0
+  [[ "$oneoff" == True ]] || return 1
+  case "${container_name#/}" in
+    "${live_project}-backup-run-"*|\
+      "${live_project}-backup-storage-init-run-"*|\
+      "${live_project}-backup-secrets-init-run-"*) return 0 ;;
+  esac
+  return 1
+}
+
 monitor_resource_workloads() {
   local browser_pid="${1:?browser pid required}"
   local backup_pid="${2:?backup pid required}"
   local evidence="${3:?evidence path required}"
   local saw_browser=false saw_backup=false saw_heavy=false saw_worker=false
-  local owned_samples=true worker_heavy_overlap=false oom_killed=false
+  local owned_samples=true worker_backup_overlap=false oom_killed=false
   local configured_limits_complete=true
   local peak_configured_cpu=0 peak_configured_memory_mib=0
   local peak_live_cpu_percent=0 peak_live_memory_mib=0
@@ -2440,10 +2837,11 @@ monitor_resource_workloads() {
   local resource_state current_listing container_oom restart_count
   local roster_policy
   local nano_cpus memory_bytes
-  local command worker_running heavy_running backup_running browser_id
+  local command worker_running heavy_running backup_activity_running browser_id
   local configured_cpu configured_memory stats sample live_cpu live_memory
   local browser_stats browser_sample browser_cpu browser_memory
-  local production_ids=()
+  local aggregate_container
+  local aggregate_ids=()
   install -m 0600 /dev/null "$evidence"
   while kill -0 "$browser_pid" 2>/dev/null ||
     kill -0 "$backup_pid" 2>/dev/null; do
@@ -2469,11 +2867,11 @@ monitor_resource_workloads() {
     }
     worker_running=false
     heavy_running=false
-    backup_running=false
+    backup_activity_running=false
     browser_id=''
     configured_cpu=0
     configured_memory=0
-    production_ids=()
+    aggregate_ids=()
     while IFS= read -r id; do
       [[ -n "$id" ]] || continue
       [[ "$id" =~ ^[a-f0-9]{64}$ ]] || {
@@ -2532,6 +2930,11 @@ monitor_resource_workloads() {
         "$state" == true ]]; then
         browser_id="$id"
       fi
+      if [[ "$state" == true ]] &&
+        resource_is_backup_activity "$inspected_name" "$service" "$oneoff"; then
+        backup_activity_running=true
+        saw_backup=true
+      fi
       if [[ "$service" == backup ]]; then
         resource_monitor_capture command 15 inspect --format \
           '{{json .Config.Cmd}}' "$id" || {
@@ -2553,31 +2956,36 @@ monitor_resource_workloads() {
         fi
       fi
       if [[ "$state" == true ]]; then
+        aggregate_container=false
         if [[ "$service" == worker ]]; then
           worker_running=true
           saw_worker=true
         fi
         case "$service" in
-          postgres|redis|minio|app|worker|backup)
-            production_ids+=("$id")
-            [[ "$service" == backup ]] && backup_running=true
-            if [[ "$nano_cpus" == 0 || "$memory_bytes" == 0 ]]; then
-              configured_limits_complete=false
-            fi
-            configured_cpu="$(
-              awk -v total="$configured_cpu" -v value="$nano_cpus" \
-                'BEGIN { printf "%.6f", total + value / 1000000000 }'
-            )"
-            configured_memory="$(
-              awk -v total="$configured_memory" -v value="$memory_bytes" \
-                'BEGIN { printf "%.6f", total + value / 1048576 }'
-            )"
-            ;;
+          postgres|redis|minio|app|worker|backup|backup-storage-init|\
+            backup-secrets-init) aggregate_container=true ;;
         esac
+        [[ "$inspected_name" == "/$browser_runner" ]] &&
+          aggregate_container=true
+        if [[ "$aggregate_container" == true ]]; then
+          aggregate_ids+=("$id")
+          if [[ "$nano_cpus" == 0 || "$memory_bytes" == 0 ]]; then
+            configured_limits_complete=false
+          fi
+          configured_cpu="$(
+            awk -v total="$configured_cpu" -v value="$nano_cpus" \
+              'BEGIN { printf "%.6f", total + value / 1000000000 }'
+          )"
+          configured_memory="$(
+            awk -v total="$configured_memory" -v value="$memory_bytes" \
+              'BEGIN { printf "%.6f", total + value / 1048576 }'
+          )"
+        fi
       fi
     done <<<"$listing"
-    if [[ "$worker_running" == true && "$heavy_running" == true ]]; then
-      worker_heavy_overlap=true
+    if [[ "$worker_running" == true &&
+      "$backup_activity_running" == true ]]; then
+      worker_backup_overlap=true
     fi
     peak_configured_cpu="$(
       awk -v old="$peak_configured_cpu" -v new="$configured_cpu" \
@@ -2587,10 +2995,10 @@ monitor_resource_workloads() {
       awk -v old="$peak_configured_memory_mib" -v new="$configured_memory" \
         'BEGIN { printf "%.3f", (new > old ? new : old) }'
     )"
-    if ((${#production_ids[@]} > 0)); then
+    if ((${#aggregate_ids[@]} > 0)); then
       resource_monitor_capture stats 30 stats --no-stream \
         --format '{{.CPUPerc}}|{{.MemUsage}}' \
-        "${production_ids[@]}" || {
+        "${aggregate_ids[@]}" || {
         resource_monitor_failure production_stats
         return 1
       }
@@ -2608,7 +3016,6 @@ monitor_resource_workloads() {
         awk -v old="$peak_live_memory_mib" -v new="$live_memory" \
           'BEGIN { printf "%.3f", (new > old ? new : old) }'
       )"
-      [[ "$backup_running" == true ]] && saw_backup=true
     fi
     if [[ -n "$browser_id" ]]; then
       if ! resource_monitor_capture browser_stats 30 stats --no-stream \
@@ -2648,13 +3055,14 @@ monitor_resource_workloads() {
   }
   {
     printf '%s\n' \
-      'resource_evidence_version=1' \
+      'resource_evidence_version=2' \
+      'browser_included=true' \
       "owned_samples=$owned_samples" \
       "saw_browser=$saw_browser" \
       "saw_backup=$saw_backup" \
       "saw_heavy=$saw_heavy" \
       "saw_worker=$saw_worker" \
-      "worker_heavy_overlap=$worker_heavy_overlap" \
+      "worker_backup_overlap=$worker_backup_overlap" \
       "configured_limits_complete=$configured_limits_complete" \
       "peak_configured_cpu=$peak_configured_cpu" \
       "peak_configured_memory_mib=$peak_configured_memory_mib" \
@@ -2671,7 +3079,7 @@ run_resource_sample() {
   local duration="${1:?duration required}"
   local report="$artifact_dir/resource-samples.tsv"
   local temporary="$tmpdir/resource-evidence"
-  local browser_status=0 backup_status=0 monitor_status=0
+  local browser_status=0 backup_status=0 monitor_status=0 finalize_status=0
   local child_status_file status=0
   for child_status_file in \
     "$resource_browser_status_file" "$resource_backup_status_file"; do
@@ -2682,7 +3090,7 @@ run_resource_sample() {
   run_resource_child "$resource_browser_status_file" \
     run_resource_browser_load "$duration" &
   resource_browser_pid=$!
-  run_resource_child "$resource_backup_status_file" run_backup_proof &
+  run_resource_child "$resource_backup_status_file" run_backup_workflow &
   resource_backup_pid=$!
   monitor_resource_workloads \
     "$resource_browser_pid" "$resource_backup_pid" "$temporary" ||
@@ -2695,17 +3103,19 @@ run_resource_sample() {
     browser_status=125
   backup_status="$(read_resource_child_status "$resource_backup_status_file")" ||
     backup_status=125
+  finalize_backup_proof "$backup_status" || finalize_status=$?
   merge_resource_statuses \
-    "$browser_status" "$backup_status" "$monitor_status" ||
+    "$browser_status" "$backup_status" "$monitor_status" "$finalize_status" ||
     status=$?
   if ((status != 0)); then
     printf \
-      'resource sample failed: browser=%s backup=%s monitor=%s\n' \
-      "$browser_status" "$backup_status" "$monitor_status" >&2
+      'resource sample failed: browser=%s backup=%s monitor=%s finalize=%s\n' \
+      "$browser_status" "$backup_status" "$monitor_status" \
+      "$finalize_status" >&2
     return "$status"
   fi
-  validate_resource_evidence "$temporary"
-  install -m 0600 "$temporary" "$report"
+  validate_resource_evidence "$temporary" || return $?
+  install -m 0600 "$temporary" "$report" || return $?
 }
 
 run_signal_contract_probe() {

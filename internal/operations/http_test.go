@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"happylearn.local/app/internal/audit"
 	"happylearn.local/app/internal/auth"
+	"happylearn.local/app/internal/platform/httpx"
 )
 
 type operationsHTTPStub struct {
@@ -83,6 +84,11 @@ func TestOperationsAuditServiceRequiresActiveAdminContext(t *testing.T) {
 func TestOperationsHTTPSettingsAreTypedStrictAndConflictSafe(t *testing.T) {
 	stub := &operationsHTTPStub{settings: validSettings()}
 	stub.settings.UpdatedAt = time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	validatedAt := time.Date(2026, 7, 28, 0, 59, 0, 0, time.UTC)
+	stub.settings.Infrastructure = []InfrastructureStatus{{
+		Key: InfrastructureApplicationDatabase, Configured: true,
+		LastValidatedAt: &validatedAt,
+	}}
 	handler := NewAdminHandler(stub, nil).Routes()
 
 	get := operationsHTTPRequest(http.MethodGet, "/settings", "", auth.RoleAdmin)
@@ -93,22 +99,56 @@ func TestOperationsHTTPSettingsAreTypedStrictAndConflictSafe(t *testing.T) {
 		t.Fatalf("get status=%d headers=%v body=%s", getResult.Code, getResult.Header(), getResult.Body.String())
 	}
 	body := getResult.Body.String()
+	var decoded struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(getResult.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Data) != 27 {
+		t.Fatalf("settings keys=%v", decoded.Data)
+	}
+	var infrastructure []map[string]json.RawMessage
+	if err := json.Unmarshal(decoded.Data["infrastructure"], &infrastructure); err != nil {
+		t.Fatal(err)
+	}
+	if len(infrastructure) != 9 {
+		t.Fatalf("infrastructure=%v", infrastructure)
+	}
+	for index, status := range infrastructure {
+		if len(status) != 3 || status["key"] == nil ||
+			status["configured"] == nil || status["lastValidatedAt"] == nil {
+			t.Fatalf("infrastructure[%d]=%v", index, status)
+		}
+	}
 	for _, field := range []string{
 		`"version":1`, `"siteName":"HappyLearn"`, `"siteAnnouncement":""`,
 		`"softDeleteRetentionDays":30`, `"auditRetentionDays":365`,
 		`"operationalSampleRetentionDays":7`, `"backupHour":3`,
 		`"backupMinute":0`, `"backupTimezone":"Asia/Shanghai"`,
 		`"diskWarningPercent":75`, `"diskCriticalPercent":90`,
+		`"backupFilesystemWarningPercent":75`, `"backupFilesystemCriticalPercent":90`,
+		`"localBackupAgeWarningHours":25`, `"localBackupAgeCriticalHours":30`,
 		`"aiErrorWarningPercent":10`, `"aiErrorCriticalPercent":25`,
 		`"processingQueueWarning":20`, `"processingQueueCritical":100`,
+		`"processingFailureWarningCount":5`, `"processingFailureCriticalCount":20`,
+		`"loginFailureWarningCount":20`, `"loginFailureCriticalCount":100`,
+		`"authorizationDenialWarningCount":50`, `"authorizationDenialCriticalCount":200`,
+		`"infrastructure":[{"key":"application_database","configured":true,"lastValidatedAt":"2026-07-28T00:59:00Z"}`,
+		`{"key":"remote_backup","configured":false,"lastValidatedAt":null}]`,
 		`"updatedAt":"2026-07-28T01:00:00Z"`,
 	} {
 		if !strings.Contains(body, field) {
 			t.Fatalf("missing %s in %s", field, body)
 		}
 	}
-	if strings.Contains(body, "updatedBy") {
-		t.Fatalf("internal updater leaked: %s", body)
+	for _, forbidden := range []string{
+		"updatedBy", "database-url-secret", "/run/secrets/database",
+		"https://private.example", "repository/private",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("forbidden value %q leaked: %s", forbidden, body)
+		}
 	}
 	queryResult := httptest.NewRecorder()
 	handler.ServeHTTP(queryResult, operationsHTTPRequest(
@@ -131,11 +171,20 @@ func TestOperationsHTTPSettingsAreTypedStrictAndConflictSafe(t *testing.T) {
 		"backupTimezone":"Asia/Shanghai",
 		"diskWarningPercent":75,
 		"diskCriticalPercent":90,
+		"backupFilesystemWarningPercent":75,
+		"backupFilesystemCriticalPercent":90,
+		"localBackupAgeWarningHours":25,
+		"localBackupAgeCriticalHours":30,
 		"aiErrorWarningPercent":10,
 		"aiErrorCriticalPercent":25,
 		"processingQueueWarning":20,
 		"processingQueueCritical":100,
-		"updatedAt":"2026-07-28T01:00:00Z"
+		"processingFailureWarningCount":5,
+		"processingFailureCriticalCount":20,
+		"loginFailureWarningCount":20,
+		"loginFailureCriticalCount":100,
+		"authorizationDenialWarningCount":50,
+		"authorizationDenialCriticalCount":200
 	}`
 	put := operationsHTTPRequest(http.MethodPut, "/settings", valid, auth.RoleAdmin)
 	putResult := httptest.NewRecorder()
@@ -173,9 +222,6 @@ func TestOperationsHTTPSettingsAreTypedStrictAndConflictSafe(t *testing.T) {
 
 func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 	valid := validOperationsSettingsJSON()
-	withoutUpdatedAt := strings.Replace(
-		valid, `,"updatedAt":"2026-07-28T01:00:00Z"`, "", 1,
-	)
 	invalidUTF8 := strings.Replace(valid, "HappyLearn", "Happy\xffLearn", 1)
 	tooLarge := valid + strings.Repeat(" ", 65<<10)
 
@@ -188,7 +234,10 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 	}{
 		{"all exact contract fields", valid, []string{"application/json"}, http.StatusOK, ""},
 		{"valid utf8 charset", valid, []string{"application/json; charset=UTF-8"}, http.StatusOK, ""},
-		{"updatedAt omitted", withoutUpdatedAt, []string{"application/json"}, http.StatusOK, ""},
+		{"updatedAt rejected", strings.Replace(valid, `"version":1`, `"version":1,"updatedAt":"2026-07-28T01:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"infrastructure rejected", strings.Replace(valid, `"version":1`, `"version":1,"infrastructure":[]`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"configured rejected", strings.Replace(valid, `"version":1`, `"version":1,"configured":true`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
+		{"lastValidatedAt rejected", strings.Replace(valid, `"version":1`, `"version":1,"lastValidatedAt":null`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"missing content type", valid, nil, http.StatusUnsupportedMediaType, "unsupported_media_type"},
 		{"duplicate content type", valid, []string{"application/json", "application/json"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
 		{"wrong content type", valid, []string{"text/plain"}, http.StatusUnsupportedMediaType, "unsupported_media_type"},
@@ -200,10 +249,6 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 		{"siteName case alias", strings.Replace(valid, `"siteName":"HappyLearn"`, `"siteName":"HappyLearn","SiteName":"Other"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"only Version alias", strings.Replace(valid, `"version":1`, `"Version":1`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"only SiteName alias", strings.Replace(valid, `"siteName":"HappyLearn"`, `"SiteName":"HappyLearn"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
-		{"duplicate updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"2026-07-28T01:00:00Z","updatedAt":"2026-07-29T01:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
-		{"null updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":null`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
-		{"zero updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"0001-01-01T00:00:00Z"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
-		{"invalid updatedAt", strings.Replace(valid, `"updatedAt":"2026-07-28T01:00:00Z"`, `"updatedAt":"not-a-time"`, 1), []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"invalid utf8", invalidUTF8, []string{"application/json"}, http.StatusBadRequest, "settings_invalid"},
 		{"too large", tooLarge, []string{"application/json"}, http.StatusRequestEntityTooLarge, "request_too_large"},
 	} {
@@ -221,7 +266,8 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 				t.Fatalf("status=%d want=%d puts=%d body=%s", result.Code, tc.wantStatus, stub.puts, result.Body.String())
 			}
 			if tc.wantStatus == http.StatusOK {
-				if stub.puts != 1 || !stub.lastPut.UpdatedAt.IsZero() {
+				if stub.puts != 1 || !stub.lastPut.UpdatedAt.IsZero() ||
+					len(stub.lastPut.Infrastructure) != 0 {
 					t.Fatalf("puts=%d lastPut=%#v", stub.puts, stub.lastPut)
 				}
 				return
@@ -230,6 +276,58 @@ func TestOperationsHTTPSettingsPUTEnforcesStrictJSONBoundary(t *testing.T) {
 				t.Fatalf("invalid request reached service: puts=%d", stub.puts)
 			}
 			assertOperationsErrorEnvelope(t, result, tc.wantCode)
+		})
+	}
+}
+
+func TestOperationsHTTPSettingsPUTUsesServiceThresholdBoundaries(t *testing.T) {
+	valid := validOperationsSettingsJSON()
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"backup filesystem warning lower bound", `"backupFilesystemWarningPercent":75`, `"backupFilesystemWarningPercent":0`},
+		{"backup filesystem critical upper bound", `"backupFilesystemCriticalPercent":90`, `"backupFilesystemCriticalPercent":101`},
+		{"backup filesystem ordering", `"backupFilesystemCriticalPercent":90`, `"backupFilesystemCriticalPercent":75`},
+		{"local backup age warning lower bound", `"localBackupAgeWarningHours":25`, `"localBackupAgeWarningHours":0`},
+		{"local backup age critical upper bound", `"localBackupAgeCriticalHours":30`, `"localBackupAgeCriticalHours":2147483648`},
+		{"local backup age ordering", `"localBackupAgeCriticalHours":30`, `"localBackupAgeCriticalHours":25`},
+		{"processing failure warning lower bound", `"processingFailureWarningCount":5`, `"processingFailureWarningCount":0`},
+		{"processing failure critical upper bound", `"processingFailureCriticalCount":20`, `"processingFailureCriticalCount":2147483648`},
+		{"processing failure ordering", `"processingFailureCriticalCount":20`, `"processingFailureCriticalCount":5`},
+		{"login failure warning lower bound", `"loginFailureWarningCount":20`, `"loginFailureWarningCount":0`},
+		{"login failure critical upper bound", `"loginFailureCriticalCount":100`, `"loginFailureCriticalCount":2147483648`},
+		{"login failure ordering", `"loginFailureCriticalCount":100`, `"loginFailureCriticalCount":20`},
+		{"authorization denial warning lower bound", `"authorizationDenialWarningCount":50`, `"authorizationDenialWarningCount":0`},
+		{"authorization denial critical upper bound", `"authorizationDenialCriticalCount":200`, `"authorizationDenialCriticalCount":2147483648`},
+		{"authorization denial ordering", `"authorizationDenialCriticalCount":200`, `"authorizationDenialCriticalCount":50`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{settings: validSettings()}
+			handler := httpx.RequestID(NewAdminHandler(NewService(store), nil).Routes())
+			body := strings.Replace(valid, tc.old, tc.new, 1)
+			if body == valid {
+				t.Fatalf("test mutation did not change request body: %s", tc.old)
+			}
+
+			result := httptest.NewRecorder()
+			handler.ServeHTTP(result, operationsHTTPRequest(
+				http.MethodPut, "/settings", body, auth.RoleAdmin,
+			))
+
+			if result.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", result.Code, result.Body.String())
+			}
+			if store.updateCalls != 0 || store.rejectionCalls != 1 || store.rejectionReason != "threshold" {
+				t.Fatalf(
+					"updates=%d rejections=%d reason=%q",
+					store.updateCalls,
+					store.rejectionCalls,
+					store.rejectionReason,
+				)
+			}
+			assertOperationsErrorEnvelope(t, result, "settings_invalid")
 		})
 	}
 }
@@ -464,7 +562,7 @@ func operationsHTTPRequest(method, target, body string, role auth.Role) *http.Re
 }
 
 func validOperationsSettingsJSON() string {
-	return `{"version":1,"siteName":"HappyLearn","siteAnnouncement":"","softDeleteRetentionDays":30,"auditRetentionDays":365,"operationalSampleRetentionDays":7,"backupHour":3,"backupMinute":0,"backupTimezone":"Asia/Shanghai","diskWarningPercent":75,"diskCriticalPercent":90,"aiErrorWarningPercent":10,"aiErrorCriticalPercent":25,"processingQueueWarning":20,"processingQueueCritical":100,"updatedAt":"2026-07-28T01:00:00Z"}`
+	return `{"version":1,"siteName":"HappyLearn","siteAnnouncement":"","softDeleteRetentionDays":30,"auditRetentionDays":365,"operationalSampleRetentionDays":7,"backupHour":3,"backupMinute":0,"backupTimezone":"Asia/Shanghai","diskWarningPercent":75,"diskCriticalPercent":90,"backupFilesystemWarningPercent":75,"backupFilesystemCriticalPercent":90,"localBackupAgeWarningHours":25,"localBackupAgeCriticalHours":30,"aiErrorWarningPercent":10,"aiErrorCriticalPercent":25,"processingQueueWarning":20,"processingQueueCritical":100,"processingFailureWarningCount":5,"processingFailureCriticalCount":20,"loginFailureWarningCount":20,"loginFailureCriticalCount":100,"authorizationDenialWarningCount":50,"authorizationDenialCriticalCount":200}`
 }
 
 func assertOperationsErrorEnvelope(t *testing.T, response *httptest.ResponseRecorder, code string) {

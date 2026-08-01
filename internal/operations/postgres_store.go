@@ -69,8 +69,13 @@ SELECT version,site_name,site_announcement,soft_delete_retention_days,
        audit_retention_days,operational_sample_retention_days,
        backup_hour,backup_minute,backup_timezone,
        disk_warning_percent,disk_critical_percent,
+       backup_filesystem_warning_percent,backup_filesystem_critical_percent,
+       local_backup_age_warning_hours,local_backup_age_critical_hours,
        ai_error_warning_percent,ai_error_critical_percent,
        processing_queue_warning,processing_queue_critical,
+       processing_failure_warning_count,processing_failure_critical_count,
+       login_failure_warning_count,login_failure_critical_count,
+       authorization_denial_warning_count,authorization_denial_critical_count,
        updated_by,updated_at
 FROM system_settings
 WHERE singleton_id=true`).Scan(
@@ -79,8 +84,13 @@ WHERE singleton_id=true`).Scan(
 		&settings.OperationalSampleRetentionDays, &settings.BackupHour,
 		&settings.BackupMinute, &settings.BackupTimezone,
 		&settings.DiskWarningPercent, &settings.DiskCriticalPercent,
+		&settings.BackupFilesystemWarningPercent, &settings.BackupFilesystemCriticalPercent,
+		&settings.LocalBackupAgeWarningHours, &settings.LocalBackupAgeCriticalHours,
 		&settings.AIErrorWarningPercent, &settings.AIErrorCriticalPercent,
 		&settings.ProcessingQueueWarning, &settings.ProcessingQueueCritical,
+		&settings.ProcessingFailureWarningCount, &settings.ProcessingFailureCriticalCount,
+		&settings.LoginFailureWarningCount, &settings.LoginFailureCriticalCount,
+		&settings.AuthorizationDenialWarningCount, &settings.AuthorizationDenialCriticalCount,
 		&updatedBy, &settings.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -92,8 +102,71 @@ WHERE singleton_id=true`).Scan(
 	if updatedBy != nil {
 		settings.UpdatedBy = *updatedBy
 	}
+	settings.Infrastructure, err = readInfrastructureStatuses(ctx, s.pool)
+	if err != nil {
+		return Settings{}, err
+	}
 	settings.UpdatedAt = settings.UpdatedAt.UTC()
 	return settings, nil
+}
+
+type infrastructureStatusQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func readInfrastructureStatuses(
+	ctx context.Context,
+	querier infrastructureStatusQuerier,
+) ([]InfrastructureStatus, error) {
+	rows, err := querier.Query(ctx, `
+SELECT configuration_key,configured,last_validated_at
+FROM infrastructure_configuration_status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	statuses := make([]InfrastructureStatus, 0, len(infrastructureKeyOrder))
+	for rows.Next() {
+		var rawKey string
+		var status InfrastructureStatus
+		var validatedAt time.Time
+		if err := rows.Scan(&rawKey, &status.Configured, &validatedAt); err != nil {
+			return nil, err
+		}
+		key, ok := infrastructureKeyFromStorage(rawKey)
+		if !ok {
+			return nil, ErrInvalid
+		}
+		validatedAt = validatedAt.UTC()
+		status.Key = key
+		status.LastValidatedAt = &validatedAt
+		statuses = append(statuses, status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return NormalizeInfrastructureStatuses(statuses), nil
+}
+
+func (s *PostgresStore) RecordInfrastructureStatus(
+	ctx context.Context,
+	key InfrastructureKey,
+	configured bool,
+	validatedAt time.Time,
+) error {
+	storageKey := infrastructureStorageKey(key)
+	if storageKey == "" || validatedAt.IsZero() {
+		return ErrInvalid
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO infrastructure_configuration_status(
+  configuration_key,configured,last_validated_at
+) VALUES($1,$2,$3)
+ON CONFLICT(configuration_key) DO UPDATE
+SET configured=EXCLUDED.configured,
+    last_validated_at=EXCLUDED.last_validated_at`,
+		storageKey, configured, validatedAt.UTC())
+	return err
 }
 
 func (s *PostgresStore) UpdateSettings(ctx context.Context, principal Principal, settings Settings) (Settings, error) {
@@ -126,24 +199,39 @@ SET site_name=$1,site_announcement=$2,soft_delete_retention_days=$3,
     audit_retention_days=$4,operational_sample_retention_days=$5,
     backup_hour=$6,backup_minute=$7,backup_timezone=$8,
     disk_warning_percent=$9,disk_critical_percent=$10,
-    ai_error_warning_percent=$11,ai_error_critical_percent=$12,
-    processing_queue_warning=$13,processing_queue_critical=$14,
-    updated_by=$15,updated_at=now(),version=version+1
-WHERE singleton_id=true AND version=$16
+    backup_filesystem_warning_percent=$11,backup_filesystem_critical_percent=$12,
+    local_backup_age_warning_hours=$13,local_backup_age_critical_hours=$14,
+    ai_error_warning_percent=$15,ai_error_critical_percent=$16,
+    processing_queue_warning=$17,processing_queue_critical=$18,
+    processing_failure_warning_count=$19,processing_failure_critical_count=$20,
+    login_failure_warning_count=$21,login_failure_critical_count=$22,
+    authorization_denial_warning_count=$23,authorization_denial_critical_count=$24,
+    updated_by=$25,updated_at=now(),version=version+1
+WHERE singleton_id=true AND version=$26
 RETURNING version,site_name,site_announcement,soft_delete_retention_days,
           audit_retention_days,operational_sample_retention_days,
           backup_hour,backup_minute,backup_timezone,
           disk_warning_percent,disk_critical_percent,
+          backup_filesystem_warning_percent,backup_filesystem_critical_percent,
+          local_backup_age_warning_hours,local_backup_age_critical_hours,
           ai_error_warning_percent,ai_error_critical_percent,
           processing_queue_warning,processing_queue_critical,
+          processing_failure_warning_count,processing_failure_critical_count,
+          login_failure_warning_count,login_failure_critical_count,
+          authorization_denial_warning_count,authorization_denial_critical_count,
           updated_by,updated_at`,
 		settings.SiteName, settings.SiteAnnouncement,
 		settings.SoftDeleteRetentionDays, settings.AuditRetentionDays,
 		settings.OperationalSampleRetentionDays, settings.BackupHour,
 		settings.BackupMinute, settings.BackupTimezone,
 		settings.DiskWarningPercent, settings.DiskCriticalPercent,
+		settings.BackupFilesystemWarningPercent, settings.BackupFilesystemCriticalPercent,
+		settings.LocalBackupAgeWarningHours, settings.LocalBackupAgeCriticalHours,
 		settings.AIErrorWarningPercent, settings.AIErrorCriticalPercent,
 		settings.ProcessingQueueWarning, settings.ProcessingQueueCritical,
+		settings.ProcessingFailureWarningCount, settings.ProcessingFailureCriticalCount,
+		settings.LoginFailureWarningCount, settings.LoginFailureCriticalCount,
+		settings.AuthorizationDenialWarningCount, settings.AuthorizationDenialCriticalCount,
 		principal.User.ID, settings.Version,
 	).Scan(
 		&updated.Version, &updated.SiteName, &updated.SiteAnnouncement,
@@ -151,8 +239,13 @@ RETURNING version,site_name,site_announcement,soft_delete_retention_days,
 		&updated.OperationalSampleRetentionDays, &updated.BackupHour,
 		&updated.BackupMinute, &updated.BackupTimezone,
 		&updated.DiskWarningPercent, &updated.DiskCriticalPercent,
+		&updated.BackupFilesystemWarningPercent, &updated.BackupFilesystemCriticalPercent,
+		&updated.LocalBackupAgeWarningHours, &updated.LocalBackupAgeCriticalHours,
 		&updated.AIErrorWarningPercent, &updated.AIErrorCriticalPercent,
 		&updated.ProcessingQueueWarning, &updated.ProcessingQueueCritical,
+		&updated.ProcessingFailureWarningCount, &updated.ProcessingFailureCriticalCount,
+		&updated.LoginFailureWarningCount, &updated.LoginFailureCriticalCount,
+		&updated.AuthorizationDenialWarningCount, &updated.AuthorizationDenialCriticalCount,
 		&updated.UpdatedBy, &updated.UpdatedAt,
 	)
 	if err != nil {
@@ -167,6 +260,10 @@ RETURNING version,site_name,site_announcement,soft_delete_retention_days,
 		RequestID:   principal.RequestID,
 		IP:          append(net.IP(nil), principal.IP...),
 	}); err != nil {
+		return Settings{}, err
+	}
+	updated.Infrastructure, err = readInfrastructureStatuses(ctx, tx)
+	if err != nil {
 		return Settings{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

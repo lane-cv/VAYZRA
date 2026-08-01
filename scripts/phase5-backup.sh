@@ -21,7 +21,13 @@ LIVE_COMPOSE_FILE=''
 E2E_LIVE_COMPOSE_FILE=''
 LIVE_ROOT=''
 LIVE_ONE_SHOT_RECORD_FILE=''
+LIVE_RUN_ID_FILE=''
 ACTIVE_EXTERNAL_GROUP_PID=''
+ACTIVE_EXTERNAL_GROUP_IDENTITY=''
+ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
+UNCERTAIN_EXTERNAL_GROUP_PID=''
+UNCERTAIN_EXTERNAL_GROUP_IDENTITY=''
+EXTERNAL_CLEANUP_UNSAFE=false
 LOCK_DIRECTORY=''
 LOCK_HELD=false
 LOCK_OWNER_DIRECTORY=''
@@ -36,21 +42,29 @@ OBSERVED_LOCK_OWNER_TOKEN=''
 LEASE_FIFO=''
 LEASE_OUTPUT=''
 LEASE_PID=''
+LEASE_PROCESS_IDENTITY=''
+LEASE_GROUP_HANDSHAKE=''
 LEASE_FD_OPEN=false
 LEASE_OWNER_ID=''
 LEASE_TOKEN=''
 LEASE_DURABLE=false
 LEASE_HEARTBEAT_PID=''
+LEASE_HEARTBEAT_IDENTITY=''
+LEASE_HEARTBEAT_HANDSHAKE=''
 LEASE_HEARTBEAT_FAILED=''
 RUN_ID=''
+WORKER_STOP_REQUESTED=false
 WORKER_STOPPED=false
 AISTOR_STOPPED=false
+BACKUP_ACTIVITY_AUDITED=false
 TERMINAL_RECORDED=false
 REMOTE_ENABLED=false
 REMOTE_DEGRADED=false
 RECOVERY_UNSAFE=false
 ALLOW_LOST_LEASE_ACTIONS=false
 SEPARATE_EXTERNAL_GROUP=true
+SHARED_EXTERNAL_GROUP_PID=''
+CAPTURED_CHILD_IDENTITY=''
 CLEANING_UP=false
 FAILURE_CATEGORY='internal'
 CURRENT_STAGE='startup'
@@ -130,6 +144,15 @@ portable_mode() {
     stat -f '%Lp' "$path"
   else
     stat -c '%a' "$path"
+  fi
+}
+
+portable_size() {
+  local path="$1"
+  if stat -f '%z' "$path" >/dev/null 2>&1; then
+    stat -f '%z' "$path"
+  else
+    stat -c '%s' "$path"
   fi
 }
 
@@ -327,15 +350,60 @@ configure_live_context() {
     return 1
   owner_only_directory "$LIVE_ROOT/runtime-secrets" || return 1
   LIVE_ONE_SHOT_RECORD_FILE="$LIVE_ROOT/coordinator-one-shots"
+  LIVE_RUN_ID_FILE="$LIVE_ROOT/coordinator-run-id"
   [[ -f "$LIVE_ONE_SHOT_RECORD_FILE" &&
     ! -L "$LIVE_ONE_SHOT_RECORD_FILE" &&
     ! -s "$LIVE_ONE_SHOT_RECORD_FILE" &&
     "$(portable_mode "$LIVE_ONE_SHOT_RECORD_FILE")" == '600' &&
     "$(portable_owner "$LIVE_ONE_SHOT_RECORD_FILE")" == "$(id -u)" ]] ||
     return 1
+  [[ -f "$LIVE_RUN_ID_FILE" &&
+    ! -L "$LIVE_RUN_ID_FILE" &&
+    ! -s "$LIVE_RUN_ID_FILE" &&
+    "$(portable_mode "$LIVE_RUN_ID_FILE" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$LIVE_RUN_ID_FILE" 2>/dev/null)" == "$(id -u)" ]] ||
+    return 1
   HAPPYLEARN_BACKUP_LIVE_ROOT="$LIVE_ROOT"
   export HAPPYLEARN_BACKUP_LIVE_ROOT
   EFFECTIVE_PROJECT="$live_project"
+}
+
+publish_live_run_id() {
+  [[ -n "$LIVE_ROOT" && -n "$LIVE_RUN_ID_FILE" ]] || return 0
+  local temporary=''
+  local published=''
+  [[ "$RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  [[ -f "$LIVE_RUN_ID_FILE" &&
+    ! -L "$LIVE_RUN_ID_FILE" &&
+    ! -s "$LIVE_RUN_ID_FILE" &&
+    "$(portable_mode "$LIVE_RUN_ID_FILE" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$LIVE_RUN_ID_FILE" 2>/dev/null)" == "$(id -u)" ]] ||
+    return 1
+  temporary="$(
+    mktemp "$LIVE_ROOT/.coordinator-run-id.XXXXXX" 2>/dev/null
+  )" || return 1
+  if ! chmod 0600 "$temporary" 2>/dev/null ||
+    ! printf '%s\n' "$RUN_ID" >"$temporary" 2>/dev/null ||
+    [[ ! -f "$temporary" || -L "$temporary" ||
+      "$(portable_mode "$temporary" 2>/dev/null)" != '600' ||
+      "$(portable_owner "$temporary" 2>/dev/null)" != "$(id -u)" ||
+      "$(portable_size "$temporary" 2>/dev/null)" != '37' ]]; then
+    rm -f "$temporary" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f "$temporary" "$LIVE_RUN_ID_FILE" 2>/dev/null; then
+    rm -f "$temporary" 2>/dev/null || true
+    return 1
+  fi
+  [[ -f "$LIVE_RUN_ID_FILE" &&
+    ! -L "$LIVE_RUN_ID_FILE" &&
+    "$(portable_mode "$LIVE_RUN_ID_FILE" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$LIVE_RUN_ID_FILE" 2>/dev/null)" == "$(id -u)" &&
+    "$(portable_size "$LIVE_RUN_ID_FILE" 2>/dev/null)" == '37' ]] ||
+    return 1
+  IFS= read -r published <"$LIVE_RUN_ID_FILE" 2>/dev/null || return 1
+  [[ "$published" == "$RUN_ID" ]]
 }
 
 portable_file_identity() {
@@ -370,6 +438,343 @@ process_identity_matches() {
   [[ -n "$expected" ]] || return 1
   actual="$(portable_process_identity "$pid")" || return 1
   [[ "$actual" == "$expected" ]]
+}
+
+portable_process_group() {
+  local pid="$1"
+  local process_group
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_group="$(ps -o pgid= -p "$pid" 2>/dev/null)" || return 1
+  process_group="${process_group#"${process_group%%[![:space:]]*}"}"
+  process_group="${process_group%"${process_group##*[![:space:]]}"}"
+  [[ "$process_group" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s' "$process_group"
+}
+
+owned_group_witness_matches() {
+  local pid="$1"
+  local expected_identity="$2"
+  local process_group
+  process_identity_matches "$pid" "$expected_identity" || return 1
+  process_group="$(portable_process_group "$pid")" || return 1
+  [[ "$process_group" == "$pid" ]]
+}
+
+direct_child_job_running() {
+  local pid="$1"
+  local candidate
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  for candidate in $(jobs -pr); do
+    [[ "$candidate" == "$pid" ]] && return 0
+  done
+  return 1
+}
+
+capture_direct_child_identity() {
+  local pid="$1"
+  local identity
+  CAPTURED_CHILD_IDENTITY=''
+  direct_child_job_running "$pid" || return 1
+  identity="$(portable_process_identity "$pid")" || return 1
+  direct_child_job_running "$pid" || return 1
+  owned_group_witness_matches "$pid" "$identity" || return 1
+  CAPTURED_CHILD_IDENTITY="$identity"
+}
+
+valid_group_owner_handshake_directory() {
+  local directory="$1"
+  [[ -n "$LOCK_OWNER_DIRECTORY" &&
+    "$directory" == "$LOCK_OWNER_DIRECTORY/.group-owner."?????? &&
+    -d "$directory" && ! -L "$directory" &&
+    "$(portable_mode "$directory" 2>/dev/null)" == '700' &&
+    "$(portable_owner "$directory" 2>/dev/null)" == "$(id -u)" ]]
+}
+
+create_group_owner_handshake() {
+  local directory
+  directory="$(
+    mktemp -d "$LOCK_OWNER_DIRECTORY/.group-owner.XXXXXX" 2>/dev/null
+  )" || return 1
+  if ! chmod 0700 "$directory" ||
+    ! valid_group_owner_handshake_directory "$directory"; then
+    rmdir "$directory" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s' "$directory"
+}
+
+cleanup_group_owner_handshake() {
+  local directory="$1"
+  [[ "$directory" == "$LOCK_OWNER_DIRECTORY/.group-owner."?????? ]] ||
+    return 1
+  rm -f \
+    "$directory/ready" "$directory/ready.pending" \
+    "$directory/decision" \
+    "$directory/decision.start.pending" \
+    "$directory/decision.cancel.pending" 2>/dev/null ||
+    return 1
+  if [[ -d "$directory" && ! -L "$directory" ]]; then
+    rmdir "$directory" 2>/dev/null || return 1
+  else
+    [[ ! -e "$directory" && ! -L "$directory" ]] || return 1
+  fi
+}
+
+publish_group_owner_control() {
+  local directory="$1"
+  local name="$2"
+  local pending="$directory/$name.pending"
+  local target="$directory/$name"
+  valid_group_owner_handshake_directory "$directory" || return 1
+  [[ "$name" == ready ]] || return 1
+  [[ ! -e "$pending" && ! -L "$pending" &&
+    ! -e "$target" && ! -L "$target" ]] ||
+    return 1
+  if ! (umask 077 && printf '%s\n' "$name" >"$pending") ||
+    ! chmod 0600 "$pending" ||
+    ! mv "$pending" "$target"; then
+    rm -f "$pending" 2>/dev/null || true
+    return 1
+  fi
+  [[ -f "$target" && ! -L "$target" &&
+    "$(portable_mode "$target" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$target" 2>/dev/null)" == "$(id -u)" ]]
+}
+
+group_owner_control_matches() {
+  local directory="$1"
+  local name="$2"
+  local path="$directory/$name"
+  local value
+  valid_group_owner_handshake_directory "$directory" || return 1
+  [[ -f "$path" && ! -L "$path" &&
+    "$(portable_mode "$path" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$path" 2>/dev/null)" == "$(id -u)" ]] ||
+    return 1
+  value="$(sed -n '1p' "$path" 2>/dev/null)" || return 1
+  [[ "$value" == "$name" ]]
+}
+
+publish_group_owner_decision() {
+  local directory="$1"
+  local decision="$2"
+  local pending="$directory/decision.${decision}.pending"
+  local target="$directory/decision"
+  local published=false
+  local status=0
+  valid_group_owner_handshake_directory "$directory" || {
+    safe_log 'group_owner_decision_directory_invalid'
+    return 1
+  }
+  case "$decision" in
+    start|cancel) ;;
+    *) return 1 ;;
+  esac
+  if group_owner_decision_matches "$directory" "$decision"; then
+    return 0
+  fi
+  [[ ! -e "$pending" && ! -L "$pending" ]] || {
+    safe_log 'group_owner_decision_pending_exists'
+    return 1
+  }
+  if ! (umask 077 && printf '%s\n' "$decision" >"$pending") ||
+    ! chmod 0600 "$pending"; then
+    safe_log 'group_owner_decision_pending_failed'
+    rm -f "$pending" 2>/dev/null || true
+    return 1
+  fi
+  if ! ln "$pending" "$target" 2>/dev/null; then
+    safe_log 'group_owner_decision_conflict'
+    status=1
+  else
+    published=true
+  fi
+  if ! rm -f "$pending" 2>/dev/null; then
+    if [[ -e "$directory" || -L "$directory" ]]; then
+      safe_log 'group_owner_decision_pending_cleanup_failed'
+      status=1
+    fi
+  fi
+  if [[ "$published" == true &&
+    ! -e "$directory" && ! -L "$directory" ]]; then
+    return 0
+  fi
+  if [[ "$published" == true && "$status" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    group_owner_decision_matches "$directory" "$decision"
+    return
+  fi
+  group_owner_decision_matches "$directory" "$decision" || {
+    safe_log 'group_owner_decision_validation_failed'
+    return 1
+  }
+}
+
+group_owner_decision_matches() {
+  local directory="$1"
+  local expected="$2"
+  local path="$directory/decision"
+  local value
+  valid_group_owner_handshake_directory "$directory" || return 1
+  case "$expected" in
+    start|cancel) ;;
+    *) return 1 ;;
+  esac
+  [[ -f "$path" && ! -L "$path" &&
+    "$(portable_mode "$path" 2>/dev/null)" == '600' &&
+    "$(portable_owner "$path" 2>/dev/null)" == "$(id -u)" ]] ||
+    return 1
+  value="$(sed -n '1p' "$path" 2>/dev/null)" || return 1
+  [[ "$value" == "$expected" ]]
+}
+
+hold_owned_group() {
+  trap '' HUP INT TERM
+  while :; do
+    sleep "$EXTERNAL_MONITOR_POLL_SECONDS" || true
+  done
+}
+
+run_external_group_owner() {
+  local handshake_directory="$1"
+  shift
+  local child_pid
+  local child_status=0
+  local handshake_attempts=0
+  set +m
+  trap 'cleanup_group_owner_handshake "$handshake_directory" 2>/dev/null || true; exit 1' \
+    HUP INT TERM
+  publish_group_owner_control "$handshake_directory" ready || return 1
+  while ((handshake_attempts < HEARTBEAT_HANDSHAKE_ATTEMPTS)); do
+    if group_owner_decision_matches "$handshake_directory" cancel; then
+      trap - HUP INT TERM
+      cleanup_group_owner_handshake "$handshake_directory" || true
+      return 1
+    fi
+    if group_owner_decision_matches "$handshake_directory" start; then
+      trap 'hold_owned_group' HUP INT TERM
+      cleanup_group_owner_handshake "$handshake_directory" || return 1
+      break
+    fi
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+    handshake_attempts=$((handshake_attempts + 1))
+  done
+  if ((handshake_attempts >= HEARTBEAT_HANDSHAKE_ATTEMPTS)); then
+    trap - HUP INT TERM
+    cleanup_group_owner_handshake "$handshake_directory" 2>/dev/null || true
+    return 1
+  fi
+  "$@" &
+  child_pid="$!"
+  if wait "$child_pid"; then
+    :
+  else
+    child_status=$?
+  fi
+  trap - HUP INT TERM
+  return "$child_status"
+}
+
+prepare_group_owner() {
+  local pid="$1"
+  local handshake_directory="$2"
+  local handshake_attempts=0
+  CAPTURED_CHILD_IDENTITY=''
+  while ((handshake_attempts < HEARTBEAT_HANDSHAKE_ATTEMPTS)); do
+    if group_owner_control_matches "$handshake_directory" ready; then
+      break
+    fi
+    direct_child_job_running "$pid" || return 1
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+    handshake_attempts=$((handshake_attempts + 1))
+  done
+  ((handshake_attempts < HEARTBEAT_HANDSHAKE_ATTEMPTS)) || return 1
+  capture_direct_child_identity "$pid" || return 1
+}
+
+commit_group_owner() {
+  local pid="$1"
+  local expected_identity="$2"
+  local handshake_directory="$3"
+  local registered_pid="$4"
+  local registered_identity="$5"
+  local registered_handshake="$6"
+  local handshake_attempts=0
+  [[ "$pid" =~ ^[1-9][0-9]*$ &&
+    "$registered_pid" == "$pid" &&
+    -n "$expected_identity" &&
+    "$registered_identity" == "$expected_identity" &&
+    "$registered_handshake" == "$handshake_directory" ]] || {
+    safe_log 'group_owner_registration_invalid'
+    return 1
+  }
+  owned_group_witness_matches "$pid" "$expected_identity" || {
+    safe_log 'group_owner_identity_changed_before_commit'
+    return 1
+  }
+  publish_group_owner_decision "$handshake_directory" start || {
+    safe_log 'group_owner_start_decision_failed'
+    return 1
+  }
+  handshake_attempts=0
+  while valid_group_owner_handshake_directory "$handshake_directory"; do
+    if ! direct_child_job_running "$pid"; then
+      [[ ! -e "$handshake_directory" && ! -L "$handshake_directory" ]] &&
+        return 0
+      safe_log 'group_owner_exited_before_ack'
+      return 1
+    fi
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+    handshake_attempts=$((handshake_attempts + 1))
+    if ((handshake_attempts >= HEARTBEAT_HANDSHAKE_ATTEMPTS)); then
+      safe_log 'group_owner_ack_timeout'
+      return 1
+    fi
+  done
+  if [[ ! -e "$handshake_directory" && ! -L "$handshake_directory" ]]; then
+    return 0
+  fi
+  safe_log 'group_owner_ack_invalid'
+  return 1
+}
+
+cancel_or_terminate_group_owner() {
+  local pid="$1"
+  local expected_identity="$2"
+  local handshake_directory="$3"
+  local grace_seconds="${4:-$EXTERNAL_TERMINATION_GRACE_SECONDS}"
+  local handshake_attempts=0
+  if valid_group_owner_handshake_directory "$handshake_directory"; then
+    if publish_group_owner_decision "$handshake_directory" cancel; then
+      while direct_child_job_running "$pid" &&
+        valid_group_owner_handshake_directory "$handshake_directory" &&
+        ((handshake_attempts < HEARTBEAT_HANDSHAKE_ATTEMPTS)); do
+        sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+        handshake_attempts=$((handshake_attempts + 1))
+      done
+      if ! direct_child_job_running "$pid"; then
+        wait "$pid" 2>/dev/null || true
+        if ! cleanup_group_owner_handshake \
+          "$handshake_directory" 2>/dev/null &&
+          [[ -e "$handshake_directory" || -L "$handshake_directory" ]]; then
+          return 1
+        fi
+        return 0
+      fi
+    fi
+  fi
+  [[ -n "$expected_identity" ]] || return 1
+  if terminate_external_group "$pid" "$expected_identity" "$grace_seconds"; then
+    if ! cleanup_group_owner_handshake \
+      "$handshake_directory" 2>/dev/null &&
+      [[ -e "$handshake_directory" || -L "$handshake_directory" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  return 1
 }
 
 heartbeat_owner_matches() {
@@ -778,10 +1183,93 @@ record_live_coordinator_one_shots() {
   done <<<"$ids"
 }
 
+audit_running_production_backup_activity() {
+  local service ids container_id metadata
+  local inspected_id inspected_name project inspected_service
+  local oneoff running extra
+  for service in backup backup-storage-init backup-secrets-init; do
+    ids="$(
+      run_guarded_external 30 docker ps --quiet --no-trunc \
+        --filter "label=com.docker.compose.project=${EFFECTIVE_PROJECT}" \
+        --filter 'label=com.docker.compose.oneoff=True' \
+        --filter "label=com.docker.compose.service=${service}"
+    )" || return 1
+    while IFS= read -r container_id; do
+      [[ -n "$container_id" ]] || continue
+      [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+      metadata="$(
+        run_guarded_external 30 docker container inspect --format \
+          '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{.State.Running}}' \
+          "$container_id"
+      )" || return 1
+      IFS='|' read -r inspected_id inspected_name project \
+        inspected_service oneoff running extra <<<"$metadata"
+      [[ "$inspected_id" == "$container_id" &&
+        "$inspected_name" == /* &&
+        "$project" == "$EFFECTIVE_PROJECT" &&
+        "$inspected_service" == "$service" &&
+        "$oneoff" == True &&
+        "$running" =~ ^(true|false)$ &&
+        -z "$extra" ]] ||
+        return 1
+      [[ "$running" == false ]] || return 1
+    done <<<"$ids"
+  done
+}
+
+audit_recorded_live_coordinator_one_shots() {
+  BACKUP_ACTIVITY_AUDITED=false
+  if [[ -z "$LIVE_ROOT" ]]; then
+    audit_running_production_backup_activity || return 1
+    BACKUP_ACTIVITY_AUDITED=true
+    return 0
+  fi
+  if [[ -z "$LIVE_ONE_SHOT_RECORD_FILE" ]]; then
+    BACKUP_ACTIVITY_AUDITED=true
+    return 0
+  fi
+  local expected_owner
+  local ids container_id ownership project oneoff owner running extra
+  expected_owner="${EFFECTIVE_PROJECT#happylearn-phase5-live-}"
+  [[ "$EFFECTIVE_PROJECT" == "happylearn-phase5-live-${expected_owner}" &&
+    "$expected_owner" =~ ^[a-f0-9]{12}$ ]] ||
+    return 1
+  record_live_coordinator_one_shots || return 1
+  ids="$(sort -u "$LIVE_ONE_SHOT_RECORD_FILE")" || return 1
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    ownership="$(
+      docker container inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{.State.Running}}' \
+        "$container_id"
+    )" || return 1
+    IFS='|' read -r project oneoff owner running extra <<<"$ownership"
+    [[ "$project" == "$EFFECTIVE_PROJECT" &&
+      "$oneoff" == True &&
+      "$owner" == "$expected_owner" &&
+      "$running" == false &&
+      -z "$extra" ]] ||
+      return 1
+  done <<<"$ids"
+  BACKUP_ACTIVITY_AUDITED=true
+}
+
 cleanup_recorded_live_coordinator_one_shots() {
-  [[ -n "$LIVE_ROOT" && -n "$LIVE_ONE_SHOT_RECORD_FILE" ]] || return 0
+  BACKUP_ACTIVITY_AUDITED=false
+  if [[ -z "$LIVE_ROOT" ]]; then
+    audit_running_production_backup_activity || return 1
+    BACKUP_ACTIVITY_AUDITED=true
+    return 0
+  fi
+  if [[ -z "$LIVE_ONE_SHOT_RECORD_FILE" ]]; then
+    BACKUP_ACTIVITY_AUDITED=true
+    return 0
+  fi
   local expected_owner
   local ids container_id ownership remaining
+  audit_recorded_live_coordinator_one_shots || return 1
+  BACKUP_ACTIVITY_AUDITED=false
   expected_owner="${EFFECTIVE_PROJECT#happylearn-phase5-live-}"
   [[ "$EFFECTIVE_PROJECT" == "happylearn-phase5-live-${expected_owner}" &&
     "$expected_owner" =~ ^[a-f0-9]{12}$ ]] ||
@@ -808,10 +1296,12 @@ cleanup_recorded_live_coordinator_one_shots() {
       --filter "label=com.docker.compose.project=${EFFECTIVE_PROJECT}" \
       --filter 'label=com.docker.compose.oneoff=True'
   )" || return 1
-  [[ -z "$remaining" ]]
+  [[ -z "$remaining" ]] || return 1
+  BACKUP_ACTIVITY_AUDITED=true
 }
 
 compose_run() {
+  BACKUP_ACTIVITY_AUDITED=false
   if [[ -z "$LIVE_ROOT" ]]; then
     compose run --rm "$@"
     return
@@ -998,21 +1488,60 @@ wait_for_marker() {
     if [[ -n "$LEASE_PID" ]] && ! kill -0 "$LEASE_PID" 2>/dev/null; then
       return 1
     fi
-    sleep "$POLL_INTERVAL_SECONDS"
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
   done
   return 1
 }
 
+operational_lock_session_payload() {
+  database_session <"$LEASE_FIFO" >"$LEASE_OUTPUT" 2>/dev/null
+}
+
 start_operational_lock_session() {
+  local group_handshake
+  local lease_pid
   mkfifo "$LEASE_FIFO"
   : >"$LEASE_OUTPUT"
   chmod 0600 "$LEASE_OUTPUT"
+  group_handshake="$(create_group_owner_handshake)" || return 1
   set -m
   (
-    database_session <"$LEASE_FIFO" >"$LEASE_OUTPUT" 2>/dev/null
+    run_external_group_owner \
+      "$group_handshake" operational_lock_session_payload
   ) &
-  LEASE_PID="$!"
+  lease_pid="$!"
   set +m
+  if ! prepare_group_owner "$lease_pid" "$group_handshake"; then
+    if ! cancel_or_terminate_group_owner \
+      "$lease_pid" '' "$group_handshake"; then
+      remember_uncertain_external_group "$lease_pid" '' || true
+    fi
+    return 1
+  fi
+  LEASE_GROUP_HANDSHAKE="$group_handshake"
+  LEASE_PROCESS_IDENTITY="$CAPTURED_CHILD_IDENTITY"
+  LEASE_PID="$lease_pid"
+  if ! commit_group_owner \
+    "$lease_pid" \
+    "$LEASE_PROCESS_IDENTITY" \
+    "$group_handshake" \
+    "$LEASE_PID" \
+    "$LEASE_PROCESS_IDENTITY" \
+    "$LEASE_GROUP_HANDSHAKE"; then
+    if cancel_or_terminate_group_owner \
+      "$LEASE_PID" \
+      "$LEASE_PROCESS_IDENTITY" \
+      "$LEASE_GROUP_HANDSHAKE"; then
+      LEASE_PID=''
+      LEASE_PROCESS_IDENTITY=''
+      LEASE_GROUP_HANDSHAKE=''
+    else
+      remember_uncertain_external_group \
+        "$LEASE_PID" "$LEASE_PROCESS_IDENTITY" || true
+    fi
+    return 1
+  fi
+  LEASE_GROUP_HANDSHAKE=''
   exec 9>"$LEASE_FIFO"
   LEASE_FD_OPEN=true
   printf '%s\n' \
@@ -1025,14 +1554,33 @@ start_operational_lock_session() {
 }
 
 abort_operational_lock_session() {
+  local status=0
   if [[ "$LEASE_FD_OPEN" == true ]]; then
     exec 9>&-
     LEASE_FD_OPEN=false
   fi
   if [[ -n "$LEASE_PID" ]]; then
-    terminate_external_group "$LEASE_PID"
-    LEASE_PID=''
+    if [[ -n "$LEASE_GROUP_HANDSHAKE" ]]; then
+      cancel_or_terminate_group_owner \
+        "$LEASE_PID" \
+        "$LEASE_PROCESS_IDENTITY" \
+        "$LEASE_GROUP_HANDSHAKE" ||
+        status=1
+    else
+      terminate_external_group \
+        "$LEASE_PID" "$LEASE_PROCESS_IDENTITY" ||
+        status=1
+    fi
+    if [[ "$status" -eq 0 ]]; then
+      LEASE_PID=''
+      LEASE_PROCESS_IDENTITY=''
+      LEASE_GROUP_HANDSHAKE=''
+    else
+      remember_uncertain_external_group \
+        "$LEASE_PID" "$LEASE_PROCESS_IDENTITY" || true
+    fi
   fi
+  return "$status"
 }
 
 prepare_lease_values() {
@@ -1135,9 +1683,70 @@ SQL
   [[ "$renewed" == 'renewed' ]]
 }
 
+lease_heartbeat_worker() {
+  local original_owner_pid="$1"
+  local original_owner_process_identity="$2"
+  local heartbeat_pid_file="$3"
+  local heartbeat_ready_file="$4"
+  local heartbeat_ready_pending="$5"
+  local heartbeat_process_pid=''
+  local handshake_attempts=0
+  set +m
+  exec 8<&-
+  exec 9>&-
+  while [[ "$handshake_attempts" -lt "$HEARTBEAT_HANDSHAKE_ATTEMPTS" ]]; do
+    process_identity_matches \
+      "$original_owner_pid" "$original_owner_process_identity" ||
+      return 0
+    heartbeat_process_pid="$(
+      read_heartbeat_handshake_file "$heartbeat_pid_file" 2>/dev/null ||
+        true
+    )"
+    [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] && break
+    sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
+    handshake_attempts=$((handshake_attempts + 1))
+  done
+  [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  heartbeat_owner_matches \
+    "$heartbeat_process_pid" \
+    "$original_owner_pid" \
+    "$original_owner_process_identity" ||
+    return 0
+  ALLOW_LOST_LEASE_ACTIONS=true
+  SEPARATE_EXTERNAL_GROUP=false
+  SHARED_EXTERNAL_GROUP_PID="$heartbeat_process_pid"
+  write_heartbeat_handshake_file \
+    "$heartbeat_ready_file" \
+    "$heartbeat_ready_pending" \
+    "$heartbeat_process_pid" ||
+    return 0
+  while heartbeat_owner_matches \
+    "$heartbeat_process_pid" \
+    "$original_owner_pid" \
+    "$original_owner_process_identity"; do
+    sleep "$HEARTBEAT_INTERVAL_SECONDS"
+    heartbeat_owner_matches \
+      "$heartbeat_process_pid" \
+      "$original_owner_pid" \
+      "$original_owner_process_identity" ||
+      return 0
+    if ! renew_operational_lease; then
+      printf '%s\n' 'lease_lost' >"$LEASE_HEARTBEAT_FAILED"
+      return 1
+    fi
+    heartbeat_owner_matches \
+      "$heartbeat_process_pid" \
+      "$original_owner_pid" \
+      "$original_owner_process_identity" ||
+      return 0
+  done
+}
+
 start_lease_heartbeat() {
   local original_owner_pid="$LOCK_OWNER_PID"
   local original_owner_process_identity
+  local group_handshake
+  local heartbeat_pid
   local heartbeat_pid_file="$LOCK_OWNER_DIRECTORY/heartbeat.pid"
   local heartbeat_pid_pending="$LOCK_OWNER_DIRECTORY/heartbeat.pid.pending"
   local heartbeat_ready_file="$LOCK_OWNER_DIRECTORY/heartbeat.ready"
@@ -1152,68 +1761,58 @@ start_lease_heartbeat() {
     ! -e "$heartbeat_ready_file" && ! -L "$heartbeat_ready_file" &&
     ! -e "$heartbeat_ready_pending" && ! -L "$heartbeat_ready_pending" ]] ||
     return 1
+  group_handshake="$(create_group_owner_handshake)" || return 1
   set -m
   (
-    heartbeat_process_pid=''
-    handshake_attempts=0
-    set +m
-    exec 8<&-
-    exec 9>&-
-    while [[ "$handshake_attempts" -lt "$HEARTBEAT_HANDSHAKE_ATTEMPTS" ]]; do
-      process_identity_matches \
-        "$original_owner_pid" "$original_owner_process_identity" ||
-        exit 0
-      heartbeat_process_pid="$(
-        read_heartbeat_handshake_file "$heartbeat_pid_file" 2>/dev/null ||
-          true
-      )"
-      [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] && break
-      sleep "$HEARTBEAT_HANDSHAKE_POLL_SECONDS"
-      handshake_attempts=$((handshake_attempts + 1))
-    done
-    [[ "$heartbeat_process_pid" =~ ^[1-9][0-9]*$ ]] || exit 0
-    heartbeat_owner_matches \
-      "$heartbeat_process_pid" \
+    run_external_group_owner \
+      "$group_handshake" \
+      lease_heartbeat_worker \
       "$original_owner_pid" \
-      "$original_owner_process_identity" ||
-      exit 0
-    write_heartbeat_handshake_file \
+      "$original_owner_process_identity" \
+      "$heartbeat_pid_file" \
       "$heartbeat_ready_file" \
-      "$heartbeat_ready_pending" \
-      "$heartbeat_process_pid" ||
-      exit 0
-    ALLOW_LOST_LEASE_ACTIONS=true
-    SEPARATE_EXTERNAL_GROUP=false
-    while heartbeat_owner_matches \
-      "$heartbeat_process_pid" \
-      "$original_owner_pid" \
-      "$original_owner_process_identity"; do
-      sleep "$HEARTBEAT_INTERVAL_SECONDS"
-      heartbeat_owner_matches \
-        "$heartbeat_process_pid" \
-        "$original_owner_pid" \
-        "$original_owner_process_identity" ||
-        exit 0
-      if ! renew_operational_lease; then
-        printf '%s\n' 'lease_lost' >"$LEASE_HEARTBEAT_FAILED"
-        exit 1
-      fi
-      heartbeat_owner_matches \
-        "$heartbeat_process_pid" \
-        "$original_owner_pid" \
-        "$original_owner_process_identity" ||
-        exit 0
-    done
+      "$heartbeat_ready_pending"
   ) &
-  LEASE_HEARTBEAT_PID="$!"
+  heartbeat_pid="$!"
   set +m
+  if ! prepare_group_owner "$heartbeat_pid" "$group_handshake"; then
+    if ! cancel_or_terminate_group_owner \
+      "$heartbeat_pid" '' "$group_handshake"; then
+      remember_uncertain_external_group "$heartbeat_pid" '' || true
+    fi
+    return 1
+  fi
+  LEASE_HEARTBEAT_HANDSHAKE="$group_handshake"
+  LEASE_HEARTBEAT_IDENTITY="$CAPTURED_CHILD_IDENTITY"
+  LEASE_HEARTBEAT_PID="$heartbeat_pid"
+  if ! commit_group_owner \
+    "$heartbeat_pid" \
+    "$LEASE_HEARTBEAT_IDENTITY" \
+    "$group_handshake" \
+    "$LEASE_HEARTBEAT_PID" \
+    "$LEASE_HEARTBEAT_IDENTITY" \
+    "$LEASE_HEARTBEAT_HANDSHAKE"; then
+    if cancel_or_terminate_group_owner \
+      "$LEASE_HEARTBEAT_PID" \
+      "$LEASE_HEARTBEAT_IDENTITY" \
+      "$LEASE_HEARTBEAT_HANDSHAKE"; then
+      LEASE_HEARTBEAT_PID=''
+      LEASE_HEARTBEAT_IDENTITY=''
+      LEASE_HEARTBEAT_HANDSHAKE=''
+    else
+      remember_uncertain_external_group \
+        "$LEASE_HEARTBEAT_PID" "$LEASE_HEARTBEAT_IDENTITY" || true
+    fi
+    return 1
+  fi
+  LEASE_HEARTBEAT_HANDSHAKE=''
   if ! write_heartbeat_handshake_file \
     "$heartbeat_pid_file" \
     "$heartbeat_pid_pending" \
     "$LEASE_HEARTBEAT_PID" ||
     ! wait_for_heartbeat_handshake \
       "$heartbeat_ready_file" "$LEASE_HEARTBEAT_PID"; then
-    stop_lease_heartbeat
+    stop_lease_heartbeat || true
     rm -f \
       "$heartbeat_pid_file" "$heartbeat_pid_pending" \
       "$heartbeat_ready_file" "$heartbeat_ready_pending"
@@ -1227,31 +1826,105 @@ assert_lease_heartbeat() {
     ! kill -0 "$LEASE_HEARTBEAT_PID" 2>/dev/null ||
     ! renew_operational_lease; then
     FAILURE_CATEGORY='lease_lost'
+    RECOVERY_UNSAFE=true
     return 1
   fi
 }
 
 terminate_external_group() {
   local pid="$1"
-  local grace_seconds="${2:-$POLL_INTERVAL_SECONDS}"
-  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  local expected_identity="$2"
+  local grace_seconds="${3:-$EXTERNAL_TERMINATION_GRACE_SECONDS}"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -n "$expected_identity" ]] ||
+    return 1
+  if ! owned_group_witness_matches "$pid" "$expected_identity"; then
+    if kill -0 "$pid" 2>/dev/null ||
+      kill -0 "-$pid" 2>/dev/null; then
+      return 1
+    fi
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  kill -TERM "-$pid" 2>/dev/null || return 1
   sleep "$grace_seconds"
-  kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  if ! owned_group_witness_matches "$pid" "$expected_identity"; then
+    if kill -0 "$pid" 2>/dev/null ||
+      kill -0 "-$pid" 2>/dev/null; then
+      return 1
+    fi
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  kill -KILL "-$pid" 2>/dev/null || return 1
   wait "$pid" 2>/dev/null || true
   return 0
 }
 
+remember_uncertain_external_group() {
+  local pid="$1"
+  local expected_identity="$2"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  RECOVERY_UNSAFE=true
+  if [[ -z "$UNCERTAIN_EXTERNAL_GROUP_PID" ]]; then
+    UNCERTAIN_EXTERNAL_GROUP_PID="$pid"
+    UNCERTAIN_EXTERNAL_GROUP_IDENTITY="$expected_identity"
+    return 0
+  fi
+  [[ "$UNCERTAIN_EXTERNAL_GROUP_PID" == "$pid" &&
+    "$UNCERTAIN_EXTERNAL_GROUP_IDENTITY" == "$expected_identity" ]]
+}
+
 terminate_active_external_group() {
   local pid="$ACTIVE_EXTERNAL_GROUP_PID"
-  ACTIVE_EXTERNAL_GROUP_PID=''
+  local expected_identity="$ACTIVE_EXTERNAL_GROUP_IDENTITY"
+  local handshake_directory="$ACTIVE_EXTERNAL_GROUP_HANDSHAKE"
+  local status=0
   [[ -n "$pid" ]] || return 0
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  terminate_external_group "$pid" "$EXTERNAL_TERMINATION_GRACE_SECONDS"
+  if [[ "$SEPARATE_EXTERNAL_GROUP" == false ]]; then
+    [[ "$SHARED_EXTERNAL_GROUP_PID" =~ ^[1-9][0-9]*$ &&
+      -n "$LEASE_HEARTBEAT_FAILED" ]] ||
+      return 1
+    printf '%s\n' 'query_timeout' >"$LEASE_HEARTBEAT_FAILED" 2>/dev/null ||
+      true
+    kill -KILL "-$SHARED_EXTERNAL_GROUP_PID" 2>/dev/null
+    ACTIVE_EXTERNAL_GROUP_PID=''
+    ACTIVE_EXTERNAL_GROUP_IDENTITY=''
+    ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
+    return 1
+  fi
+  if [[ -n "$handshake_directory" ]]; then
+    cancel_or_terminate_group_owner \
+      "$pid" \
+      "$expected_identity" \
+      "$handshake_directory" \
+      "$EXTERNAL_TERMINATION_GRACE_SECONDS" ||
+      status=1
+  else
+    terminate_external_group \
+      "$pid" "$expected_identity" "$EXTERNAL_TERMINATION_GRACE_SECONDS" ||
+      status=1
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    remember_uncertain_external_group "$pid" "$expected_identity" || true
+  fi
+  ACTIVE_EXTERNAL_GROUP_PID=''
+  ACTIVE_EXTERNAL_GROUP_IDENTITY=''
+  ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
+  return "$status"
 }
 
 cleanup_timed_out_external() {
-  terminate_active_external_group || return 1
-  cleanup_recorded_live_coordinator_one_shots
+  if ! terminate_active_external_group; then
+    EXTERNAL_CLEANUP_UNSAFE=true
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if ! cleanup_recorded_live_coordinator_one_shots; then
+    EXTERNAL_CLEANUP_UNSAFE=true
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
 }
 
 wait_for_lease_session_exit() {
@@ -1270,18 +1943,53 @@ run_guarded_external() {
   local timeout_seconds="$1"
   shift
   valid_uint "$timeout_seconds" || return 1
-  local deadline=$((SECONDS + timeout_seconds))
+  if [[ -n "$UNCERTAIN_EXTERNAL_GROUP_PID" &&
+    "$CLEANING_UP" != true ]]; then
+    RECOVERY_UNSAFE=true
+    safe_log 'external_group_unsafe'
+    return 1
+  fi
+  local command_status=0
+  local deadline
   local pid
+  local group_handshake=''
   if [[ "$SEPARATE_EXTERNAL_GROUP" == true ]]; then
+    group_handshake="$(create_group_owner_handshake)" || return 1
     set -m
-    ( "$@" ) &
+    (run_external_group_owner "$group_handshake" "$@") &
     pid="$!"
     set +m
+    if ! prepare_group_owner "$pid" "$group_handshake"; then
+      safe_log 'external_group_prepare_failed'
+      if ! cancel_or_terminate_group_owner \
+        "$pid" '' "$group_handshake"; then
+        remember_uncertain_external_group "$pid" '' || true
+      fi
+      return 1
+    fi
+    ACTIVE_EXTERNAL_GROUP_HANDSHAKE="$group_handshake"
+    ACTIVE_EXTERNAL_GROUP_IDENTITY="$CAPTURED_CHILD_IDENTITY"
+    ACTIVE_EXTERNAL_GROUP_PID="$pid"
+    if ! commit_group_owner \
+      "$pid" \
+      "$ACTIVE_EXTERNAL_GROUP_IDENTITY" \
+      "$group_handshake" \
+      "$ACTIVE_EXTERNAL_GROUP_PID" \
+      "$ACTIVE_EXTERNAL_GROUP_IDENTITY" \
+      "$ACTIVE_EXTERNAL_GROUP_HANDSHAKE"; then
+      safe_log 'external_group_commit_failed'
+      terminate_active_external_group || true
+      return 1
+    fi
+    ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
   else
     ( "$@" ) &
     pid="$!"
+    ACTIVE_EXTERNAL_GROUP_IDENTITY=''
+    ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
+    ACTIVE_EXTERNAL_GROUP_PID="$pid"
   fi
-  ACTIVE_EXTERNAL_GROUP_PID="$pid"
+  deadline=$((SECONDS + timeout_seconds))
   while kill -0 "$pid" 2>/dev/null; do
     if [[ "$ALLOW_LOST_LEASE_ACTIONS" == false &&
       "$LEASE_DURABLE" == true ]] &&
@@ -1289,6 +1997,7 @@ run_guarded_external() {
         [[ -z "$LEASE_HEARTBEAT_PID" ]] ||
         ! kill -0 "$LEASE_HEARTBEAT_PID" 2>/dev/null; }; then
       FAILURE_CATEGORY='lease_lost'
+      RECOVERY_UNSAFE=true
       if ! cleanup_timed_out_external; then
         RECOVERY_UNSAFE=true
       fi
@@ -1303,19 +2012,48 @@ run_guarded_external() {
     fi
     sleep "$EXTERNAL_MONITOR_POLL_SECONDS"
   done
-  ACTIVE_EXTERNAL_GROUP_PID=''
   if wait "$pid"; then
-    return 0
+    command_status=0
   else
-    return $?
+    command_status=$?
   fi
+  if [[ "$SEPARATE_EXTERNAL_GROUP" == true ]] &&
+    kill -0 "-$pid" 2>/dev/null; then
+    safe_log 'external_group_descendant_survived'
+    remember_uncertain_external_group \
+      "$pid" "$ACTIVE_EXTERNAL_GROUP_IDENTITY" || true
+    return 1
+  fi
+  ACTIVE_EXTERNAL_GROUP_PID=''
+  ACTIVE_EXTERNAL_GROUP_IDENTITY=''
+  ACTIVE_EXTERNAL_GROUP_HANDSHAKE=''
+  return "$command_status"
 }
 
 stop_lease_heartbeat() {
+  local status=0
   if [[ -n "$LEASE_HEARTBEAT_PID" ]]; then
-    terminate_external_group "$LEASE_HEARTBEAT_PID"
-    LEASE_HEARTBEAT_PID=''
+    if [[ -n "$LEASE_HEARTBEAT_HANDSHAKE" ]]; then
+      cancel_or_terminate_group_owner \
+        "$LEASE_HEARTBEAT_PID" \
+        "$LEASE_HEARTBEAT_IDENTITY" \
+        "$LEASE_HEARTBEAT_HANDSHAKE" ||
+        status=1
+    else
+      terminate_external_group \
+        "$LEASE_HEARTBEAT_PID" "$LEASE_HEARTBEAT_IDENTITY" ||
+        status=1
+    fi
+    if [[ "$status" -eq 0 ]]; then
+      LEASE_HEARTBEAT_PID=''
+      LEASE_HEARTBEAT_IDENTITY=''
+      LEASE_HEARTBEAT_HANDSHAKE=''
+    else
+      remember_uncertain_external_group \
+        "$LEASE_HEARTBEAT_PID" "$LEASE_HEARTBEAT_IDENTITY" || true
+    fi
   fi
+  return "$status"
 }
 
 durable_active_count() {
@@ -1493,6 +2231,7 @@ cleanup_sync_container() {
 
 backup_sync_command() {
   local command_status cleanup_status
+  BACKUP_ACTIVITY_AUDITED=false
   prepare_sync_container_identity || return 1
   SYNC_CONTAINER_ID=''
   if run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
@@ -1520,11 +2259,30 @@ backup_sync_command() {
   return "$command_status"
 }
 
-stop_snapshot_services() {
+worker_is_stopped() {
+  local running
+  running="$(compose ps --status running --quiet worker)" || return 1
+  [[ -z "$running" ]]
+}
+
+stop_and_verify_worker() {
   FAILURE_CATEGORY='object_store_stop'
+  WORKER_STOP_REQUESTED=true
+  if ! run_guarded_external "$((SERVICE_STOP_TIMEOUT_SECONDS + 30))" \
+    compose stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" worker; then
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  if ! run_guarded_external 30 worker_is_stopped; then
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
   WORKER_STOPPED=true
-  run_guarded_external "$((SERVICE_STOP_TIMEOUT_SECONDS + 30))" \
-    compose stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" worker
+}
+
+stop_snapshot_services() {
+  [[ "$WORKER_STOPPED" == true ]] || return 1
+  FAILURE_CATEGORY='object_store_stop'
   AISTOR_STOPPED=true
   run_guarded_external "$((SERVICE_STOP_TIMEOUT_SECONDS + 30))" \
     compose stop --timeout "$SERVICE_STOP_TIMEOUT_SECONDS" minio
@@ -1561,14 +2319,26 @@ restart_aistor_service() {
 
 restart_stopped_services() {
   restart_aistor_service || return 1
-  if [[ "$WORKER_STOPPED" == true ]]; then
-    if ! run_guarded_external 60 \
-      compose up --detach --no-deps worker; then
-      RECOVERY_UNSAFE=true
-      return 1
-    fi
-    WORKER_STOPPED=false
+  restart_worker_service
+}
+
+restart_worker_service() {
+  [[ "$WORKER_STOP_REQUESTED" == true ]] || return 0
+  [[ "$WORKER_STOPPED" == true &&
+    "$BACKUP_ACTIVITY_AUDITED" == true &&
+    "$RECOVERY_UNSAFE" == false &&
+    "$EXTERNAL_CLEANUP_UNSAFE" == false &&
+    -z "$UNCERTAIN_EXTERNAL_GROUP_PID" ]] || {
+    RECOVERY_UNSAFE=true
+    return 1
+  }
+  if ! run_guarded_external 60 \
+    compose up --detach --no-deps worker; then
+    RECOVERY_UNSAFE=true
+    return 1
   fi
+  WORKER_STOPPED=false
+  WORKER_STOP_REQUESTED=false
 }
 
 local_snapshot_id() {
@@ -1775,15 +2545,27 @@ complete_remote_degraded() {
   if [[ "$FAILURE_CATEGORY" == 'lease_lost' ]]; then
     return 1
   fi
-  restart_stopped_services || return 1
   FAILURE_CATEGORY='remote_unavailable'
   backup_command fail --run-id "$RUN_ID" --category "$FAILURE_CATEGORY"
   TERMINAL_RECORDED=true
+  audit_recorded_live_coordinator_one_shots || {
+    RECOVERY_UNSAFE=true
+    return 1
+  }
+  restart_stopped_services || return 1
   release_operational_lease
 }
 
 record_failure() {
   [[ -n "$RUN_ID" && "$TERMINAL_RECORDED" == false ]] || return 0
+  if [[ "$WORKER_STOPPED" != true ||
+    "$FAILURE_CATEGORY" == lease_lost ]]; then
+    if record_unprepared_failure; then
+      TERMINAL_RECORDED=true
+      return 0
+    fi
+    return 1
+  fi
   if run_guarded_external "$((EXTERNAL_TIMEOUT_SECONDS + 15))" \
     bounded_backup_compose \
     fail --run-id "$RUN_ID" --category "$FAILURE_CATEGORY"; then
@@ -1822,7 +2604,11 @@ SQL
 }
 
 stop_operational_lock_session() {
-  [[ "$LEASE_FD_OPEN" == true ]] || return 0
+  if [[ "$LEASE_FD_OPEN" != true ]]; then
+    [[ -n "$LEASE_PID" ]] || return 0
+    abort_operational_lock_session
+    return
+  fi
   printf '%s\n' \
     "SELECT pg_advisory_unlock(${OPERATIONS_ADVISORY_KEY}); -- PHASE5_RELEASE_LOCK" \
     "SELECT 'PHASE5_LEASE_RELEASED';" \
@@ -1844,8 +2630,12 @@ stop_operational_lock_session() {
       return 1
     fi
     LEASE_PID=''
+    LEASE_PROCESS_IDENTITY=''
+    LEASE_GROUP_HANDSHAKE=''
   fi
   LEASE_PID=''
+  LEASE_PROCESS_IDENTITY=''
+  LEASE_GROUP_HANDSHAKE=''
   return 0
 }
 
@@ -1854,7 +2644,7 @@ release_operational_lease() {
   if [[ "$LEASE_DURABLE" == true ]]; then
     if [[ "$RECOVERY_UNSAFE" == true ]]; then
       if ! transition_operational_mode release; then
-        stop_lease_heartbeat
+        stop_lease_heartbeat || RECOVERY_UNSAFE=true
         return 1
       fi
     else
@@ -1877,14 +2667,22 @@ SQL
       )"
       if [[ "$released" != 'released' ]]; then
         safe_log 'durable_lease_release_failed'
-        stop_lease_heartbeat
+        RECOVERY_UNSAFE=true
+        stop_lease_heartbeat || RECOVERY_UNSAFE=true
         return 1
       fi
     fi
     LEASE_DURABLE=false
   fi
-  stop_lease_heartbeat
-  stop_operational_lock_session
+  if ! stop_lease_heartbeat; then
+    RECOVERY_UNSAFE=true
+    stop_operational_lock_session || true
+    return 1
+  fi
+  if ! stop_operational_lock_session; then
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
 }
 
 remove_host_lock() {
@@ -1932,6 +2730,7 @@ cleanup() {
   local failed_stage="$FAILURE_CATEGORY"
   local signal_cleanup=false
   local signal_status=''
+  local external_group_safe=true
   if [[ "$CLEANING_UP" == true ]]; then
     exit "$status"
   fi
@@ -1944,19 +2743,55 @@ cleanup() {
       signal_status="$status"
       ;;
   esac
+  if [[ "$EXTERNAL_CLEANUP_UNSAFE" == true ||
+    -n "$UNCERTAIN_EXTERNAL_GROUP_PID" ]]; then
+    safe_log 'cleanup_external_state_unsafe'
+    RECOVERY_UNSAFE=true
+    external_group_safe=false
+    status=1
+  fi
   if ! terminate_active_external_group; then
     safe_log 'cleanup_external_group_failed'
+    RECOVERY_UNSAFE=true
+    external_group_safe=false
     status=1
   fi
-  if restart_stopped_services; then
+  if [[ "$external_group_safe" == true ]]; then
+    if ! restart_aistor_service; then
+      safe_log 'cleanup_aistor_restart_failed'
+      status=1
+    fi
     FAILURE_CATEGORY="$failed_stage"
-  else
-    safe_log 'cleanup_restart_failed'
-    status=1
-  fi
-  if [[ "$status" -ne 0 ]] && ! record_failure; then
-    safe_log 'cleanup_record_failure_failed'
-    status=1
+    if [[ "$status" -ne 0 ]] && ! record_failure; then
+      safe_log 'cleanup_record_failure_failed'
+      RECOVERY_UNSAFE=true
+      status=1
+    fi
+    if [[ "$signal_cleanup" == true ]]; then
+      if ! cleanup_recorded_live_coordinator_one_shots; then
+        safe_log 'cleanup_live_one_shots_failed'
+        RECOVERY_UNSAFE=true
+        status=1
+      fi
+    elif ! audit_recorded_live_coordinator_one_shots; then
+      safe_log 'cleanup_live_one_shot_audit_failed'
+      RECOVERY_UNSAFE=true
+      status=1
+    fi
+    if [[ "$RECOVERY_UNSAFE" == false ]] &&
+      ! restart_worker_service; then
+      safe_log 'cleanup_worker_restart_failed'
+      status=1
+    fi
+  elif [[ "$status" -ne 0 && -n "$RUN_ID" &&
+    "$TERMINAL_RECORDED" == false ]]; then
+    FAILURE_CATEGORY="$failed_stage"
+    if record_unprepared_failure; then
+      TERMINAL_RECORDED=true
+    else
+      safe_log 'cleanup_unprepared_failure_record_failed'
+      status=1
+    fi
   fi
   if ! release_operational_lease; then
     safe_log 'cleanup_release_failed'
@@ -1966,12 +2801,6 @@ cleanup() {
   fi
   if ! remove_host_lock; then
     safe_log 'cleanup_host_lock_failed'
-    status=1
-  fi
-  if [[ "$signal_cleanup" == true ]] &&
-    ! cleanup_recorded_live_coordinator_one_shots; then
-    safe_log 'cleanup_live_one_shots_failed'
-    RECOVERY_UNSAFE=true
     status=1
   fi
   if [[ "$signal_cleanup" == true ]]; then
@@ -1994,11 +2823,6 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   acquire_host_lock
-  CURRENT_STAGE='mount_init'
-  initialize_backup_mounts
-  CURRENT_STAGE='mount_verify'
-  verify_backup_mount_ownership
-
   CURRENT_STAGE='queue'
   local result
   if queue_or_select_run; then
@@ -2011,6 +2835,8 @@ main() {
     FAILURE_CATEGORY='internal'
     return 1
   fi
+  CURRENT_STAGE='run_id_publish'
+  publish_live_run_id
   CURRENT_STAGE='lease_values'
   prepare_lease_values
   CURRENT_STAGE='lock_session'
@@ -2019,6 +2845,22 @@ main() {
   acquire_durable_lease
   CURRENT_STAGE='heartbeat'
   start_lease_heartbeat
+  assert_lease_heartbeat
+
+  FAILURE_CATEGORY='drain_timeout'
+  CURRENT_STAGE='drain'
+  wait_for_durable_drain
+  transition_operational_mode backup
+  assert_lease_heartbeat
+  CURRENT_STAGE='worker_stop'
+  stop_and_verify_worker
+  assert_lease_heartbeat
+
+  FAILURE_CATEGORY='internal'
+  CURRENT_STAGE='mount_init'
+  initialize_backup_mounts
+  CURRENT_STAGE='mount_verify'
+  verify_backup_mount_ownership
   assert_lease_heartbeat
 
   FAILURE_CATEGORY='integrity'
@@ -2034,19 +2876,13 @@ main() {
   CURRENT_STAGE='local_repository'
   ensure_repository local
   assert_lease_heartbeat
-  FAILURE_CATEGORY='drain_timeout'
-  CURRENT_STAGE='drain'
-  wait_for_durable_drain
-  transition_operational_mode backup
-  assert_lease_heartbeat
-  CURRENT_STAGE='stop_services'
+
+  CURRENT_STAGE='aistor_stop'
   stop_snapshot_services
-  assert_lease_heartbeat
 
   FAILURE_CATEGORY='snapshot'
   CURRENT_STAGE='snapshot'
   backup_command snapshot --run-id "$RUN_ID"
-  assert_lease_heartbeat
   CURRENT_STAGE='aistor_restart'
   restart_aistor_service
   assert_lease_heartbeat
@@ -2127,16 +2963,21 @@ main() {
     assert_lease_heartbeat
   fi
 
-  FAILURE_CATEGORY='object_store_restart'
-  CURRENT_STAGE='service_restart'
-  restart_stopped_services
-  assert_lease_heartbeat
   FAILURE_CATEGORY='internal'
   CURRENT_STAGE='finish'
   backup_command finish --run-id "$RUN_ID"
   TERMINAL_RECORDED=true
+  CURRENT_STAGE='one_shot_audit'
+  if ! audit_recorded_live_coordinator_one_shots; then
+    RECOVERY_UNSAFE=true
+    return 1
+  fi
+  CURRENT_STAGE='worker_restart'
+  restart_worker_service
+  assert_lease_heartbeat
   if ! release_operational_lease; then
     safe_log 'main_release_failed'
+    RECOVERY_UNSAFE=true
     return 1
   fi
 }

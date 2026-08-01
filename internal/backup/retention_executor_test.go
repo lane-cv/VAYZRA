@@ -254,6 +254,7 @@ func TestExecutorForgetsInDeterministicBoundedGlobalBatches(t *testing.T) {
 			command.Args[len(command.Args)-1] != "--prune" {
 			t.Fatalf("unsafe forget command=%q", command.Args)
 		}
+		requireResticTemporaryDirectory(t, command, executor.config.WorkRoot)
 		batch := command.Args[4 : len(command.Args)-1]
 		if len(batch) > RetentionDeleteBatchLimit {
 			t.Fatalf("batch size=%d", len(batch))

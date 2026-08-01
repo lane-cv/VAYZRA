@@ -59,6 +59,12 @@ const (
 	AlertSeverityCritical AlertSeverity = "critical"
 )
 
+const (
+	AlertKeyBackupRemoteSync                      = "backup_remote_sync"
+	alertDependencyUnavailableSuffix              = "_dependency_unavailable"
+	AlertKeyBackupRemoteSyncDependencyUnavailable = AlertKeyBackupRemoteSync + alertDependencyUnavailableSuffix
+)
+
 type AlertState string
 
 const (
@@ -160,7 +166,7 @@ var alertDependencySummaries = map[string]string{
 	"filesystem_root_usage":     "Root filesystem metrics are unavailable",
 	"filesystem_backup_usage":   "Backup filesystem metrics are unavailable",
 	"backup_local_age":          "Local backup status is unavailable",
-	"backup_remote_replication": "Remote backup status is unavailable",
+	AlertKeyBackupRemoteSync:      "Remote backup status is unavailable",
 	"ai_error_rate":             "AI request metrics are unavailable",
 	"processing_queue_depth":    "Processing queue metrics are unavailable",
 	"processing_failures":       "Processing failure metrics are unavailable",
@@ -183,18 +189,19 @@ func DefaultAlertRules(settings Settings) ([]Rule, error) {
 		{
 			DedupeKey: "filesystem_backup_usage", Category: "storage",
 			Summary:   "Backup filesystem usage is high",
-			Warning:   float64(settings.DiskWarningPercent),
-			Critical:  float64(settings.DiskCriticalPercent),
+			Warning:   float64(settings.BackupFilesystemWarningPercent),
+			Critical:  float64(settings.BackupFilesystemCriticalPercent),
 			Direction: DirectionAbove, MinimumSamples: 1,
 		},
 		{
 			DedupeKey: "backup_local_age", Category: "backup",
-			Summary: "Verified local backup is overdue",
-			Warning: 25 * 60 * 60, Critical: 30 * 60 * 60,
+			Summary:   "Verified local backup is overdue",
+			Warning:   float64(settings.LocalBackupAgeWarningHours) * 60 * 60,
+			Critical:  float64(settings.LocalBackupAgeCriticalHours) * 60 * 60,
 			Direction: DirectionAbove, MinimumSamples: 1,
 		},
 		{
-			DedupeKey: "backup_remote_replication", Category: "backup",
+			DedupeKey: AlertKeyBackupRemoteSync, Category: "backup",
 			Summary: "Remote backup replication is unavailable",
 			Warning: 1, Critical: -1,
 			Direction: DirectionBelow, MinimumSamples: 1,
@@ -215,20 +222,23 @@ func DefaultAlertRules(settings Settings) ([]Rule, error) {
 		},
 		{
 			DedupeKey: "processing_failures", Category: "processing",
-			Summary: "Processing failures are high",
-			Warning: 5, Critical: 20,
+			Summary:   "Processing failures are high",
+			Warning:   float64(settings.ProcessingFailureWarningCount),
+			Critical:  float64(settings.ProcessingFailureCriticalCount),
 			Direction: DirectionAbove, MinimumSamples: 1,
 		},
 		{
 			DedupeKey: "login_failures", Category: "security",
-			Summary: "Login failures are high",
-			Warning: 20, Critical: 100,
+			Summary:   "Login failures are high",
+			Warning:   float64(settings.LoginFailureWarningCount),
+			Critical:  float64(settings.LoginFailureCriticalCount),
 			Direction: DirectionAbove, MinimumSamples: 1,
 		},
 		{
 			DedupeKey: "authorization_denials", Category: "security",
-			Summary: "Authorization denials are high",
-			Warning: 50, Critical: 200,
+			Summary:   "Authorization denials are high",
+			Warning:   float64(settings.AuthorizationDenialWarningCount),
+			Critical:  float64(settings.AuthorizationDenialCriticalCount),
 			Direction: DirectionAbove, MinimumSamples: 1,
 		},
 	}
@@ -272,7 +282,7 @@ func BuildAlertEvaluations(
 		if err := validateAlertRule(rule); err != nil {
 			return nil, err
 		}
-		if rule.DedupeKey == "backup_remote_replication" {
+		if rule.DedupeKey == AlertKeyBackupRemoteSync {
 			switch remoteReplicationState {
 			case RemoteReplicationUnknown:
 				evaluations = append(evaluations, Evaluation{
@@ -328,7 +338,7 @@ func alertDependencyEvaluation(
 		return Evaluation{}, ErrInvalid
 	}
 	rule := Rule{
-		DedupeKey:      evaluation.Rule.DedupeKey + "_dependency_unavailable",
+		DedupeKey:      evaluation.Rule.DedupeKey + alertDependencyUnavailableSuffix,
 		Category:       evaluation.Rule.Category,
 		Summary:        summary,
 		Warning:        1,
@@ -455,7 +465,7 @@ func alertSeriesForRule(dedupeKey string) (sampleSeries, bool) {
 			source: SampleSourceApp, metric: SampleMetricBackupAgeSeconds,
 			scope: SampleScopeLocal,
 		}, true
-	case "backup_remote_replication":
+	case AlertKeyBackupRemoteSync:
 		return sampleSeries{
 			source: SampleSourceApp, metric: SampleMetricBackupRemoteUp,
 			scope: SampleScopeRemote,

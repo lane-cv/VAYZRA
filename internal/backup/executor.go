@@ -324,7 +324,7 @@ func NewExecutor(config ExecutorConfig) (Executor, error) {
 		config.Secrets == nil ||
 		!filepath.IsAbs(config.WorkRoot) ||
 		!filepath.IsAbs(config.ObjectRoot) ||
-		filepath.Clean(config.WorkRoot) == filepath.Clean(config.ObjectRoot) ||
+		directoryRootsOverlap(config.WorkRoot, config.ObjectRoot) ||
 		!safeDatabaseHost.MatchString(config.DatabaseHost) ||
 		portErr != nil ||
 		port == 0 ||
@@ -342,6 +342,30 @@ func NewExecutor(config ExecutorConfig) (Executor, error) {
 	config.WorkRoot = filepath.Clean(config.WorkRoot)
 	config.ObjectRoot = filepath.Clean(config.ObjectRoot)
 	return Executor{config: config}, nil
+}
+
+func directoryRootsOverlap(left string, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if directoryContains(left, right) || directoryContains(right, left) {
+		return true
+	}
+	resolvedLeft, leftErr := filepath.EvalSymlinks(left)
+	resolvedRight, rightErr := filepath.EvalSymlinks(right)
+	return leftErr == nil &&
+		rightErr == nil &&
+		(directoryContains(resolvedLeft, resolvedRight) ||
+			directoryContains(resolvedRight, resolvedLeft))
+}
+
+func directoryContains(root string, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || filepath.IsAbs(relative) {
+		return false
+	}
+	return relative == "." ||
+		(relative != ".." &&
+			!strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 func validSSLMode(mode string) bool {
@@ -412,43 +436,174 @@ func RemoteSyncFailureStage(err error) string {
 	return "unknown"
 }
 
+type snapshotFailure struct {
+	stage       string
+	cause       error
+	exitCode    int
+	hasExitCode bool
+}
+
+func (failure *snapshotFailure) Error() string {
+	return failure.cause.Error()
+}
+
+func (failure *snapshotFailure) Unwrap() error {
+	return failure.cause
+}
+
+func snapshotFailureAt(stage string, cause error) error {
+	if !validSnapshotFailureStage(stage) {
+		stage = "unknown"
+	}
+	return &snapshotFailure{
+		stage: stage,
+		cause: safeSnapshotFailureCause(cause),
+	}
+}
+
+func snapshotExitFailureAt(stage string, cause error, exitCode int) error {
+	failure := snapshotFailureAt(stage, cause).(*snapshotFailure)
+	if !validSnapshotExitStage(failure.stage) {
+		return failure
+	}
+	failure.exitCode = normalizeSnapshotExitCode(exitCode)
+	failure.hasExitCode = true
+	return failure
+}
+
+func normalizeSnapshotExitCode(exitCode int) int {
+	if exitCode < 1 || exitCode > 255 {
+		return -1
+	}
+	return exitCode
+}
+
+func validSnapshotExitStage(stage string) bool {
+	switch stage {
+	case "pg_dump_exit", "age_exit", "restic_exit":
+		return true
+	default:
+		return false
+	}
+}
+
+func safeSnapshotFailureCause(cause error) error {
+	switch {
+	case errors.Is(cause, ErrCancelled):
+		return ErrCancelled
+	case errors.Is(cause, ErrCleanup):
+		return ErrCleanup
+	case errors.Is(cause, ErrCapacity):
+		return ErrCapacity
+	case errors.Is(cause, ErrDatabaseDump):
+		return ErrDatabaseDump
+	case errors.Is(cause, ErrSnapshot):
+		return ErrSnapshot
+	default:
+		return ErrSnapshot
+	}
+}
+
+func validSnapshotFailureStage(stage string) bool {
+	switch stage {
+	case "input",
+		"work_root",
+		"object_root",
+		"secrets",
+		"work_dir",
+		"pg_dump_run",
+		"pg_dump_exit",
+		"dump_hash",
+		"object_walk",
+		"object_symlink",
+		"object_nonregular",
+		"object_lstat",
+		"object_open",
+		"object_identity_changed",
+		"object_read",
+		"object_close",
+		"object_size_changed",
+		"object_capacity",
+		"manifest",
+		"recovery_bundle",
+		"age_run",
+		"age_exit",
+		"restic_run",
+		"restic_exit",
+		"restic_summary",
+		"capacity",
+		"cleanup",
+		"cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func SnapshotFailureStage(err error) string {
+	var failure *snapshotFailure
+	if errors.As(err, &failure) &&
+		failure != nil &&
+		validSnapshotFailureStage(failure.stage) {
+		return failure.stage
+	}
+	return "unknown"
+}
+
+func SnapshotFailureExitCode(err error) (int, bool) {
+	var failure *snapshotFailure
+	if !errors.As(err, &failure) ||
+		failure == nil ||
+		!failure.hasExitCode ||
+		!validSnapshotExitStage(failure.stage) {
+		return 0, false
+	}
+	return normalizeSnapshotExitCode(failure.exitCode), true
+}
+
 func (executor Executor) Snapshot(
 	ctx context.Context,
 	input SnapshotInput,
 ) (result SnapshotResult, resultErr error) {
 	if !canonicalRunID(input.RunID) || input.DatabaseMigrationVersion < 1 {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("input", ErrSnapshot)
 	}
 	if err := secureDirectory(executor.config.WorkRoot); err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("work_root", ErrSnapshot)
 	}
 	if err := sourceDirectory(executor.config.ObjectRoot); err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("object_root", ErrSnapshot)
+	}
+	if directoryRootsOverlap(
+		executor.config.WorkRoot,
+		executor.config.ObjectRoot,
+	) {
+		return SnapshotResult{}, snapshotFailureAt("object_root", ErrSnapshot)
 	}
 	databasePassword, err := executor.config.Secrets.Read(SecretDatabasePassword)
 	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("secrets", ErrSnapshot)
 	}
 	repository, err := executor.config.Secrets.Read(SecretLocalRepository)
 	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("secrets", ErrSnapshot)
 	}
 	repositoryPassword, err := executor.config.Secrets.Read(SecretLocalPassword)
 	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("secrets", ErrSnapshot)
 	}
 	workDirectory, err := os.MkdirTemp(executor.config.WorkRoot, ".backup-")
 	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("work_dir", ErrSnapshot)
 	}
 	if err := os.Chmod(workDirectory, 0o700); err != nil {
 		_ = os.RemoveAll(workDirectory)
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("work_dir", ErrSnapshot)
 	}
 	defer func() {
 		if err := cleanupWorkDirectory(executor.config.WorkRoot, workDirectory); err != nil {
 			result = SnapshotResult{}
-			resultErr = ErrCleanup
+			resultErr = snapshotFailureAt("cleanup", ErrCleanup)
 		}
 	}()
 
@@ -476,10 +631,18 @@ func (executor Executor) Snapshot(
 		StderrLimit: CommandOutputLimit,
 	})
 	if err != nil {
-		return SnapshotResult{}, mapExecutorRunError(ctx, err, ErrDatabaseDump)
+		mapped := mapExecutorRunError(ctx, err, ErrDatabaseDump)
+		if errors.Is(mapped, ErrCancelled) {
+			return SnapshotResult{}, snapshotFailureAt("cancelled", mapped)
+		}
+		return SnapshotResult{}, snapshotFailureAt("pg_dump_run", mapped)
 	}
 	if pgResult.ExitCode != 0 {
-		return SnapshotResult{}, ErrDatabaseDump
+		return SnapshotResult{}, snapshotExitFailureAt(
+			"pg_dump_exit",
+			ErrDatabaseDump,
+			pgResult.ExitCode,
+		)
 	}
 	dumpHash, dumpBytes, err := hashBoundedRegularFile(
 		ctx,
@@ -488,18 +651,15 @@ func (executor Executor) Snapshot(
 	)
 	if err != nil {
 		if errors.Is(err, ErrCancelled) {
-			return SnapshotResult{}, ErrCancelled
+			return SnapshotResult{}, snapshotFailureAt("cancelled", err)
 		}
-		return SnapshotResult{}, ErrDatabaseDump
+		return SnapshotResult{}, snapshotFailureAt("dump_hash", ErrDatabaseDump)
 	}
 
 	objectCount, referencedBytes, objectIdentity, err :=
 		summarizeObjectFiles(ctx, executor.config.ObjectRoot)
 	if err != nil {
-		if errors.Is(err, ErrCancelled) {
-			return SnapshotResult{}, ErrCancelled
-		}
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotObjectSummaryFailure(err)
 	}
 	manifest := Manifest{
 		SchemaVersion:            1,
@@ -513,12 +673,12 @@ func (executor Executor) Snapshot(
 	}
 	manifestBytes, err := MarshalManifest(manifest)
 	if err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("manifest", ErrSnapshot)
 	}
 	manifestHash := sha256.Sum256(manifestBytes)
 	manifestPath := filepath.Join(workDirectory, "manifest.json")
 	if err := writeOwnerOnlyFile(manifestPath, manifestBytes); err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt("manifest", ErrSnapshot)
 	}
 	recoveryBundleBytes, err := json.Marshal(recoveryBundle{
 		SchemaVersion: 1,
@@ -531,11 +691,17 @@ func (executor Executor) Snapshot(
 		},
 	})
 	if err != nil || len(recoveryBundleBytes) > ManifestMaxBytes {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt(
+			"recovery_bundle",
+			ErrSnapshot,
+		)
 	}
 	recoveryBundlePath := filepath.Join(workDirectory, "recovery-bundle.json")
 	if err := writeOwnerOnlyFile(recoveryBundlePath, recoveryBundleBytes); err != nil {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotFailureAt(
+			"recovery_bundle",
+			ErrSnapshot,
+		)
 	}
 	bundlePath := filepath.Join(workDirectory, "recovery-bundle.age")
 	ageResult, err := executor.config.Runner.Run(ctx, Command{
@@ -554,10 +720,18 @@ func (executor Executor) Snapshot(
 		StderrLimit: CommandOutputLimit,
 	})
 	if err != nil {
-		return SnapshotResult{}, mapExecutorRunError(ctx, err, ErrSnapshot)
+		mapped := mapExecutorRunError(ctx, err, ErrSnapshot)
+		if errors.Is(mapped, ErrCancelled) {
+			return SnapshotResult{}, snapshotFailureAt("cancelled", mapped)
+		}
+		return SnapshotResult{}, snapshotFailureAt("age_run", mapped)
 	}
 	if ageResult.ExitCode != 0 {
-		return SnapshotResult{}, ErrSnapshot
+		return SnapshotResult{}, snapshotExitFailureAt(
+			"age_exit",
+			ErrSnapshot,
+			ageResult.ExitCode,
+		)
 	}
 	snapshotSummary, err := executor.resticBackup(
 		ctx,
@@ -580,7 +754,7 @@ func (executor Executor) Snapshot(
 	}
 	logicalBytes := dumpBytes + referencedBytes
 	if logicalBytes < dumpBytes {
-		return SnapshotResult{}, ErrCapacity
+		return SnapshotResult{}, snapshotFailureAt("capacity", ErrCapacity)
 	}
 	return SnapshotResult{
 		Manifest:          manifest,
@@ -616,7 +790,10 @@ func (executor Executor) resticBackup(
 	}
 	for _, tag := range tags {
 		if tag == "" || strings.TrimSpace(tag) != tag {
-			return resticSummary{}, ErrSnapshot
+			return resticSummary{}, snapshotFailureAt(
+				"restic_run",
+				ErrSnapshot,
+			)
 		}
 		args = append(args, "--tag", tag)
 	}
@@ -626,6 +803,7 @@ func (executor Executor) resticBackup(
 		Args:       args,
 		Env: []string{
 			"LC_ALL=C",
+			"TMPDIR=" + workDirectory,
 			"RESTIC_REPOSITORY=" + repository,
 			"RESTIC_PASSWORD=" + password,
 		},
@@ -635,14 +813,25 @@ func (executor Executor) resticBackup(
 		StderrLimit: CommandOutputLimit,
 	})
 	if err != nil {
-		return resticSummary{}, mapExecutorRunError(ctx, err, ErrSnapshot)
+		mapped := mapExecutorRunError(ctx, err, ErrSnapshot)
+		if errors.Is(mapped, ErrCancelled) {
+			return resticSummary{}, snapshotFailureAt("cancelled", mapped)
+		}
+		return resticSummary{}, snapshotFailureAt("restic_run", mapped)
 	}
 	if result.ExitCode != 0 {
-		return resticSummary{}, ErrSnapshot
+		return resticSummary{}, snapshotExitFailureAt(
+			"restic_exit",
+			ErrSnapshot,
+			result.ExitCode,
+		)
 	}
 	summary, err := decodeResticSummary(result.Stdout)
 	if err != nil {
-		return resticSummary{}, ErrSnapshot
+		return resticSummary{}, snapshotFailureAt(
+			"restic_summary",
+			ErrSnapshot,
+		)
 	}
 	return summary, nil
 }
@@ -654,6 +843,9 @@ func (executor Executor) Verify(
 	if !canonicalRunID(input.RunID) ||
 		!resticSnapshotID.MatchString(input.SnapshotID) ||
 		len(input.SnapshotID) != sha256.Size*2 {
+		return VerifyResult{}, ErrIntegrity
+	}
+	if err := secureDirectory(executor.config.WorkRoot); err != nil {
 		return VerifyResult{}, ErrIntegrity
 	}
 	repository, err := executor.config.Secrets.Read(SecretLocalRepository)
@@ -682,6 +874,7 @@ func (executor Executor) Verify(
 			Args:       args,
 			Env: []string{
 				"LC_ALL=C",
+				"TMPDIR=" + executor.config.WorkRoot,
 				"RESTIC_REPOSITORY=" + repository,
 				"RESTIC_PASSWORD=" + password,
 			},
@@ -731,6 +924,19 @@ func (executor Executor) Verify(
 func (executor Executor) RemoteConfigured() (bool, error) {
 	_, configured, err := executor.remoteConfiguration()
 	return configured, err
+}
+
+func (executor Executor) LocalConfigured() (bool, error) {
+	for _, name := range []SecretName{
+		SecretLocalRepository,
+		SecretLocalPassword,
+	} {
+		value, err := executor.config.Secrets.Read(name)
+		if err != nil || value == "" {
+			return false, ErrSnapshot
+		}
+	}
+	return true, nil
 }
 
 type remoteConfiguration struct {
@@ -843,6 +1049,7 @@ func (executor Executor) Sync(
 	}
 	remoteEnv := []string{
 		"LC_ALL=C",
+		"TMPDIR=" + workDirectory,
 		"RESTIC_REPOSITORY=" + remote.repository,
 		"RESTIC_PASSWORD=" + remote.password,
 		"AWS_ACCESS_KEY_ID=" + remote.accessKey,
@@ -1222,7 +1429,8 @@ func summarizeObjectFiles(
 	root string,
 ) (int64, int64, [sha256.Size]byte, error) {
 	if ctx == nil {
-		return 0, 0, [sha256.Size]byte{}, ErrCancelled
+		return 0, 0, [sha256.Size]byte{},
+			snapshotFailureAt("cancelled", ErrCancelled)
 	}
 	var count int64
 	var bytesCount int64
@@ -1230,39 +1438,45 @@ func summarizeObjectFiles(
 	_, _ = setHash.Write([]byte("happylearn-object-set-v1\x00"))
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if ctx.Err() != nil {
-			return ErrCancelled
+			return snapshotFailureAt("cancelled", ErrCancelled)
 		}
 		if walkErr != nil {
-			return ErrSnapshot
+			return snapshotFailureAt("object_walk", ErrSnapshot)
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
-			return ErrSnapshot
+			return snapshotFailureAt("object_symlink", ErrSnapshot)
 		}
 		if entry.IsDir() {
 			return nil
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() < 0 {
-			return ErrSnapshot
+		if err != nil {
+			return snapshotFailureAt("object_lstat", ErrSnapshot)
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 {
+			return snapshotFailureAt("object_nonregular", ErrSnapshot)
 		}
 		if count == int64(^uint64(0)>>1) || bytesCount > int64(^uint64(0)>>1)-info.Size() {
-			return ErrCapacity
+			return snapshotFailureAt("object_capacity", ErrCapacity)
 		}
 		relativePath, err := filepath.Rel(root, path)
 		if err != nil ||
 			relativePath == "." ||
 			filepath.IsAbs(relativePath) ||
 			strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
-			return ErrSnapshot
+			return snapshotFailureAt("object_walk", ErrSnapshot)
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			return ErrSnapshot
+			return snapshotFailureAt("object_open", ErrSnapshot)
 		}
 		openedInfo, statErr := file.Stat()
 		if statErr != nil || !os.SameFile(info, openedInfo) {
 			_ = file.Close()
-			return ErrSnapshot
+			return snapshotFailureAt(
+				"object_identity_changed",
+				ErrSnapshot,
+			)
 		}
 		fileHash, written, copyErr := hashFileContents(
 			ctx,
@@ -1270,11 +1484,13 @@ func summarizeObjectFiles(
 			info.Size(),
 		)
 		closeErr := file.Close()
-		if copyErr != nil || closeErr != nil || written != info.Size() {
-			if errors.Is(copyErr, ErrCancelled) {
-				return ErrCancelled
-			}
-			return ErrSnapshot
+		if failure := objectContentFailure(
+			copyErr,
+			closeErr,
+			written,
+			info.Size(),
+		); failure != nil {
+			return failure
 		}
 		_, _ = setHash.Write([]byte(filepath.ToSlash(relativePath)))
 		_, _ = setHash.Write([]byte{0})
@@ -1286,11 +1502,47 @@ func summarizeObjectFiles(
 		return nil
 	})
 	if err != nil {
+		if SnapshotFailureStage(err) == "unknown" {
+			err = snapshotFailureAt("object_walk", err)
+		}
 		return 0, 0, [sha256.Size]byte{}, err
 	}
 	var identity [sha256.Size]byte
 	copy(identity[:], setHash.Sum(nil))
 	return count, bytesCount, identity, nil
+}
+
+func snapshotObjectSummaryFailure(err error) error {
+	if errors.Is(err, ErrCancelled) {
+		return snapshotFailureAt("cancelled", ErrCancelled)
+	}
+	stage := SnapshotFailureStage(err)
+	if stage == "unknown" {
+		stage = "object_walk"
+	}
+	return snapshotFailureAt(stage, ErrSnapshot)
+}
+
+func objectContentFailure(
+	copyErr error,
+	closeErr error,
+	written int64,
+	expected int64,
+) error {
+	switch {
+	case errors.Is(copyErr, ErrCancelled):
+		return snapshotFailureAt("cancelled", ErrCancelled)
+	case errors.Is(copyErr, ErrCapacity):
+		return snapshotFailureAt("object_size_changed", ErrSnapshot)
+	case copyErr != nil:
+		return snapshotFailureAt("object_read", ErrSnapshot)
+	case closeErr != nil:
+		return snapshotFailureAt("object_close", ErrSnapshot)
+	case written != expected:
+		return snapshotFailureAt("object_size_changed", ErrSnapshot)
+	default:
+		return nil
+	}
 }
 
 func hashBoundedRegularFile(

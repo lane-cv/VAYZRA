@@ -1,4 +1,21 @@
-export type OperationsSettings = {
+export type InfrastructureKey =
+  | 'application_database'
+  | 'redis_security'
+  | 'object_store'
+  | 'ai_encryption'
+  | 'internal_metrics'
+  | 'host_metrics_ingestion'
+  | 'alert_webhook'
+  | 'local_backup'
+  | 'remote_backup'
+
+export type InfrastructureStatus = {
+  key: InfrastructureKey
+  configured: boolean
+  lastValidatedAt: string | null
+}
+
+export type OperationsSettingsUpdate = {
   version: number
   siteName: string
   siteAnnouncement: string
@@ -10,10 +27,24 @@ export type OperationsSettings = {
   backupTimezone: 'Asia/Shanghai'
   diskWarningPercent: number
   diskCriticalPercent: number
+  backupFilesystemWarningPercent: number
+  backupFilesystemCriticalPercent: number
+  localBackupAgeWarningHours: number
+  localBackupAgeCriticalHours: number
   aiErrorWarningPercent: number
   aiErrorCriticalPercent: number
   processingQueueWarning: number
   processingQueueCritical: number
+  processingFailureWarningCount: number
+  processingFailureCriticalCount: number
+  loginFailureWarningCount: number
+  loginFailureCriticalCount: number
+  authorizationDenialWarningCount: number
+  authorizationDenialCriticalCount: number
+}
+
+export type OperationsSettings = OperationsSettingsUpdate & {
+  infrastructure: InfrastructureStatus[]
   updatedAt: string
 }
 

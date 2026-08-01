@@ -19,12 +19,23 @@ const safeSettingsKeys = [
   'aiErrorCriticalPercent',
   'aiErrorWarningPercent',
   'auditRetentionDays',
+  'authorizationDenialCriticalCount',
+  'authorizationDenialWarningCount',
+  'backupFilesystemCriticalPercent',
+  'backupFilesystemWarningPercent',
   'backupHour',
   'backupMinute',
   'backupTimezone',
   'diskCriticalPercent',
   'diskWarningPercent',
+  'infrastructure',
+  'localBackupAgeCriticalHours',
+  'localBackupAgeWarningHours',
+  'loginFailureCriticalCount',
+  'loginFailureWarningCount',
   'operationalSampleRetentionDays',
+  'processingFailureCriticalCount',
+  'processingFailureWarningCount',
   'processingQueueCritical',
   'processingQueueWarning',
   'siteAnnouncement',
@@ -33,6 +44,17 @@ const safeSettingsKeys = [
   'updatedAt',
   'version',
 ].sort()
+const infrastructureKeys = [
+  'application_database',
+  'redis_security',
+  'object_store',
+  'ai_encryption',
+  'internal_metrics',
+  'host_metrics_ingestion',
+  'alert_webhook',
+  'local_backup',
+  'remote_backup',
+]
 const forbiddenOperationsField = /authorization|body|content|cookie|credential|object.?key|password|query|repository.?path|secret|token|url/i
 const forbiddenAuditMetadata = /authorization|body|content|cookie|credential|filename|\bip\b|object.?key|password|prompt|query|secret|token|url/i
 
@@ -114,7 +136,18 @@ test('@phase5 teacher manages operations without exposing secrets', async ({ pag
   const initialSettings = await responseJSON<SettingsEnvelope>(await settingsResponse)
   expect(Object.keys(initialSettings.data).sort()).toEqual(safeSettingsKeys)
   expectSecretFreeKeys(initialSettings)
+  const infrastructure = initialSettings.data.infrastructure as Array<Record<string, unknown>>
+  expect(infrastructure.map((status) => status.key)).toEqual(infrastructureKeys)
+  expect(infrastructure.every((status) => (
+    Object.keys(status).sort().join(',') === 'configured,key,lastValidatedAt'
+    && typeof status.configured === 'boolean'
+    && (status.lastValidatedAt === null || typeof status.lastValidatedAt === 'string')
+  ))).toBe(true)
   await expect(page.locator('input[type="password"]')).toHaveCount(0)
+  const infrastructureSection = page.getByTestId('infrastructure-status')
+  await expect(infrastructureSection).toBeVisible()
+  await expect(infrastructureSection.getByTestId('infrastructure-row')).toHaveCount(9)
+  await expect(infrastructureSection.locator('input, [title], [data-config], [data-source], [data-url], [data-path]')).toHaveCount(0)
   await expect(page.getByText(new RegExp(`^版本 ${initialSettings.data.version} ·`))).toBeVisible()
 
   const announcement = `Phase 5 acceptance ${randomUUID()}`
@@ -122,11 +155,18 @@ test('@phase5 teacher manages operations without exposing secrets', async ({ pag
   const updateResponse = page.waitForResponse((response) =>
     response.request().method() === 'PUT'
     && response.url().endsWith('/api/v1/admin/operations/settings'))
+  const updateRequest = page.waitForRequest((request) =>
+    request.method() === 'PUT'
+    && request.url().endsWith('/api/v1/admin/operations/settings'))
   await page.getByRole('button', { name: '保存设置' }).click()
+  const updatePayload = (await updateRequest).postDataJSON() as Record<string, unknown>
+  expect(updatePayload).not.toHaveProperty('infrastructure')
+  expect(updatePayload).not.toHaveProperty('updatedAt')
   const updatedSettings = await responseJSON<SettingsEnvelope>(await updateResponse)
   expect(updatedSettings.data.version).toBe(initialSettings.data.version + 1)
   expect(updatedSettings.data.siteAnnouncement).toBe(announcement)
   expect(Object.keys(updatedSettings.data).sort()).toEqual(safeSettingsKeys)
+  expect((updatedSettings.data.infrastructure as Array<Record<string, unknown>>).map((status) => status.key)).toEqual(infrastructureKeys)
   expectSecretFreeKeys(updatedSettings)
   await expect(page.getByRole('status')).toContainText('系统设置已保存')
   await expect(page.getByText(new RegExp(`^版本 ${updatedSettings.data.version} ·`))).toBeVisible()
@@ -221,6 +261,7 @@ test('@phase5 student cannot access operations', async ({ page, request }) => {
     '/api/v1/admin/operations/audit',
     '/api/v1/admin/operations/alerts',
     '/api/v1/admin/operations/backups',
+    '/api/v1/admin/operations/backups/53000000-0000-4000-8000-000000000001',
   ]) {
     expect((await page.request.get(route)).status(), route).toBe(403)
   }

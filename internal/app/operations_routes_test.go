@@ -112,9 +112,15 @@ func TestApplicationMountsAdminOperationsWithOriginAndCSRF(t *testing.T) {
 		"softDeleteRetentionDays":30,"auditRetentionDays":365,
 		"operationalSampleRetentionDays":7,"backupHour":3,"backupMinute":0,
 		"backupTimezone":"Asia/Shanghai","diskWarningPercent":75,
-		"diskCriticalPercent":90,"aiErrorWarningPercent":10,
+		"diskCriticalPercent":90,"backupFilesystemWarningPercent":75,
+		"backupFilesystemCriticalPercent":90,
+		"localBackupAgeWarningHours":25,"localBackupAgeCriticalHours":30,
+		"aiErrorWarningPercent":10,
 		"aiErrorCriticalPercent":25,"processingQueueWarning":20,
-		"processingQueueCritical":100
+		"processingQueueCritical":100,"processingFailureWarningCount":5,
+		"processingFailureCriticalCount":20,"loginFailureWarningCount":20,
+		"loginFailureCriticalCount":100,"authorizationDenialWarningCount":50,
+		"authorizationDenialCriticalCount":200
 	}`
 	for name, configure := range map[string]func(*http.Request){
 		"cross origin": func(request *http.Request) {

@@ -445,7 +445,7 @@ func TestLatestEmbeddedMigrationVersionIsStrictAndCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if latest != 25 {
+	if latest != 27 {
 		t.Fatalf("latest migration=%d", latest)
 	}
 

@@ -91,6 +91,39 @@ func (s mapSecrets) Read(name SecretName) (string, error) {
 	return value, nil
 }
 
+func requireResticTemporaryDirectory(
+	t *testing.T,
+	command Command,
+	workRoot string,
+) {
+	t.Helper()
+	var values []string
+	for _, value := range command.Env {
+		if strings.HasPrefix(value, "TMPDIR=") {
+			values = append(values, strings.TrimPrefix(value, "TMPDIR="))
+		}
+	}
+	if len(values) != 1 {
+		t.Fatalf("restic TMPDIR values=%q environment=%q", values, command.Env)
+	}
+	temporaryDirectory := values[0]
+	if !filepath.IsAbs(temporaryDirectory) ||
+		filepath.Clean(temporaryDirectory) != temporaryDirectory {
+		t.Fatalf("restic TMPDIR is not canonical: %q", temporaryDirectory)
+	}
+	if temporaryDirectory != workRoot {
+		if filepath.Dir(temporaryDirectory) != workRoot ||
+			command.Dir != temporaryDirectory {
+			t.Fatalf(
+				"restic TMPDIR=%q dir=%q work root=%q",
+				temporaryDirectory,
+				command.Dir,
+				workRoot,
+			)
+		}
+	}
+}
+
 func executorFixture(t *testing.T, runner Runner) (Executor, string) {
 	t.Helper()
 	workRoot := t.TempDir()
@@ -126,6 +159,539 @@ func executorFixture(t *testing.T, runner Runner) (Executor, string) {
 		t.Fatal(err)
 	}
 	return executor, workRoot
+}
+
+func TestNewExecutorRejectsOverlappingWorkAndObjectRoots(t *testing.T) {
+	executor, _ := executorFixture(t, &recordingRunner{})
+	config := executor.config
+
+	physicalRoot := t.TempDir()
+	objectRoot := filepath.Join(physicalRoot, "objects")
+	nestedWorkRoot := filepath.Join(objectRoot, "work")
+	if err := os.MkdirAll(nestedWorkRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(t.TempDir(), "physical-alias")
+	if err := os.Symlink(physicalRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		workRoot   string
+		objectRoot string
+	}{
+		{
+			name:       "work-inside-object",
+			workRoot:   nestedWorkRoot,
+			objectRoot: objectRoot,
+		},
+		{
+			name:       "object-inside-work",
+			workRoot:   physicalRoot,
+			objectRoot: objectRoot,
+		},
+		{
+			name:       "physical-alias",
+			workRoot:   filepath.Join(aliasRoot, "objects", "work"),
+			objectRoot: objectRoot,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testConfig := config
+			testConfig.WorkRoot = tc.workRoot
+			testConfig.ObjectRoot = tc.objectRoot
+			if _, err := NewExecutor(testConfig); !errors.Is(err, ErrExecutorConfig) {
+				t.Fatalf("overlapping roots accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutorSnapshotRejectsRootsThatBecomePhysicalAliases(t *testing.T) {
+	runner := &recordingRunner{}
+	fixture, _ := executorFixture(t, runner)
+	config := fixture.config
+
+	physicalRoot := t.TempDir()
+	config.ObjectRoot = filepath.Join(physicalRoot, "objects")
+	if err := os.Mkdir(config.ObjectRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(t.TempDir(), "physical-alias")
+	if err := os.Symlink(physicalRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+	config.WorkRoot = filepath.Join(aliasRoot, "objects", "late-work")
+	executor, err := NewExecutor(config)
+	if err != nil {
+		t.Fatalf("nonexistent work root rejected before overlap was observable: %v", err)
+	}
+	if err := os.Mkdir(config.WorkRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = executor.Snapshot(context.Background(), SnapshotInput{
+		RunID:                    commandRunIDForExecutor,
+		DatabaseMigrationVersion: 20,
+	})
+	if !errors.Is(err, ErrSnapshot) ||
+		SnapshotFailureStage(err) != "object_root" {
+		t.Fatalf(
+			"physical overlap error=%v stage=%q",
+			err,
+			SnapshotFailureStage(err),
+		)
+	}
+	if calls := runner.calls(); len(calls) != 0 {
+		t.Fatalf("physical overlap ran external commands: %+v", calls)
+	}
+}
+
+func TestSnapshotFailureStageIsFixedSafeAndPreservesSentinels(t *testing.T) {
+	stages := []string{
+		"input",
+		"work_root",
+		"object_root",
+		"secrets",
+		"work_dir",
+		"pg_dump_run",
+		"pg_dump_exit",
+		"dump_hash",
+		"object_walk",
+		"object_symlink",
+		"object_nonregular",
+		"object_lstat",
+		"object_open",
+		"object_identity_changed",
+		"object_read",
+		"object_close",
+		"object_size_changed",
+		"object_capacity",
+		"manifest",
+		"recovery_bundle",
+		"age_run",
+		"age_exit",
+		"restic_run",
+		"restic_exit",
+		"restic_summary",
+		"capacity",
+		"cleanup",
+		"cancelled",
+	}
+	causes := []error{
+		ErrSnapshot,
+		ErrDatabaseDump,
+		ErrCapacity,
+		ErrCleanup,
+		ErrCancelled,
+	}
+	const secret = "snapshot-stage-secret"
+	for _, stage := range stages {
+		for _, cause := range causes {
+			t.Run(stage+"/"+cause.Error(), func(t *testing.T) {
+				err := snapshotFailureAt(
+					stage,
+					fmt.Errorf("%s: %w", secret, cause),
+				)
+				if actual := SnapshotFailureStage(err); actual != stage {
+					t.Fatalf("stage=%q want=%q", actual, stage)
+				}
+				if !errors.Is(err, cause) {
+					t.Fatalf("error=%v does not preserve %v", err, cause)
+				}
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("raw cause leaked from error=%v", err)
+				}
+			})
+		}
+	}
+
+	unsafe := snapshotFailureAt("attacker-"+secret, errors.New(secret))
+	if stage := SnapshotFailureStage(unsafe); stage != "unknown" {
+		t.Fatalf("unsafe stage=%q", stage)
+	}
+	if !errors.Is(unsafe, ErrSnapshot) ||
+		strings.Contains(unsafe.Error(), secret) {
+		t.Fatalf("unsafe error=%v", unsafe)
+	}
+	if stage := SnapshotFailureStage(errors.New(secret)); stage != "unknown" {
+		t.Fatalf("plain stage=%q", stage)
+	}
+}
+
+func TestSnapshotFailureExitCodeIsOptionalNormalizedAndExitOnly(t *testing.T) {
+	const secret = "snapshot-exit-secret"
+	for _, stage := range []string{
+		"pg_dump_exit",
+		"age_exit",
+		"restic_exit",
+	} {
+		t.Run(stage, func(t *testing.T) {
+			err := snapshotExitFailureAt(
+				stage,
+				fmt.Errorf("%s: %w", secret, ErrSnapshot),
+				23,
+			)
+			code, ok := SnapshotFailureExitCode(err)
+			if !ok || code != 23 {
+				t.Fatalf("code=%d ok=%t", code, ok)
+			}
+			if SnapshotFailureStage(err) != stage ||
+				!errors.Is(err, ErrSnapshot) ||
+				strings.Contains(err.Error(), secret) {
+				t.Fatalf("error=%v stage=%q", err, SnapshotFailureStage(err))
+			}
+		})
+	}
+
+	for _, code := range []int{-9, 0, 256, 1 << 20} {
+		t.Run(fmt.Sprintf("invalid-%d", code), func(t *testing.T) {
+			err := snapshotExitFailureAt("restic_exit", ErrSnapshot, code)
+			actual, ok := SnapshotFailureExitCode(err)
+			if !ok || actual != -1 {
+				t.Fatalf("code=%d ok=%t want=-1,true", actual, ok)
+			}
+		})
+	}
+
+	for _, err := range []error{
+		snapshotFailureAt("restic_exit", ErrSnapshot),
+		snapshotExitFailureAt("restic_run", ErrSnapshot, 17),
+		snapshotExitFailureAt("attacker-"+secret, errors.New(secret), 17),
+		errors.New(secret),
+	} {
+		if code, ok := SnapshotFailureExitCode(err); ok || code != 0 {
+			t.Fatalf("unsafe error=%v exposed code=%d ok=%t", err, code, ok)
+		}
+	}
+}
+
+func TestExecutorSnapshotReportsExactExternalCommandFailureStage(t *testing.T) {
+	const secret = "external-command-secret"
+	for _, tc := range []struct {
+		name         string
+		stage        string
+		sentinel     error
+		failRun      string
+		failMode     string
+		exitCode     int
+		wantExitCode int
+		wantExit     bool
+	}{
+		{
+			name: "pg-dump-run", stage: "pg_dump_run",
+			sentinel: ErrDatabaseDump, failRun: "pg_dump", failMode: "run",
+		},
+		{
+			name: "pg-dump-output-limit", stage: "pg_dump_run",
+			sentinel: ErrCapacity, failRun: "pg_dump", failMode: "capacity",
+		},
+		{
+			name: "pg-dump-exit", stage: "pg_dump_exit",
+			sentinel: ErrDatabaseDump, failRun: "pg_dump", failMode: "exit",
+			exitCode: 23, wantExitCode: 23, wantExit: true,
+		},
+		{
+			name: "age-run", stage: "age_run",
+			sentinel: ErrSnapshot, failRun: "age", failMode: "run",
+		},
+		{
+			name: "age-output-limit", stage: "age_run",
+			sentinel: ErrCapacity, failRun: "age", failMode: "capacity",
+		},
+		{
+			name: "age-exit", stage: "age_exit",
+			sentinel: ErrSnapshot, failRun: "age", failMode: "exit",
+			exitCode: 24, wantExitCode: 24, wantExit: true,
+		},
+		{
+			name: "restic-run", stage: "restic_run",
+			sentinel: ErrSnapshot, failRun: "restic", failMode: "run",
+		},
+		{
+			name: "restic-output-limit", stage: "restic_run",
+			sentinel: ErrCapacity, failRun: "restic", failMode: "capacity",
+		},
+		{
+			name: "restic-exit", stage: "restic_exit",
+			sentinel: ErrSnapshot, failRun: "restic", failMode: "exit",
+			exitCode: 25, wantExitCode: 25, wantExit: true,
+		},
+		{
+			name: "restic-invalid-exit", stage: "restic_exit",
+			sentinel: ErrSnapshot, failRun: "restic", failMode: "exit",
+			exitCode: 999, wantExitCode: -1, wantExit: true,
+		},
+		{
+			name: "restic-summary", stage: "restic_summary",
+			sentinel: ErrSnapshot, failRun: "restic", failMode: "summary",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &recordingRunner{run: func(
+				_ context.Context,
+				command Command,
+				_ int,
+			) (CommandResult, error) {
+				executable := filepath.Base(command.Executable)
+				if executable == tc.failRun {
+					switch tc.failMode {
+					case "run":
+						return CommandResult{}, errors.New(secret)
+					case "capacity":
+						return CommandResult{}, ErrCommandOutputLimit
+					case "exit":
+						return CommandResult{
+							ExitCode: tc.exitCode,
+							Stderr:   []byte(secret),
+						}, nil
+					case "summary":
+						return CommandResult{
+							ExitCode: 0,
+							Stdout:   []byte(`{"message_type":"summary"}`),
+						}, nil
+					default:
+						t.Fatalf("unknown failure mode %q", tc.failMode)
+					}
+				}
+				switch executable {
+				case "pg_dump":
+					if err := os.WriteFile(
+						command.StdoutFile,
+						[]byte("PGDMP"),
+						0o600,
+					); err != nil {
+						t.Fatal(err)
+					}
+					return CommandResult{ExitCode: 0}, nil
+				case "age":
+					if err := os.WriteFile(
+						command.StdoutFile,
+						[]byte("age-encrypted"),
+						0o600,
+					); err != nil {
+						t.Fatal(err)
+					}
+					return CommandResult{ExitCode: 0}, nil
+				default:
+					t.Fatalf("unexpected executable %q", executable)
+					return CommandResult{}, nil
+				}
+			}}
+			executor, _ := executorFixture(t, runner)
+			_, err := executor.Snapshot(context.Background(), SnapshotInput{
+				RunID:                    commandRunIDForExecutor,
+				DatabaseMigrationVersion: 20,
+			})
+			if !errors.Is(err, tc.sentinel) {
+				t.Fatalf("error=%v want sentinel=%v", err, tc.sentinel)
+			}
+			if actual := SnapshotFailureStage(err); actual != tc.stage {
+				t.Fatalf("stage=%q want=%q error=%v", actual, tc.stage, err)
+			}
+			exitCode, hasExitCode := SnapshotFailureExitCode(err)
+			if exitCode != tc.wantExitCode ||
+				hasExitCode != tc.wantExit {
+				t.Fatalf(
+					"exit code=%d present=%t want=%d,%t",
+					exitCode,
+					hasExitCode,
+					tc.wantExitCode,
+					tc.wantExit,
+				)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked raw cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutorSnapshotPreservesDumpHashFailureContract(t *testing.T) {
+	runner := &recordingRunner{run: func(
+		_ context.Context,
+		command Command,
+		_ int,
+	) (CommandResult, error) {
+		if filepath.Base(command.Executable) != "pg_dump" {
+			t.Fatalf("unexpected executable %q", command.Executable)
+		}
+		if err := os.WriteFile(
+			command.StdoutFile,
+			[]byte("oversized"),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return CommandResult{ExitCode: 0}, nil
+	}}
+	executor, _ := executorFixture(t, runner)
+	executor.config.MaxPlaintextBytes = 4
+
+	_, err := executor.Snapshot(context.Background(), SnapshotInput{
+		RunID:                    commandRunIDForExecutor,
+		DatabaseMigrationVersion: 20,
+	})
+	if !errors.Is(err, ErrDatabaseDump) || errors.Is(err, ErrCapacity) {
+		t.Fatalf("error=%v must preserve database dump contract", err)
+	}
+	if stage := SnapshotFailureStage(err); stage != "dump_hash" {
+		t.Fatalf("stage=%q want=dump_hash", stage)
+	}
+}
+
+func TestSnapshotObjectSummaryFailurePreservesStageAndPublicCause(t *testing.T) {
+	for _, stage := range []string{
+		"object_capacity",
+		"object_size_changed",
+	} {
+		err := snapshotObjectSummaryFailure(
+			snapshotFailureAt(stage, ErrCapacity),
+		)
+		if SnapshotFailureStage(err) != stage {
+			t.Fatalf("stage=%q want=%q", SnapshotFailureStage(err), stage)
+		}
+		if !errors.Is(err, ErrSnapshot) || errors.Is(err, ErrCapacity) {
+			t.Fatalf("stage=%q error=%v changed public Snapshot cause", stage, err)
+		}
+	}
+}
+
+func TestObjectContentFailureClassifiesGrowthAsSizeChange(t *testing.T) {
+	err := objectContentFailure(ErrCapacity, nil, 5, 4)
+	if SnapshotFailureStage(err) != "object_size_changed" {
+		t.Fatalf("stage=%q want=object_size_changed", SnapshotFailureStage(err))
+	}
+	if !errors.Is(err, ErrSnapshot) || errors.Is(err, ErrCapacity) {
+		t.Fatalf("error=%v changed object summary cause", err)
+	}
+}
+
+func TestExecutorSnapshotCleanupFailureOverridesResultAndCause(t *testing.T) {
+	var workRoot string
+	runner := &recordingRunner{run: func(
+		_ context.Context,
+		command Command,
+		_ int,
+	) (CommandResult, error) {
+		switch filepath.Base(command.Executable) {
+		case "pg_dump":
+			if err := os.WriteFile(
+				command.StdoutFile,
+				[]byte("PGDMP"),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			return CommandResult{ExitCode: 0}, nil
+		case "age":
+			if err := os.WriteFile(
+				command.StdoutFile,
+				[]byte("age-encrypted"),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			return CommandResult{ExitCode: 0}, nil
+		case "restic":
+			movedRoot := workRoot + "-moved"
+			if err := os.Rename(workRoot, movedRoot); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(workRoot, []byte("not-a-directory"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return CommandResult{ExitCode: 1}, nil
+		default:
+			t.Fatalf("unexpected executable %q", command.Executable)
+			return CommandResult{}, nil
+		}
+	}}
+	executor, createdWorkRoot := executorFixture(t, runner)
+	workRoot = createdWorkRoot
+
+	result, err := executor.Snapshot(context.Background(), SnapshotInput{
+		RunID:                    commandRunIDForExecutor,
+		DatabaseMigrationVersion: 20,
+	})
+	if result != (SnapshotResult{}) {
+		t.Fatalf("cleanup failure retained result=%+v", result)
+	}
+	if !errors.Is(err, ErrCleanup) {
+		t.Fatalf("error=%v want cleanup sentinel", err)
+	}
+	if errors.Is(err, ErrSnapshot) {
+		t.Fatalf("cleanup error did not override snapshot error: %v", err)
+	}
+	if stage := SnapshotFailureStage(err); stage != "cleanup" {
+		t.Fatalf("stage=%q want=cleanup", stage)
+	}
+}
+
+func TestSummarizeObjectFilesReportsSpecificSafeStage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stage   string
+		nonRoot bool
+		setup   func(*testing.T, string)
+	}{
+		{
+			name: "symlink", stage: "object_symlink",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.Symlink(
+					filepath.Join(root, "missing"),
+					filepath.Join(root, "link"),
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "nonregular", stage: "object_nonregular",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				if err := syscall.Mkfifo(
+					filepath.Join(root, "fifo"),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "open", stage: "object_open", nonRoot: true,
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				path := filepath.Join(root, "unreadable")
+				if err := os.WriteFile(path, []byte("object"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.nonRoot && os.Geteuid() == 0 {
+				t.Skip("root can bypass owner read permission")
+			}
+			root := t.TempDir()
+			tc.setup(t, root)
+			_, _, _, err := summarizeObjectFiles(
+				context.Background(),
+				root,
+			)
+			if !errors.Is(err, ErrSnapshot) {
+				t.Fatalf("error=%v", err)
+			}
+			if actual := SnapshotFailureStage(err); actual != tc.stage {
+				t.Fatalf("stage=%q want=%q", actual, tc.stage)
+			}
+		})
+	}
 }
 
 func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing.T) {
@@ -227,6 +793,7 @@ func TestExecutorSnapshotKeepsSecretsOutOfArgumentsAndCleansPlaintext(t *testing
 	if len(resticBackups) != 1 {
 		t.Fatalf("restic backups=%d want=1", len(resticBackups))
 	}
+	requireResticTemporaryDirectory(t, resticBackups[0], workRoot)
 	manifestHashTag := "happylearn-manifest-sha256:" +
 		hex.EncodeToString(result.ManifestSHA256[:])
 	for _, required := range []string{
@@ -422,7 +989,7 @@ func TestExecutorVerifyBindsExactSnapshotBatchTagAndManifestHash(t *testing.T) {
 		"happylearn-batch:" + commandRunIDForExecutor,
 		"happylearn-manifest-sha256:" + hex.EncodeToString(manifestHash[:]),
 	}, manifestBytes)
-	executor, _ := executorFixture(t, runner)
+	executor, workRoot := executorFixture(t, runner)
 
 	verified, err := executor.Verify(context.Background(), VerifyInput{
 		RunID:          commandRunIDForExecutor,
@@ -434,6 +1001,9 @@ func TestExecutorVerifyBindsExactSnapshotBatchTagAndManifestHash(t *testing.T) {
 	}
 	if verified.Manifest != manifest {
 		t.Fatalf("manifest=%+v", verified.Manifest)
+	}
+	for _, command := range runner.calls() {
+		requireResticTemporaryDirectory(t, command, workRoot)
 	}
 }
 
@@ -744,6 +1314,9 @@ func TestExecutorSyncVerifiesDistinctAuthenticatedRemoteSnapshot(t *testing.T) {
 	if len(runner.calls()) != 5 {
 		t.Fatalf("remote commands=%+v", runner.calls())
 	}
+	for _, command := range runner.calls() {
+		requireResticTemporaryDirectory(t, command, workRoot)
+	}
 	entries, err := os.ReadDir(workRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -931,6 +1504,23 @@ func TestDecodeResticSummaryAcceptsPinnedVersionTimestampsButRejectsPartialOrUnk
 }
 
 const commandRunIDForExecutor = "10000000-0000-4000-8000-000000000001"
+
+func TestExecutorValidatesLocalConfigurationWithoutReturningValues(t *testing.T) {
+	executor, _ := executorFixture(t, &recordingRunner{})
+	executor.config.Secrets = mapSecrets{
+		SecretLocalRepository: "/private/local/repository",
+		SecretLocalPassword:   "private-local-password",
+	}
+	if configured, err := executor.LocalConfigured(); !configured || err != nil {
+		t.Fatalf("configured=%v err=%v", configured, err)
+	}
+	delete(executor.config.Secrets.(mapSecrets), SecretLocalPassword)
+	if configured, err := executor.LocalConfigured(); configured ||
+		!errors.Is(err, ErrSnapshot) ||
+		strings.Contains(err.Error(), "private") {
+		t.Fatalf("configured=%v err=%v", configured, err)
+	}
+}
 
 func TestExecutorRejectsPartialRemoteConfiguration(t *testing.T) {
 	executor, _ := executorFixture(t, &recordingRunner{})

@@ -214,7 +214,7 @@ func TestPostgresRemoteReplicationTriStatePreservesAndResolvesHistory(
 	}
 	var remote Rule
 	for _, rule := range rules {
-		if rule.DedupeKey == "backup_remote_replication" {
+		if rule.DedupeKey == AlertKeyBackupRemoteSync {
 			remote = rule
 			break
 		}
@@ -251,7 +251,7 @@ func TestPostgresRemoteReplicationTriStatePreservesAndResolvesHistory(
 	var count int
 	if err := pool.QueryRow(ctx, `
 SELECT count(*) FROM operational_alerts
-WHERE dedupe_key LIKE 'backup_remote_replication%'`).Scan(&count); err != nil {
+WHERE dedupe_key LIKE $1`, AlertKeyBackupRemoteSync+"%").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -348,8 +348,8 @@ func remoteAlertStateSnapshot(
 	rows, err := pool.Query(ctx, `
 SELECT dedupe_key,state,consecutive_successes,version
 FROM operational_alerts
-WHERE dedupe_key LIKE 'backup_remote_replication%'
-ORDER BY dedupe_key`)
+WHERE dedupe_key LIKE $1
+ORDER BY dedupe_key`, AlertKeyBackupRemoteSync+"%")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,8 +689,13 @@ INSERT INTO system_settings(singleton_id) VALUES(true)
 ON CONFLICT(singleton_id) DO NOTHING;
 UPDATE system_settings
 SET disk_warning_percent=75,disk_critical_percent=90,
+	backup_filesystem_warning_percent=75,backup_filesystem_critical_percent=90,
+	local_backup_age_warning_hours=25,local_backup_age_critical_hours=30,
     ai_error_warning_percent=10,ai_error_critical_percent=25,
     processing_queue_warning=20,processing_queue_critical=100,
+	processing_failure_warning_count=5,processing_failure_critical_count=20,
+	login_failure_warning_count=20,login_failure_critical_count=100,
+	authorization_denial_warning_count=50,authorization_denial_critical_count=200,
     version=1,updated_by=NULL,updated_at=clock_timestamp()
 WHERE singleton_id=true`); err != nil {
 		t.Fatal(err)

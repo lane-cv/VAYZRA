@@ -8,6 +8,7 @@ phase4="$repo_root/scripts/e2e-phase4.sh"
 library="$repo_root/scripts/e2e-harness-lib.sh"
 
 for file in "$library" "$phase2" "$phase3" "$phase4"; do bash -n "$file"; done
+
 for script in "$phase2" "$phase3" "$phase4"; do
   ! grep -Fq 'HAPPYLEARN_E2E_CONTRACT_MODE' "$script"
   ! grep -Eq '^[[:space:]]*docker[[:space:]]' "$script"
@@ -36,6 +37,103 @@ mkdir -p "$tmpdir/bin" "$tmpdir/runtime-tmp"
 export TMPDIR="$tmpdir/runtime-tmp"
 license="$tmpdir/dummy-license"
 : > "$license"
+
+timer_probe="$tmpdir/timer-probe"
+mkdir -p "$timer_probe/bin" "$timer_probe/state"
+cat > "$timer_probe/bin/sleep" <<'FAKE_TIMER_SLEEP'
+#!/bin/bash
+set -Eeuo pipefail
+if [[ "${1:-}" == 5 ]]; then
+  : >"${TIMER_PROBE_STATE:?}/watchdog-sleep-started"
+  trap ': >"$TIMER_PROBE_STATE/watchdog-sleep-terminated"; exit 143' TERM INT
+  /bin/sleep .5
+  : >"$TIMER_PROBE_STATE/watchdog-sleep-completed"
+  exit 0
+fi
+exec /bin/sleep "$@"
+FAKE_TIMER_SLEEP
+cat > "$timer_probe/fast-command" <<'FAKE_FAST_COMMAND'
+#!/bin/bash
+set -Eeuo pipefail
+for _ in $(seq 1 20); do
+  [[ -e "${TIMER_PROBE_STATE:?}/watchdog-sleep-started" ]] && exit 0
+  /bin/sleep .01
+done
+exit 0
+FAKE_FAST_COMMAND
+chmod +x "$timer_probe/bin/sleep" "$timer_probe/fast-command"
+timer_probe_stderr="$timer_probe/stderr"
+if ! PATH="$timer_probe/bin:$PATH" TIMER_PROBE_STATE="$timer_probe/state" \
+  LIBRARY_UNDER_TEST="$library" FAST_COMMAND="$timer_probe/fast-command" \
+  /bin/bash -c '
+    set -Eeuo pipefail
+    source "$LIBRARY_UNDER_TEST"
+    trap ":" TERM
+    run_bounded 5 "$FAST_COMMAND"
+  ' 2>"$timer_probe_stderr"; then
+  echo 'run_bounded fast-command probe failed' >&2
+  exit 1
+fi
+/bin/sleep .7
+if [[ -e "$timer_probe/state/watchdog-sleep-completed" ]]; then
+  echo 'run_bounded left an orphaned watchdog sleep' >&2
+  exit 1
+fi
+if grep -Fq 'run_pending_traps:' "$timer_probe_stderr"; then
+  echo 'run_bounded triggered the Bash pending-trap race' >&2
+  exit 1
+fi
+
+if ! HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 \
+  LIBRARY_UNDER_TEST="$library" \
+  /bin/bash -c '
+    set -Eeuo pipefail
+    source "$LIBRARY_UNDER_TEST"
+    previous_second="$SECONDS"
+    while (( SECONDS == previous_second )); do :; done
+    /bin/sleep .85
+    run_bounded 30 /bin/sleep .5
+  '; then
+  echo 'run_bounded truncated a deadline at an integer-second boundary' >&2
+  exit 1
+fi
+
+wall_clock_probe="$tmpdir/wall-clock-probe"
+mkdir -p "$wall_clock_probe/bin"
+cat > "$wall_clock_probe/bin/sleep" <<'FAKE_SLOW_POLL_SLEEP'
+#!/bin/bash
+set -Eeuo pipefail
+if [[ "${1:-}" == .1 ]]; then
+  exec /bin/sleep 1
+fi
+exec /bin/sleep "$@"
+FAKE_SLOW_POLL_SLEEP
+cat > "$wall_clock_probe/ignore-term" <<'FAKE_IGNORE_TERM'
+#!/bin/bash
+set -Eeuo pipefail
+trap '' TERM INT
+while :; do :; done
+FAKE_IGNORE_TERM
+chmod +x "$wall_clock_probe/bin/sleep" "$wall_clock_probe/ignore-term"
+wall_clock_started_at="$(date +%s)"
+wall_clock_status=0
+PATH="$wall_clock_probe/bin:$PATH" \
+  HAPPYLEARN_E2E_TEST_DEADLINE_SECONDS=1 \
+  LIBRARY_UNDER_TEST="$library" BLOCKING_COMMAND="$wall_clock_probe/ignore-term" \
+  /bin/bash -c '
+    set -Eeuo pipefail
+    source "$LIBRARY_UNDER_TEST"
+    run_bounded 30 "$BLOCKING_COMMAND"
+  ' >/dev/null 2>"$wall_clock_probe/stderr" || wall_clock_status=$?
+wall_clock_elapsed=$(( $(date +%s) - wall_clock_started_at ))
+if (( wall_clock_status == 0 )); then
+  echo 'run_bounded slow-poll probe unexpectedly succeeded' >&2
+  exit 1
+fi
+if (( wall_clock_elapsed > 5 )); then
+  echo 'run_bounded deadline followed poll counts instead of wall-clock time' >&2
+  exit 1
+fi
 
 cat > "$tmpdir/bin/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
@@ -124,9 +222,22 @@ chmod +x "$tmpdir/bin/docker"
 cat > "$tmpdir/bin/bash" <<'FAKE_BASH'
 #!/bin/bash
 set -Eeuo pipefail
-if [[ "${FAKE_DOCKER_SCENARIO:-}" == sanitizer_fail && "${1:-}" == */sanitize-e2e-artifacts.sh ]]; then
-  touch "${FAKE_DOCKER_STATE:?}/markers/sanitizer-failed"
-  exit 86
+if [[ "${1:-}" == */sanitize-e2e-artifacts.sh ]]; then
+  touch "${FAKE_DOCKER_STATE:?}/markers/sanitizer-started"
+  if [[ "${FAKE_DOCKER_SCENARIO:-}" == sanitizer_fail ]]; then
+    touch "$FAKE_DOCKER_STATE/markers/sanitizer-failed"
+    printf '%s\n' 86 >"$FAKE_DOCKER_STATE/markers/sanitizer-failed-status"
+    exit 86
+  fi
+  if /bin/bash "$@"; then
+    touch "$FAKE_DOCKER_STATE/markers/sanitizer-succeeded"
+    exit 0
+  else
+    sanitizer_status=$?
+    printf '%s\n' "$sanitizer_status" \
+      >"$FAKE_DOCKER_STATE/markers/sanitizer-failed-status"
+    exit "$sanitizer_status"
+  fi
 fi
 exec /bin/bash "$@"
 FAKE_BASH
@@ -136,6 +247,10 @@ cat > "$tmpdir/bin/install" <<'FAKE_INSTALL'
 #!/bin/bash
 set -Eeuo pipefail
 last="${*: -1}"
+if [[ "$last" == */.containers.log.*.tmp ]]; then
+  printf '%s\n' "$*" >"${FAKE_DOCKER_STATE:?}/markers/publish-install.argv"
+  touch "$FAKE_DOCKER_STATE/markers/publish-install-invoked"
+fi
 if [[ "${FAKE_DOCKER_SCENARIO:-}" == diagnostics_write_fail && "$last" == */diagnostics ]]; then
   exit 72
 fi
@@ -148,7 +263,11 @@ FAKE_INSTALL
 cat > "$tmpdir/bin/mv" <<'FAKE_MV'
 #!/bin/bash
 set -Eeuo pipefail
-if [[ "${FAKE_DOCKER_SCENARIO:-}" == publish_mv_fail && "${*: -1}" == */containers.log ]]; then
+publish_target="${E2E_ARTIFACT_DIR:?}/containers.log"
+if [[ "${FAKE_DOCKER_SCENARIO:-}" == publish_mv_fail &&
+  "${*: -1}" == "$publish_target" ]]; then
+  printf '%s\n' "$*" >"${FAKE_DOCKER_STATE:?}/markers/publish-mv.argv"
+  touch "$FAKE_DOCKER_STATE/markers/publish-mv-invoked"
   touch "${FAKE_DOCKER_STATE:?}/markers/publish-mv-failed"
   exit 74
 fi
@@ -211,8 +330,23 @@ run_case() {
   if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-hung" ]]; then failure_reasons+=$'\ncleanup hang marker missing'; fi
   if [[ "$scenario" == cleanup_hang && ! -f "$state/markers/cleanup-terminated" ]]; then failure_reasons+=$'\ncleanup deadline marker missing'; fi
   if [[ "$scenario" == sanitizer_fail && ! -f "$state/markers/sanitizer-failed" ]]; then failure_reasons+=$'\nsanitizer failure marker missing'; fi
+  if [[ "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail ]] &&
+    [[ ! -f "$state/markers/sanitizer-succeeded" ]]; then
+    failure_reasons+=$'\nsanitizer success marker missing before publish'
+  fi
+  if [[ "$scenario" == publish_install_fail &&
+    ! -f "$state/markers/publish-install-invoked" ]]; then
+    failure_reasons+=$'\npublish install invocation marker missing'
+  fi
   if [[ "$scenario" == publish_install_fail && ! -f "$state/markers/publish-install-failed" ]]; then failure_reasons+=$'\npublish install failure marker missing'; fi
+  if [[ "$scenario" == publish_mv_fail &&
+    ! -f "$state/markers/publish-mv-invoked" ]]; then
+    failure_reasons+=$'\npublish mv invocation marker missing'
+  fi
   if [[ "$scenario" == publish_mv_fail && ! -f "$state/markers/publish-mv-failed" ]]; then failure_reasons+=$'\npublish mv failure marker missing'; fi
+  if grep -Fq 'run_pending_traps:' "$state/stderr" 2>/dev/null; then
+    failure_reasons+=$'\nBash pending-trap race was triggered'
+  fi
   if [[ "$scenario" == diagnostics_write_fail || "$scenario" == sanitizer_fail || "$scenario" == publish_install_fail || "$scenario" == publish_mv_fail || "$scenario" == phase4_diagnostic ]]; then
     assert_safe_upload_directory "$artifact_path" || failure_reasons+=$'\nupload directory contains raw or non-allowlisted diagnostics'
     [[ -z "$(find "$artifact_path" -maxdepth 1 -name '.containers.log.*.tmp' -print -quit 2>/dev/null)" ]] || failure_reasons+=$'\npublish temporary file remained'
@@ -236,6 +370,13 @@ run_case() {
         printf '%s\n' "--- $diagnostic_file ---"
         if [[ -f "$state/$diagnostic_file" ]]; then sed -n '1,240p' "$state/$diagnostic_file"; else printf '%s\n' '<missing>'; fi
       done
+      printf '%s\n' '--- markers ---'
+      find "$state/markers" -maxdepth 1 -type f -exec basename {} \; \
+        2>/dev/null | LC_ALL=C sort
+      if [[ -f "$state/markers/sanitizer-failed-status" ]]; then
+        printf 'sanitizer_failed_status='
+        sed -n '1p' "$state/markers/sanitizer-failed-status"
+      fi
     } >&2
     rm -rf "$artifact_path"
     return 1

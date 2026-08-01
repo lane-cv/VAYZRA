@@ -566,11 +566,11 @@ FROM generate_series(1,20) AS value`); err != nil {
 		!loginDependency.Available || loginDependency.Value != 0 {
 		t.Fatalf("login=%+v dependency=%+v", login, loginDependency)
 	}
-	remote, exists := byKey["backup_remote_replication"]
+	remote, exists := byKey[AlertKeyBackupRemoteSync]
 	if !exists || remote.Available {
 		t.Fatalf("remote unknown threshold=%+v exists=%t", remote, exists)
 	}
-	if _, exists := byKey["backup_remote_replication_dependency_unavailable"]; exists {
+	if _, exists := byKey[AlertKeyBackupRemoteSyncDependencyUnavailable]; exists {
 		t.Fatal("remote dependency evaluated without current configuration truth")
 	}
 	var persisted int

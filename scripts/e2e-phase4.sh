@@ -86,6 +86,7 @@ if [[ "$allowed_artifact_root_canonical" != "$allowed_artifact_root" ||
 fi
 artifact_init_script="$script_dir/init-e2e-artifacts.sh"
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 admin_user="$(id -u):$(id -g)"
 early_cleanup() {
   local exit_status=$?
@@ -93,7 +94,9 @@ early_cleanup() {
   rm -rf "$tmpdir"
   exit "$exit_status"
 }
-trap early_cleanup EXIT INT TERM
+trap early_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 master_key_file="$tmpdir/master-key"
 provider_key_file="$tmpdir/provider-key"
 control_key_file="$tmpdir/control-key"
@@ -171,7 +174,7 @@ cleanup() {
   rm -rf "$tmpdir" || true
   exit "$exit_status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
 wait_for() {
   local label="$1" container="$2"

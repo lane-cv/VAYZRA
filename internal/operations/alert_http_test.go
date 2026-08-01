@@ -54,11 +54,13 @@ func TestOperationsHTTPListsAlertsWithExactFiltersAndStableCursor(t *testing.T) 
 		ID:             uuid.MustParse("10000000-0000-4000-8000-000000000003"),
 	}
 	next := AlertCursor{LastObservedAt: now, ID: secondID}
+	first := alertHTTPFixture(firstID, now.Add(time.Minute))
+	first.DedupeKey = AlertKeyBackupRemoteSync
 	stub := &alertHTTPStub{
 		operationsHTTPStub: &operationsHTTPStub{},
 		page: AlertPage{
 			Items: []Alert{
-				alertHTTPFixture(firstID, now.Add(time.Minute)),
+				first,
 				alertHTTPFixture(secondID, now),
 			},
 			Next: &next,
@@ -97,7 +99,7 @@ func TestOperationsHTTPListsAlertsWithExactFiltersAndStableCursor(t *testing.T) 
 	body := result.Body.String()
 	for _, expected := range []string{
 		`"id":"` + firstID.String() + `"`,
-		`"dedupeKey":"backup_local_age"`,
+		`"dedupeKey":"` + AlertKeyBackupRemoteSync + `"`,
 		`"category":"backup"`,
 		`"severity":"critical"`,
 		`"state":"open"`,
@@ -114,7 +116,7 @@ func TestOperationsHTTPListsAlertsWithExactFiltersAndStableCursor(t *testing.T) 
 	}
 	for _, forbidden := range []string{
 		"dedupe_key", "acknowledged_by", "consecutiveFailures",
-		"consecutiveSuccesses", "version",
+		"consecutiveSuccesses", "version", "backup_remote_replication",
 	} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("internal field %q leaked in %s", forbidden, body)
