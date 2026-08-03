@@ -73,6 +73,7 @@ const (
 
 type Dashboard struct {
 	ObservedAt       time.Time       `json:"observedAt"`
+	ReleaseVersion   string          `json:"releaseVersion"`
 	Students         StudentSummary  `json:"students"`
 	Questions        QuestionSummary `json:"questions"`
 	AI               AISummary       `json:"ai"`

@@ -190,6 +190,7 @@ onBeforeUnmount(() => {
         <time data-testid="dashboard-observed-at" :datetime="dashboard.observedAt">
           {{ formatTime(dashboard.observedAt) }}
         </time>
+        <span> · 版本 <strong data-testid="release-version">{{ dashboard.releaseVersion }}</strong></span>
       </p>
     </header>
 

@@ -79,6 +79,9 @@ container=happylearn_phase4_123_fake_ai
 state_status=running
 exit_code=0
 oom_killed=false
+release_state=failed_safe
+release_result=failed
+rollback_failure_category=rollback_manifest_validation_failed
 unknown_nonsecret_diagnostic=omitted
 SAFE_LOG
 touch "$safe_dir/nested/trace.zip" "$safe_dir/nested/failure.png" \
@@ -91,7 +94,7 @@ mode="$(file_mode "$safe_dir/containers.log")"
 test "$mode" = 600
 while IFS= read -r line; do
   case "$line" in
-    diagnostics_version=1|container=happylearn_phase2_[A-Za-z0-9_-]*|container=happylearn_phase3_[A-Za-z0-9_-]*|container=happylearn_phase4_[A-Za-z0-9_-]*|container=happylearn_phase5_[A-Za-z0-9_-]*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|log_lines_omitted=[0-9]*) ;;
+    diagnostics_version=1|container=happylearn_phase2_[A-Za-z0-9_-]*|container=happylearn_phase3_[A-Za-z0-9_-]*|container=happylearn_phase4_[A-Za-z0-9_-]*|container=happylearn_phase5_[A-Za-z0-9_-]*|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|exit_code=[0-9]*|oom_killed=true|oom_killed=false|release_state=[a-z_]*|release_result=[a-z_]*|rollback_failure_category=[a-z_]*|log_lines_omitted=[0-9]*) ;;
     *) echo "unexpected sanitizer output: $line" >&2; exit 1 ;;
   esac
 done < "$safe_dir/containers.log"

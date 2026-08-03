@@ -1,0 +1,406 @@
+name: happylearn-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-service-defaults: &service-defaults
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 30s
+  logging: *logging
+  networks: [private]
+
+x-app-environment: &app-environment
+  HAPPYLEARN_ENV: production
+  HAPPYLEARN_LISTEN: ":8080"
+  HAPPYLEARN_INTERNAL_LISTEN: ":9090"
+  HAPPYLEARN_DATABASE_URL_FILE: /run/secrets/database-url
+  HAPPYLEARN_REDIS_URL_FILE: /run/secrets/redis-url
+  HAPPYLEARN_LOGIN_THROTTLE_SECRET_FILE: /run/secrets/login-throttle
+  HAPPYLEARN_PUBLIC_ORIGIN: https://${HAPPYLEARN_DOMAIN:?set HAPPYLEARN_DOMAIN}
+  HAPPYLEARN_MINIO_ENDPOINT: minio:9000
+  HAPPYLEARN_MINIO_ACCESS_KEY_FILE: /run/secrets/minio-access-key
+  HAPPYLEARN_MINIO_SECRET_KEY_FILE: /run/secrets/minio-secret-key
+  HAPPYLEARN_MINIO_USE_TLS: "false"
+  HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
+  HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
+  HAPPYLEARN_AI_MASTER_KEY_FILE: /run/secrets/ai-master-key
+  HAPPYLEARN_AI_MASTER_KEY_VERSION: "1"
+  HAPPYLEARN_AI_BUSINESS_TIMEZONE: ${HAPPYLEARN_TIMEZONE:?set HAPPYLEARN_TIMEZONE}
+  HAPPYLEARN_AI_GLOBAL_CONCURRENCY: "2"
+  HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY: "1"
+  HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer
+  HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac
+
+x-app-secrets: &app-secrets
+  - source: app_database_url
+    target: database-url
+  - source: app_redis_url
+    target: redis-url
+  - source: app_login_throttle
+    target: login-throttle
+  - source: app_minio_access_key
+    target: minio-access-key
+  - source: app_minio_secret_key
+    target: minio-secret-key
+  - source: app_ai_master_key
+    target: ai-master-key
+  - source: metrics_bearer
+    target: metrics-bearer
+  - source: host_metrics_hmac
+    target: host-metrics-hmac
+
+x-worker-secrets: &worker-secrets
+  - source: worker_database_url
+    target: database-url
+  - source: worker_redis_url
+    target: redis-url
+  - source: worker_login_throttle
+    target: login-throttle
+  - source: worker_minio_access_key
+    target: minio-access-key
+  - source: worker_minio_secret_key
+    target: minio-secret-key
+  - source: worker_ai_master_key
+    target: ai-master-key
+
+services:
+  caddy:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_CADDY_IMAGE:?set HAPPYLEARN_CADDY_IMAGE}
+    user: "1000:1000"
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    environment:
+      HAPPYLEARN_DOMAIN: ${HAPPYLEARN_DOMAIN:?set HAPPYLEARN_DOMAIN}
+    volumes:
+      - ${HAPPYLEARN_CADDYFILE:?set HAPPYLEARN_CADDYFILE}:/etc/caddy/Caddyfile:ro
+      - ${HAPPYLEARN_MAINTENANCE_CADDYFILE:?set HAPPYLEARN_MAINTENANCE_CADDYFILE}:/etc/caddy/Caddyfile.maintenance:ro
+      - ${HAPPYLEARN_MAINTENANCE_FILE:?set HAPPYLEARN_MAINTENANCE_FILE}:/srv/maintenance.html:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
+    networks: [edge, private]
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, caddy, version]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 96m
+    cpus: 0.10
+
+  app:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_APP_IMAGE:?set HAPPYLEARN_APP_IMAGE}
+    user: "10001:10001"
+    environment: *app-environment
+    secrets: *app-secrets
+    volumes:
+      - app_state:/var/lib/happylearn
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/api/v1/health/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 320m
+    cpus: 0.25
+
+  worker:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_WORKER_IMAGE:?set HAPPYLEARN_WORKER_IMAGE}
+    user: "10002:10002"
+    environment:
+      <<: *app-environment
+      HAPPYLEARN_WORK_DIR: /work
+      # These credentials belong only to the app's internal metrics listener.
+      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: ""
+      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: ""
+    secrets: *worker-secrets
+    tmpfs:
+      - /work:rw,noexec,nosuid,nodev,size=1024m,uid=10002,gid=10002,mode=0700
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=10002,gid=10002,mode=0700
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8081/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 1664m
+    cpus: 0.90
+
+  postgres:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_POSTGRES_IMAGE:?set HAPPYLEARN_POSTGRES_IMAGE}
+    user: "999:999"
+    environment:
+      POSTGRES_USER: happylearn
+      POSTGRES_DB: happylearn
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+    secrets:
+      - source: postgres_password
+        target: postgres-password
+    volumes:
+      # PostgreSQL 18 stores clusters below a major-version directory and the
+      # official image requires the durable mount at this parent path.
+      - postgres_data:/var/lib/postgresql
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0700
+      - /run/postgresql:rw,noexec,nosuid,nodev,size=8m,uid=999,gid=999,mode=0750
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U happylearn -d happylearn]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 448m
+    cpus: 0.25
+
+  redis:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_REDIS_IMAGE:?set HAPPYLEARN_REDIS_IMAGE}
+    user: "999:999"
+    entrypoint: [/bin/sh, -eu, -c]
+    command: ['exec redis-server --appendonly no --save "" --requirepass "$$(cat /run/secrets/redis-password)"']
+    secrets:
+      - source: redis_password
+        target: redis-password
+    volumes:
+      - redis_data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,uid=999,gid=999,mode=0700
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli --no-auth-warning -a "$$(cat /run/secrets/redis-password)" ping | grep -qx PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 96m
+    cpus: 0.10
+
+  minio-volume-init:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_MINIO_IMAGE:?set HAPPYLEARN_MINIO_IMAGE}
+    user: "0:0"
+    entrypoint: [/bin/sh, -eu, -c]
+    command: ['chown 1000:10003 /data && chmod 2750 /data']
+    cap_add: [CHOWN, FOWNER]
+    volumes:
+      - minio_data:/data
+    restart: "no"
+    mem_limit: 32m
+    cpus: 0.02
+
+  minio:
+    <<: *service-defaults
+    image: ${HAPPYLEARN_MINIO_IMAGE:?set HAPPYLEARN_MINIO_IMAGE}
+    user: "1000:10003"
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio-access-key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio-secret-key
+    command: [minio, server, /data, --console-address, ":9001", --license, /run/secrets/aistor-license]
+    secrets:
+      - source: minio_access_key
+        target: minio-access-key
+      - source: minio_secret_key
+        target: minio-secret-key
+      - source: aistor_license
+        target: aistor-license
+    volumes:
+      - minio_data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=10003,mode=0700
+    restart: unless-stopped
+    depends_on:
+      minio-volume-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:9000/minio/health/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 448m
+    cpus: 0.25
+
+  migrate:
+    <<: *service-defaults
+    profiles: [release]
+    image: ${HAPPYLEARN_MIGRATE_IMAGE:?set HAPPYLEARN_MIGRATE_IMAGE}
+    user: "10001:10001"
+    environment: *app-environment
+    secrets: *app-secrets
+    command: [run, --manifest, /release-input/candidate-manifest.json]
+    volumes:
+      - ${HAPPYLEARN_RELEASE_STATE_PATH:?set HAPPYLEARN_RELEASE_STATE_PATH}/release-input:/release-input:ro
+    restart: "no"
+    mem_limit: 128m
+    cpus: 0.10
+
+  release-control:
+    <<: *service-defaults
+    profiles: [release]
+    image: ${HAPPYLEARN_MIGRATE_IMAGE:?set HAPPYLEARN_MIGRATE_IMAGE}
+    user: "10001:10001"
+    environment:
+      HAPPYLEARN_DATABASE_URL_FILE: /run/secrets/database-url
+    secrets:
+      - source: app_database_url
+        target: database-url
+    entrypoint: [/app/happylearn-release-control]
+    stop_grace_period: 10s
+    restart: on-failure:3
+    mem_limit: 64m
+    cpus: 0.05
+
+  acceptance:
+    <<: *service-defaults
+    profiles: [release]
+    image: ${HAPPYLEARN_APP_IMAGE:?set HAPPYLEARN_APP_IMAGE}
+    user: "10001:10001"
+    environment:
+      <<: *app-environment
+      HAPPYLEARN_ACCEPTANCE_PUBLIC_URL: http://app:8080
+      HAPPYLEARN_ACCEPTANCE_INTERNAL_URL: http://app:9090
+    secrets: *app-secrets
+    entrypoint: [/app/happylearn-acceptance]
+    command: [run, --manifest, /release-input/candidate-manifest.json]
+    volumes:
+      - ${HAPPYLEARN_RELEASE_STATE_PATH:?set HAPPYLEARN_RELEASE_STATE_PATH}/release-input:/release-input:ro
+    restart: "no"
+    mem_limit: 128m
+    cpus: 0.10
+
+  backup:
+    <<: *service-defaults
+    profiles: [backup]
+    image: ${HAPPYLEARN_BACKUP_IMAGE:?set HAPPYLEARN_BACKUP_IMAGE}
+    user: "10003:10003"
+    environment:
+      HAPPYLEARN_ENV: production
+      HAPPYLEARN_DATABASE_HOST: postgres
+      HAPPYLEARN_DATABASE_PORT: "5432"
+      HAPPYLEARN_DATABASE_USER: happylearn
+      HAPPYLEARN_DATABASE_NAME: happylearn
+      HAPPYLEARN_DATABASE_SSLMODE: disable
+      HAPPYLEARN_BACKUP_AGE_RECIPIENT: ${HAPPYLEARN_BACKUP_AGE_RECIPIENT:?set HAPPYLEARN_BACKUP_AGE_RECIPIENT}
+      HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID: ${HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID:?set HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID}
+      HAPPYLEARN_BACKUP_PASSWORD_FILE: /run/secrets/local_password
+    secrets:
+      - source: backup_database_password
+        target: database_password
+      - source: backup_local_repository
+        target: local_repository
+      - source: backup_password
+        target: local_password
+    volumes:
+      - ${HAPPYLEARN_BACKUP_HOST_PATH:?set HAPPYLEARN_BACKUP_HOST_PATH}:/repository
+      - ${HAPPYLEARN_RELEASE_STATE_PATH:?set HAPPYLEARN_RELEASE_STATE_PATH}/backup-workflows:/state
+      - minio_data:/source/aistor:ro
+    tmpfs:
+      - /work:rw,noexec,nosuid,nodev,size=256m,uid=10003,gid=10003,mode=0700
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10003,gid=10003,mode=0700
+    restart: "no"
+    mem_limit: 384m
+    cpus: 0.15
+
+  restore:
+    <<: *service-defaults
+    profiles: [restore]
+    image: ${HAPPYLEARN_BACKUP_IMAGE:?set HAPPYLEARN_BACKUP_IMAGE}
+    user: "10003:10003"
+    environment:
+      HAPPYLEARN_BACKUP_PASSWORD_FILE: /run/secrets/backup-password
+      HAPPYLEARN_BACKUP_AGE_IDENTITY_FILE: /run/secrets/backup-age-identity
+    secrets:
+      - source: backup_password
+        target: backup-password
+      - source: backup_age_identity
+        target: backup-age-identity
+    volumes:
+      - ${HAPPYLEARN_BACKUP_HOST_PATH:?set HAPPYLEARN_BACKUP_HOST_PATH}:/repository:ro
+      - ${HAPPYLEARN_RELEASE_STATE_PATH:?set HAPPYLEARN_RELEASE_STATE_PATH}/backup-workflows:/state
+    restart: "no"
+    mem_limit: 384m
+    cpus: 0.15
+
+networks:
+  edge:
+  private:
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  app_state:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  postgres_password:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/postgres-password
+  redis_password:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/redis-password
+  minio_access_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/minio-access-key
+  minio_secret_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/minio-secret-key
+  aistor_license:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/aistor-license
+  app_database_url:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-database-url
+  app_redis_url:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-redis-url
+  app_login_throttle:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-login-throttle
+  app_minio_access_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-minio-access-key
+  app_minio_secret_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-minio-secret-key
+  app_ai_master_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/app-ai-master-key
+  worker_database_url:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-database-url
+  worker_redis_url:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-redis-url
+  worker_login_throttle:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-login-throttle
+  worker_minio_access_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-minio-access-key
+  worker_minio_secret_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-minio-secret-key
+  worker_ai_master_key:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/worker-ai-master-key
+  metrics_bearer:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/metrics-bearer
+  host_metrics_hmac:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/host-metrics-hmac
+  backup_password:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/backup-password
+  backup_age_identity:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/backup-age-identity
+  backup_database_password:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/backup-database-password
+  backup_local_repository:
+    file: ${HAPPYLEARN_SECRET_DIR:?set HAPPYLEARN_SECRET_DIR}/backup-local-repository

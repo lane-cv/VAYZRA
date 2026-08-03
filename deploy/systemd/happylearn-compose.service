@@ -1,0 +1,29 @@
+[Unit]
+Description=HappyLearn production Compose stack
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@DEPLOY_USER@
+Group=@DEPLOY_GROUP@
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=@PROJECT_DIR@/deploy/production.env
+ExecStart=@DOCKER@ compose --project-name happylearn-prod --project-directory @PROJECT_DIR@ --env-file @PROJECT_DIR@/deploy/production.env -f @PROJECT_DIR@/deploy/compose.prod.yml up --detach --remove-orphans
+ExecStop=@DOCKER@ compose --project-name happylearn-prod --project-directory @PROJECT_DIR@ --env-file @PROJECT_DIR@/deploy/production.env -f @PROJECT_DIR@/deploy/compose.prod.yml stop
+TimeoutStartSec=15min
+TimeoutStopSec=5min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=-/srv/happylearn -@PROJECT_DIR@/deploy/release-state
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

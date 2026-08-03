@@ -25,6 +25,7 @@ import (
 	"happylearn.local/app/internal/operations"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/safelog"
+	"happylearn.local/app/internal/platform/secretfile"
 )
 
 const (
@@ -1297,6 +1298,8 @@ type productionConfig struct {
 	databaseSSLMode string
 	ageRecipient    string
 	encryptionKey   string
+	backupPassword  string
+	ageIdentity     string
 }
 
 func loadProductionConfig(getenv func(string) string) (productionConfig, error) {
@@ -1311,6 +1314,28 @@ func loadProductionConfig(getenv func(string) string) (productionConfig, error) 
 		databaseSSLMode: getenv("HAPPYLEARN_DATABASE_SSLMODE"),
 		ageRecipient:    getenv("HAPPYLEARN_BACKUP_AGE_RECIPIENT"),
 		encryptionKey:   getenv("HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID"),
+	}
+	production := getenv("HAPPYLEARN_ENV") == "production"
+	var err error
+	config.backupPassword, err = resolveBackupSecret(
+		getenv,
+		"HAPPYLEARN_BACKUP_PASSWORD",
+		4*1024,
+		production,
+		production,
+	)
+	if err != nil {
+		return productionConfig{}, errWorkflowUnavailable
+	}
+	config.ageIdentity, err = resolveBackupSecret(
+		getenv,
+		"HAPPYLEARN_BACKUP_AGE_IDENTITY",
+		64*1024,
+		false,
+		production,
+	)
+	if err != nil {
+		return productionConfig{}, errWorkflowUnavailable
 	}
 	for _, value := range []string{
 		config.databaseHost,
@@ -1328,6 +1353,38 @@ func loadProductionConfig(getenv func(string) string) (productionConfig, error) 
 	return config, nil
 }
 
+func resolveBackupSecret(
+	getenv func(string) string,
+	name string,
+	maxBytes int64,
+	required bool,
+	fileOnly bool,
+) (string, error) {
+	if fileOnly && getenv(name) != "" {
+		return "", errWorkflowUnavailable
+	}
+	value, err := secretfile.Resolve(func(variable string) (string, bool) {
+		value := getenv(variable)
+		return value, value != ""
+	}, name, maxBytes)
+	if err != nil || (required && value == "") {
+		return "", errWorkflowUnavailable
+	}
+	return value, nil
+}
+
+type productionSecrets struct {
+	base           backup.SecretSource
+	backupPassword string
+}
+
+func (secrets productionSecrets) Read(name backup.SecretName) (string, error) {
+	if name == backup.SecretLocalPassword && secrets.backupPassword != "" {
+		return secrets.backupPassword, nil
+	}
+	return secrets.base.Read(name)
+}
+
 func newProductionActions(
 	ctx context.Context,
 	getenv func(string) string,
@@ -1336,7 +1393,11 @@ func newProductionActions(
 	if err != nil {
 		return nil, func() {}, errWorkflowUnavailable
 	}
-	secrets := backup.NewFileSecrets()
+	fileSecrets := backup.NewFileSecrets()
+	secrets := backup.SecretSource(fileSecrets)
+	if config.backupPassword != "" {
+		secrets = productionSecrets{base: fileSecrets, backupPassword: config.backupPassword}
+	}
 	databasePassword, err := secrets.Read(backup.SecretDatabasePassword)
 	if err != nil {
 		return nil, func() {}, errWorkflowUnavailable

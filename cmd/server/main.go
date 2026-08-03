@@ -24,6 +24,7 @@ import (
 	"happylearn.local/app/internal/files"
 	"happylearn.local/app/internal/notifications"
 	"happylearn.local/app/internal/operations"
+	"happylearn.local/app/internal/platform/buildinfo"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/httpx"
@@ -33,6 +34,15 @@ import (
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
+)
+
+var (
+	buildVersion     string
+	buildCommit      string
+	buildTime        string
+	buildMinSchema   string
+	buildMaxSchema   string
+	runtimeBuildInfo = buildinfo.Development()
 )
 
 func main() {
@@ -52,6 +62,12 @@ func main() {
 		})
 		os.Exit(1)
 	}
+	release, err := loadBuildInfo(cfg.Environment)
+	if err != nil {
+		bootstrapLogger.Error("server.error", safelog.Field{Name: "stage", Value: "build_info"})
+		os.Exit(1)
+	}
+	runtimeBuildInfo = release
 	logger, err := safelog.NewFromConfig(os.Stderr, time.Now, cfg)
 	if err != nil {
 		bootstrapLogger.Error("server.error", safelog.Field{
@@ -78,6 +94,9 @@ func main() {
 		logger.Error("server.error", safelog.Field{
 			Name:  "stage",
 			Value: "startup",
+		}, safelog.Field{
+			Name:  "category",
+			Value: applicationStartupComponent(err),
 		})
 		os.Exit(1)
 	}
@@ -108,6 +127,44 @@ func main() {
 	); err != nil {
 		os.Exit(1)
 	}
+}
+
+func applicationStartupComponent(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	components := map[string]string{
+		"open authentication storage":             "database",
+		"migrate authentication storage":          "migration",
+		"initialize authentication service":       "authentication",
+		"initialize upload service":               "uploads",
+		"initialize question upload service":      "question_uploads",
+		"initialize AI upload service":            "ai_uploads",
+		"initialize student AI service":           "student_ai",
+		"initialize AI configuration service":     "ai_configuration",
+		"initialize AI read services":             "ai_reads",
+		"initialize file access service":          "file_access",
+		"initialize question file access service": "question_file_access",
+		"initialize AI file access service":       "ai_file_access",
+		"initialize readiness check":              "readiness",
+		"initialize operations gate":              "operations_gate",
+		"initialize alert webhook":                "alert_webhook",
+		"initialize operations service":           "operations",
+		"initialize backup service":               "backup",
+		"initialize login throttling":             "login_throttling",
+		"initialize upload cleanup":               "upload_cleanup",
+		"initialize notification outbox":          "notification_outbox",
+		"initialize AI runner":                    "ai_runner",
+		"initialize alert runner":                 "alert_runner",
+		"initialize webhook runner":               "webhook_runner",
+		"initialize retention scheduler":          "retention",
+		"initialize internal handler":             "internal_handler",
+		"record infrastructure status":            "infrastructure_status",
+	}
+	if component, ok := components[err.Error()]; ok {
+		return component
+	}
+	return "unknown"
 }
 
 type serverLifecycle interface {
@@ -979,7 +1036,7 @@ func newProductionObjectReadiness(ctx context.Context, cfg config.Config) (func(
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -1036,7 +1093,7 @@ func newProductionUploadServiceWithPolicy(ctx context.Context, pool *pgxpool.Poo
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -1048,7 +1105,7 @@ func newProductionFileAccessService(ctx context.Context, pool *pgxpool.Pool, cfg
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -1061,7 +1118,7 @@ func newProductionQAFileAccessService(ctx context.Context, pool *pgxpool.Pool, c
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -1073,7 +1130,7 @@ func newProductionAIFileAccessService(ctx context.Context, pool *pgxpool.Pool, c
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -1089,7 +1146,7 @@ func newProductionStudentAIService(ctx context.Context, pool *pgxpool.Pool, cfg 
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -1169,7 +1226,8 @@ func newProductionAdminOperationsServiceWithWebhook(
 		time.Now,
 		operations.DashboardSampleFreshFor,
 		operations.DashboardDependencies{
-			Students: dashboardStore, Questions: dashboardStore,
+			ReleaseVersion: runtimeBuildInfo.Version,
+			Students:       dashboardStore, Questions: dashboardStore,
 			AI: dashboardStore, Storage: sampleStore,
 			Services: sampleStore, Queues: dashboardStore,
 			Backup: dashboardStore, Alerts: dashboardStore,
@@ -1358,11 +1416,24 @@ func newProductionInternalHandler(
 		Metrics:               samples,
 		Samples:               samples,
 		Nonces:                nonces,
+		Release:               runtimeBuildInfo,
+		SchemaVersion: func(ctx context.Context) (int64, error) {
+			var version int64
+			err := pool.QueryRow(ctx, `SELECT COALESCE(max(version_id),0) FROM goose_db_version WHERE is_applied`).Scan(&version)
+			return version, err
+		},
 	})
 	if err != nil {
 		return nil, errors.New("initialize internal handler")
 	}
 	return handler, nil
+}
+
+func loadBuildInfo(environment string) (buildinfo.Info, error) {
+	if environment != "production" {
+		return buildinfo.Development(), nil
+	}
+	return buildinfo.Parse(buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema)
 }
 
 func newProductionAdminBackupService(pool *pgxpool.Pool) backup.HTTPService {
@@ -1412,7 +1483,7 @@ func newProductionAIRunnerWithLog(
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return nil, err

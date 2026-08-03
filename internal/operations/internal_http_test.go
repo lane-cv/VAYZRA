@@ -18,6 +18,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"happylearn.local/app/internal/platform/buildinfo"
 )
 
 type internalMetricsStub struct {
@@ -158,6 +159,40 @@ func TestInternalMetricsFailsClosedWithoutLeakingProviderErrors(t *testing.T) {
 	}
 	if got := result.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q", got)
+	}
+}
+
+func TestInternalReadyIncludesSafeReleaseMetadata(t *testing.T) {
+	handler := mustInternalHandler(t, InternalHTTPConfig{
+		MetricsBearerSecret: "metrics-bearer-secret", HostMetricsHMACSecret: []byte("host-hmac-secret"),
+		Clock: time.Now, Metrics: internalMetricsStub{}, Samples: &internalSampleSink{}, Nonces: &internalNonceStore{},
+		Release:       buildinfo.Info{Version: "1.0.0-rc.1", Commit: "0123456789abcdef", BuiltAt: "2026-08-02T00:00:00Z", MinSchemaVersion: 27, MaxSchemaVersion: 28},
+		SchemaVersion: func(context.Context) (int64, error) { return 27, nil },
+	})
+	request := httptest.NewRequest(http.MethodGet, "/internal/readiness", nil)
+	request.Header.Set("Authorization", "Bearer metrics-bearer-secret")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+	if result.Code != http.StatusOK || result.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d headers=%v body=%q", result.Code, result.Header(), result.Body.String())
+	}
+	want := `{"status":"ready","version":"1.0.0-rc.1","commit":"0123456789abcdef","schemaVersion":27,"minSchemaVersion":27,"maxSchemaVersion":28}` + "\n"
+	if result.Body.String() != want || strings.Contains(result.Body.String(), "builtAt") {
+		t.Fatalf("body=%q", result.Body.String())
+	}
+}
+
+func TestInternalReadyRejectsMissingBearerToken(t *testing.T) {
+	handler := mustInternalHandler(t, InternalHTTPConfig{
+		MetricsBearerSecret: "metrics-bearer-secret", HostMetricsHMACSecret: []byte("host-hmac-secret"),
+		Clock: time.Now, Metrics: internalMetricsStub{}, Samples: &internalSampleSink{}, Nonces: &internalNonceStore{},
+		Release:       buildinfo.Development(),
+		SchemaVersion: func(context.Context) (int64, error) { return 27, nil },
+	})
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/internal/readiness", nil))
+	if result.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%q", result.Code, result.Body.String())
 	}
 }
 

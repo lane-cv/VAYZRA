@@ -31,6 +31,20 @@ func TestHealthSeparatesLivenessAndReadiness(t *testing.T) {
 	}
 }
 
+func TestLoadBuildInfoRequiresLinkerMetadataOnlyInProduction(t *testing.T) {
+	old := [5]string{buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema}
+	t.Cleanup(func() {
+		buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema = old[0], old[1], old[2], old[3], old[4]
+	})
+	buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema = "", "", "", "", ""
+	if _, err := loadBuildInfo("development"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBuildInfo("production"); err == nil {
+		t.Fatal("production accepted missing linker metadata")
+	}
+}
+
 func TestWorkerReadinessRequiresEveryDependency(t *testing.T) {
 	checks := 0
 	ready := workerReadiness(func(context.Context) error { checks++; return nil }, func(context.Context) error { checks++; return errors.New("storage") }, t.TempDir(), false, map[string][]string{"unused": {"--version"}})

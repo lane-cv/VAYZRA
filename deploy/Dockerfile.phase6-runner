@@ -1,0 +1,13 @@
+FROM docker:28.3.3-cli@sha256:0135662b510037ea581d99c2e5929c5e01185139c0b86986a418bd4da0b98a44
+
+RUN apk add --no-cache \
+      bash=5.2.37-r0 \
+      coreutils=9.7-r1 \
+      findutils=4.10.0-r0 \
+      grep=3.12-r0 \
+      jq=1.8.1-r0 \
+      procps-ng=4.0.4-r3 \
+      sed=4.9-r2 \
+      util-linux=2.41-r9
+
+ENTRYPOINT ["/bin/bash"]

@@ -19,12 +19,21 @@ import (
 	"github.com/google/uuid"
 
 	"happylearn.local/app/internal/operations"
+	"happylearn.local/app/internal/platform/buildinfo"
 	"happylearn.local/app/internal/platform/config"
 	"happylearn.local/app/internal/platform/database"
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/objectstore"
 	"happylearn.local/app/internal/platform/safelog"
 	"happylearn.local/app/internal/processing"
+)
+
+var (
+	buildVersion   string
+	buildCommit    string
+	buildTime      string
+	buildMinSchema string
+	buildMaxSchema string
 )
 
 const (
@@ -57,13 +66,17 @@ func run() error {
 		Name:  "stage",
 		Value: "start",
 	})
-	cfg, err := config.Load(os.Getenv)
+	cfg, err := config.LoadWorker(os.Getenv)
 	if err != nil {
 		bootstrapLogger.Error("worker.error", safelog.Field{
 			Name:  "stage",
 			Value: "configuration",
 		})
 		return errors.New("worker configuration")
+	}
+	if _, err := loadBuildInfo(cfg.Environment); err != nil {
+		bootstrapLogger.Error("worker.error", safelog.Field{Name: "stage", Value: "build_info"})
+		return errors.New("worker build information")
 	}
 	logger, err := safelog.NewFromConfig(os.Stderr, time.Now, cfg)
 	if err != nil {
@@ -82,6 +95,13 @@ func run() error {
 		Value: "start",
 	})
 	return runConfiguredWorker(cfg, logger)
+}
+
+func loadBuildInfo(environment string) (buildinfo.Info, error) {
+	if environment != "production" {
+		return buildinfo.Development(), nil
+	}
+	return buildinfo.Parse(buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema)
 }
 
 func runConfiguredWorker(cfg config.Config, logger safelog.Logger) error {
@@ -111,7 +131,7 @@ func runConfiguredWorker(cfg config.Config, logger safelog.Logger) error {
 		return workerStartupFailure(logger, "worker migration")
 	}
 	operationalGate = operations.NewPostgresStore(pool)
-	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development"})
+	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS, OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket, SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap})
 	if err != nil {
 		return workerStartupFailure(logger, "worker object storage")
 	}

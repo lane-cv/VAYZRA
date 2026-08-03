@@ -1,0 +1,34 @@
+(security_headers) {
+	header {
+		Content-Security-Policy "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self'; style-src 'self' 'unsafe-inline'"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Retry-After "300"
+		Cache-Control "no-store"
+		-Server
+	}
+}
+
+http://{$HAPPYLEARN_DOMAIN} {
+	redir https://{$HAPPYLEARN_DOMAIN}{uri} 308
+}
+
+{$HAPPYLEARN_DOMAIN} {
+	import security_headers
+	route {
+		@read method GET HEAD
+		handle @read {
+			root * /srv
+			rewrite * /maintenance.html
+			file_server {
+				status 503
+			}
+		}
+		handle {
+			respond "Service Unavailable" 503
+		}
+	}
+}

@@ -13,6 +13,7 @@ vi.mock('../operations/api', async (original) => ({
 const observedAt = '2026-07-30T08:00:00Z'
 const dashboard: OperationsDashboard = {
   observedAt,
+  releaseVersion: '1.0.0-rc.1',
   students: { state: 'healthy', observedAt, active: 28, disabled: 2 },
   questions: { state: 'healthy', observedAt, waiting: 3, oldestWaitSeconds: 7200 },
   ai: {
@@ -90,6 +91,7 @@ describe('AdminHomeView operations dashboard', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="dashboard-observed-at"]').attributes('datetime')).toBe(observedAt)
+    expect(wrapper.get('[data-testid="release-version"]').text()).toBe('1.0.0-rc.1')
     expect(wrapper.get('[data-testid="student-summary"]').text()).toContain('28')
     expect(wrapper.get('[data-testid="service-app"]').text()).toContain('正常')
     expect(wrapper.get('[data-testid="backup-summary"]').text()).toContain('本地恢复点')

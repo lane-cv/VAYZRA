@@ -3,6 +3,7 @@ set -euo pipefail
 export LC_ALL=C
 
 readonly USAGE='Usage: scripts/phase5-backup.sh --project happylearn-dev --trigger scheduled|manual|pre_release'
+readonly PRODUCTION_USAGE='Production additionally accepts --project happylearn-prod when HAPPYLEARN_PRODUCTION_ENV_FILE is set.'
 readonly OPERATIONS_ADVISORY_KEY='845103120'
 readonly BACKUP_ADVISORY_KEY='845103121'
 readonly SYNC_RUN_LABEL='io.happylearn.phase5.sync-run'
@@ -19,6 +20,7 @@ ROOT=''
 COMPOSE_FILE=''
 LIVE_COMPOSE_FILE=''
 E2E_LIVE_COMPOSE_FILE=''
+PRODUCTION_ENV_FILE=''
 LIVE_ROOT=''
 LIVE_ONE_SHOT_RECORD_FILE=''
 LIVE_RUN_ID_FILE=''
@@ -105,7 +107,15 @@ validate_arguments() {
   PROJECT="$2"
   EFFECTIVE_PROJECT="$PROJECT"
   TRIGGER="$4"
-  [[ "$PROJECT" == "happylearn-dev" ]] || usage_error
+  if [[ "$PROJECT" == "happylearn-dev" ]]; then
+    :
+  elif [[ "$PROJECT" != "happylearn-prod" ]]; then
+    usage_error
+  fi
+  if [[ "$PROJECT" == happylearn-prod && -n ${HAPPYLEARN_LOCAL_COMPOSE_PROJECT:-} ]]; then
+    [[ $HAPPYLEARN_LOCAL_COMPOSE_PROJECT =~ ^happylearn_phase6_[a-z0-9]+_[a-z0-9]+$ ]] || usage_error
+    EFFECTIVE_PROJECT=$HAPPYLEARN_LOCAL_COMPOSE_PROJECT
+  fi
   case "$TRIGGER" in
     scheduled|manual|pre_release) ;;
     *) usage_error ;;
@@ -132,7 +142,13 @@ resolve_root() {
   local script_directory
   script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
   ROOT="$(cd "$script_directory/.." && pwd -P)"
-  COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"
+  if [[ "$PROJECT" == 'happylearn-prod' ]]; then
+    COMPOSE_FILE="$ROOT/deploy/compose.prod.yml"
+    PRODUCTION_ENV_FILE="${HAPPYLEARN_PRODUCTION_ENV_FILE:-}"
+    [[ "$PRODUCTION_ENV_FILE" == /* && -f "$PRODUCTION_ENV_FILE" && ! -L "$PRODUCTION_ENV_FILE" && "$(portable_mode "$PRODUCTION_ENV_FILE")" == 600 ]] || usage_error
+  else
+    COMPOSE_FILE="$ROOT/deploy/compose.dev.yml"
+  fi
   LIVE_COMPOSE_FILE="$ROOT/deploy/compose.backup-live.yml"
   [[ -f "$COMPOSE_FILE" && -f "$ROOT/Dockerfile.backup" ]] ||
     usage_error
@@ -173,7 +189,9 @@ portable_owner() {
 owner_only_secret() {
   local path="$1"
   local size
-  [[ -f "$path" && ! -L "$path" && "$(portable_mode "$path")" == '400' ]] ||
+  local expected_mode='400'
+  [[ "$PROJECT" != 'happylearn-prod' ]] || expected_mode='600'
+  [[ -f "$path" && ! -L "$path" && "$(portable_mode "$path")" == "$expected_mode" ]] ||
     return 1
   if stat -f '%z' "$path" >/dev/null 2>&1; then
     size="$(stat -f '%z' "$path")"
@@ -181,6 +199,18 @@ owner_only_secret() {
     size="$(stat -c '%s' "$path")"
   fi
   [[ "$size" -ge 1 && "$size" -le 4096 ]]
+}
+
+backup_secret_path() {
+  local logical=$1 filename=$1
+  if [[ "$PROJECT" == 'happylearn-prod' ]]; then
+    case "$logical" in
+      database_password) filename='backup-database-password' ;;
+      local_repository) filename='backup-local-repository' ;;
+      local_password) filename='backup-password' ;;
+    esac
+  fi
+  printf '%s/%s' "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" "$filename"
 }
 
 single_line_secret_value() {
@@ -263,17 +293,21 @@ validate_paths_and_secrets() {
     ! -L "$HAPPYLEARN_AISTOR_LICENSE_FILE" &&
     -s "$HAPPYLEARN_AISTOR_LICENSE_FILE" ]] ||
     return 1
-  owner_only_directory "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
+  if [[ "$PROJECT" == 'happylearn-prod' ]]; then
+    [[ "$(id -u)" == 0 && -d "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" && ! -L "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" && "$(portable_mode "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY")" == 711 ]] || return 1
+  else
+    owner_only_directory "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY" || return 1
+  fi
   owner_only_directory "$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY" || return 1
   owner_only_directory "$HAPPYLEARN_BACKUP_STATE_DIRECTORY" || return 1
   single_line_secret_value \
-    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/database_password" >/dev/null ||
+    "$(backup_secret_path database_password)" >/dev/null ||
     return 1
   [[ "$(single_line_secret_value \
-    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_repository")" == '/repository' ]] ||
+    "$(backup_secret_path local_repository)")" == '/repository' ]] ||
     return 1
   single_line_secret_value \
-    "$HAPPYLEARN_BACKUP_SECRET_DIRECTORY/local_password" >/dev/null ||
+    "$(backup_secret_path local_password)" >/dev/null ||
     return 1
   [[ "$HAPPYLEARN_BACKUP_AGE_RECIPIENT" =~ ^age1[023456789ac-hj-np-z]{20,100}$ ]] ||
     return 1
@@ -1158,6 +1192,14 @@ compose() {
     --project-name "$EFFECTIVE_PROJECT"
     --file "$COMPOSE_FILE"
   )
+  if [[ -n "$PRODUCTION_ENV_FILE" ]]; then
+    arguments+=(--profile '*')
+    arguments+=(--env-file "$PRODUCTION_ENV_FILE")
+    if [[ -n ${HAPPYLEARN_LOCAL_COMPOSE_PROJECT:-} ]]; then
+      [[ -f $ROOT/deploy/compose.prod.local.yml && ! -L $ROOT/deploy/compose.prod.local.yml ]] || return 1
+      arguments+=(--file "$ROOT/deploy/compose.prod.local.yml")
+    fi
+  fi
   if [[ -n "$LIVE_ROOT" ]]; then
     arguments+=(--file "$LIVE_COMPOSE_FILE")
     arguments+=(--file "$E2E_LIVE_COMPOSE_FILE")
@@ -1313,6 +1355,9 @@ compose_run() {
 }
 
 initialize_backup_mounts() {
+  if [[ "$PROJECT" == 'happylearn-prod' ]]; then
+    return 0
+  fi
   run_guarded_external 300 \
     compose_run --no-deps backup-storage-init
   run_guarded_external 300 \
@@ -1320,6 +1365,17 @@ initialize_backup_mounts() {
 }
 
 verify_backup_mount_ownership() {
+  if [[ "$PROJECT" == 'happylearn-prod' ]]; then
+    run_guarded_external 120 \
+      compose_run --no-deps --entrypoint /bin/sh backup -eu -c '
+        test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700" || exit 1
+        test "$(stat -c "%u:%g:%a" /state)" = "10003:0:700" || exit 1
+        for name in database_password local_repository local_password; do
+          test "$(stat -c "%u:%a" "/run/secrets/${name}")" = "10003:600" || exit 1
+        done
+      '
+    return
+  fi
   run_guarded_external 120 \
     compose_run --no-deps --entrypoint /bin/sh backup -eu -c '
       test "$(stat -c "%u:%g:%a" /repository)" = "10003:0:700" ||

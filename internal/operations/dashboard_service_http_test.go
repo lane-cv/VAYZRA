@@ -128,6 +128,7 @@ func TestOperationsHTTPDashboardIsAdminOnlyStrictNoStoreAndAggregateOnly(t *test
 	body := result.Body.String()
 	for _, field := range []string{
 		`"observedAt":"2026-07-29T07:00:00Z"`,
+		`"releaseVersion":"1.0.0-rc.1"`,
 		`"students":{"state":"healthy"`,
 		`"questions":{"state":"healthy"`,
 		`"ai":{"state":"healthy"`,
@@ -207,7 +208,7 @@ func TestOperationsHTTPDashboardInternalFailureIsUniformAndSanitized(t *testing.
 func dashboardHTTPFixture(now time.Time) Dashboard {
 	at := cloneDashboardTime(&now)
 	return Dashboard{
-		ObservedAt: now,
+		ObservedAt: now, ReleaseVersion: "1.0.0-rc.1",
 		Students: StudentSummary{
 			State: DataStateHealthy, ObservedAt: at, Active: 2, Disabled: 1,
 		},

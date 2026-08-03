@@ -9,6 +9,7 @@ import type { OperationalAlert, OperationsDashboard } from './types'
 const observedAt = '2026-07-30T08:00:00Z'
 const dashboard: OperationsDashboard = {
   observedAt,
+  releaseVersion: '1.0.0-rc.1',
   students: { state: 'healthy', observedAt, active: 1, disabled: 0 },
   questions: { state: 'empty', observedAt, waiting: 0, oldestWaitSeconds: 0 },
   ai: {
@@ -58,6 +59,13 @@ describe('operations monitoring API', () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: dashboard })))
     await expect(readDashboard()).resolves.toStrictEqual(dashboard)
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/operations/dashboard')
+  })
+
+  it('rejects a non-semantic release version', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: { ...dashboard, releaseVersion: '<script>' },
+    })))
+    await expect(readDashboard()).rejects.toMatchObject({ code: 'invalid_response' })
   })
 
   it('accepts the backend fail-closed dashboard and validates storage thresholds by state', async () => {

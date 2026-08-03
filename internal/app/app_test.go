@@ -77,6 +77,11 @@ func TestLivenessIncludesRequestID(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"status":"ok"`) {
 		t.Fatal(w.Body.String())
 	}
+	for _, forbidden := range []string{"version", "commit", "schema", "builtAt"} {
+		if strings.Contains(w.Body.String(), forbidden) {
+			t.Fatalf("public liveness leaked %q: %s", forbidden, w.Body.String())
+		}
+	}
 }
 
 func TestReadinessReturnsStableError(t *testing.T) {

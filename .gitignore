@@ -8,6 +8,12 @@ data/
 *.log
 *.license
 secrets/
+!deploy/secrets/
+deploy/secrets/*
+!deploy/secrets/README.md
+deploy/production.env
+deploy/local-certs/
+deploy/release-state/
 
 .pnpm-store/
 .tmp-go-build-cache/

@@ -1,0 +1,21 @@
+services:
+  app:
+    environment:
+      HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER: "true"
+      HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP: "true"
+
+  worker:
+    environment:
+      HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER: "true"
+      HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP: "true"
+
+  caddy:
+    ports: !override
+      - "127.0.0.1:${HAPPYLEARN_LOCAL_HTTP_PORT:-18080}:80"
+      - "127.0.0.1:${HAPPYLEARN_LOCAL_HTTPS_PORT:-18443}:443"
+    volumes:
+      - ${HAPPYLEARN_CADDYFILE:?set HAPPYLEARN_CADDYFILE}:/etc/caddy/Caddyfile:ro
+
+networks:
+  edge:
+    internal: false

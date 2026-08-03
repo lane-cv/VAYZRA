@@ -12,30 +12,33 @@ import (
 
 func productionConfigEnv(t *testing.T) map[string]string {
 	t.Helper()
-	return map[string]string{
+	env := map[string]string{
 		"HAPPYLEARN_ENV":                    "production",
-		"HAPPYLEARN_DATABASE_URL":           "postgres://app:test@localhost/app",
-		"HAPPYLEARN_REDIS_URL":              "redis://localhost:6379/0",
-		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":  "test-login-throttle-secret-0123456789",
 		"HAPPYLEARN_PUBLIC_ORIGIN":          "https://learn.example.com",
 		"HAPPYLEARN_MINIO_ENDPOINT":         "minio.internal:9000",
-		"HAPPYLEARN_MINIO_ACCESS_KEY":       "test-access-key",
-		"HAPPYLEARN_MINIO_SECRET_KEY":       "test-secret-key",
 		"HAPPYLEARN_MINIO_USE_TLS":          "true",
 		"HAPPYLEARN_MINIO_ORIGINALS_BUCKET": "happylearn-originals",
 		"HAPPYLEARN_MINIO_PREVIEWS_BUCKET":  "happylearn-previews",
-		"HAPPYLEARN_AI_MASTER_KEY":          base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		"HAPPYLEARN_METRICS_BEARER_SECRET_FILE": writeConfigSecretFixture(
-			t,
-			"test-metrics-bearer-secret-0123456789",
-			0o600,
-		),
-		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE": writeConfigSecretFixture(
-			t,
-			"test-host-metrics-hmac-secret-0123456789",
-			0o600,
-		),
 	}
+	for name, value := range map[string]string{
+		"HAPPYLEARN_DATABASE_URL":             "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":                "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":    "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_MINIO_ACCESS_KEY":         "test-access-key",
+		"HAPPYLEARN_MINIO_SECRET_KEY":         "test-secret-key",
+		"HAPPYLEARN_AI_MASTER_KEY":            base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"HAPPYLEARN_METRICS_BEARER_SECRET":    "test-metrics-bearer-secret-0123456789",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET": "test-host-metrics-hmac-secret-0123456789",
+	} {
+		setProductionSecret(t, env, name, value)
+	}
+	return env
+}
+
+func setProductionSecret(t *testing.T, env map[string]string, name, value string) {
+	t.Helper()
+	delete(env, name)
+	env[name+"_FILE"] = writeConfigSecretFixture(t, value, 0o600)
 }
 
 func mapEnv(values map[string]string) func(string) string {
@@ -44,8 +47,12 @@ func mapEnv(values map[string]string) func(string) string {
 
 func TestProductionRequires32ByteBase64AIMasterKey(t *testing.T) {
 	_, err := Load(mapEnv(map[string]string{
-		"HAPPYLEARN_ENV":           "production",
-		"HAPPYLEARN_AI_MASTER_KEY": base64.StdEncoding.EncodeToString(make([]byte, 31)),
+		"HAPPYLEARN_ENV": "production",
+		"HAPPYLEARN_AI_MASTER_KEY_FILE": writeConfigSecretFixture(
+			t,
+			base64.StdEncoding.EncodeToString(make([]byte, 31)),
+			0o600,
+		),
 	}))
 	if err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_AI_MASTER_KEY") {
 		t.Fatalf("err=%v", err)
@@ -54,7 +61,7 @@ func TestProductionRequires32ByteBase64AIMasterKey(t *testing.T) {
 
 func TestLoadParsesAIConfiguration(t *testing.T) {
 	env := productionConfigEnv(t)
-	env["HAPPYLEARN_AI_MASTER_KEY"] = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
+	setProductionSecret(t, env, "HAPPYLEARN_AI_MASTER_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 	env["HAPPYLEARN_AI_MASTER_KEY_VERSION"] = "17"
 	env["HAPPYLEARN_AI_BUSINESS_TIMEZONE"] = "Asia/Shanghai"
 	env["HAPPYLEARN_AI_GLOBAL_CONCURRENCY"] = "8"
@@ -132,7 +139,7 @@ func TestLoadRejectsInvalidAIConfiguration(t *testing.T) {
 			env := productionConfigEnv(t)
 			switch tc.wantVariable {
 			case "HAPPYLEARN_AI_MASTER_KEY":
-				env[tc.wantVariable] = tc.value
+				setProductionSecret(t, env, tc.wantVariable, tc.value)
 			case "HAPPYLEARN_AI_MASTER_KEY_VERSION", "HAPPYLEARN_AI_BUSINESS_TIMEZONE", "HAPPYLEARN_AI_GLOBAL_CONCURRENCY", "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY":
 				env[tc.wantVariable] = tc.value
 				if tc.wantVariable == "HAPPYLEARN_AI_PER_STUDENT_CONCURRENCY" && tc.value == "3" {
@@ -170,14 +177,66 @@ func TestLoadAllowsPrivateAIProvidersOnlyInDevelopment(t *testing.T) {
 	}
 }
 
+func TestLoadAllowsPhase6PrivateProviderOnlyWithExplicitLocalProductionControl(t *testing.T) {
+	production := productionConfigEnv(t)
+	production["HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER"] = "true"
+	cfg, err := Load(mapEnv(production))
+	if err != nil || !cfg.AIAllowPrivateProvider {
+		t.Fatalf("cfg=%#v err=%v", cfg, err)
+	}
+
+	for _, value := range []string{"false", "1", "TRUE"} {
+		env := productionConfigEnv(t)
+		env["HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER"] = value
+		if _, err := Load(mapEnv(env)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER") {
+			t.Fatalf("value=%q error=%v", value, err)
+		}
+	}
+	development := map[string]string{
+		"HAPPYLEARN_ENV":                             "development",
+		"HAPPYLEARN_DATABASE_URL":                    "postgres://app:test@localhost/app",
+		"HAPPYLEARN_REDIS_URL":                       "redis://localhost:6379/0",
+		"HAPPYLEARN_LOGIN_THROTTLE_SECRET":           "test-login-throttle-secret-0123456789",
+		"HAPPYLEARN_PUBLIC_ORIGIN":                   "https://learn.example.com",
+		"HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER": "true",
+	}
+	if _, err := Load(mapEnv(development)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER") {
+		t.Fatalf("development error=%v", err)
+	}
+}
+
+func TestLoadAllowsLifecycleBootstrapBypassOnlyForLocalProductionAcceptance(t *testing.T) {
+	production := productionConfigEnv(t)
+	production["HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP"] = "true"
+	cfg, err := Load(mapEnv(production))
+	if err != nil || !cfg.SkipObjectStoreLifecycleBootstrap {
+		t.Fatalf("cfg=%#v err=%v", cfg, err)
+	}
+
+	for _, value := range []string{"false", "1", "TRUE"} {
+		env := productionConfigEnv(t)
+		env["HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP"] = value
+		if _, err := Load(mapEnv(env)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP") {
+			t.Fatalf("value=%q error=%v", value, err)
+		}
+	}
+	development := map[string]string{
+		"HAPPYLEARN_ENV": "development",
+		"HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP": "true",
+	}
+	if _, err := Load(mapEnv(development)); err == nil || !strings.Contains(err.Error(), "HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP") {
+		t.Fatalf("development error=%v", err)
+	}
+}
+
 func TestLoadRejectsMissingMinIOValuesInProduction(t *testing.T) {
 	tests := []struct {
 		name string
 		want string
 	}{
 		{"HAPPYLEARN_MINIO_ENDPOINT", "HAPPYLEARN_MINIO_ENDPOINT is required in production"},
-		{"HAPPYLEARN_MINIO_ACCESS_KEY", "HAPPYLEARN_MINIO_ACCESS_KEY is required in production"},
-		{"HAPPYLEARN_MINIO_SECRET_KEY", "HAPPYLEARN_MINIO_SECRET_KEY is required in production"},
+		{"HAPPYLEARN_MINIO_ACCESS_KEY", "HAPPYLEARN_MINIO_ACCESS_KEY_FILE is required in production"},
+		{"HAPPYLEARN_MINIO_SECRET_KEY", "HAPPYLEARN_MINIO_SECRET_KEY_FILE is required in production"},
 		{"HAPPYLEARN_MINIO_ORIGINALS_BUCKET", "HAPPYLEARN_MINIO_ORIGINALS_BUCKET is required in production"},
 		{"HAPPYLEARN_MINIO_PREVIEWS_BUCKET", "HAPPYLEARN_MINIO_PREVIEWS_BUCKET is required in production"},
 	}
@@ -185,6 +244,7 @@ func TestLoadRejectsMissingMinIOValuesInProduction(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env := productionConfigEnv(t)
 			delete(env, tc.name)
+			delete(env, tc.name+"_FILE")
 			_, err := Load(func(k string) string { return env[k] })
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("error=%v, want %q", err, tc.want)
@@ -392,12 +452,12 @@ func TestLoadInternalListenAndSecretsFromOwnerOnlyFiles(t *testing.T) {
 		"host-hmac-0123456789abcdef012345\n",
 		0o600,
 	)
-	env["HAPPYLEARN_WEBHOOK_URL_SECRET_FILE"] = writeConfigSecretFixture(
+	env["HAPPYLEARN_WEBHOOK_URL_FILE"] = writeConfigSecretFixture(
 		t,
 		"https://alerts.example.test/operations\n",
 		0o600,
 	)
-	env["HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE"] = writeConfigSecretFixture(
+	env["HAPPYLEARN_WEBHOOK_AUTHORIZATION_FILE"] = writeConfigSecretFixture(
 		t,
 		"Bearer webhook-authorization-value\n",
 		0o600,
@@ -422,12 +482,29 @@ func TestLoadInternalListenAndSecretsFromOwnerOnlyFiles(t *testing.T) {
 	}
 }
 
+func TestLoadWorkerDoesNotRequireServerOnlyInternalMetricsSecrets(t *testing.T) {
+	env := productionConfigEnv(t)
+	delete(env, "HAPPYLEARN_METRICS_BEARER_SECRET_FILE")
+	delete(env, "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE")
+
+	cfg, err := LoadWorker(mapEnv(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MetricsBearerSecret != "" || len(cfg.HostMetricsHMACSecret) != 0 {
+		t.Fatalf("worker received server-only metrics secrets: %#v", cfg)
+	}
+	if _, err := Load(mapEnv(env)); err == nil {
+		t.Fatal("server configuration accepted missing internal metrics secrets")
+	}
+}
+
 func TestLoadInternalSecretsAcceptsOnlyDocumentedFileVariables(t *testing.T) {
 	for variable, fileVariable := range map[string]string{
 		"HAPPYLEARN_METRICS_BEARER_SECRET":    "HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
 		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET": "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
-		"HAPPYLEARN_WEBHOOK_URL":              "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
-		"HAPPYLEARN_WEBHOOK_AUTHORIZATION":    "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
+		"HAPPYLEARN_WEBHOOK_URL":              "HAPPYLEARN_WEBHOOK_URL_FILE",
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION":    "HAPPYLEARN_WEBHOOK_AUTHORIZATION_FILE",
 	} {
 		t.Run(variable, func(t *testing.T) {
 			env := productionConfigEnv(t)
@@ -485,14 +562,14 @@ func TestLoadRejectsUnsafeInternalSecretFilesWithoutSensitiveDetails(t *testing.
 		},
 		{
 			name:     "group writable webhook URL",
-			variable: "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
+			variable: "HAPPYLEARN_WEBHOOK_URL_FILE",
 			build: func(t *testing.T) string {
 				return writeConfigSecretFixture(t, secret, 0o620)
 			},
 		},
 		{
 			name:     "world writable webhook authorization",
-			variable: "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
+			variable: "HAPPYLEARN_WEBHOOK_AUTHORIZATION_FILE",
 			build: func(t *testing.T) string {
 				return writeConfigSecretFixture(t, secret, 0o602)
 			},

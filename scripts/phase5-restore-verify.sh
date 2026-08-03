@@ -33,6 +33,8 @@ REPORT_TEMPORARY=''
 RESTORE_LOCK_FILE=''
 RESTORE_LOCK_FD_OPEN=false
 REPORT_LOCK_FILE=''
+HANDOFF_FILE=''
+HANDOFF_TEMPORARY=''
 REPORT_LOCK_FD_OPEN=false
 NETWORK_NAME=''
 POSTGRES_VOLUME=''
@@ -51,6 +53,7 @@ CLEANING_UP=false
 START_SECONDS="$SECONDS"
 CONTAINER_RECORD=''
 CLEANUP_INTENT_LEDGER=''
+PRESERVED_VOLUMES_RECORD=''
 NETWORK_CREATED=false
 POSTGRES_VOLUME_CREATED=false
 AISTOR_VOLUME_CREATED=false
@@ -64,9 +67,13 @@ ACTIVE_EXTERNAL_IDENTITY=''
 PENDING_SIGNAL_STATUS=''
 WORKSPACE_INITIALIZED=false
 HTTP_PROBE_SUCCEEDED=false
+PRESERVE_VERIFIED_VOLUMES="${HAPPYLEARN_RESTORE_PRESERVE_VERIFIED_VOLUMES:-false}"
+PRESERVED_VOLUMES=false
+REQUESTED_PROJECT="${HAPPYLEARN_RESTORE_TARGET_PROJECT:-}"
 BOUNDED_BATCH_ACTIVE=false
 SUPERVISOR_STAT_STYLE=''
 DATABASE_ROW_COUNTS_JSON=''
+LOCAL_FAILURE_INJECTION="${HAPPYLEARN_LOCAL_RESTORE_FAILURE_INJECTION:-}"
 
 EXTERNAL_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_EXTERNAL_TIMEOUT_SECONDS:-300}"
 READY_TIMEOUT_SECONDS="${HAPPYLEARN_RESTORE_READY_TIMEOUT_SECONDS:-300}"
@@ -83,6 +90,13 @@ usage_error() {
 
 safe_log() {
   printf 'phase5_restore: %s\n' "$1" >&2
+}
+
+restore_error() {
+  local status=$?
+  trap - ERR
+  safe_log "${RESTORE_FAILURE_STAGE:-restore_stage_failed}"
+  return "$status"
 }
 
 valid_uint() {
@@ -127,11 +141,22 @@ validate_arguments() {
   valid_image_reference "$APP_IMAGE" || usage_error
   valid_image_reference "$POSTGRES_IMAGE" || usage_error
   valid_image_reference "$REDIS_IMAGE" || usage_error
+  [[ "$PRESERVE_VERIFIED_VOLUMES" == false ||
+    "$PRESERVE_VERIFIED_VOLUMES" == true ]] || usage_error
+  [[ -z "$REQUESTED_PROJECT" ||
+    ( "$PRESERVE_VERIFIED_VOLUMES" == true &&
+      "$REQUESTED_PROJECT" != 'happylearn-prod' &&
+      "$REQUESTED_PROJECT" =~ ^happylearn-phase5-restore-[a-f0-9]{12}$ ) ]] ||
+    usage_error
+  [[ -z "$LOCAL_FAILURE_INJECTION" ||
+    ( "$LOCAL_FAILURE_INJECTION" == missing_object &&
+      "$PRESERVE_VERIFIED_VOLUMES" == true ) ]] ||
+    usage_error
 }
 
 portable_mode() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%a' "$path" >/dev/null 2>&1; then
     stat -c '%a' "$path"
   elif stat -f '%Lp' "$path" >/dev/null 2>&1; then
     stat -f '%Lp' "$path"
@@ -142,7 +167,7 @@ portable_mode() {
 
 portable_owner() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%u' "$path" >/dev/null 2>&1; then
     stat -c '%u' "$path"
   elif stat -f '%u' "$path" >/dev/null 2>&1; then
     stat -f '%u' "$path"
@@ -153,7 +178,7 @@ portable_owner() {
 
 portable_group() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%g' "$path" >/dev/null 2>&1; then
     stat -c '%g' "$path"
   elif stat -f '%g' "$path" >/dev/null 2>&1; then
     stat -f '%g' "$path"
@@ -164,7 +189,7 @@ portable_group() {
 
 portable_size() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%s' "$path" >/dev/null 2>&1; then
     stat -c '%s' "$path"
   elif stat -f '%z' "$path" >/dev/null 2>&1; then
     stat -f '%z' "$path"
@@ -177,7 +202,9 @@ owner_only_directory() {
   local path="$1"
   [[ -d "$path" && ! -L "$path" &&
     "$(portable_mode "$path")" == '700' &&
-    "$(portable_owner "$path")" == "$(id -u)" ]]
+    ( "$(portable_owner "$path")" == "$(id -u)" ||
+      ( "$PRESERVE_VERIFIED_VOLUMES" == true && "$(id -u)" == 0 &&
+        "$(portable_owner "$path")" == 10003 ) ) ]]
 }
 
 owner_only_secret() {
@@ -253,6 +280,13 @@ validate_paths() {
     return 1
   REPORT_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/restore-${BACKUP_ID}.json"
   REPORT_TEMPORARY="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new"
+  if [[ "$PRESERVE_VERIFIED_VOLUMES" == true ]]; then
+    HANDOFF_FILE="${HAPPYLEARN_RESTORE_HANDOFF_FILE:-}"
+    [[ "$HANDOFF_FILE" == "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/restore-${BACKUP_ID}-handoff.json" &&
+      ! -e "$HANDOFF_FILE" && ! -L "$HANDOFF_FILE" ]] || return 1
+    HANDOFF_TEMPORARY="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}-handoff.new"
+    [[ ! -e "$HANDOFF_TEMPORARY" && ! -L "$HANDOFF_TEMPORARY" ]] || return 1
+  fi
   RESTORE_LOCK_FILE="$HAPPYLEARN_BACKUP_REPOSITORY_DIRECTORY/.phase5-restore-${BACKUP_ID}.lock"
   REPORT_LOCK_FILE="$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.lock"
 }
@@ -299,7 +333,10 @@ acquire_report_lock() {
   fi
   REPORT_LOCK_FD_OPEN=true
   [[ ! -e "$REPORT_FILE" && ! -L "$REPORT_FILE" &&
-    ! -e "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" ]] ||
+    ! -e "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" &&
+    ( "$PRESERVE_VERIFIED_VOLUMES" != true ||
+      ( ! -e "$HANDOFF_FILE" && ! -L "$HANDOFF_FILE" &&
+        ! -e "$HANDOFF_TEMPORARY" && ! -L "$HANDOFF_TEMPORARY" ) ) ]] ||
     return 1
 }
 
@@ -318,12 +355,18 @@ initialize_identity() {
   HOST_GID="$(id -g)" || return 1
   [[ "$HOST_UID" =~ ^[0-9]+$ && "$HOST_GID" =~ ^[0-9]+$ ]] || return 1
   OWNER_TOKEN="$(random_token)" || return 1
+  if [[ -n "$REQUESTED_PROJECT" ]]; then
+    OWNER_TOKEN="${REQUESTED_PROJECT##*-}${OWNER_TOKEN:12}"
+    valid_owner_token "$OWNER_TOKEN" || return 1
+  fi
   verification_hex="${OWNER_TOKEN:0:32}"
   variant_value=$(((16#${verification_hex:16:1} & 3) | 8))
   printf -v variant_nibble '%x' "$variant_value"
   RESTORE_VERIFICATION_ID="${verification_hex:0:8}-${verification_hex:8:4}-4${verification_hex:13:3}-${variant_nibble}${verification_hex:17:3}-${verification_hex:20:12}"
   canonical_backup_uuid "$RESTORE_VERIFICATION_ID" || return 1
   PROJECT="${PROJECT_PREFIX}${OWNER_TOKEN:0:12}"
+  [[ -z "$REQUESTED_PROJECT" || "$PROJECT" == "$REQUESTED_PROJECT" ]] ||
+    return 1
   valid_project "$PROJECT" || return 1
   DATABASE_PASSWORD="$(random_token)" || return 1
   MINIO_SECRET_KEY="$(random_token)" || return 1
@@ -360,6 +403,9 @@ initialize_workspace() {
   CLEANUP_INTENT_LEDGER="$CONTROL_DIRECTORY/cleanup.intent"
   : >"$CLEANUP_INTENT_LEDGER" || return 1
   chmod 0600 "$CLEANUP_INTENT_LEDGER" || return 1
+  PRESERVED_VOLUMES_RECORD="$CONTROL_DIRECTORY/preserved-volumes"
+  [[ ! -e "$PRESERVED_VOLUMES_RECORD" &&
+    ! -L "$PRESERVED_VOLUMES_RECORD" ]] || return 1
   printf 'postgres:5432:happylearn:happylearn:%s\n' \
     "$DATABASE_PASSWORD" >"$CONTROL_DIRECTORY/pgpass" ||
     return 1
@@ -439,7 +485,8 @@ portable_supervisor_metadata() {
 }
 
 initialize_supervisor_stat_style() {
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%a|%u|%s|%h|%i' \
+      "$CONTROL_DIRECTORY" >/dev/null 2>&1; then
     SUPERVISOR_STAT_STYLE=gnu
   elif stat -f '%Lp|%u|%z|%l|%i' \
       "$CONTROL_DIRECTORY" >/dev/null 2>&1; then
@@ -1853,6 +1900,90 @@ wait_for_restored_app() {
     >/dev/null
 }
 
+inject_real_missing_object() {
+  [[ "$LOCAL_FAILURE_INJECTION" == missing_object ]] || return 0
+  local reference repository object_key bucket
+  reference="$(
+    docker exec "$POSTGRES_CONTAINER" psql --username happylearn \
+      --dbname happylearn --no-psqlrc --quiet --tuples-only --no-align \
+      --set ON_ERROR_STOP=1 --command "
+SELECT repository || '|' || object_key
+FROM (
+  SELECT 'originals'::text AS repository,object_key
+  FROM file_versions
+  WHERE purged_at IS NULL
+    AND cleanup_state IS DISTINCT FROM 'deleting'
+  UNION ALL
+  SELECT 'previews'::text AS repository,fp.object_key
+  FROM file_previews fp
+  JOIN file_versions fv ON fv.id=fp.file_version_id
+  WHERE fp.processing_state='ready'
+    AND fv.purged_at IS NULL
+    AND fv.cleanup_state IS DISTINCT FROM 'deleting'
+  UNION ALL
+  SELECT 'previews'::text AS repository,a.object_key
+  FROM file_processing_artifacts a
+  WHERE a.state='stored'
+) AS live_objects
+ORDER BY repository,object_key
+LIMIT 1;"
+  )" || {
+    safe_log 'missing_object_reference_query_failed'
+    return 1
+  }
+  [[ "$reference" != *$'\n'* && "$reference" == *'|'* ]] || {
+    safe_log 'missing_object_reference_missing'
+    return 1
+  }
+  repository=${reference%%|*}
+  object_key=${reference#*|}
+  [[ ${#object_key} -le 1024 &&
+    "$object_key" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ &&
+    "$object_key" != */../* && "$object_key" != ../* &&
+    "$object_key" != */.. ]] || {
+    safe_log 'missing_object_reference_invalid'
+    return 1
+  }
+  case "$repository" in
+    originals) bucket=happylearn-originals ;;
+    previews) bucket=happylearn-previews ;;
+    *) safe_log 'missing_object_repository_invalid'; return 1 ;;
+  esac
+  docker exec "$AISTOR_CONTAINER" /bin/sh -ceu '
+    set -a
+    . /run/restore-secrets/runtime.env
+    set +a
+    export MC_CONFIG_DIR=/tmp/phase5-restore-mc
+    client=
+    for candidate in /usr/bin/mc /usr/local/bin/mc /usr/bin/mcli /usr/local/bin/mcli; do
+      if test -x "$candidate"; then client=$candidate; break; fi
+    done
+    test -n "$client"
+    export MC_HOST_restore="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:9000"
+    "$client" rm --force "restore/$1/$2" >/dev/null
+  ' _ "$bucket" "$object_key" || {
+    safe_log 'missing_object_delete_failed'
+    return 1
+  }
+  if docker exec "$AISTOR_CONTAINER" /bin/sh -ceu '
+    set -a
+    . /run/restore-secrets/runtime.env
+    set +a
+    export MC_CONFIG_DIR=/tmp/phase5-restore-mc
+    client=
+    for candidate in /usr/bin/mc /usr/local/bin/mc /usr/bin/mcli /usr/local/bin/mcli; do
+      if test -x "$candidate"; then client=$candidate; break; fi
+    done
+    test -n "$client"
+    export MC_HOST_restore="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:9000"
+    "$client" stat "restore/$1/$2" >/dev/null 2>&1
+  ' _ "$bucket" "$object_key"; then
+    safe_log 'missing_object_still_present'
+    return 1
+  fi
+  safe_log 'local_missing_object_injected'
+}
+
 run_restore_check() {
   local actual_manifest_sha256
   [[ "$RESTORED_MANIFEST" == "$RESTORE_DIRECTORY/manifest.json" &&
@@ -2111,6 +2242,12 @@ write_sanitized_report() {
     "{\"schemaVersion\":2,\"verificationId\":\"$RESTORE_VERIFICATION_ID\",\"backupId\":\"$BACKUP_ID\",\"manifestSHA256\":\"$EXPECTED_MANIFEST_SHA256\",\"verificationReportSHA256\":\"$VERIFICATION_REPORT_SHA256\",\"evidenceSHA256\":\"$EVIDENCE_SHA256\",\"durationSeconds\":$duration,\"migrationVersion\":$MIGRATION_VERSION,\"databaseRowCounts\":$DATABASE_ROW_COUNTS_JSON,\"rowCountTotal\":$ROW_COUNT_TOTAL,\"checkedObjectCount\":$CHECKED_OBJECT_COUNT,\"missingObjectCount\":$MISSING_OBJECT_COUNT,\"unexpectedObjectCount\":$UNEXPECTED_OBJECT_COUNT,\"activeSessionCount\":$ACTIVE_SESSION_COUNT,\"isolation404ProbeCount\":2,\"reportSHA256\":\"$report_sha256\"}" \
     >"$REPORT_TEMPORARY"
   chmod 0600 "$REPORT_TEMPORARY"
+  if [[ "$PRESERVE_VERIFIED_VOLUMES" == true ]]; then
+    printf '%s\n' \
+      "{\"schemaVersion\":1,\"status\":\"verified_detached\",\"backupId\":\"$BACKUP_ID\",\"verificationId\":\"$RESTORE_VERIFICATION_ID\",\"targetProject\":\"$PROJECT\",\"volumes\":{\"postgres\":\"$POSTGRES_VOLUME\",\"aistor\":\"$AISTOR_VOLUME\",\"aistorLicense\":\"$AISTOR_LICENSE_VOLUME\",\"secrets\":\"$SECRET_VOLUME\"},\"sessionsRevoked\":true,\"authorizationVerified\":true,\"csrfVerified\":true,\"objectIntegrityVerified\":true,\"switchAutomatic\":false}" \
+      >"$HANDOFF_TEMPORARY"
+    chmod 0600 "$HANDOFF_TEMPORARY"
+  fi
 }
 
 cleanup_container() {
@@ -2132,12 +2269,106 @@ cleanup_network() {
     networks "$NETWORK_NAME" "$(resource_labels network)"
 }
 
+preserve_verified_volumes() {
+  local volume attachments names expected containers networks
+  [[ "$HTTP_PROBE_SUCCEEDED" == true ]] || {
+    safe_log 'preserve_http_probe_missing'
+    return 1
+  }
+  current_resource_matches volumes "$POSTGRES_VOLUME" postgres || {
+    safe_log 'preserve_postgres_identity_invalid'
+    return 1
+  }
+  current_resource_matches volumes "$AISTOR_VOLUME" aistor || {
+    safe_log 'preserve_aistor_identity_invalid'
+    return 1
+  }
+  current_resource_matches volumes "$AISTOR_LICENSE_VOLUME" aistor-license || {
+    safe_log 'preserve_aistor_license_identity_invalid'
+    return 1
+  }
+  current_resource_matches volumes "$SECRET_VOLUME" secrets || {
+    safe_log 'preserve_secrets_identity_invalid'
+    return 1
+  }
+  for volume in "$POSTGRES_VOLUME" "$AISTOR_VOLUME" "$AISTOR_LICENSE_VOLUME" "$SECRET_VOLUME"; do
+    attachments="$(run_cleanup_aware "$EXTERNAL_TIMEOUT_SECONDS" \
+      docker container ls --all --format '{{.ID}}' --filter "volume=$volume")" || {
+      safe_log 'preserve_attachment_query_failed'
+      return 1
+    }
+    [[ -z "$attachments" ]] || {
+      safe_log 'preserve_volume_still_attached'
+      return 1
+    }
+  done
+  cleanup_network || {
+    safe_log 'preserve_network_cleanup_failed'
+    return 1
+  }
+  containers="$(list_owned_resource_names containers)" || {
+    safe_log 'preserve_container_query_failed'
+    return 1
+  }
+  networks="$(list_owned_resource_names networks)" || {
+    safe_log 'preserve_network_query_failed'
+    return 1
+  }
+  [[ -z "$containers" && -z "$networks" ]] || {
+    safe_log 'preserve_transient_resources_remain'
+    return 1
+  }
+  names="$(list_owned_resource_names volumes | sort)" || {
+    safe_log 'preserve_volume_query_failed'
+    return 1
+  }
+  expected="$(printf '%s\n' "$POSTGRES_VOLUME" "$AISTOR_VOLUME" "$AISTOR_LICENSE_VOLUME" "$SECRET_VOLUME" | sort)"
+  [[ "$names" == "$expected" ]] || {
+    safe_log 'preserve_volume_set_invalid'
+    return 1
+  }
+  [[ -n "$PRESERVED_VOLUMES_RECORD" &&
+    "$PRESERVED_VOLUMES_RECORD" == "$CONTROL_DIRECTORY/preserved-volumes" &&
+    ! -e "$PRESERVED_VOLUMES_RECORD" &&
+    ! -L "$PRESERVED_VOLUMES_RECORD" ]] || {
+    safe_log 'preserve_record_path_invalid'
+    return 1
+  }
+  printf '%s|%s|%s\n' "$PROJECT" "$OWNER_TOKEN" "$BACKUP_ID" \
+    >"$PRESERVED_VOLUMES_RECORD" || {
+    safe_log 'preserve_record_write_failed'
+    return 1
+  }
+  chmod 0600 "$PRESERVED_VOLUMES_RECORD" || {
+    safe_log 'preserve_record_mode_failed'
+    return 1
+  }
+  PRESERVED_VOLUMES=true
+}
+
+preserved_volumes_recorded() {
+  local expected
+  [[ -n "$PRESERVED_VOLUMES_RECORD" &&
+    "$PRESERVED_VOLUMES_RECORD" == "$CONTROL_DIRECTORY/preserved-volumes" &&
+    -f "$PRESERVED_VOLUMES_RECORD" &&
+    ! -L "$PRESERVED_VOLUMES_RECORD" &&
+    "$(portable_mode "$PRESERVED_VOLUMES_RECORD")" == 600 &&
+    "$(portable_owner "$PRESERVED_VOLUMES_RECORD")" == "$(id -u)" ]] ||
+    return 1
+  expected="$PROJECT|$OWNER_TOKEN|$BACKUP_ID"
+  [[ "$(sed -n '1p' "$PRESERVED_VOLUMES_RECORD")" == "$expected" &&
+    "$(sed -n '2p' "$PRESERVED_VOLUMES_RECORD")" == '' ]]
+}
+
 cleanup_owned_resources_batch() {
-  local name kind status=0
+  local original_status=${1:-1} name kind status=0
   BOUNDED_BATCH_ACTIVE=true
   while IFS='|' read -r name kind; do
     [[ -n "$name" && -n "$kind" ]] || continue
-    cleanup_container "$name" "$kind" || status=1
+    cleanup_container "$name" "$kind" || {
+      safe_log 'cleanup_container_failed'
+      status=1
+    }
   done <<EOF
 $PROJECT-restore-http-probe|restore-http-probe
 $PROJECT-restore-check|restore-check
@@ -2159,6 +2390,13 @@ $PROJECT-volume-probe-aistor-license|volume-probe-aistor-license
 $PROJECT-volume-probe-secrets|volume-probe-secrets
 $PROJECT-volume-probe-postgres|volume-probe-postgres
 EOF
+  if [[ "$PRESERVE_VERIFIED_VOLUMES" == true &&
+    "$original_status" -eq 0 && "$status" -eq 0 ]]; then
+    if preserve_verified_volumes; then
+      return 0
+    fi
+    status=1
+  fi
   cleanup_volume "$SECRET_VOLUME" secrets || status=1
   cleanup_volume "$AISTOR_LICENSE_VOLUME" aistor-license || status=1
   cleanup_volume "$AISTOR_VOLUME" aistor || status=1
@@ -2248,9 +2486,23 @@ cleanup_restore() {
   if valid_project "$PROJECT" &&
     valid_owner_token "$OWNER_TOKEN" &&
     [[ "$WORKSPACE_INITIALIZED" == true ]]; then
-    cleanup_ledger_valid "$original_status" || status=1
-    run_bounded "$cleanup_timeout" cleanup_owned_resources_batch ||
+    cleanup_ledger_valid "$original_status" || {
+      safe_log 'cleanup_ledger_invalid'
       status=1
+    }
+    if run_bounded "$cleanup_timeout" cleanup_owned_resources_batch "$status"; then
+      if [[ "$PRESERVE_VERIFIED_VOLUMES" == true && "$status" -eq 0 ]]; then
+        if preserved_volumes_recorded; then
+          PRESERVED_VOLUMES=true
+        else
+          safe_log 'preserve_record_invalid'
+          status=1
+        fi
+      fi
+    else
+      safe_log 'cleanup_resource_batch_failed'
+      status=1
+    fi
   fi
   if [[ -n "$WORK_DIRECTORY" &&
     "$WORK_DIRECTORY" == "${TMPDIR:-/tmp}/phase5-restore-verify."* &&
@@ -2270,6 +2522,11 @@ discard_report_temporary() {
     "$REPORT_TEMPORARY" == "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new" &&
     -f "$REPORT_TEMPORARY" && ! -L "$REPORT_TEMPORARY" ]]; then
     rm -f "$REPORT_TEMPORARY"
+  fi
+  if [[ -n "$HANDOFF_TEMPORARY" &&
+    "$HANDOFF_TEMPORARY" == "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}-handoff.new" &&
+    -f "$HANDOFF_TEMPORARY" && ! -L "$HANDOFF_TEMPORARY" ]]; then
+    rm -f "$HANDOFF_TEMPORARY"
   fi
 }
 
@@ -2299,20 +2556,42 @@ on_exit() {
     exit "$status"
   fi
   if [[ "$cleanup_status" -ne 0 ]]; then
+    safe_log 'restore_cleanup_failed'
     release_report_lock || true
     exit "$cleanup_status"
+  fi
+  if [[ "$PRESERVE_VERIFIED_VOLUMES" == true ]]; then
+    if [[ "$PRESERVED_VOLUMES" != true ||
+      -z "$HANDOFF_TEMPORARY" || ! -f "$HANDOFF_TEMPORARY" ||
+      -L "$HANDOFF_TEMPORARY" || -e "$HANDOFF_FILE" ||
+      -L "$HANDOFF_FILE" ]] || ! ln "$HANDOFF_TEMPORARY" "$HANDOFF_FILE"; then
+      safe_log 'restore_handoff_publish_failed'
+      discard_report_temporary || true
+      release_report_lock || true
+      exit 1
+    fi
   fi
   if [[ -z "$REPORT_TEMPORARY" ||
     "$REPORT_TEMPORARY" != "$HAPPYLEARN_RESTORE_REPORT_DIRECTORY/.restore-${BACKUP_ID}.new" ||
     ! -f "$REPORT_TEMPORARY" || -L "$REPORT_TEMPORARY" ||
     -e "$REPORT_FILE" || -L "$REPORT_FILE" ]] ||
     ! ln "$REPORT_TEMPORARY" "$REPORT_FILE"; then
+    safe_log 'restore_report_publish_failed'
+    [[ -z "$HANDOFF_FILE" ]] || rm -f "$HANDOFF_FILE" || true
     discard_report_temporary || true
     release_report_lock || true
     exit 1
   fi
   if ! rm -f "$REPORT_TEMPORARY"; then
+    safe_log 'restore_report_temporary_cleanup_failed'
     rm -f "$REPORT_FILE" || true
+    [[ -z "$HANDOFF_FILE" ]] || rm -f "$HANDOFF_FILE" || true
+    release_report_lock || true
+    exit 1
+  fi
+  if [[ -n "$HANDOFF_TEMPORARY" ]] && ! rm -f "$HANDOFF_TEMPORARY"; then
+    safe_log 'restore_handoff_temporary_cleanup_failed'
+    rm -f "$REPORT_FILE" "$HANDOFF_FILE" || true
     release_report_lock || true
     exit 1
   fi
@@ -2368,20 +2647,38 @@ main() {
     "$EXPECTED_MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ &&
     -z "$selection_extra" ]] ||
     return 1
+  trap restore_error ERR
+  RESTORE_FAILURE_STAGE=snapshot_restore_failed
   restore_snapshot "$snapshot_id"
+  RESTORE_FAILURE_STAGE=object_restore_failed
   restore_object_data
+  RESTORE_FAILURE_STAGE=aistor_license_initialization_failed
   initialize_aistor_license
+  RESTORE_FAILURE_STAGE=secret_volume_initialization_failed
   initialize_secret_volume
+  RESTORE_FAILURE_STAGE=postgres_start_failed
   start_postgres
+  RESTORE_FAILURE_STAGE=database_restore_failed
   restore_database
+  RESTORE_FAILURE_STAGE=dependency_start_failed
   start_dependencies
+  RESTORE_FAILURE_STAGE=session_revocation_failed
   revoke_restored_sessions
+  RESTORE_FAILURE_STAGE=restored_app_start_failed
   start_restored_app
+  RESTORE_FAILURE_STAGE=restored_app_readiness_failed
   wait_for_restored_app
+  RESTORE_FAILURE_STAGE=missing_object_injection_failed
+  inject_real_missing_object
+  RESTORE_FAILURE_STAGE=restore_check_failed
   run_restore_check
+  RESTORE_FAILURE_STAGE=restore_counts_failed
   load_safe_restore_counts
+  RESTORE_FAILURE_STAGE=restore_http_probe_failed
   run_restore_http_probe
+  RESTORE_FAILURE_STAGE=restore_report_failed
   write_sanitized_report
+  trap - ERR
 }
 
 main "$@"

@@ -763,6 +763,7 @@ function parseDashboard(value: unknown): OperationsDashboard {
   const source = record(value)
   exactKeys(source, new Set([
     'observedAt',
+    'releaseVersion',
     'students',
     'questions',
     'ai',
@@ -933,6 +934,7 @@ function parseDashboard(value: unknown): OperationsDashboard {
 
   return {
     observedAt: monitoringTime(source.observedAt),
+    releaseVersion: safeReleaseVersion(source.releaseVersion),
     students,
     questions,
     ai,
@@ -947,6 +949,15 @@ function parseDashboard(value: unknown): OperationsDashboard {
     ),
     recentAudit,
   }
+}
+
+function safeReleaseVersion(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || value.length > 128
+    || !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(value)
+  ) throw invalidResponse()
+  return value
 }
 
 function parseOperationalAlert(value: unknown): OperationalAlert {

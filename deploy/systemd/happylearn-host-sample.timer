@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect HappyLearn host metrics every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+Unit=happylearn-host-sample.service
+
+[Install]
+WantedBy=timers.target

@@ -1566,8 +1566,8 @@ grep -Fq 'publish_supervisor_handshake' "$TARGET" ||
   fail 'bounded commands have no owner-only status/ack handshake'
 grep -Fq 'direct_running_job "$pid"' "$TARGET" ||
   fail 'negative PGID signaling is not fenced by the direct supervisor job'
-grep -Fq 'stat --version' "$TARGET" ||
-  fail 'restore harness does not prefer GNU stat explicitly'
+grep -Fq "stat -c '%a|%u|%s|%h|%i'" "$TARGET" ||
+  fail 'restore harness does not probe GNU-compatible stat directly'
 grep -Fq -- '--cpus "$CONTAINER_CPUS"' "$TARGET" ||
   fail 'restore containers do not share an explicit CPU budget'
 grep -Fq -- '--memory-swap "$CONTAINER_MEMORY_SWAP"' "$TARGET" ||

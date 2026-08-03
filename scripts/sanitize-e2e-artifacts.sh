@@ -89,11 +89,14 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     diagnostics_version=1|state_status=created|state_status=running|state_status=paused|state_status=restarting|state_status=removing|state_status=exited|state_status=dead|oom_killed=true|oom_killed=false)
       printf '%s\n' "$line" >> "$temporary"
       ;;
-    container=happylearn_phase2_*|container=happylearn_phase3_*|container=happylearn_phase4_*|container=happylearn_phase5_*)
-      if [[ "$line" =~ ^container=happylearn_phase[2345]_[A-Za-z0-9_-]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
+    container=happylearn_phase2_*|container=happylearn_phase3_*|container=happylearn_phase4_*|container=happylearn_phase5_*|container=happylearn_phase6_*)
+      if [[ "$line" =~ ^container=happylearn_phase[23456]_[A-Za-z0-9_-]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
       ;;
     exit_code=*)
       if [[ "$line" =~ ^exit_code=[0-9]+$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
+      ;;
+    release_state=*|release_result=*|rollback_failure_category=*)
+      if [[ "$line" =~ ^(release_state|release_result|rollback_failure_category)=[a-z][a-z_]{0,63}$ ]]; then printf '%s\n' "$line" >> "$temporary"; else omitted=$((omitted+1)); fi
       ;;
     *) omitted=$((omitted+1)) ;;
   esac

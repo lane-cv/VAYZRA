@@ -208,6 +208,26 @@ func TestNewExecutorRejectsOverlappingWorkAndObjectRoots(t *testing.T) {
 	}
 }
 
+func TestNewExecutorAcceptsExplicitDatabaseSSLPolicies(t *testing.T) {
+	executor, _ := executorFixture(t, &recordingRunner{})
+	config := executor.config
+
+	for _, mode := range []string{"disable", "require", "verify-ca", "verify-full"} {
+		t.Run(mode, func(t *testing.T) {
+			testConfig := config
+			testConfig.DatabaseSSLMode = mode
+			if _, err := NewExecutor(testConfig); err != nil {
+				t.Fatalf("explicit database SSL policy %q rejected: %v", mode, err)
+			}
+		})
+	}
+
+	config.DatabaseSSLMode = "prefer"
+	if _, err := NewExecutor(config); !errors.Is(err, ErrExecutorConfig) {
+		t.Fatalf("opportunistic database SSL policy accepted: %v", err)
+	}
+}
+
 func TestExecutorSnapshotRejectsRootsThatBecomePhysicalAliases(t *testing.T) {
 	runner := &recordingRunner{}
 	fixture, _ := executorFixture(t, runner)
@@ -1757,6 +1777,10 @@ func TestFileSecretsRequireOwnerOnlyRegularNonSymlinkFiles(t *testing.T) {
 	secrets := fileSecretsAt(root)
 	if got, err := secrets.Read(SecretDatabasePassword); err != nil || got != "value" {
 		t.Fatalf("got=%q err=%v", got, err)
+	}
+	write(string(SecretLocalRepository), 0o600)
+	if got, err := secrets.Read(SecretLocalRepository); err != nil || got != "value" {
+		t.Fatalf("0600 owner-only secret: got=%q err=%v", got, err)
 	}
 	for _, name := range []SecretName{
 		SecretRemoteAccessKey,

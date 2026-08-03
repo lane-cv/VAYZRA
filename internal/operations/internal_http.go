@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"happylearn.local/app/internal/platform/buildinfo"
 )
 
 const (
@@ -47,6 +48,8 @@ type InternalHTTPConfig struct {
 	Metrics               MetricsSource
 	Samples               HostSampleStore
 	Nonces                HostNonceStore
+	Release               buildinfo.Info
+	SchemaVersion         func(context.Context) (int64, error)
 }
 
 type HostPayload struct {
@@ -77,6 +80,8 @@ type internalHTTPHandler struct {
 	metrics               MetricsSource
 	samples               HostSampleStore
 	nonces                HostNonceStore
+	release               buildinfo.Info
+	schemaVersion         func(context.Context) (int64, error)
 }
 
 type RedisHostNonceStore struct {
@@ -125,6 +130,8 @@ func NewInternalHandler(cfg InternalHTTPConfig) (http.Handler, error) {
 		metrics:               cfg.Metrics,
 		samples:               cfg.Samples,
 		nonces:                cfg.Nonces,
+		release:               cfg.Release,
+		schemaVersion:         cfg.SchemaVersion,
 	}, nil
 }
 
@@ -133,11 +140,43 @@ func (h *internalHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/internal/metrics":
 		h.serveMetrics(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/internal/readiness":
+		h.serveReadiness(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/internal/host-samples":
 		h.serveHostSamples(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (h *internalHTTPHandler) serveReadiness(w http.ResponseWriter, r *http.Request) {
+	if !h.validBearer(r) {
+		http.NotFound(w, r)
+		return
+	}
+	if h.schemaVersion == nil || h.release.Version == "" {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	version, err := h.schemaVersion(r.Context())
+	if err != nil || version < h.release.MinSchemaVersion || version > h.release.MaxSchemaVersion {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		Status           string `json:"status"`
+		Version          string `json:"version"`
+		Commit           string `json:"commit"`
+		SchemaVersion    int64  `json:"schemaVersion"`
+		MinSchemaVersion int64  `json:"minSchemaVersion"`
+		MaxSchemaVersion int64  `json:"maxSchemaVersion"`
+	}{
+		Status: "ready", Version: h.release.Version, Commit: h.release.Commit,
+		SchemaVersion: version, MinSchemaVersion: h.release.MinSchemaVersion,
+		MaxSchemaVersion: h.release.MaxSchemaVersion,
+	})
 }
 
 func (h *internalHTTPHandler) serveMetrics(w http.ResponseWriter, r *http.Request) {

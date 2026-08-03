@@ -190,6 +190,7 @@ export type ObservedSummary = {
 
 export type OperationsDashboard = {
   observedAt: string
+  releaseVersion: string
   students: ObservedSummary & { active: number; disabled: number }
   questions: ObservedSummary & { waiting: number; oldestWaitSeconds: number }
   ai: ObservedSummary & {

@@ -47,15 +47,16 @@ type AuditDashboardReader interface {
 }
 
 type DashboardDependencies struct {
-	Students  StudentDashboardReader
-	Questions QuestionDashboardReader
-	AI        AIDashboardReader
-	Storage   StorageDashboardReader
-	Services  ServiceDashboardReader
-	Queues    QueueDashboardReader
-	Backup    BackupDashboardReader
-	Alerts    AlertDashboardReader
-	Audit     AuditDashboardReader
+	ReleaseVersion string
+	Students       StudentDashboardReader
+	Questions      QuestionDashboardReader
+	AI             AIDashboardReader
+	Storage        StorageDashboardReader
+	Services       ServiceDashboardReader
+	Queues         QueueDashboardReader
+	Backup         BackupDashboardReader
+	Alerts         AlertDashboardReader
+	Audit          AuditDashboardReader
 }
 
 type DashboardAssembler struct {
@@ -216,10 +217,11 @@ func (a *DashboardAssembler) assembleOnce(ctx context.Context, now time.Time) (D
 	auditResult := <-audit
 
 	dashboard := Dashboard{
-		ObservedAt:  now,
-		Services:    unavailableServices(DataStateUnavailable),
-		Queues:      unavailableQueues(DataStateUnavailable),
-		RecentAudit: make([]AuditSummary, 0),
+		ObservedAt:     now,
+		ReleaseVersion: a.dependencies.ReleaseVersion,
+		Services:       unavailableServices(DataStateUnavailable),
+		Queues:         unavailableQueues(DataStateUnavailable),
+		RecentAudit:    make([]AuditSummary, 0),
 	}
 	dashboard.Students = a.studentSummary(studentResult, now)
 	dashboard.Questions = a.questionSummary(questionResult, now)

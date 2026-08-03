@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify HappyLearn restore quarterly
+
+[Timer]
+OnCalendar=quarterly
+RandomizedDelaySec=1h
+Persistent=true
+Unit=happylearn-restore-verify.service
+
+[Install]
+WantedBy=timers.target

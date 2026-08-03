@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test'
 
+const chromiumSPKI = process.env.E2E_CHROMIUM_SPKI_LIST
+if (chromiumSPKI && !/^[A-Za-z0-9+/]{43}=$/.test(chromiumSPKI)) {
+  throw new Error('E2E_CHROMIUM_SPKI_LIST must be one base64-encoded SHA-256 digest')
+}
+
 export default defineConfig({
   testDir: './tests/e2e',
   outputDir: process.env.E2E_OUTPUT_DIR ?? 'test-results',
@@ -18,16 +23,29 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'off',
+    launchOptions: chromiumSPKI
+      ? { args: [`--ignore-certificate-errors-spki-list=${chromiumSPKI}`] }
+      : undefined,
   },
   projects: [
     {
       name: 'chromium',
-      grepInvert: /@phase4-mobile|@phase5-mobile/,
+      grepInvert: /@phase4-mobile|@phase5-mobile|@phase6/,
       use: { ...devices['Desktop Chrome'] },
     },
     {
       name: 'mobile',
       grep: /@phase4-mobile|@phase5-mobile/,
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'phase6',
+      grep: /@phase6(?!-mobile)/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'phase6-mobile',
+      grep: /@phase6-mobile/,
       use: { ...devices['Pixel 7'] },
     },
   ],

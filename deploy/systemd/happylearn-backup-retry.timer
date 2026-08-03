@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry degraded HappyLearn backups hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+Unit=happylearn-backup-retry.service
+
+[Install]
+WantedBy=timers.target

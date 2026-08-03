@@ -133,6 +133,90 @@ func TestReadRejectsFIFOWorkingWithoutBlockingForAWriter(t *testing.T) {
 	}
 }
 
+func TestResolveReturnsDirectValue(t *testing.T) {
+	lookup := mapLookup(map[string]string{"TOKEN": "direct-value"})
+	got, err := Resolve(lookup, "TOKEN", 64)
+	if err != nil || got != "direct-value" {
+		t.Fatalf("Resolve()=(%q,%v), want direct value", got, err)
+	}
+}
+
+func TestResolveReadsTrimmedRegularFile(t *testing.T) {
+	path := writeSecretFixture(t, "file-value\r\n", 0o600)
+	got, err := Resolve(mapLookup(map[string]string{"TOKEN_FILE": path}), "TOKEN", 64)
+	if err != nil || got != "file-value" {
+		t.Fatalf("Resolve()=(%q,%v), want trimmed file value", got, err)
+	}
+}
+
+func TestResolveRejectsDirectAndFileTogether(t *testing.T) {
+	path := writeSecretFixture(t, "file-value", 0o600)
+	_, err := Resolve(mapLookup(map[string]string{
+		"TOKEN":      "direct-value",
+		"TOKEN_FILE": path,
+	}), "TOKEN", 64)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("Resolve() error=%v, want ErrConflict", err)
+	}
+}
+
+func TestResolveRejectsSymlink(t *testing.T) {
+	target := writeSecretFixture(t, "file-value", 0o600)
+	link := filepath.Join(t.TempDir(), "secret-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Resolve(mapLookup(map[string]string{"TOKEN_FILE": link}), "TOKEN", 64)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Resolve() error=%v, want ErrInvalid", err)
+	}
+}
+
+func TestResolveRejectsEmptyFile(t *testing.T) {
+	path := writeSecretFixture(t, "", 0o600)
+	_, err := Resolve(mapLookup(map[string]string{"TOKEN_FILE": path}), "TOKEN", 64)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Resolve() error=%v, want ErrInvalid", err)
+	}
+}
+
+func TestResolveRejectsOversizedFile(t *testing.T) {
+	path := writeSecretFixture(t, "12345", 0o600)
+	_, err := Resolve(mapLookup(map[string]string{"TOKEN_FILE": path}), "TOKEN", 4)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Resolve() error=%v, want ErrInvalid", err)
+	}
+}
+
+func TestResolveRejectsGroupOrWorldWritableFile(t *testing.T) {
+	for _, mode := range []os.FileMode{0o620, 0o602} {
+		path := writeSecretFixture(t, "file-value", mode)
+		_, err := Resolve(mapLookup(map[string]string{"TOKEN_FILE": path}), "TOKEN", 64)
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Resolve(mode=%o) error=%v, want ErrInvalid", mode, err)
+		}
+	}
+}
+
+func TestResolveDoesNotIncludeValueOrPathInError(t *testing.T) {
+	const value = "sensitive-direct-value"
+	path := filepath.Join(t.TempDir(), "sensitive-file-path")
+	_, err := Resolve(mapLookup(map[string]string{
+		"TOKEN":      value,
+		"TOKEN_FILE": path,
+	}), "TOKEN", 64)
+	if err == nil || strings.Contains(err.Error(), value) || strings.Contains(err.Error(), path) || strings.Contains(err.Error(), "TOKEN") {
+		t.Fatalf("Resolve() leaked sensitive context: %v", err)
+	}
+}
+
+func mapLookup(values map[string]string) Lookup {
+	return func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	}
+}
+
 func writeSecretFixture(t *testing.T, body string, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "secret")

@@ -123,7 +123,7 @@ valid_nonnegative_int64() {
 
 portable_mode() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%a' "$path" >/dev/null 2>&1; then
     stat -c '%a' "$path"
   else
     stat -f '%Lp' "$path"
@@ -132,7 +132,7 @@ portable_mode() {
 
 portable_owner() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%u' "$path" >/dev/null 2>&1; then
     stat -c '%u' "$path"
   else
     stat -f '%u' "$path"
@@ -141,7 +141,7 @@ portable_owner() {
 
 portable_size() {
   local path="$1"
-  if stat --version 2>/dev/null | grep -Fq 'GNU coreutils'; then
+  if stat -c '%s' "$path" >/dev/null 2>&1; then
     stat -c '%s' "$path"
   else
     stat -f '%z' "$path"

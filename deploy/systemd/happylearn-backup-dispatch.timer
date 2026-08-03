@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the database-backed HappyLearn backup schedule every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+Unit=happylearn-backup-dispatch.service
+
+[Install]
+WantedBy=timers.target

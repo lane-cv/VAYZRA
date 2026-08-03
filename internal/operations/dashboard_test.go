@@ -10,7 +10,7 @@ import (
 func TestDashboardDTOContainsOnlySafeAggregateFields(t *testing.T) {
 	observedAt := time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)
 	dashboard := Dashboard{
-		ObservedAt: observedAt,
+		ObservedAt: observedAt, ReleaseVersion: "1.0.0-rc.1",
 		Students: StudentSummary{
 			State: DataStateHealthy, ObservedAt: timePointer(observedAt),
 			Active: 3, Disabled: 1,
@@ -66,7 +66,7 @@ func TestDashboardDTOContainsOnlySafeAggregateFields(t *testing.T) {
 	}
 	body := string(encoded)
 	for _, required := range []string{
-		`"observedAt"`, `"students"`, `"active":3`, `"disabled":1`,
+		`"observedAt"`, `"releaseVersion":"1.0.0-rc.1"`, `"students"`, `"active":3`, `"disabled":1`,
 		`"questions"`, `"waiting":2`, `"oldestWaitSeconds":15`,
 		`"successRatePercent":75`, `"dailyCostMicroUSD":123`,
 		`"usedBytes":1024`, `"capacityBytes":4096`,

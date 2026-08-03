@@ -253,9 +253,13 @@ func (secrets FileSecrets) Read(name SecretName) (string, error) {
 	}
 	path := filepath.Join(secrets.root, string(name))
 	info, err := os.Lstat(path)
+	permissions := os.FileMode(0)
+	if err == nil {
+		permissions = info.Mode().Perm()
+	}
 	if err != nil ||
 		!info.Mode().IsRegular() ||
-		info.Mode().Perm() != 0o400 ||
+		(permissions != 0o400 && permissions != 0o600) ||
 		info.Mode()&os.ModeSymlink != 0 ||
 		!ownedByCurrentUser(info) {
 		return "", ErrSecretUnavailable
@@ -370,7 +374,7 @@ func directoryContains(root string, candidate string) bool {
 
 func validSSLMode(mode string) bool {
 	switch mode {
-	case "require", "verify-ca", "verify-full":
+	case "disable", "require", "verify-ca", "verify-full":
 		return true
 	default:
 		return false

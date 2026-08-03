@@ -29,6 +29,24 @@ func TestNewServerUsesConfiguredAddressAndTimeouts(t *testing.T) {
 	}
 }
 
+func TestLoadBuildInfoRequiresLinkerMetadataOnlyInProduction(t *testing.T) {
+	old := [5]string{buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema}
+	t.Cleanup(func() {
+		buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema = old[0], old[1], old[2], old[3], old[4]
+	})
+	buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema = "", "", "", "", ""
+	if info, err := loadBuildInfo("development"); err != nil || info.Version != "0.0.0-dev" {
+		t.Fatalf("development info=%#v err=%v", info, err)
+	}
+	if _, err := loadBuildInfo("production"); err == nil {
+		t.Fatal("production accepted missing linker metadata")
+	}
+	buildVersion, buildCommit, buildTime, buildMinSchema, buildMaxSchema = "1.0.0-rc.1", "0123456789abcdef", "2026-08-02T00:00:00Z", "27", "28"
+	if info, err := loadBuildInfo("production"); err != nil || info.MaxSchemaVersion != 28 {
+		t.Fatalf("production info=%#v err=%v", info, err)
+	}
+}
+
 func TestCombinedReadinessRequiresDatabaseAndObjectStoreWithoutLeaking(t *testing.T) {
 	if defaultReadinessTimeout != 5*time.Second {
 		t.Fatalf("default readiness timeout=%s", defaultReadinessTimeout)

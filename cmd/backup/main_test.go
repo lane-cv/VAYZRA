@@ -2075,3 +2075,101 @@ func mustManifestBytes(t *testing.T, manifest backup.Manifest) []byte {
 	}
 	return encoded
 }
+
+func TestLoadProductionConfigUsesBackupSecretFiles(t *testing.T) {
+	env := backupProductionConfigEnv()
+	passwordPath := writeBackupConfigSecret(t, "repository-password\n", 0o600)
+	identityPath := writeBackupConfigSecret(t, "AGE-SECRET-KEY-TEST\n", 0o600)
+	env["HAPPYLEARN_BACKUP_PASSWORD_FILE"] = passwordPath
+	env["HAPPYLEARN_BACKUP_AGE_IDENTITY_FILE"] = identityPath
+	config, err := loadProductionConfig(func(name string) string { return env[name] })
+	if err != nil || config.backupPassword != "repository-password" || config.ageIdentity != "AGE-SECRET-KEY-TEST" {
+		t.Fatalf("config password=%q identity=%q err=%v", config.backupPassword, config.ageIdentity, err)
+	}
+}
+
+func TestLoadProductionConfigRejectsDirectBackupSecrets(t *testing.T) {
+	for _, name := range []string{"HAPPYLEARN_BACKUP_PASSWORD", "HAPPYLEARN_BACKUP_AGE_IDENTITY"} {
+		t.Run(name, func(t *testing.T) {
+			env := backupProductionConfigEnv()
+			env["HAPPYLEARN_BACKUP_PASSWORD_FILE"] = writeBackupConfigSecret(t, "repository-password", 0o600)
+			env[name] = "sensitive-direct-value"
+			_, err := loadProductionConfig(func(key string) string { return env[key] })
+			if !errors.Is(err, errWorkflowUnavailable) || strings.Contains(err.Error(), "sensitive-direct-value") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadProductionConfigRejectsUnsafeBackupSecretFiles(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		body string
+		mode os.FileMode
+	}{
+		{"empty", "", 0o600},
+		{"group-writable", "repository-password", 0o620},
+		{"oversized", strings.Repeat("x", 4*1024+1), 0o600},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			env := backupProductionConfigEnv()
+			path := writeBackupConfigSecret(t, fixture.body, fixture.mode)
+			env["HAPPYLEARN_BACKUP_PASSWORD_FILE"] = path
+			_, err := loadProductionConfig(func(key string) string { return env[key] })
+			if !errors.Is(err, errWorkflowUnavailable) || strings.Contains(err.Error(), path) ||
+				(fixture.body != "" && strings.Contains(err.Error(), fixture.body)) {
+				t.Fatalf("unsafe error=%v", err)
+			}
+		})
+	}
+}
+
+func TestProductionSecretsOverridesOnlyLocalRepositoryPassword(t *testing.T) {
+	base := backupSecretSourceStub{
+		backup.SecretDatabasePassword: "database-password",
+		backup.SecretLocalPassword:    "legacy-password",
+	}
+	secrets := productionSecrets{base: base, backupPassword: "phase6-password"}
+	if got, err := secrets.Read(backup.SecretLocalPassword); err != nil || got != "phase6-password" {
+		t.Fatalf("local password=%q err=%v", got, err)
+	}
+	if got, err := secrets.Read(backup.SecretDatabasePassword); err != nil || got != "database-password" {
+		t.Fatalf("database password=%q err=%v", got, err)
+	}
+}
+
+type backupSecretSourceStub map[backup.SecretName]string
+
+func (source backupSecretSourceStub) Read(name backup.SecretName) (string, error) {
+	value, ok := source[name]
+	if !ok {
+		return "", errors.New("unavailable")
+	}
+	return value, nil
+}
+
+func backupProductionConfigEnv() map[string]string {
+	return map[string]string{
+		"HAPPYLEARN_ENV":                      "production",
+		"HAPPYLEARN_DATABASE_HOST":            "postgres",
+		"HAPPYLEARN_DATABASE_PORT":            "5432",
+		"HAPPYLEARN_DATABASE_USER":            "happylearn",
+		"HAPPYLEARN_DATABASE_NAME":            "happylearn",
+		"HAPPYLEARN_DATABASE_SSLMODE":         "disable",
+		"HAPPYLEARN_BACKUP_AGE_RECIPIENT":     "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp5m40h",
+		"HAPPYLEARN_BACKUP_ENCRYPTION_KEY_ID": "key-2026-08",
+	}
+}
+
+func writeBackupConfigSecret(t *testing.T, body string, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

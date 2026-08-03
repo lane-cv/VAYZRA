@@ -1,9 +1,10 @@
 GO ?= go
+SHELLCHECK ?= shellcheck
 PNPM ?= pnpm
 GOBIN ?= $(CURDIR)/.tools/bin
 GOVULNCHECK := $(GOBIN)/govulncheck
 
-.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-phase5 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract phase5-restore-live-contract phase5-failure-matrix-contract phase5-operations-docs-contract host-sampler host-metrics-contract host-metrics-uid-contract host-metrics-live host-metrics
+.PHONY: test-go test-web tools verify e2e e2e-phase2 e2e-phase3 e2e-phase4 e2e-phase5 e2e-phase6 e2e-contracts phase5-backup-contract phase5-backup-live phase5-backup phase5-restore-contract phase5-restore-live-contract phase5-failure-matrix-contract phase5-operations-docs-contract phase6-production-contracts phase6-caddy-runtime-contract phase6-release-go-contracts phase6-host-contracts phase6-shellcheck phase6-release-contracts phase6-contracts host-sampler host-metrics-contract host-metrics-uid-contract host-metrics-live host-metrics
 
 BACKUP_TRIGGER ?= manual
 
@@ -47,7 +48,10 @@ e2e-phase4:
 e2e-phase5:
 	bash scripts/e2e-phase5.sh
 
-e2e-contracts:
+e2e-phase6:
+	bash scripts/e2e-phase6.sh
+
+e2e-contracts: phase6-release-contracts
 	bash scripts/ci-compose_contract_test.sh
 	bash scripts/ci-compose_contract_mutation_test.sh
 	bash scripts/ci-goenv_contract_test.sh
@@ -65,6 +69,41 @@ e2e-contracts:
 	bash scripts/host-metrics_contract_test.sh
 	bash scripts/host-metrics_uid_contract_test.sh
 	bash scripts/phase5-operations-docs_contract_test.sh
+
+phase6-production-contracts:
+	bash scripts/phase6-production_contract_test.sh
+	bash scripts/phase6-production_contract_mutation_test.sh
+
+phase6-caddy-runtime-contract:
+	HAPPYLEARN_PHASE6_CONTRACT_SCOPE=caddy-runtime bash scripts/phase6-production_contract_test.sh
+
+phase6-release-go-contracts:
+	$(GO) test ./internal/release ./cmd/release-manifest ./cmd/migrate ./cmd/acceptance ./cmd/release-control
+
+phase6-host-contracts:
+	bash scripts/prod-common_contract_test.sh
+	bash scripts/prod-preflight_contract_test.sh
+	bash scripts/prod-backup_contract_test.sh
+	bash scripts/prod-release_contract_test.sh
+	bash scripts/prod-rollback_contract_test.sh
+	bash scripts/phase5-restore_preserve_contract_test.sh
+	bash scripts/prod-restore_contract_test.sh
+	bash scripts/phase6-release_failure_matrix_contract_test.sh
+	bash scripts/phase6-systemd_contract_test.sh
+
+phase6-shellcheck:
+	$(SHELLCHECK) -x scripts/prod-common.sh scripts/prod-preflight.sh scripts/prod-backup.sh scripts/prod-release.sh scripts/prod-rollback.sh scripts/prod-restore.sh scripts/render-systemd.sh scripts/systemd-maintenance.sh scripts/phase6-release_failure_matrix.sh scripts/phase6-release_failure_matrix_adapter.sh scripts/phase6-release_failure_matrix_contract_test.sh scripts/phase6-systemd_contract_test.sh scripts/e2e-phase6.sh scripts/e2e-phase6_security.sh scripts/e2e-phase6_resources.sh
+
+phase6-release-contracts: phase6-release-go-contracts phase6-production-contracts phase6-host-contracts phase6-shellcheck
+
+phase6-contracts: phase6-release-contracts
+	bash scripts/e2e-phase6_contract_test.sh
+	bash scripts/e2e-phase6_security_contract_test.sh
+	bash scripts/e2e-phase6_resources_contract_test.sh
+	bash scripts/phase6-docs_contract_test.sh
+	bash scripts/phase6-ci_contract_test.sh
+	bash scripts/phase6-ci_contract_mutation_test.sh
+	bash scripts/e2e-artifact-sanitization_contract_test.sh
 
 phase5-backup-contract:
 	bash scripts/phase5-backup_contract_test.sh

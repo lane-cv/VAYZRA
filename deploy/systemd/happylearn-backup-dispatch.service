@@ -1,0 +1,20 @@
+[Unit]
+Description=Dispatch the due HappyLearn production backup
+After=happylearn-compose.service
+Requires=happylearn-compose.service
+
+[Service]
+Type=oneshot
+User=@DEPLOY_USER@
+Group=@DEPLOY_GROUP@
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@TIMEOUT@ --foreground --kill-after=30s 7250s @PROJECT_DIR@/scripts/systemd-maintenance.sh --task scheduled --project-dir @PROJECT_DIR@ --env-file @PROJECT_DIR@/deploy/production.env
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=-/srv/happylearn -@PROJECT_DIR@/deploy/release-state
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

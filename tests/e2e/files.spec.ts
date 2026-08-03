@@ -107,12 +107,12 @@ test('multipart upload resumes from IndexedDB after a browser reload', async ({ 
   let release!: () => void
   const blocked = new Promise<void>((resolve) => { release = resolve })
   const secondPart = '**/api/v1/admin/uploads/*/parts/2'
-  await page.route(secondPart, async (route) => { await blocked; await route.continue().catch(() => undefined) })
+  await page.route(secondPart, async (route) => { await blocked; await route.abort('failed').catch(() => undefined) })
   const firstPart = page.waitForResponse((response) => response.url().includes('/parts/1') && response.ok())
   await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.pdf'))
   await firstPart
-  await page.reload()
   release()
+  await page.reload()
   await page.unroute(secondPart)
   await page.getByLabel('允许下载').check()
   await page.locator('input[type="file"]').setInputFiles(join(fixtureDir, 'resume.pdf'))

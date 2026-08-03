@@ -17,36 +17,47 @@ import (
 const developmentAIMasterKey = "happylearn-dev-ai-master-key-000"
 
 type Config struct {
-	Environment             string
-	ListenAddress           string
-	InternalListenAddress   string
-	DatabaseURL             string
-	RedisURL                string
-	LoginThrottleSecret     string
-	TrustedProxyCIDRs       []netip.Prefix
-	PublicOrigin            string
-	SessionIdleTTL          time.Duration
-	SessionAbsoluteTTL      time.Duration
-	CookieSecure            bool
-	MinIOEndpoint           string
-	MinIOAccessKey          string
-	MinIOSecretKey          string
-	MinIOUseTLS             bool
-	MinIOOriginalsBucket    string
-	MinIOPreviewsBucket     string
-	AIMasterKey             []byte
-	AIMasterKeyVersion      int16
-	AIBusinessTimezone      string
-	AIGlobalConcurrency     int
-	AIPerStudentConcurrency int
-	AIAllowPrivateProvider  bool
-	MetricsBearerSecret     string
-	HostMetricsHMACSecret   []byte
-	WebhookURL              string
-	WebhookAuthorization    string
+	Environment                       string
+	ListenAddress                     string
+	InternalListenAddress             string
+	DatabaseURL                       string
+	RedisURL                          string
+	LoginThrottleSecret               string
+	TrustedProxyCIDRs                 []netip.Prefix
+	PublicOrigin                      string
+	SessionIdleTTL                    time.Duration
+	SessionAbsoluteTTL                time.Duration
+	CookieSecure                      bool
+	MinIOEndpoint                     string
+	MinIOAccessKey                    string
+	MinIOSecretKey                    string
+	MinIOUseTLS                       bool
+	MinIOOriginalsBucket              string
+	MinIOPreviewsBucket               string
+	AIMasterKey                       []byte
+	AIMasterKeyVersion                int16
+	AIBusinessTimezone                string
+	AIGlobalConcurrency               int
+	AIPerStudentConcurrency           int
+	AIAllowPrivateProvider            bool
+	SkipObjectStoreLifecycleBootstrap bool
+	MetricsBearerSecret               string
+	HostMetricsHMACSecret             []byte
+	WebhookURL                        string
+	WebhookAuthorization              string
 }
 
 func Load(getenv func(string) string) (Config, error) {
+	return load(getenv, true)
+}
+
+// LoadWorker loads the shared runtime configuration without granting the
+// worker access to the server-only internal metrics credentials.
+func LoadWorker(getenv func(string) string) (Config, error) {
+	return load(getenv, false)
+}
+
+func load(getenv func(string) string, requireInternalMetrics bool) (Config, error) {
 	c := Config{
 		Environment:             "development",
 		ListenAddress:           ":8080",
@@ -72,7 +83,17 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.Environment != "development" && c.Environment != "production" {
 		return Config{}, fmt.Errorf("HAPPYLEARN_ENV must be development or production")
 	}
-	if raw := getenv("HAPPYLEARN_AI_MASTER_KEY"); raw != "" {
+	aiMasterKey, err := resolveSecret(
+		getenv,
+		"HAPPYLEARN_AI_MASTER_KEY",
+		4*1024,
+		c.Environment == "production",
+		c.Environment == "production",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	if raw := aiMasterKey; raw != "" {
 		key, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil || len(key) != 32 || base64.StdEncoding.EncodeToString(key) != raw {
 			return Config{}, fmt.Errorf("HAPPYLEARN_AI_MASTER_KEY must be standard base64 of exactly 32 bytes")
@@ -124,9 +145,43 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("HAPPYLEARN_AI_ALLOW_PRIVATE_PROVIDER must be true or false")
 		}
 	}
-	c.DatabaseURL = getenv("HAPPYLEARN_DATABASE_URL")
-	c.RedisURL = getenv("HAPPYLEARN_REDIS_URL")
-	c.LoginThrottleSecret = getenv("HAPPYLEARN_LOGIN_THROTTLE_SECRET")
+	// The disposable Phase 6 production harness uses the production binary and
+	// configuration while binding its deterministic provider to app loopback.
+	// Host release scripts reject every HAPPYLEARN_LOCAL_* control in server
+	// mode, and the production Compose file never sets this local-only switch.
+	if raw := getenv("HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER"); raw != "" {
+		if raw != "true" || c.Environment != "production" {
+			return Config{}, fmt.Errorf("HAPPYLEARN_LOCAL_AI_ALLOW_PRIVATE_PROVIDER is only valid for production local acceptance")
+		}
+		c.AIAllowPrivateProvider = true
+	}
+	if raw := getenv("HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP"); raw != "" {
+		if raw != "true" || c.Environment != "production" {
+			return Config{}, fmt.Errorf("HAPPYLEARN_LOCAL_OBJECTSTORE_SKIP_LIFECYCLE_BOOTSTRAP is only valid for production local acceptance")
+		}
+		c.SkipObjectStoreLifecycleBootstrap = true
+	}
+	for _, target := range []struct {
+		name     string
+		maxBytes int64
+		set      func(string)
+	}{
+		{"HAPPYLEARN_DATABASE_URL", 8 * 1024, func(value string) { c.DatabaseURL = value }},
+		{"HAPPYLEARN_REDIS_URL", 8 * 1024, func(value string) { c.RedisURL = value }},
+		{"HAPPYLEARN_LOGIN_THROTTLE_SECRET", 4 * 1024, func(value string) { c.LoginThrottleSecret = value }},
+	} {
+		value, resolveErr := resolveSecret(
+			getenv,
+			target.name,
+			target.maxBytes,
+			c.Environment == "production",
+			c.Environment == "production",
+		)
+		if resolveErr != nil {
+			return Config{}, resolveErr
+		}
+		target.set(value)
+	}
 	if raw := getenv("HAPPYLEARN_TRUSTED_PROXY_CIDRS"); raw != "" {
 		for _, value := range strings.Split(raw, ",") {
 			prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
@@ -150,8 +205,26 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	c.CookieSecure = c.Environment == "production"
 	c.MinIOEndpoint = getenv("HAPPYLEARN_MINIO_ENDPOINT")
-	c.MinIOAccessKey = getenv("HAPPYLEARN_MINIO_ACCESS_KEY")
-	c.MinIOSecretKey = getenv("HAPPYLEARN_MINIO_SECRET_KEY")
+	c.MinIOAccessKey, err = resolveSecret(
+		getenv,
+		"HAPPYLEARN_MINIO_ACCESS_KEY",
+		4*1024,
+		c.Environment == "production",
+		c.Environment == "production",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	c.MinIOSecretKey, err = resolveSecret(
+		getenv,
+		"HAPPYLEARN_MINIO_SECRET_KEY",
+		4*1024,
+		c.Environment == "production",
+		c.Environment == "production",
+	)
+	if err != nil {
+		return Config{}, err
+	}
 	c.MinIOOriginalsBucket = getenv("HAPPYLEARN_MINIO_ORIGINALS_BUCKET")
 	c.MinIOPreviewsBucket = getenv("HAPPYLEARN_MINIO_PREVIEWS_BUCKET")
 	if c.Environment == "development" {
@@ -223,49 +296,43 @@ func Load(getenv func(string) string) (Config, error) {
 	if len(c.LoginThrottleSecret) < 32 {
 		return Config{}, fmt.Errorf("HAPPYLEARN_LOGIN_THROTTLE_SECRET must be at least 32 bytes")
 	}
-	for _, variable := range []struct {
-		direct string
-		file   string
-	}{
-		{"HAPPYLEARN_METRICS_BEARER_SECRET", "HAPPYLEARN_METRICS_BEARER_SECRET_FILE"},
-		{"HAPPYLEARN_HOST_METRICS_HMAC_SECRET", "HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE"},
-		{"HAPPYLEARN_WEBHOOK_URL", "HAPPYLEARN_WEBHOOK_URL_SECRET_FILE"},
-		{"HAPPYLEARN_WEBHOOK_AUTHORIZATION", "HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE"},
-	} {
-		if getenv(variable.direct) != "" {
-			return Config{}, fmt.Errorf(
-				"%s must be used instead of %s",
-				variable.file,
-				variable.direct,
-			)
-		}
-	}
-	var err error
-	if c.MetricsBearerSecret, err = readSecretString(
+	if c.MetricsBearerSecret, err = resolveSecret(
 		getenv,
-		"HAPPYLEARN_METRICS_BEARER_SECRET_FILE",
+		"HAPPYLEARN_METRICS_BEARER_SECRET",
+		8*1024,
+		c.Environment == "production" && requireInternalMetrics,
 		c.Environment == "production",
 	); err != nil {
 		return Config{}, err
 	}
-	if c.HostMetricsHMACSecret, err = readSecretBytes(
+	hostMetricsHMAC, resolveErr := resolveSecret(
 		getenv,
-		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE",
+		"HAPPYLEARN_HOST_METRICS_HMAC_SECRET",
+		8*1024,
+		c.Environment == "production" && requireInternalMetrics,
 		c.Environment == "production",
-	); err != nil {
-		return Config{}, err
+	)
+	if resolveErr != nil {
+		return Config{}, resolveErr
 	}
-	if c.WebhookURL, err = readSecretString(
+	c.HostMetricsHMACSecret = []byte(hostMetricsHMAC)
+	if c.WebhookURL, err = resolveSecretWithLegacyFile(
 		getenv,
+		"HAPPYLEARN_WEBHOOK_URL",
 		"HAPPYLEARN_WEBHOOK_URL_SECRET_FILE",
+		64*1024,
 		false,
+		c.Environment == "production",
 	); err != nil {
 		return Config{}, err
 	}
-	if c.WebhookAuthorization, err = readSecretString(
+	if c.WebhookAuthorization, err = resolveSecretWithLegacyFile(
 		getenv,
+		"HAPPYLEARN_WEBHOOK_AUTHORIZATION",
 		"HAPPYLEARN_WEBHOOK_AUTHORIZATION_SECRET_FILE",
+		8*1024,
 		false,
+		c.Environment == "production",
 	); err != nil {
 		return Config{}, err
 	}
@@ -273,35 +340,51 @@ func Load(getenv func(string) string) (Config, error) {
 	return c, nil
 }
 
-func readSecretString(
+func resolveSecret(
 	getenv func(string) string,
-	variable string,
+	name string,
+	maxBytes int64,
 	required bool,
+	fileOnly bool,
 ) (string, error) {
-	value, err := readSecretBytes(getenv, variable, required)
-	if err != nil {
-		return "", err
+	if fileOnly && getenv(name) != "" {
+		return "", fmt.Errorf("%s_FILE must be used instead of %s", name, name)
 	}
-	return string(value), nil
-}
-
-func readSecretBytes(
-	getenv func(string) string,
-	variable string,
-	required bool,
-) ([]byte, error) {
-	path := getenv(variable)
-	if path == "" {
-		if required {
-			return nil, fmt.Errorf("%s is required in production", variable)
+	value, err := secretfile.Resolve(func(variable string) (string, bool) {
+		value := getenv(variable)
+		return value, value != ""
+	}, name, maxBytes)
+	if err != nil {
+		return "", fmt.Errorf("%s_FILE is invalid", name)
+	}
+	if value == "" && required {
+		if fileOnly {
+			return "", fmt.Errorf("%s_FILE is required in production", name)
 		}
-		return nil, nil
-	}
-	value, err := secretfile.Read(path)
-	if err != nil {
-		return nil, fmt.Errorf("%s is invalid", variable)
+		return "", fmt.Errorf("%s is required", name)
 	}
 	return value, nil
+}
+
+func resolveSecretWithLegacyFile(
+	getenv func(string) string,
+	name string,
+	legacyFile string,
+	maxBytes int64,
+	required bool,
+	fileOnly bool,
+) (string, error) {
+	canonicalFile := name + "_FILE"
+	if getenv(canonicalFile) != "" && getenv(legacyFile) != "" {
+		return "", fmt.Errorf("%s secret source is invalid", name)
+	}
+	lookup := func(variable string) string {
+		if variable == canonicalFile && getenv(variable) == "" {
+			return getenv(legacyFile)
+		}
+		return getenv(variable)
+	}
+	return resolveSecret(lookup, name, maxBytes, required, fileOnly)
 }
 
 func normalizePublicOrigin(raw string) (string, error) {

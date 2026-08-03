@@ -1,0 +1,85 @@
+(security_headers) {
+	header {
+		Content-Security-Policy "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		-Server
+	}
+}
+
+(safe_access_log) {
+	log {
+		output stdout
+		format filter {
+			request>uri delete
+			request>headers delete
+			request>remote_ip ip_mask 24 48
+			request>client_ip ip_mask 24 48
+			wrap json
+		}
+	}
+	log_append uri_path {http.request.uri.path}
+}
+
+http://{$HAPPYLEARN_DOMAIN} {
+	redir https://{$HAPPYLEARN_DOMAIN}{uri} 308
+}
+
+{$HAPPYLEARN_DOMAIN} {
+	tls internal
+	import security_headers
+	import safe_access_log
+
+	@oversized_upload {
+		path_regexp upload_limit ^/api/v1/(admin/uploads|student/(question-uploads|ai-uploads)|admin/question-uploads)/[^/]+/parts/[0-9]+$
+		expression {http.request.header.Content-Length} != '' && int({http.request.header.Content-Length}) > 9437184
+	}
+	@oversized_default {
+		not path_regexp upload_exclusion ^/api/v1/(admin/uploads|student/(question-uploads|ai-uploads)|admin/question-uploads)/[^/]+/parts/[0-9]+$
+		expression {http.request.header.Content-Length} != '' && int({http.request.header.Content-Length}) > 2097152
+	}
+
+	route {
+		respond @oversized_upload 413
+		respond @oversized_default 413
+		handle /internal/* {
+			respond "not found" 404
+		}
+
+		@upload_parts path_regexp upload ^/api/v1/(admin/uploads|student/(question-uploads|ai-uploads)|admin/question-uploads)/[^/]+/parts/[0-9]+$
+		handle @upload_parts {
+			request_body {
+				max_size 9MiB
+			}
+			reverse_proxy app:8080
+		}
+
+		@sse path /api/v1/student/ai/runs/*/events
+		handle @sse {
+			request_body {
+				max_size 2MiB
+			}
+			reverse_proxy app:8080 {
+				flush_interval -1
+				stream_timeout 5m
+				transport http {
+					read_timeout 5m
+				}
+			}
+		}
+
+		handle {
+			request_body {
+				max_size 2MiB
+			}
+			reverse_proxy app:8080 {
+				transport http {
+					dial_timeout 3s
+					response_header_timeout 30s
+				}
+			}
+		}
+	}
+}

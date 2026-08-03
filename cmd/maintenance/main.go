@@ -100,7 +100,7 @@ func runConfiguredMaintenance(
 	stores, err := objectstore.NewMinIO(ctx, objectstore.MinIOConfig{
 		Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey, SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
 		OriginalsBucket: cfg.MinIOOriginalsBucket, PreviewsBucket: cfg.MinIOPreviewsBucket,
-		SkipLifecycleBootstrap: cfg.Environment == "development",
+		SkipLifecycleBootstrap: cfg.Environment == "development" || cfg.SkipObjectStoreLifecycleBootstrap,
 	})
 	if err != nil {
 		return errors.New("maintenance object storage")
