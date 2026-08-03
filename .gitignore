@@ -1,26 +1,46 @@
-.superpowers/
-.worktrees/
-.env
-.env.*
-!.env.example
-backups/
-data/
+# Local orchestration and worktrees
+/.superpowers/
+/.worktrees/
+
+# Environment files, credentials, and local runtime state
+/.env
+/.env.*
+!/.env.example
+/*.license
+/backups/
+/data/
+/secrets/
+/deploy/production.env
+/deploy/local-certs/
+/deploy/release-state/
+/deploy/secrets/*
+!/deploy/secrets/README.md
+
+# Dependencies and build output
+/node_modules/
+/web/node_modules/
+/.pnpm-store/
+/.tools/
+/web/dist/
+/.tmp-go-build-cache/
+/.tmp-go-mod-cache/
+
+# Test, coverage, and browser artifacts
+/playwright-report/
+/test-results/
+/coverage/
+/.nyc_output/
+*.out
+*.test
+
+# Package-manager and application logs
 *.log
-*.license
-secrets/
-!deploy/secrets/
-deploy/secrets/*
-!deploy/secrets/README.md
-deploy/production.env
-deploy/local-certs/
-deploy/release-state/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
 
-.pnpm-store/
-.tmp-go-build-cache/
-.tmp-go-mod-cache/
-node_modules/
-web/dist/
-
-.tools/
-playwright-report/
-test-results/
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~
