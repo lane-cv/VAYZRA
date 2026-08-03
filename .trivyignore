@@ -1,0 +1,3 @@
+# The Phase 6 coordinator intentionally runs as root because it mounts the
+# Docker daemon socket and must preserve root-owned release evidence files.
+DS-0002
