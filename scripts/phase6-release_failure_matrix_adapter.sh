@@ -198,8 +198,9 @@ write_snapshot() {
 invoke_release() {
   local environment=$1 manifest=$2 injection=${3:-} rollback_injection=${4:-} runner=root_exec
   [[ $case_name != insufficient_disk ]] || runner=root_exec_low_disk
-  "$runner" env HAPPYLEARN_RELEASE_FAILURE_INJECTION="$injection" \
-    HAPPYLEARN_ROLLBACK_FAILURE_INJECTION="$rollback_injection" \
+  "$runner" -eu -c 'exec env "$@"' _ \
+    "HAPPYLEARN_RELEASE_FAILURE_INJECTION=$injection" \
+    "HAPPYLEARN_ROLLBACK_FAILURE_INJECTION=$rollback_injection" \
     "$RELEASE_PROJECT/scripts/prod-release.sh" --project-dir "$RELEASE_PROJECT" \
     --env-file "$environment" --manifest "$manifest" \
     --version "$(root_exec -eu -c 'jq -er .version "$1"' _ "$manifest")" \
@@ -253,7 +254,7 @@ prepare_unavailable_digest() {
 }
 
 run_signal_matrix() {
-  local signal_state status terminal result
+  local signal_state status terminal result resume_status
   local -a states=(preflight backup_started backup_verified release_mode maintenance drained images_pulled schema_compatible migrated services_started ready smoke_passed activated normal traffic_open succeeded)
   : >"$case_root/signal-results"
   for signal_state in "${states[@]}"; do
@@ -264,16 +265,24 @@ run_signal_matrix() {
     ((status != 0)) || fail "signal $signal_state did not interrupt"
     terminal=$(state_value '.state // "none"')
     result=$(state_value '.result // "none"')
-    if [[ $terminal != failed_safe && ! ( $terminal == normal && $result == rolled_back ) &&
+    if [[ $terminal != failed_safe && ! ( $terminal == traffic_open && $result == rolled_back ) &&
       ! ( $terminal == succeeded && $result == succeeded ) ]]; then
-      invoke_release "$MAIN_ENV" "$MANIFEST_B" >"$case_root/resume.$signal_state.log" 2>&1 ||
-        fail "signal $signal_state was neither resumable nor failed safe"
+      resume_status=0
+      invoke_release "$MAIN_ENV" "$MANIFEST_B" >"$case_root/resume.$signal_state.log" 2>&1 || resume_status=$?
+      if ((resume_status != 0)); then
+        grep -Eo '"category":"[a-z_]+"' "$case_root/resume.$signal_state.log" | sort -u >&2 || true
+        sed -n '1,20p' "$case_root/resume.$signal_state.log" |
+          sed -E 's#([A-Za-z][A-Za-z0-9_]*(password|credential|authorization|cookie|token|secret|database_url|redis_url)[A-Za-z0-9_]*)=[^[:space:]]+#\1=[REDACTED]#Ig; s#[A-Za-z0-9+/=_-]{32,}#[REDACTED]#g' >&2
+        terminal=$(state_value '.state // "none"')
+        result=$(state_value '.result // "none"')
+        fail "signal $signal_state resume failed status=$resume_status state=$terminal result=$result"
+      fi
       terminal=$(state_value '.state // "none"')
       result=$(state_value '.result // "none"')
     fi
     if [[ $terminal == failed_safe && $result == failed ]]; then
       printf '%s|failed_safe\n' "$signal_state" >>"$case_root/signal-results"
-    elif [[ $terminal == normal && $result == rolled_back ]]; then
+    elif [[ $terminal == traffic_open && $result == rolled_back ]]; then
       printf '%s|rolled_back\n' "$signal_state" >>"$case_root/signal-results"
     elif [[ $terminal == succeeded && $result == succeeded ]]; then
       printf '%s|resumed\n' "$signal_state" >>"$case_root/signal-results"
@@ -308,30 +317,46 @@ inject_case() {
   esac
   invoke_release "$environment" "$manifest" "$injection" "$rollback_injection" >"$release_log" 2>&1 || status=$?
   ((status != 0)) || fail 'injected release unexpectedly succeeded'
+  printf '%s\n' "$status" >"$case_root/release-status"
+  chmod 0600 "$case_root/release-status"
   write_snapshot
 }
 
+durable_state_diagnostics() {
+  jq -c . "$snapshot" >&2
+  if [[ -f $case_root/release-status && ! -L $case_root/release-status ]]; then
+    printf 'release_status=%s\n' "$(<"$case_root/release-status")" >&2
+  fi
+  if [[ -f $release_log && ! -L $release_log ]]; then
+    grep -Eo '"category":"[a-z_]+"' "$release_log" | sort -u >&2 || true
+    sed -n '1,20p' "$release_log" |
+      sed -E 's#([A-Za-z][A-Za-z0-9_]*(password|credential|authorization|cookie|token|secret|database_url|redis_url)[A-Za-z0-9_]*)=[^[:space:]]+#\1=[REDACTED]#Ig; s#[A-Za-z0-9+/=_-]{32,}#[REDACTED]#g' >&2
+  fi
+}
+
 assert_durable_state() {
+  local matched=true
   [[ -f $snapshot && ! -L $snapshot ]] || fail 'snapshot unavailable'
   case $expected in
     preflight_rejected)
-      jq -e '.state=="preflight" and .result=="failed"' "$snapshot" >/dev/null ;;
+      jq -e '.state=="preflight" and .result=="failed"' "$snapshot" >/dev/null || matched=false ;;
     pre_maintenance_failed)
-      jq -e '.state=="backup_started" and .result=="failed"' "$snapshot" >/dev/null ;;
+      jq -e '.state=="backup_started" and .result=="failed"' "$snapshot" >/dev/null || matched=false ;;
     previous_image_rolled_back)
-      jq -e '.state=="normal" and .result=="rolled_back"' "$snapshot" >/dev/null ;;
+      jq -e '.state=="traffic_open" and .result=="rolled_back"' "$snapshot" >/dev/null || matched=false ;;
     maintenance_failed_safe)
-      jq -e '.state=="failed_safe" and .result=="failed"' "$snapshot" >/dev/null ;;
+      jq -e '.state=="failed_safe" and .result=="failed"' "$snapshot" >/dev/null || matched=false ;;
     resumable_or_failed_safe)
-      [[ $(wc -l <"$case_root/signal-results") == 16 ]] ;;
-    *) return 1 ;;
+      [[ $(wc -l <"$case_root/signal-results") == 16 ]] || matched=false ;;
+    *) matched=false ;;
   esac
   case $case_name in
     previous_image_incompatible)
-      jq -e '.failureCategory=="schema_incompatible"' "$snapshot" >/dev/null ;;
+      jq -e '.failureCategory=="schema_incompatible"' "$snapshot" >/dev/null || matched=false ;;
     previous_image_readiness_failure)
-      jq -e '.failureCategory=="rollback_readiness_failed"' "$snapshot" >/dev/null ;;
+      jq -e '.failureCategory=="rollback_readiness_failed"' "$snapshot" >/dev/null || matched=false ;;
   esac
+  [[ $matched == true ]] || { durable_state_diagnostics; return 1; }
 }
 
 assert_maintenance() {

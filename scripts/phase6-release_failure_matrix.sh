@@ -24,10 +24,12 @@ readonly ASSERTION_STAGES=(durable_state maintenance traffic manifests schema re
 readonly adapter_variable=HAPPYLEARN_PHASE6_FAILURE_MATRIX_ADAPTER
 readonly root_variable=HAPPYLEARN_PHASE6_FAILURE_MATRIX_ROOT
 readonly deadline_variable=HAPPYLEARN_PHASE6_FAILURE_MATRIX_CASE_DEADLINE_SECONDS
+readonly selected_case_variable=HAPPYLEARN_PHASE6_FAILURE_MATRIX_CASE
 
 adapter=${HAPPYLEARN_PHASE6_FAILURE_MATRIX_ADAPTER:-}
 matrix_root=${HAPPYLEARN_PHASE6_FAILURE_MATRIX_ROOT:-}
 case_deadline=${HAPPYLEARN_PHASE6_FAILURE_MATRIX_CASE_DEADLINE_SECONDS:-900}
+selected_case=${HAPPYLEARN_PHASE6_FAILURE_MATRIX_CASE:-}
 active_case=''
 active_expected=''
 active_clean=true
@@ -54,6 +56,14 @@ owner_only_directory() {
 
 [[ $case_deadline =~ ^[1-9][0-9]*$ ]] || fail "$deadline_variable is invalid"
 (( case_deadline <= 14400 )) || fail "$deadline_variable is invalid"
+if [[ -n $selected_case ]]; then
+  [[ $selected_case =~ ^[a-z][a-z0-9_]{0,63}$ ]] || fail "$selected_case_variable is invalid"
+  selected_known=false
+  for entry in "${FAILURE_MATRIX[@]}"; do
+    [[ ${entry%%:*} != "$selected_case" ]] || selected_known=true
+  done
+  [[ $selected_known == true ]] || fail "$selected_case_variable is invalid"
+fi
 owner_only_executable "$adapter" || fail "$adapter_variable is unsafe"
 owner_only_directory "$matrix_root" || fail "$root_variable is unsafe"
 [[ -x $(command -v timeout) ]] || fail 'timeout unavailable'
@@ -78,9 +88,12 @@ trap 'cleanup_active_case; exit 130' INT
 trap 'cleanup_active_case; exit 143' TERM
 
 passed=0
+total=0
 for entry in "${FAILURE_MATRIX[@]}"; do
   case_name=${entry%%:*}
   expected=${entry#*:}
+  [[ -z $selected_case || $case_name == "$selected_case" ]] || continue
+  total=$((total + 1))
   [[ $case_name =~ ^[a-z][a-z0-9_]{0,63}$ && $expected =~ ^[a-z][a-z0-9_]{0,63}$ ]] || fail 'invalid matrix definition'
   active_case=$case_name
   active_expected=$expected
@@ -101,4 +114,4 @@ for entry in "${FAILURE_MATRIX[@]}"; do
 done
 
 trap - EXIT HUP INT TERM
-printf 'phase6 release failure matrix: PASS (%d/%d)\n' "$passed" "${#FAILURE_MATRIX[@]}"
+printf 'phase6 release failure matrix: PASS (%d/%d)\n' "$passed" "$total"

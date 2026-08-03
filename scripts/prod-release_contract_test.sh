@@ -20,7 +20,12 @@ grep -Fq 'state_at_least traffic_open' "$target" || { echo 'prod release contrac
 grep -Fq 'persist_state traffic_open failed' "$target" || { echo 'prod release contract: FAIL: traffic-open resume checkpoint'; exit 1; }
 grep -Fq '^(activated|normal|traffic_open)$' "$target" || { echo 'prod release contract: FAIL: promoted-manifest resume boundary'; exit 1; }
 grep -Fq 'previous_hash=$(jq -r' "$target" || { echo 'prod release contract: FAIL: resumable previous manifest hash'; exit 1; }
+previous_materialized=$(grep -nF 'hl_atomic_json_write "$previous_manifest" "$(<"$active_manifest")"' "$target" | head -n1 | cut -d: -f1)
+preflight_invoked=$(grep -nF '"$SCRIPT_DIR/prod-preflight.sh" "${preflight_args[@]}"' "$target" | cut -d: -f1)
+[[ $previous_materialized =~ ^[0-9]+$ && $preflight_invoked =~ ^[0-9]+$ &&
+  $previous_materialized -lt $preflight_invoked ]] || { echo 'prod release contract: FAIL: rollback manifest not durable before preflight'; exit 1; }
 grep -Fq 'release-history' "$target" || { echo 'prod release contract: FAIL: terminal release history rollover'; exit 1; }
+grep -Fq 'terminal_state == traffic_open && $terminal_result == rolled_back' "$target" || { echo 'prod release contract: FAIL: rolled-back terminal history rollover'; exit 1; }
 grep -A2 -F 'if [[ $mode == server ]]; then' "$target" | grep -Fq 'dirty_checkout' || { echo 'prod release contract: FAIL: server dirty-checkout guard'; exit 1; }
 bash -n "$target"
 echo 'prod release contract: PASS'

@@ -83,7 +83,7 @@ if [[ -f $state_file ]]; then
   terminal_result=$(jq -r '.result // empty' "$state_file")
   terminal_state=$(jq -r '.state // empty' "$state_file")
   terminal_id=$(jq -r '.releaseId // empty' "$state_file")
-  if [[ $terminal_state == succeeded && $terminal_result == succeeded || $terminal_state == normal && $terminal_result == rolled_back ]]; then
+  if [[ $terminal_state == succeeded && $terminal_result == succeeded || $terminal_state == traffic_open && $terminal_result == rolled_back ]]; then
     [[ $terminal_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || { hl_fail release_history_invalid; exit 1; }
     if [[ ! -d $release_history ]]; then install -d -o 0 -g 0 -m 0700 "$release_history"; fi
     hl_secure_directory "$release_history"
@@ -125,6 +125,21 @@ else
   release_id=$(cat /proc/sys/kernel/random/uuid)
   trace_id=${release_id//-/}
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+fi
+
+if [[ -n $previous_hash ]]; then
+  if [[ -f $active_manifest && ! -L $active_manifest &&
+    $(sha256sum "$active_manifest" | awk '{print $1}') == "$previous_hash" ]]; then
+    # The durable state references the rollback manifest from its first
+    # checkpoint, so materialize that evidence before an interruption can
+    # make preflight resumption depend on a later activation step.
+    hl_atomic_json_write "$previous_manifest" "$(<"$active_manifest")"
+  fi
+  [[ -f $previous_manifest && ! -L $previous_manifest &&
+    $(sha256sum "$previous_manifest" | awk '{print $1}') == "$previous_hash" ]] || {
+    hl_fail previous_manifest_unavailable
+    exit 1
+  }
 fi
 
 persist_state() {
