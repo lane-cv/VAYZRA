@@ -2,7 +2,99 @@
 
 HappyLearn 是一个由 Go API、Vue 管理控制台、文件处理 Worker、PostgreSQL、Redis 和 AIStor 对象存储组成的教学平台。
 
-本文说明如何在 Linux 本机从 GitHub 拉取代码并使用 Docker Compose 部署开发环境。它不会执行 Phase 6 生产发布、真实服务器切换或数据恢复操作；生产部署请使用 [`docs/runbooks/phase6-real-server-acceptance.md`](docs/runbooks/phase6-real-server-acceptance.md) 和已审批的发布流程。
+当前初版 release：`v0.1.0`。
+
+本文提供从安装到部署的最短路径：可以直接使用 Docker Compose 部署本地/测试环境，也可以安装 Go、Node.js 和 pnpm 进行源码开发。它不会执行 Phase 6 生产发布、真实服务器切换或数据恢复操作；生产部署请使用 [`docs/runbooks/phase6-real-server-acceptance.md`](docs/runbooks/phase6-real-server-acceptance.md)、[`docs/runbooks/phase6-release-rollback.md`](docs/runbooks/phase6-release-rollback.md) 和已审批的发布流程。
+
+## 安装方式
+
+| 场景 | 推荐方式 | 是否需要在主机安装 Go/Node.js/pnpm |
+| --- | --- | --- |
+| 首次体验或本地部署 | `scripts/deploy-from-github.sh` + Docker Compose | 否 |
+| 日常前端/后端开发 | 源码安装 + 本地依赖 | 是 |
+| 生产环境 | Ubuntu 24.04 + `compose.prod.yml` + 不可变镜像 | 构建机需要，生产机不需要 |
+
+### 方式 A：Docker Compose 快速安装
+
+这是最简单的安装方式。它会构建应用和 Worker 镜像，并启动 PostgreSQL、Redis、AIStor、API、管理控制台和文件处理 Worker。默认端口只绑定到 `127.0.0.1`，适合个人电脑、测试机或反向代理后的内网服务。
+
+```bash
+git clone git@github.com:lane-cv/VAYZRA.git "$HOME/apps/VAYZRA"
+cd "$HOME/apps/VAYZRA"
+
+# AIStor license 必须是仓库外的真实文件，并且仅当前用户可读。
+chmod 600 /absolute/path/to/minio.license
+
+./scripts/deploy-from-github.sh \
+  --directory "$PWD" \
+  --license-file /absolute/path/to/minio.license
+```
+
+没有 SSH Key 时，可将第一行替换为：
+
+```bash
+git clone https://github.com/lane-cv/VAYZRA.git "$HOME/apps/VAYZRA"
+```
+
+脚本会自动创建被 Git 忽略的 `.env.github-deploy`、`.secrets/github-deploy/` 和本机 AI 主密钥；不要删除或替换 AI 主密钥，否则已保存的 AI Provider 凭据将无法解密。完整选项和端口覆盖方式见下方的[首次从 GitHub 部署](#首次从-github-部署)。
+
+### 方式 B：源码开发安装
+
+源码开发需要以下版本：Go `1.26.5`、Node.js `24.18.0`、pnpm `11.9.0`。此外仍建议用 Docker Compose 提供 PostgreSQL、Redis 和 AIStor。安装依赖并执行基础检查：
+
+```bash
+git clone git@github.com:lane-cv/VAYZRA.git
+cd VAYZRA
+
+corepack enable
+corepack prepare pnpm@11.9.0 --activate
+pnpm install --frozen-lockfile
+go mod download
+
+go test ./...
+pnpm test
+pnpm typecheck
+pnpm lint
+pnpm build
+```
+
+本地环境变量、数据库迁移、管理员初始化和源码启动命令见 [`docs/runbooks/local-development.md`](docs/runbooks/local-development.md)。不要把 `.env`、`.secrets/`、AIStor license 或管理员密码提交到 Git。
+
+### 方式 C：生产环境安装
+
+生产环境不是 `compose.dev.yml` 的放大版。生产主机要求 Ubuntu 24.04、Docker Compose、systemd、至少 2 CPU/4 GiB 内存，并使用 `deploy/compose.prod.yml`、外部 secret 文件、不可变镜像摘要和发布前备份。生产主机不需要安装 Go、Node.js 或 pnpm。
+
+准备生产配置的入口文件：
+
+```bash
+sudo install -d -o root -g root -m 0711 /etc/happylearn/secrets
+cp deploy/production.env.example deploy/production.env
+chmod 600 deploy/production.env
+```
+
+随后必须按 [`deploy/secrets/README.md`](deploy/secrets/README.md) 创建每个服务所需的 secret 文件，并将 `deploy/production.env` 中的镜像地址全部替换为已审核的 `@sha256:...` 摘要。不要直接使用示例中的占位值，也不要把密钥写入环境变量或命令行参数。
+
+在生产维护窗口中，先执行只读预检，再按发布手册运行发布协调器：
+
+```bash
+sudo scripts/prod-preflight.sh \
+  --project-dir /srv/happylearn/current \
+  --env-file /etc/happylearn/production.env \
+  --manifest /srv/happylearn/releases/release-input/candidate-manifest.json \
+  --mode server \
+  --expected-host-address '<approved-public-address>'
+
+sudo scripts/prod-release.sh \
+  --project-dir /srv/happylearn/current \
+  --env-file /etc/happylearn/production.env \
+  --manifest /srv/happylearn/releases/release-input/candidate-manifest.json \
+  --version 0.1.0 \
+  --mode server \
+  --expected-host-address '<approved-public-address>' \
+  --confirm-maintenance-window
+```
+
+上述命令只是发布流程的执行入口，不替代主机盘点、DNS/TLS、防火墙、systemd 安装、备份恢复验收和独立审批。首次生产部署前必须完整阅读 [`phase6-real-server-acceptance.md`](docs/runbooks/phase6-real-server-acceptance.md)；出现 trace ID 或失败安全状态时，按 [`phase6-release-rollback.md`](docs/runbooks/phase6-release-rollback.md) 处理。
 
 ## 前置条件
 
