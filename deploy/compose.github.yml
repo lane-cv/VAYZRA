@@ -1,0 +1,43 @@
+# Local host-access override used by scripts/deploy-from-github.sh.
+# The base application network remains internal; only loopback-published
+# services also join this separate bridge network.
+services:
+  app:
+    environment:
+      HAPPYLEARN_PUBLIC_ORIGIN: ${HAPPYLEARN_PUBLIC_ORIGIN:-http://127.0.0.1:8080}
+    ports: !override
+      - "127.0.0.1:${HAPPYLEARN_APP_PORT:-8080}:8080"
+      - "127.0.0.1:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"
+    networks:
+      - happylearn
+      - host_access
+
+  worker:
+    environment:
+      HAPPYLEARN_PUBLIC_ORIGIN: ${HAPPYLEARN_PUBLIC_ORIGIN:-http://127.0.0.1:8080}
+
+  postgres:
+    ports: !override
+      - "127.0.0.1:${HAPPYLEARN_POSTGRES_PORT:-54329}:5432"
+    networks:
+      - happylearn
+      - host_access
+
+  redis:
+    ports: !override
+      - "127.0.0.1:${HAPPYLEARN_REDIS_PORT:-56379}:6379"
+    networks:
+      - happylearn
+      - host_access
+
+  minio:
+    ports: !override
+      - "127.0.0.1:${HAPPYLEARN_AISTOR_API_PORT:-59000}:9000"
+      - "127.0.0.1:${HAPPYLEARN_AISTOR_CONSOLE_PORT:-59001}:9001"
+    networks:
+      - happylearn
+      - host_access
+
+networks:
+  host_access:
+    driver: bridge
