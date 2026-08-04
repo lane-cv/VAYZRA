@@ -18,6 +18,7 @@ services:
         condition: service_healthy
 
   update-agent:
+    image: ${HAPPYLEARN_UPDATE_AGENT_IMAGE:-happylearn-update-agent:local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.update-agent

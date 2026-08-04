@@ -140,6 +140,46 @@ cd "$HOME/apps/VAYZRA"
 
 所有端口只绑定本机回环地址，不对局域网或公网开放。
 
+### Docker 镜像离线部署
+
+如果目标服务器无法访问 Docker Hub，可以在网络正常的构建机上构建并导出镜像：
+
+```bash
+cd /path/to/VAYZRA
+
+docker build -t happylearn-app:local -f Dockerfile .
+docker build -t happylearn-worker:local -f Dockerfile.worker .
+docker build -t happylearn-update-agent:local -f deploy/Dockerfile.update-agent .
+docker pull postgres:18.4
+docker pull redis:8.8
+docker pull debian:12.12-slim
+docker pull 'quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120'
+
+docker save \
+  happylearn-app:local \
+  happylearn-worker:local \
+  happylearn-update-agent:local \
+  postgres:18.4 \
+  redis:8.8 \
+  debian:12.12-slim \
+  'quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120' \
+  | gzip > vayzra-images.tar.gz
+```
+
+把 `vayzra-images.tar.gz` 和仓库目录复制到目标服务器后：
+
+```bash
+cd "$HOME/apps/VAYZRA"
+docker load -i /path/to/vayzra-images.tar.gz
+
+./scripts/deploy-from-github.sh \
+  --offline \
+  --directory "$PWD" \
+  --license-file /home/ubuntu/minio.license
+```
+
+`--offline` 要求目标机已有 Git checkout 和上述全部镜像；它不会执行 `git pull`，也不会构建或拉取镜像。许可证、密钥和命名数据卷仍然单独保管，不会打进镜像包。
+
 ### 存储占用显示“暂无数据”
 
 首页的“存储占用”来自 AIStor 的容量采样。应用启动后会由运维采样器读取 AIStor 管理 API 的磁盘已用空间和总容量，并写入 PostgreSQL；首次启动通常等待一个采样周期即可显示。

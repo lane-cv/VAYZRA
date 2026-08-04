@@ -81,7 +81,7 @@ services:
 
   minio-data-init:
     logging: *default-logging
-    image: quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120
+    image: ${HAPPYLEARN_AISTOR_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command: ["chown 1000:0 /data && chmod 0750 /data"]
@@ -92,7 +92,7 @@ services:
 
   minio:
     logging: *default-logging
-    image: quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120
+    image: ${HAPPYLEARN_AISTOR_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120}
     user: "1000:0"
     command: ["minio", "server", "/data", "--console-address", ":9001", "--license", "/minio.license"]
     environment:
@@ -177,6 +177,7 @@ services:
 
   app:
     logging: *default-logging
+    image: ${HAPPYLEARN_APP_IMAGE:-happylearn-app:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -236,6 +237,7 @@ services:
 
   worker:
     logging: *default-logging
+    image: ${HAPPYLEARN_WORKER_IMAGE:-happylearn-worker:local}
     build:
       context: ..
       dockerfile: Dockerfile.worker

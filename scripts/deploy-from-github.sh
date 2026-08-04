@@ -6,6 +6,7 @@ umask 077
 readonly DEFAULT_REPOSITORY='https://github.com/lane-cv/VAYZRA.git'
 readonly DEFAULT_REF='master'
 readonly DEFAULT_PROJECT='happylearn-dev'
+readonly DEFAULT_AISTOR_IMAGE='quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120'
 
 repository=$DEFAULT_REPOSITORY
 ref=$DEFAULT_REF
@@ -19,13 +20,19 @@ postgres_port=54329
 redis_port=56379
 aistor_api_port=59000
 aistor_console_port=59001
+offline=false
+app_image=${HAPPYLEARN_APP_IMAGE:-happylearn-app:local}
+worker_image=${HAPPYLEARN_WORKER_IMAGE:-happylearn-worker:local}
+update_agent_image=${HAPPYLEARN_UPDATE_AGENT_IMAGE:-happylearn-update-agent:local}
+aistor_image=${HAPPYLEARN_AISTOR_IMAGE:-$DEFAULT_AISTOR_IMAGE}
 
 usage() {
   cat <<'EOF'
 Usage: deploy-from-github.sh --license-file PATH [options]
 
 Clone or fast-forward a clean HappyLearn checkout, build its images, and deploy
-the local Docker Compose stack without deleting existing named volumes.
+the local Docker Compose stack without deleting existing named volumes. With
+--offline, use preloaded images and do not contact GitHub or build images.
 
 Options:
   --repository URL           GitHub clone URL
@@ -40,6 +47,7 @@ Options:
   --redis-port PORT          Redis loopback port (default: 56379)
   --aistor-api-port PORT     AIStor S3 loopback port (default: 59000)
   --aistor-console-port PORT AIStor console loopback port (default: 59001)
+  --offline                  Use preloaded images; require an existing checkout
   -h, --help                 Show this help
 
 This script is for local/development deployment. It does not perform the
@@ -111,6 +119,10 @@ while (($#)); do
       esac
       shift 2
       ;;
+    --offline)
+      offline=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -164,6 +176,7 @@ parent=$(realpath -e -- "$parent") || fail 'deployment directory parent is unava
 directory="$parent/$directory_name"
 
 if [[ ! -e $directory ]]; then
+  [[ $offline == false ]] || fail 'offline mode requires an existing Git checkout'
   git clone --branch "$ref" --single-branch -- "$repository" "$directory"
 else
   [[ -d $directory && ! -L $directory && -d $directory/.git ]] || fail 'deployment directory is not a Git checkout'
@@ -175,7 +188,9 @@ else
   esac
   current_branch=$(git -C "$directory" symbolic-ref --quiet --short HEAD) || fail 'deployment checkout is detached'
   [[ $current_branch == "$ref" ]] || fail "checkout branch is $current_branch, expected $ref"
-  git -C "$directory" pull --ff-only origin "$ref"
+  if [[ $offline == false ]]; then
+    git -C "$directory" pull --ff-only origin "$ref"
+  fi
 fi
 
 for required in deploy/compose.dev.yml deploy/compose.github.yml scripts/phase4-ai-operations.sh; do
@@ -226,6 +241,10 @@ chmod 0600 "$temporary_env"
   printf 'HAPPYLEARN_REDIS_PORT=%s\n' "$redis_port"
   printf 'HAPPYLEARN_AISTOR_API_PORT=%s\n' "$aistor_api_port"
   printf 'HAPPYLEARN_AISTOR_CONSOLE_PORT=%s\n' "$aistor_console_port"
+  printf 'HAPPYLEARN_APP_IMAGE=%s\n' "$app_image"
+  printf 'HAPPYLEARN_WORKER_IMAGE=%s\n' "$worker_image"
+  printf 'HAPPYLEARN_UPDATE_AGENT_IMAGE=%s\n' "$update_agent_image"
+  printf 'HAPPYLEARN_AISTOR_IMAGE=%s\n' "$aistor_image"
   printf 'HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:%s\n' "$app_port"
   printf 'HAPPYLEARN_UPDATE_REPOSITORY=%s\n' "$directory"
   printf 'HAPPYLEARN_UPDATE_REF=%s\n' "$ref"
@@ -251,7 +270,22 @@ compose=(
 
 export HAPPYLEARN_AISTOR_LICENSE_FILE=$license_file
 "${compose[@]}" config --quiet
-"${compose[@]}" up -d --build --wait --wait-timeout 300
+if [[ $offline == true ]]; then
+  for image in \
+    "$app_image" \
+    "$worker_image" \
+    "$update_agent_image" \
+    'postgres:18.4' \
+    'redis:8.8' \
+    'debian:12.12-slim' \
+    "$aistor_image"; do
+    docker image inspect "$image" >/dev/null 2>&1 ||
+      fail "offline image is not loaded: $image"
+  done
+  "${compose[@]}" up -d --no-build --wait --wait-timeout 300
+else
+  "${compose[@]}" up -d --build --wait --wait-timeout 300
+fi
 
 ready_url="http://127.0.0.1:$app_port/api/v1/health/ready"
 for _ in {1..30}; do
