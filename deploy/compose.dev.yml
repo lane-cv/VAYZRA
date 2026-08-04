@@ -179,7 +179,7 @@ services:
     logging: *default-logging
     image: ${HAPPYLEARN_APP_IMAGE:-happylearn-app:local}
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile
     user: "10001:10001"
     environment:
@@ -239,7 +239,7 @@ services:
     logging: *default-logging
     image: ${HAPPYLEARN_WORKER_IMAGE:-happylearn-worker:local}
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile.worker
     user: "10002:10002"
     environment:
@@ -292,7 +292,7 @@ services:
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile.backup
     user: "0:0"
     entrypoint:
@@ -331,7 +331,7 @@ services:
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile.backup
     user: "0:0"
     entrypoint:
@@ -386,7 +386,7 @@ services:
     profiles: ["backup"]
     image: ${HAPPYLEARN_BACKUP_IMAGE:-happylearn-backup:phase5}
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile.backup
     user: "10003:0"
     init: true

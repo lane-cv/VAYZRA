@@ -20,7 +20,7 @@ services:
   update-agent:
     image: ${HAPPYLEARN_UPDATE_AGENT_IMAGE:-happylearn-update-agent:local}
     build:
-      context: ..
+      context: .
       dockerfile: deploy/Dockerfile.update-agent
     environment:
       UPDATE_AGENT_LISTEN: ":8765"
