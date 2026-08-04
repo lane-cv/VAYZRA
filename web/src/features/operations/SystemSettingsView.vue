@@ -3,8 +3,15 @@ import { computed, nextTick, onBeforeMount, onBeforeUnmount, onMounted, ref } fr
 import { onBeforeRouteLeave } from 'vue-router'
 import { APIError } from '../../api/client'
 import { useSessionStore } from '../../stores/session'
-import { readSettings, saveSettings } from './api'
+import {
+  applyApplicationUpdate,
+  checkForUpdates,
+  readSettings,
+  readUpdateStatus,
+  saveSettings,
+} from './api'
 import type {
+  ApplicationUpdateStatus,
   InfrastructureKey,
   InfrastructureStatus,
   OperationsSettings,
@@ -24,11 +31,16 @@ const requestId = ref('')
 const validationError = ref('')
 const conflict = ref(false)
 const savedMessage = ref('')
+const updateStatus = ref<ApplicationUpdateStatus>()
+const updateLoading = ref(false)
+const updateApplying = ref(false)
+const updateError = ref('')
 const feedback = ref<HTMLElement>()
 const pageTitle = ref<HTMLElement>()
 let generation = 0
 let alive = true
 let loadController: AbortController | undefined
+let updateTimer: number | undefined
 
 const dirty = computed(() => (
   current.value !== undefined
@@ -67,6 +79,65 @@ function failure(reason: unknown, fallback: string) {
   return reason instanceof APIError
     ? { message: reason.message || fallback, requestId: reason.requestId }
     : { message: fallback, requestId: '' }
+}
+
+function updateFailure(reason: unknown): string {
+  if (reason instanceof APIError && (
+    reason.status === 404 || reason.code === 'updates_disabled'
+  )) return '当前部署未启用在线更新'
+  return reason instanceof APIError && reason.message
+    ? reason.message
+    : 'GitHub 更新检查失败，请稍后重试'
+}
+
+function shortCommit(value: string): string {
+  return value ? value.slice(0, 12) : '—'
+}
+
+function updateStateLabel(value: ApplicationUpdateStatus['state']): string {
+  const labels: Record<ApplicationUpdateStatus['state'], string> = {
+    disabled: '未启用',
+    unknown: '待检查',
+    checking: '检查中',
+    current: '已是最新',
+    available: '有新版本',
+    updating: '更新中',
+    success: '更新完成',
+    failed: '更新失败',
+    blocked: '已阻止',
+  }
+  return labels[value]
+}
+
+async function refreshUpdate(check = false) {
+  if (!isAdmin.value || updateLoading.value || updateApplying.value) return
+  updateLoading.value = true
+  updateError.value = ''
+  try {
+    updateStatus.value = check ? await checkForUpdates() : await readUpdateStatus()
+  } catch (reason) {
+    updateError.value = updateFailure(reason)
+    if (reason instanceof APIError && (
+      reason.status === 404 || reason.code === 'updates_disabled'
+    )) updateStatus.value = undefined
+  } finally {
+    updateLoading.value = false
+  }
+}
+
+async function applyUpdate() {
+  if (!updateStatus.value?.updateAvailable || updateStatus.value.dirty || updateApplying.value) return
+  if (!window.confirm('确定拉取 GitHub 最新代码、重新构建并重启 App 与 Worker 吗？')) return
+  updateApplying.value = true
+  updateError.value = ''
+  try {
+    updateStatus.value = await applyApplicationUpdate()
+    window.setTimeout(() => { if (alive) void refreshUpdate() }, 3000)
+  } catch (reason) {
+    updateError.value = updateFailure(reason)
+  } finally {
+    updateApplying.value = false
+  }
 }
 
 async function focusFeedback() {
@@ -195,12 +266,17 @@ function beforeUnload(event: BeforeUnloadEvent | Event) {
 onBeforeRouteLeave(() => (
   !dirty.value || window.confirm('系统设置尚未保存，确定离开吗？')
 ))
-onBeforeMount(() => { void loadSettings() })
+onBeforeMount(() => {
+  void loadSettings()
+  void refreshUpdate(true)
+  updateTimer = window.setInterval(() => { void refreshUpdate(true) }, 5 * 60 * 1000)
+})
 onMounted(() => window.addEventListener('beforeunload', beforeUnload))
 onBeforeUnmount(() => {
   alive = false
   generation++
   loadController?.abort()
+  if (updateTimer !== undefined) window.clearInterval(updateTimer)
   window.removeEventListener('beforeunload', beforeUnload)
 })
 </script>
@@ -249,6 +325,42 @@ onBeforeUnmount(() => {
           </dd>
         </div>
       </dl>
+    </section>
+    <section class="updates" data-testid="application-updates" aria-labelledby="updates-heading">
+      <div class="updates-heading">
+        <div>
+          <h2 id="updates-heading">GitHub 版本更新</h2>
+          <p>每 5 分钟自动检查一次。仅管理员可以拉取代码、重建并重启 App 与 Worker。</p>
+        </div>
+        <button type="button" :disabled="updateLoading || updateApplying" @click="refreshUpdate(true)">
+          {{ updateLoading ? '检查中…' : '立即检查' }}
+        </button>
+      </div>
+      <p v-if="updateError" class="update-feedback" role="alert">{{ updateError }}</p>
+      <div v-else-if="!updateStatus" class="update-empty" role="status">当前部署未启用在线更新。</div>
+      <template v-else>
+        <div class="update-summary">
+          <span class="update-state" :class="`state-${updateStatus.state}`">{{ updateStateLabel(updateStatus.state) }}</span>
+          <strong>{{ updateStatus.message || '暂无更新信息' }}</strong>
+        </div>
+        <dl class="update-details">
+          <div><dt>分支</dt><dd>{{ updateStatus.ref || '—' }}</dd></div>
+          <div><dt>当前提交</dt><dd><code>{{ shortCommit(updateStatus.currentCommit) }}</code></dd></div>
+          <div><dt>远端提交</dt><dd><code>{{ shortCommit(updateStatus.latestCommit) }}</code></dd></div>
+        </dl>
+        <p v-if="updateStatus.dirty" class="update-feedback" role="alert">部署目录有未提交修改，自动更新已禁用。</p>
+        <p v-if="updateStatus.state === 'updating'" class="update-feedback" role="status">正在构建并重启服务，页面可能短暂断开，完成后会自动恢复。</p>
+        <div class="update-actions">
+          <button
+            v-if="updateStatus.updateAvailable || updateStatus.state === 'failed'"
+            type="button"
+            :disabled="updateStatus.dirty || updateApplying || updateStatus.state === 'updating'"
+            @click="applyUpdate"
+          >
+            {{ updateApplying || updateStatus.state === 'updating' ? '更新中…' : '更新并重启' }}
+          </button>
+        </div>
+      </template>
     </section>
     <form novalidate @submit.prevent="submit">
       <fieldset :disabled="saving || loading">
@@ -390,5 +502,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.page{max-width:1080px}.page-heading{margin-bottom:24px}.page-heading h1{margin:.35rem 0;font-size:clamp(1.75rem,4vw,2.55rem)}.page-heading p:not(.eyebrow){color:#5b6b80}.page-heading a{display:inline-block;color:#1269ad;font-weight:700}.eyebrow{margin:0;color:#1673b9;font-size:.84rem;font-weight:700;letter-spacing:.06em}.infrastructure{margin-bottom:18px;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}.infrastructure h2{margin:0;color:#183b67;font-size:1.15rem}.infrastructure>p{color:#5b6b80}.infrastructure dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.infrastructure-row{padding:12px;border-radius:9px;background:#f5f8fc}.infrastructure-row dt{font-weight:800}.infrastructure-row dd{display:grid;gap:4px;margin:6px 0 0;color:#52657c;font-size:.9rem}form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}fieldset{display:grid;align-content:start;gap:14px;margin:0;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}legend{padding:0 7px;color:#183b67;font-weight:800}label{display:grid;gap:7px;color:#40536b;font-weight:700}input,textarea{box-sizing:border-box;width:100%;border:1px solid #b8c7d9;border-radius:8px;background:#fff;color:#172b47;padding:10px 11px;font:inherit}input[readonly]{background:#eef3f8;color:#53657a}.feedback,.form-actions{grid-column:1/-1}.feedback{padding:14px 16px;border:1px solid #a9d7b7;border-radius:10px;background:#f2fbf5;outline:none}.feedback.error{border-color:#efb3ae;background:#fff5f4;color:#862b25}.feedback p{margin:0 0 8px}.feedback p:last-child{margin-bottom:0}.feedback button,.form-actions button{border:0;border-radius:8px;background:#176eb5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}.form-actions{display:flex;align-items:center;justify-content:space-between;gap:16px}.form-actions p{color:#68778a;font-size:.9rem}.form-actions button:disabled,.feedback button:disabled{opacity:.55;cursor:not-allowed}.denied{max-width:650px;padding:32px;border:1px solid #efc1be;border-radius:13px;background:#fff}@media(max-width:760px){.infrastructure dl,form{grid-template-columns:1fr}.form-actions{align-items:stretch;flex-direction:column}.form-actions button{width:100%}}
+.page{max-width:1080px}.page-heading{margin-bottom:24px}.page-heading h1{margin:.35rem 0;font-size:clamp(1.75rem,4vw,2.55rem)}.page-heading p:not(.eyebrow){color:#5b6b80}.page-heading a{display:inline-block;color:#1269ad;font-weight:700}.eyebrow{margin:0;color:#1673b9;font-size:.84rem;letter-spacing:.06em;font-weight:700}.infrastructure,.updates{margin-bottom:18px;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}.infrastructure h2,.updates h2{margin:0;color:#183b67;font-size:1.15rem}.infrastructure>p,.updates-heading p{color:#5b6b80}.infrastructure dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.infrastructure-row{padding:12px;border-radius:9px;background:#f5f8fc}.infrastructure-row dt{font-weight:800}.infrastructure-row dd{display:grid;gap:4px;margin:6px 0 0;color:#52657c;font-size:.9rem}.updates-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.updates-heading button,.update-actions button{border:0;border-radius:8px;background:#176eb5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}.updates-heading button:disabled,.update-actions button:disabled{opacity:.55;cursor:not-allowed}.update-summary{display:flex;align-items:center;gap:10px;margin:14px 0;color:#183b67}.update-state{display:inline-flex;border-radius:999px;padding:4px 10px;font-size:.82rem;font-weight:800}.state-current,.state-success{background:#e4f6ed;color:#167244}.state-available{background:#fff2d9;color:#8a5600}.state-checking,.state-updating{background:#e9f2fb;color:#176eb5}.state-failed,.state-blocked{background:#fbe8e7;color:#a4332d}.state-unknown{background:#eef2f6;color:#52647a}.update-details{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.update-details div{padding:12px;border-radius:9px;background:#f5f8fc}.update-details dt{color:#68778a;font-size:.86rem}.update-details dd{margin:5px 0 0;color:#183b67;font-weight:750}.update-details code{font-size:.88rem}.update-feedback,.update-empty{margin:14px 0 0;padding:10px 12px;border-radius:8px;background:#fff5f4;color:#862b25}.update-empty{background:#f5f8fc;color:#52647a}.update-actions{display:flex;justify-content:flex-end;margin-top:14px}form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}fieldset{display:grid;align-content:start;gap:14px;margin:0;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}legend{padding:0 7px;color:#183b67;font-weight:800}label{display:grid;gap:7px;color:#40536b;font-weight:700}input,textarea{box-sizing:border-box;width:100%;border:1px solid #b8c7d9;border-radius:8px;background:#fff;color:#172b47;padding:10px 11px;font:inherit}input[readonly]{background:#eef3f8;color:#53657a}.feedback,.form-actions{grid-column:1/-1}.feedback{padding:14px 16px;border:1px solid #a9d7b7;border-radius:10px;background:#f2fbf5;outline:none}.feedback.error{border-color:#efb3ae;background:#fff5f4;color:#862b25}.feedback p{margin:0 0 8px}.feedback p:last-child{margin-bottom:0}.feedback button,.form-actions button{border:0;border-radius:8px;background:#176eb5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}.form-actions{display:flex;align-items:center;justify-content:space-between;gap:16px}.form-actions p{color:#68778a;font-size:.9rem}.form-actions button:disabled,.feedback button:disabled{opacity:.55;cursor:not-allowed}.denied{max-width:650px;padding:32px;border:1px solid #efc1be;border-radius:13px;background:#fff}@media(max-width:760px){.infrastructure dl,.update-details,form{grid-template-columns:1fr}.updates-heading{display:grid}.updates-heading button{width:100%}.form-actions{align-items:stretch;flex-direction:column}.form-actions button{width:100%}}
 </style>

@@ -137,16 +137,16 @@ services:
       - -c
     command:
       - |
-        for name in metrics-bearer host-metrics-hmac; do
+        for name in metrics-bearer host-metrics-hmac update-agent; do
           test -f "/source/$${name}"
         done
-        for name in metrics-bearer host-metrics-hmac; do
+        for name in metrics-bearer host-metrics-hmac update-agent; do
           rm -f "/secrets/.$${name}.new"
           cp "/source/$${name}" "/secrets/.$${name}.new"
           chown 10001:10001 "/secrets/.$${name}.new"
           chmod 0400 "/secrets/.$${name}.new"
         done
-        for name in metrics-bearer host-metrics-hmac; do
+        for name in metrics-bearer host-metrics-hmac update-agent; do
           mv -f "/secrets/.$${name}.new" "/secrets/$${name}"
           test "$(stat -c '%u:%g:%a' "/secrets/$${name}")" = '10001:10001:400'
         done
@@ -168,6 +168,8 @@ services:
         target: /source/metrics-bearer
       - source: host_metrics_hmac_secret
         target: /source/host-metrics-hmac
+      - source: update_agent_token
+        target: /source/update-agent
     network_mode: "none"
     restart: "no"
     mem_limit: 64m
@@ -439,6 +441,8 @@ secrets:
     file: ${HAPPYLEARN_METRICS_BEARER_SECRET_FILE:-./fixtures/development-metrics-bearer-do-not-use-in-production}
   host_metrics_hmac_secret:
     file: ${HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE:-./fixtures/development-host-metrics-hmac-do-not-use-in-production}
+  update_agent_token:
+    file: ${HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE:-./fixtures/development-update-agent-token-do-not-use-in-production}
 
 x-happylearn-backup-secret-files:
   required:

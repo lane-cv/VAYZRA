@@ -34,6 +34,7 @@ import (
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
+	"happylearn.local/app/internal/updates"
 )
 
 var (
@@ -150,6 +151,7 @@ func applicationStartupComponent(err error) string {
 		"initialize operations gate":              "operations_gate",
 		"initialize alert webhook":                "alert_webhook",
 		"initialize operations service":           "operations",
+		"initialize update service":               "updates",
 		"initialize backup service":               "backup",
 		"initialize login throttling":             "login_throttling",
 		"initialize upload cleanup":               "upload_cleanup",
@@ -806,6 +808,19 @@ func buildApplicationRuntime(
 			return nil, nil, errors.New("initialize backup service")
 		}
 	}
+	var adminUpdates updates.HTTPService
+	if cfg.UpdateAgentURL != "" {
+		updateAgent, clientErr := updates.NewAgentClient(cfg.UpdateAgentURL, cfg.UpdateAgentToken)
+		if clientErr != nil {
+			closeResources()
+			return nil, nil, errors.New("initialize update service")
+		}
+		adminUpdates, clientErr = updates.NewService(updateAgent, audit.NewPostgresWriter(pool))
+		if clientErr != nil || adminUpdates == nil {
+			closeResources()
+			return nil, nil, errors.New("initialize update service")
+		}
+	}
 	if deps.openRedis != nil {
 		client, err := deps.openRedis(cfg.RedisURL)
 		if err != nil {
@@ -871,6 +886,7 @@ func buildApplicationRuntime(
 		OperationsWriteGate: operationalGate,
 		AdminOperations:     adminOperations,
 		AdminBackups:        adminBackups,
+		AdminUpdates:        adminUpdates,
 		AIFileAccess:        aiFileAccessService,
 		PublicOrigin:        cfg.PublicOrigin,
 		CookieSecure:        cfg.CookieSecure,

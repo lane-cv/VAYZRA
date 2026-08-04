@@ -48,6 +48,31 @@ export type OperationsSettings = OperationsSettingsUpdate & {
   updatedAt: string
 }
 
+export type UpdateState =
+  | 'disabled'
+  | 'unknown'
+  | 'checking'
+  | 'current'
+  | 'available'
+  | 'updating'
+  | 'success'
+  | 'failed'
+  | 'blocked'
+
+export type ApplicationUpdateStatus = {
+  enabled: boolean
+  state: UpdateState
+  repository: string
+  ref: string
+  currentCommit: string
+  latestCommit: string
+  updateAvailable: boolean
+  dirty: boolean
+  message: string
+  startedAt: string | null
+  finishedAt: string | null
+}
+
 export type AuditMetadata = Partial<{
   status: string
   reason: string

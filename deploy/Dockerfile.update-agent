@@ -1,0 +1,12 @@
+FROM golang:1.26.5-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY cmd/update-agent ./cmd/update-agent
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-update-agent ./cmd/update-agent
+
+FROM docker:28.3.3-cli
+RUN apk add --no-cache ca-certificates curl git
+RUN mkdir -p /run/update-agent
+COPY --from=build /out/happylearn-update-agent /usr/local/bin/happylearn-update-agent
+RUN chmod 0555 /usr/local/bin/happylearn-update-agent
+ENTRYPOINT ["/usr/local/bin/happylearn-update-agent"]

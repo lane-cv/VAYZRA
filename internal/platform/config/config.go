@@ -45,6 +45,8 @@ type Config struct {
 	HostMetricsHMACSecret             []byte
 	WebhookURL                        string
 	WebhookAuthorization              string
+	UpdateAgentURL                    string
+	UpdateAgentToken                  string
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -335,6 +337,28 @@ func load(getenv func(string) string, requireInternalMetrics bool) (Config, erro
 		c.Environment == "production",
 	); err != nil {
 		return Config{}, err
+	}
+	c.UpdateAgentURL = strings.TrimSpace(getenv("HAPPYLEARN_UPDATE_AGENT_URL"))
+	if c.UpdateAgentURL != "" {
+		parsed, parseErr := url.Parse(c.UpdateAgentURL)
+		if parseErr != nil || parsed.Scheme != "http" || parsed.Host == "" ||
+			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+			(c.Environment != "development") {
+			return Config{}, fmt.Errorf("HAPPYLEARN_UPDATE_AGENT_URL is invalid or unsupported")
+		}
+		c.UpdateAgentToken, err = resolveSecret(
+			getenv,
+			"HAPPYLEARN_UPDATE_AGENT_TOKEN",
+			8*1024,
+			true,
+			false,
+		)
+		if err != nil {
+			return Config{}, err
+		}
+		if len(c.UpdateAgentToken) < 32 {
+			return Config{}, fmt.Errorf("HAPPYLEARN_UPDATE_AGENT_TOKEN must be at least 32 bytes")
+		}
 	}
 
 	return c, nil

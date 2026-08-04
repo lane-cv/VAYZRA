@@ -23,6 +23,8 @@ import type {
   OperationsDataState,
   OperationsSettings,
   OperationsSettingsUpdate,
+  ApplicationUpdateStatus,
+  UpdateState,
   RecoveryState,
   RestoreVerification,
 } from './types'
@@ -184,6 +186,65 @@ export async function saveSettings(value: OperationsSettingsUpdate): Promise<Ope
     method: 'PUT',
     json: value,
   }))
+}
+
+const updateStates = new Set<UpdateState>([
+  'disabled', 'unknown', 'checking', 'current', 'available',
+  'updating', 'success', 'failed', 'blocked',
+])
+const updateCommitPattern = /^[0-9a-f]{40}$/
+
+function parseUpdateStatus(value: unknown): ApplicationUpdateStatus {
+  const source = record(value)
+  exactKeys(source, new Set([
+    'enabled', 'state', 'repository', 'ref', 'currentCommit', 'latestCommit',
+    'updateAvailable', 'dirty', 'message', 'startedAt', 'finishedAt',
+  ]))
+  if (
+    typeof source.enabled !== 'boolean'
+    || typeof source.state !== 'string'
+    || !updateStates.has(source.state as UpdateState)
+    || typeof source.repository !== 'string'
+    || typeof source.ref !== 'string'
+    || typeof source.currentCommit !== 'string'
+    || typeof source.latestCommit !== 'string'
+    || typeof source.updateAvailable !== 'boolean'
+    || typeof source.dirty !== 'boolean'
+    || typeof source.message !== 'string'
+    || (source.startedAt !== null && typeof source.startedAt !== 'string')
+    || (source.finishedAt !== null && typeof source.finishedAt !== 'string')
+  ) throw invalidResponse()
+  if (
+    (source.currentCommit !== '' && !updateCommitPattern.test(source.currentCommit))
+    || (source.latestCommit !== '' && !updateCommitPattern.test(source.latestCommit))
+    || (source.startedAt !== null && !validTimestamp(source.startedAt))
+    || (source.finishedAt !== null && !validTimestamp(source.finishedAt))
+  ) throw invalidResponse()
+  return {
+    enabled: source.enabled,
+    state: source.state as UpdateState,
+    repository: source.repository,
+    ref: source.ref,
+    currentCommit: source.currentCommit,
+    latestCommit: source.latestCommit,
+    updateAvailable: source.updateAvailable,
+    dirty: source.dirty,
+    message: source.message,
+    startedAt: source.startedAt,
+    finishedAt: source.finishedAt,
+  }
+}
+
+export async function readUpdateStatus(signal?: AbortSignal): Promise<ApplicationUpdateStatus> {
+  return parseUpdateStatus(await request<unknown>('/admin/updates/status', { signal }))
+}
+
+export async function checkForUpdates(): Promise<ApplicationUpdateStatus> {
+  return parseUpdateStatus(await request<unknown>('/admin/updates/check', { method: 'POST' }))
+}
+
+export async function applyApplicationUpdate(): Promise<ApplicationUpdateStatus> {
+  return parseUpdateStatus(await request<unknown>('/admin/updates/apply', { method: 'POST' }))
 }
 
 const metadataKeys = [

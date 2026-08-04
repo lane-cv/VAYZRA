@@ -18,6 +18,7 @@ import (
 	"happylearn.local/app/internal/qanda"
 	"happylearn.local/app/internal/students"
 	"happylearn.local/app/internal/teaching"
+	"happylearn.local/app/internal/updates"
 
 	"happylearn.local/app/internal/platform/httpx"
 	"happylearn.local/app/internal/platform/redisx"
@@ -50,6 +51,7 @@ type Dependencies struct {
 	OperationsWriteGate operations.WriteGate
 	AdminOperations     operations.HTTPService
 	AdminBackups        backup.HTTPService
+	AdminUpdates        updates.HTTPService
 	AIFileAccess        files.AIAccessHTTPService
 	PublicOrigin        string
 	CookieSecure        bool
@@ -148,6 +150,9 @@ func New(d Dependencies) http.Handler {
 				}
 				if d.AdminOperations != nil {
 					private.Mount("/admin/operations", operations.NewAdminHandler(d.AdminOperations, d.TrustedProxyCIDRs).Routes())
+				}
+				if d.AdminUpdates != nil {
+					private.Mount("/admin/updates", updates.NewAdminHandler(d.AdminUpdates, d.TrustedProxyCIDRs).Routes())
 				}
 				if d.StudentAI != nil {
 					private.Mount("/student/ai", aiqa.NewStudentHandlerWithConfig(d.StudentAI, d.StudentAIEvents, aiqa.StudentHTTPConfig{

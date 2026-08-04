@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/host-metrics-path.sh"
 INTERNAL_ENDPOINT='http://127.0.0.1:9090/internal/host-samples'
+INTERNAL_ENDPOINT="${HAPPYLEARN_HOST_METRICS_INTERNAL_ENDPOINT:-$INTERNAL_ENDPOINT}"
 MAX_FILE_BYTES=$((64 * 1024))
 monitored_service_allowlist=(caddy app worker postgres redis minio)
 auxiliary_service_allowlist=(app-secrets-init postgres-tls-init minio-data-init backup-storage-init backup-secrets-init backup migrate restore acceptance)
@@ -85,7 +86,7 @@ if ! jq -sce '
   | if type != "array" or
        any(.[];
          type != "object" or
-         has("Environment") or has("Env") or has("Mounts") or
+         has("Environment") or has("Env") or
          has("ImageRegistryAuth") or has("RegistryAuth") or has("Logs"))
     then error("unsafe compose rows")
     else .
@@ -94,6 +95,38 @@ if ! jq -sce '
   die
 fi
 check_bounded_file "$compose_all" || die
+
+# Recent Compose versions include Mounts in JSON output. Do not consume that
+# row shape; request only the fields needed by the sampler instead.
+mount_result=0
+jq -e 'any(.[ ]; has("Mounts"))' "$compose_all" >/dev/null || mount_result=$?
+case "$mount_result" in
+  0)
+    compose_template_raw="$temporary/compose-ps-template.txt"
+    if ! run_bounded_capture "$compose_template_raw" 10 docker compose \
+      -p "$compose_project" \
+      -f "$compose_file" \
+      ps --format '{{.ID}}\t{{.Service}}\t{{.State}}\t{{.Health}}'; then
+      die
+    fi
+    compose_template_json="$temporary/compose-template.json"
+    if ! jq -Rsc '
+      split("\n")
+      | map(select(length > 0) | split("\t") |
+          if length != 4 or any(.[]; type != "string")
+          then error("invalid compose template row")
+          else {
+            ID: .[0], Service: .[1], State: .[2], Health: .[3]
+          }
+          end)
+    ' "$compose_template_raw" >"$compose_template_json"; then
+      die
+    fi
+    compose_all="$compose_template_json"
+    ;;
+  1) ;;
+  *) die ;;
+esac
 
 compose_selected="$temporary/compose-selected.json"
 compose_allowlist_json="$(

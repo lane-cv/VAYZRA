@@ -1,13 +1,60 @@
 # Local host-access override used by scripts/deploy-from-github.sh.
-# The base application network remains internal; only loopback-published
-# services also join this separate bridge network.
+# The base application network remains internal; the update agent also joins
+# this separate bridge so it can reach GitHub without exposing its HTTP port.
 services:
   app:
     environment:
       HAPPYLEARN_PUBLIC_ORIGIN: ${HAPPYLEARN_PUBLIC_ORIGIN:-http://127.0.0.1:8080}
+      HAPPYLEARN_UPDATE_AGENT_URL: http://update-agent:8765
+      HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE: /run/secrets/update-agent
     ports: !override
       - "127.0.0.1:${HAPPYLEARN_APP_PORT:-8080}:8080"
       - "127.0.0.1:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"
+    networks:
+      - happylearn
+      - host_access
+    depends_on:
+      update-agent:
+        condition: service_healthy
+
+  update-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.update-agent
+    environment:
+      UPDATE_AGENT_LISTEN: ":8765"
+      UPDATE_AGENT_REPOSITORY: /workspace
+      UPDATE_AGENT_REF: ${HAPPYLEARN_UPDATE_REF:-master}
+      UPDATE_AGENT_PROJECT: ${HAPPYLEARN_UPDATE_PROJECT:-happylearn-dev}
+      UPDATE_AGENT_ENV_FILE: /workspace/.env.github-deploy
+      UPDATE_AGENT_AI_ENV_FILE: /workspace/.secrets/github-deploy/ai.env
+      UPDATE_AGENT_COMPOSE_OVERRIDE: /workspace/deploy/compose.github.yml
+      UPDATE_AGENT_LICENSE_FILE: /run/secrets/aistor-license
+      UPDATE_AGENT_TOKEN_FILE: /run/secrets/update-agent-token
+      UPDATE_AGENT_GITHUB_TOKEN_FILE: /run/update-agent/github-token
+      UPDATE_AGENT_APP_PORT: ${HAPPYLEARN_APP_PORT:-8080}
+      UPDATE_AGENT_INTERNAL_PORT: ${HAPPYLEARN_INTERNAL_PORT:-9090}
+    volumes:
+      - ${HAPPYLEARN_UPDATE_REPOSITORY:?set HAPPYLEARN_UPDATE_REPOSITORY}:/workspace:rw
+      - ${HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE:-./fixtures/development-github-token-do-not-use-in-production}:/run/update-agent/github-token:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - update_agent_state:/var/lib/happylearn-update
+    secrets:
+      - source: update_agent_token
+        target: update-agent-token
+      - source: aistor_license
+        target: aistor-license
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks:
       - happylearn
       - host_access
@@ -41,3 +88,10 @@ services:
 networks:
   host_access:
     driver: bridge
+
+volumes:
+  update_agent_state:
+
+secrets:
+  update_agent_token:
+    file: ${HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE:?set HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE}

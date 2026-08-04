@@ -12,6 +12,7 @@ ref=$DEFAULT_REF
 project=$DEFAULT_PROJECT
 directory="$PWD/VAYZRA"
 license_file=${HAPPYLEARN_AISTOR_LICENSE_FILE:-}
+github_token_file=${HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE:-}
 app_port=8080
 internal_port=9090
 postgres_port=54329
@@ -32,6 +33,7 @@ Options:
   --directory PATH           Checkout/deployment directory (default: ./VAYZRA)
   --project NAME             Compose project (default: happylearn-dev)
   --license-file PATH        Readable AIStor minio.license file (required)
+  --github-token-file PATH   Optional GitHub token file for private repository updates
   --app-port PORT            Web/API loopback port (default: 8080)
   --internal-port PORT       Internal API loopback port (default: 9090)
   --postgres-port PORT       PostgreSQL loopback port (default: 54329)
@@ -91,7 +93,7 @@ validate_ai_env() {
 
 while (($#)); do
   case $1 in
-    --repository|--ref|--directory|--project|--license-file|--app-port|--internal-port|--postgres-port|--redis-port|--aistor-api-port|--aistor-console-port)
+    --repository|--ref|--directory|--project|--license-file|--github-token-file|--app-port|--internal-port|--postgres-port|--redis-port|--aistor-api-port|--aistor-console-port)
       require_value "$@"
       case $1 in
         --repository) repository=$2 ;;
@@ -99,6 +101,7 @@ while (($#)); do
         --directory) directory=$2 ;;
         --project) project=$2 ;;
         --license-file) license_file=$2 ;;
+        --github-token-file) github_token_file=$2 ;;
         --app-port) app_port=$2 ;;
         --internal-port) internal_port=$2 ;;
         --postgres-port) postgres_port=$2 ;;
@@ -145,6 +148,11 @@ done
 [[ $license_file != *$'\n'* && $license_file != *$'\r'* ]] || fail 'license path is unsafe'
 license_file=$(realpath -e -- "$license_file") || fail 'license file does not exist'
 [[ -f $license_file && ! -L $license_file && -r $license_file && -s $license_file ]] || fail 'license file is not a readable regular file'
+if [[ -n $github_token_file ]]; then
+  [[ $github_token_file != *$'\n'* && $github_token_file != *$'\r'* ]] || fail 'GitHub token path is unsafe'
+  github_token_file=$(realpath -e -- "$github_token_file") || fail 'GitHub token file does not exist'
+  secure_file "$github_token_file" 'GitHub token file'
+fi
 
 if [[ $directory != /* ]]; then directory="$PWD/$directory"; fi
 [[ $directory != / && $directory != "${HOME:-/nonexistent}" && ! -L $directory ]] || fail 'deployment directory is unsafe'
@@ -178,6 +186,7 @@ secret_dir="$directory/.secrets/github-deploy"
 base_env="$directory/.env.github-deploy"
 ai_key="$secret_dir/ai-master-key"
 ai_env="$secret_dir/ai.env"
+update_agent_token="$secret_dir/update-agent-token"
 install -d -m 0700 -- "$secret_dir"
 
 if [[ -f $ai_env && ! -f $ai_key ]]; then
@@ -197,6 +206,15 @@ if [[ ! -f $ai_env ]]; then
 fi
 secure_file "$ai_env" 'AI environment file'
 validate_ai_env "$ai_env"
+if [[ ! -f $update_agent_token ]]; then
+  temporary_token=$(mktemp "$secret_dir/.update-agent-token.XXXXXX")
+  trap 'rm -f -- "${temporary_key:-}" "${temporary_env:-}" "${temporary_token:-}"' EXIT INT TERM HUP
+  openssl rand -hex 32 >"$temporary_token"
+  chmod 0600 "$temporary_token"
+  mv -f -- "$temporary_token" "$update_agent_token"
+  temporary_token=''
+fi
+secure_file "$update_agent_token" 'update-agent token file'
 
 temporary_env=$(mktemp "$directory/.env.github-deploy.XXXXXX")
 trap 'rm -f -- "${temporary_key:-}" "${temporary_env:-}"' EXIT INT TERM HUP
@@ -209,6 +227,13 @@ chmod 0600 "$temporary_env"
   printf 'HAPPYLEARN_AISTOR_API_PORT=%s\n' "$aistor_api_port"
   printf 'HAPPYLEARN_AISTOR_CONSOLE_PORT=%s\n' "$aistor_console_port"
   printf 'HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:%s\n' "$app_port"
+  printf 'HAPPYLEARN_UPDATE_REPOSITORY=%s\n' "$directory"
+  printf 'HAPPYLEARN_UPDATE_REF=%s\n' "$ref"
+  printf 'HAPPYLEARN_UPDATE_PROJECT=%s\n' "$project"
+  printf 'HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE=%s\n' "$update_agent_token"
+  if [[ -n $github_token_file ]]; then
+    printf 'HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE=%s\n' "$github_token_file"
+  fi
 } >"$temporary_env"
 mv -f -- "$temporary_env" "$base_env"
 temporary_env=''

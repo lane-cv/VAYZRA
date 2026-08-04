@@ -23,6 +23,9 @@ const infrastructure: OperationsSettings['infrastructure'] = [
 vi.mock('./api', () => ({
   readSettings: vi.fn(),
   saveSettings: vi.fn(),
+  checkForUpdates: vi.fn(),
+  readUpdateStatus: vi.fn(),
+  applyApplicationUpdate: vi.fn(),
 }))
 
 const settings: OperationsSettings = {
