@@ -29,10 +29,13 @@ type PostgresAlertStore struct {
 
 var _ AlertStore = (*PostgresAlertStore)(nil)
 
-func NewPostgresAlertStore(pool *pgxpool.Pool) *PostgresAlertStore {
+func NewPostgresAlertStore(
+	pool *pgxpool.Pool,
+	objectStore ...ObjectStoreCapacityReader,
+) *PostgresAlertStore {
 	return newPostgresAlertStoreWithCollectors(
 		pool,
-		NewPostgresAlertCollectors(pool),
+		NewPostgresAlertCollectors(pool, objectStore...),
 	)
 }
 
@@ -40,13 +43,14 @@ func NewPostgresAlertStoreWithWebhookOutbox(
 	pool *pgxpool.Pool,
 	clock func() time.Time,
 	newUUID func() uuid.UUID,
+	objectStore ...ObjectStoreCapacityReader,
 ) (*PostgresAlertStore, error) {
 	if pool == nil || clock == nil || newUUID == nil {
 		return nil, ErrInvalid
 	}
 	store := newPostgresAlertStoreWithCollectors(
 		pool,
-		NewPostgresAlertCollectors(pool),
+		NewPostgresAlertCollectors(pool, objectStore...),
 	)
 	store.webhookEnabled = true
 	store.clock = clock

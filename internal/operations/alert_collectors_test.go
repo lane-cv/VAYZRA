@@ -74,6 +74,70 @@ func TestPostgresActivityAlertCollectorUsesBoundedExactAggregates(t *testing.T) 
 	}
 }
 
+func TestObjectStoreAlertCollectorCollectsCapacityAndUsage(t *testing.T) {
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	collector := newObjectStoreAlertCollector(objectStoreCapacityStub{
+		usedBytes:     30,
+		capacityBytes: 100,
+	})
+	collection, err := collector.Collect(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collection.Samples) != 2 {
+		t.Fatalf("samples=%d", len(collection.Samples))
+	}
+	for _, sample := range collection.Samples {
+		if sample.Source != SampleSourceObjectStore ||
+			sample.Scope != SampleScopeObjectStore ||
+			sample.Unit != SampleUnitBytes ||
+			!sample.ObservedAt.Equal(now) {
+			t.Fatalf("sample=%+v", sample)
+		}
+		switch sample.Metric {
+		case SampleMetricObjectUsedBytes:
+			if sample.Value != 30 {
+				t.Fatalf("used sample=%+v", sample)
+			}
+		case SampleMetricObjectCapacityBytes:
+			if sample.Value != 100 {
+				t.Fatalf("capacity sample=%+v", sample)
+			}
+		default:
+			t.Fatalf("unexpected sample=%+v", sample)
+		}
+	}
+}
+
+func TestObjectStoreAlertCollectorRejectsInvalidCapacity(t *testing.T) {
+	collector := newObjectStoreAlertCollector(objectStoreCapacityStub{
+		usedBytes:     101,
+		capacityBytes: 100,
+	})
+	if _, err := collector.Collect(
+		context.Background(),
+		time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC),
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestPostgresAlertCollectorsIncludeObjectStoreCapacityReader(t *testing.T) {
+	collectors := NewPostgresAlertCollectors(nil, objectStoreCapacityStub{
+		usedBytes: 1, capacityBytes: 2,
+	})
+	if len(collectors) != 3 {
+		t.Fatalf("collectors=%d", len(collectors))
+	}
+	collection, err := collectors[2].Collect(
+		context.Background(),
+		time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil || len(collection.Samples) != 2 {
+		t.Fatalf("collection=%+v error=%v", collection, err)
+	}
+}
+
 func TestPostgresActivityAlertCollectorCountsCancelledAtWindowBoundaries(
 	t *testing.T,
 ) {
@@ -676,6 +740,17 @@ type alertCollectorDBStub struct {
 type alertCollectorStub struct {
 	collection AlertCollection
 	err        error
+}
+
+type objectStoreCapacityStub struct {
+	usedBytes     int64
+	capacityBytes int64
+}
+
+func (stub objectStoreCapacityStub) StorageUsage(
+	context.Context,
+) (int64, int64, error) {
+	return stub.usedBytes, stub.capacityBytes, nil
 }
 
 func (stub alertCollectorStub) Collect(

@@ -80,6 +80,12 @@ type AlertSampleCollector interface {
 	Collect(context.Context, time.Time) (AlertCollection, error)
 }
 
+// ObjectStoreCapacityReader reads the current capacity and used bytes of the
+// configured object-storage cluster.
+type ObjectStoreCapacityReader interface {
+	StorageUsage(context.Context) (usedBytes, capacityBytes int64, err error)
+}
+
 type alertCollectorDB interface {
 	QueryRow(context.Context, string, ...any) dashboardRow
 }
@@ -92,12 +98,23 @@ type postgresBackupAlertCollector struct {
 	db alertCollectorDB
 }
 
-func NewPostgresAlertCollectors(pool *pgxpool.Pool) []AlertSampleCollector {
+type objectStoreAlertCollector struct {
+	reader ObjectStoreCapacityReader
+}
+
+func NewPostgresAlertCollectors(
+	pool *pgxpool.Pool,
+	objectStore ...ObjectStoreCapacityReader,
+) []AlertSampleCollector {
 	database := postgresDashboardDB{pool: pool}
-	return []AlertSampleCollector{
+	collectors := []AlertSampleCollector{
 		newPostgresBackupAlertCollectorDB(database),
 		newPostgresActivityAlertCollectorDB(database),
 	}
+	if len(objectStore) > 0 && objectStore[0] != nil {
+		collectors = append(collectors, newObjectStoreAlertCollector(objectStore[0]))
+	}
+	return collectors
 }
 
 func newPostgresActivityAlertCollectorDB(
@@ -110,6 +127,48 @@ func newPostgresBackupAlertCollectorDB(
 	db alertCollectorDB,
 ) AlertSampleCollector {
 	return &postgresBackupAlertCollector{db: db}
+}
+
+func newObjectStoreAlertCollector(
+	reader ObjectStoreCapacityReader,
+) AlertSampleCollector {
+	return &objectStoreAlertCollector{reader: reader}
+}
+
+func (collector *objectStoreAlertCollector) Collect(
+	ctx context.Context,
+	now time.Time,
+) (AlertCollection, error) {
+	if collector == nil || collector.reader == nil {
+		return AlertCollection{}, errStoreClosed
+	}
+	if ctx == nil || !validSampleTime(now) {
+		return AlertCollection{}, ErrInvalid
+	}
+	now = now.UTC()
+	queryCtx, cancel := context.WithTimeout(ctx, alertCollectorQueryTimeout)
+	defer cancel()
+	usedBytes, capacityBytes, err := collector.reader.StorageUsage(queryCtx)
+	if err != nil {
+		return AlertCollection{}, err
+	}
+	if usedBytes < 0 || capacityBytes <= 0 || usedBytes > capacityBytes ||
+		!validSampleValue(float64(usedBytes), SampleUnitBytes) ||
+		!validSampleValue(float64(capacityBytes), SampleUnitBytes) {
+		return AlertCollection{}, ErrInvalid
+	}
+	return AlertCollection{Samples: []Sample{
+		{
+			Source: SampleSourceObjectStore, Metric: SampleMetricObjectUsedBytes,
+			Scope: SampleScopeObjectStore, Value: float64(usedBytes),
+			Unit: SampleUnitBytes, ObservedAt: now,
+		},
+		{
+			Source: SampleSourceObjectStore, Metric: SampleMetricObjectCapacityBytes,
+			Scope: SampleScopeObjectStore, Value: float64(capacityBytes),
+			Unit: SampleUnitBytes, ObservedAt: now,
+		},
+	}}, nil
 }
 
 func (collector *postgresActivityAlertCollector) Collect(

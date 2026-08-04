@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
@@ -43,9 +44,14 @@ type MinIOStores struct {
 	Previews  *MinIOStore
 
 	core                   *minio.Core
+	admin                  storageAdminClient
 	buckets                []string
 	operationTimeout       time.Duration
 	skipLifecycleBootstrap bool
+}
+
+type storageAdminClient interface {
+	StorageInfo(context.Context) (madmin.StorageInfo, error)
 }
 
 type MinIOStore struct {
@@ -59,8 +65,7 @@ func NewMinIO(ctx context.Context, cfg MinIOConfig) (*MinIOStores, error) {
 	if operationTimeout <= 0 {
 		operationTimeout = defaultOperationTimeout
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	transport := newMinIOTransport()
 	core, err := minio.NewCore(cfg.Endpoint, &minio.Options{
 		Creds:        credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 		Secure:       cfg.UseTLS,
@@ -71,8 +76,13 @@ func NewMinIO(ctx context.Context, cfg MinIOConfig) (*MinIOStores, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize object store: %w", ErrUnavailable)
 	}
+	admin, err := newStorageAdminClient(cfg, transport)
+	if err != nil {
+		return nil, fmt.Errorf("initialize object store metrics: %w", ErrUnavailable)
+	}
 	stores := &MinIOStores{
 		core:                   core,
+		admin:                  admin,
 		buckets:                uniqueBuckets(cfg.OriginalsBucket, cfg.PreviewsBucket),
 		operationTimeout:       operationTimeout,
 		skipLifecycleBootstrap: cfg.SkipLifecycleBootstrap,
@@ -83,6 +93,37 @@ func NewMinIO(ctx context.Context, cfg MinIOConfig) (*MinIOStores, error) {
 		return nil, err
 	}
 	return stores, nil
+}
+
+// NewMinIOStorageMetrics creates an authenticated AIStor admin client for
+// capacity sampling without bootstrapping application buckets.
+func NewMinIOStorageMetrics(cfg MinIOConfig) (*MinIOStores, error) {
+	operationTimeout := cfg.OperationTimeout
+	if operationTimeout <= 0 {
+		operationTimeout = defaultOperationTimeout
+	}
+	admin, err := newStorageAdminClient(cfg, newMinIOTransport())
+	if err != nil {
+		return nil, fmt.Errorf("initialize object store metrics: %w", ErrUnavailable)
+	}
+	return &MinIOStores{admin: admin, operationTimeout: operationTimeout}, nil
+}
+
+func newMinIOTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return transport
+}
+
+func newStorageAdminClient(
+	cfg MinIOConfig,
+	transport http.RoundTripper,
+) (*madmin.AdminClient, error) {
+	return madmin.NewWithOptions(cfg.Endpoint, &madmin.Options{
+		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure:    cfg.UseTLS,
+		Transport: transport,
+	})
 }
 
 func uniqueBuckets(names ...string) []string {
@@ -258,6 +299,35 @@ func (s *MinIOStores) Ready(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// StorageUsage returns raw bytes used and total across the disks reported by
+// the AIStor storage-info admin API.
+func (s *MinIOStores) StorageUsage(ctx context.Context) (int64, int64, error) {
+	if s == nil || s.admin == nil || ctx == nil {
+		return 0, 0, ErrUnavailable
+	}
+	info, err := s.admin.StorageInfo(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read object store storage info: %w", ErrUnavailable)
+	}
+	var usedBytes, capacityBytes uint64
+	for _, disk := range info.Disks {
+		if disk.TotalSpace == 0 {
+			continue
+		}
+		if usedBytes > ^uint64(0)-disk.UsedSpace ||
+			capacityBytes > ^uint64(0)-disk.TotalSpace {
+			return 0, 0, ErrUnavailable
+		}
+		usedBytes += disk.UsedSpace
+		capacityBytes += disk.TotalSpace
+	}
+	if capacityBytes == 0 || usedBytes > capacityBytes ||
+		usedBytes > uint64(^uint64(0)>>1) || capacityBytes > uint64(^uint64(0)>>1) {
+		return 0, 0, ErrUnavailable
+	}
+	return int64(usedBytes), int64(capacityBytes), nil
 }
 
 // DeleteBuckets removes only the two buckets configured for this instance.

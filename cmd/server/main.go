@@ -499,10 +499,23 @@ func buildProductionApplicationWithLog(
 			pool *pgxpool.Pool,
 			webhookEnabled bool,
 		) func() {
+			objectStoreMetrics, metricsErr := objectstore.NewMinIOStorageMetrics(
+				objectstore.MinIOConfig{
+					Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.MinIOAccessKey,
+					SecretKey: cfg.MinIOSecretKey, UseTLS: cfg.MinIOUseTLS,
+				},
+			)
+			if metricsErr != nil {
+				runnerLogs.alert("object_store_metrics_unavailable")
+				return newProductionAlertRunnerWithWebhookAndLog(
+					pool, webhookEnabled, runnerLogs.alert,
+				)
+			}
 			return newProductionAlertRunnerWithWebhookAndLog(
 				pool,
 				webhookEnabled,
 				runnerLogs.alert,
+				objectStoreMetrics,
 			)
 		},
 		startWebhookRunner: func(
@@ -1269,14 +1282,16 @@ func newProductionAlertRunnerWithWebhookAndLog(
 	pool *pgxpool.Pool,
 	webhookEnabled bool,
 	logCategory func(string),
+	objectStore ...operations.ObjectStoreCapacityReader,
 ) func() {
-	store := operations.NewPostgresAlertStore(pool)
+	store := operations.NewPostgresAlertStore(pool, objectStore...)
 	if webhookEnabled {
 		var err error
 		store, err = operations.NewPostgresAlertStoreWithWebhookOutbox(
 			pool,
 			time.Now,
 			uuid.New,
+			objectStore...,
 		)
 		if err != nil {
 			return nil
