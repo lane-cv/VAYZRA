@@ -269,6 +269,11 @@ compose=(
 )
 
 export HAPPYLEARN_AISTOR_LICENSE_FILE=$license_file
+export HAPPYLEARN_METRICS_BEARER_SECRET_FILE="${HAPPYLEARN_METRICS_BEARER_SECRET_FILE:-$directory/deploy/fixtures/development-metrics-bearer-do-not-use-in-production}"
+export HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE="${HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE:-$directory/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production}"
+if [[ -z ${HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE:-} ]]; then
+  export HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE="$directory/deploy/fixtures/development-github-token-do-not-use-in-production"
+fi
 "${compose[@]}" config --quiet
 if [[ $offline == true ]]; then
   for image in \
@@ -286,6 +291,14 @@ if [[ $offline == true ]]; then
 else
   "${compose[@]}" up -d --build --wait --wait-timeout 300
 fi
+
+# Compose secrets backed by host files are mounted when a container is
+# created.  Reusing the one-shot initializer after the deployment token has
+# been created or rotated would leave app_secrets with an older token, while
+# update-agent could receive the current one.  Refresh the initializer, then
+# recreate both consumers so they use the same token.
+"${compose[@]}" up -d --force-recreate --wait --wait-timeout 300 app-secrets-init
+"${compose[@]}" up -d --no-build --no-deps --force-recreate --wait --wait-timeout 300 app update-agent
 
 ready_url="http://127.0.0.1:$app_port/api/v1/health/ready"
 for _ in {1..30}; do

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -397,7 +398,7 @@ func (a *agent) gitNetwork(ctx context.Context, args ...string) (string, error) 
 		command.Env = overrideEnvironment(os.Environ(), map[string]string{
 			"GIT_CONFIG_COUNT":   "1",
 			"GIT_CONFIG_KEY_0":   "http.extraHeader",
-			"GIT_CONFIG_VALUE_0": "Authorization: Bearer " + a.cfg.githubToken,
+			"GIT_CONFIG_VALUE_0": githubGitAuthorization(a.cfg.githubToken),
 		})
 	}
 	output, err := command.Output()
@@ -405,6 +406,10 @@ func (a *agent) gitNetwork(ctx context.Context, args ...string) (string, error) 
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func githubGitAuthorization(token string) string {
+	return "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 }
 
 func (a *agent) compose(ctx context.Context, args ...string) error {
