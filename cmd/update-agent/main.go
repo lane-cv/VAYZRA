@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -365,9 +366,13 @@ func (a *agent) runUpdate() {
 	a.mu.Unlock()
 }
 
+func (a *agent) gitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	gitArgs := append([]string{"-c", "safe.directory=" + a.cfg.repository, "-C", a.cfg.repository}, args...)
+	return exec.CommandContext(ctx, "git", gitArgs...)
+}
+
 func (a *agent) git(ctx context.Context, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-c", "safe.directory=" + a.cfg.repository, "-C", a.cfg.repository}, args...)...)
-	output, err := command.Output()
+	output, err := a.gitCommand(ctx, args...).Output()
 	if err != nil {
 		return "", err
 	}
@@ -391,20 +396,58 @@ func (a *agent) remoteURL(ctx context.Context) (string, error) {
 	return "", errors.New("unsupported github remote")
 }
 
+func (a *agent) gitNetworkCommand(ctx context.Context, args ...string) *exec.Cmd {
+	command := a.gitCommand(ctx, args...)
+	command.Env = gitNetworkEnvironment(os.Environ(), a.cfg.githubToken)
+	return command
+}
+
 func (a *agent) gitNetwork(ctx context.Context, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-c", "safe.directory=" + a.cfg.repository, "-C", a.cfg.repository}, args...)...)
-	if a.cfg.githubToken != "" {
-		command.Env = overrideEnvironment(os.Environ(), map[string]string{
-			"GIT_CONFIG_COUNT":   "1",
-			"GIT_CONFIG_KEY_0":   "http.extraHeader",
-			"GIT_CONFIG_VALUE_0": "Authorization: Bearer " + a.cfg.githubToken,
-		})
-	}
-	output, err := command.Output()
+	output, err := a.gitNetworkCommand(ctx, args...).Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func githubBasicAuthorization(token string) string {
+	credential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	return "Authorization: Basic " + credential
+}
+
+func gitNetworkEnvironment(base []string, token string) []string {
+	result := make([]string, 0, len(base)+16)
+	for _, entry := range base {
+		name, _, ok := strings.Cut(entry, "=")
+		preserveGitTLS := name == "GIT_SSL_CAINFO" || name == "GIT_SSL_CAPATH"
+		if !ok || strings.HasPrefix(name, "GIT_") && !preserveGitTLS || name == "GCM_INTERACTIVE" || strings.HasPrefix(name, "SSH_ASKPASS") {
+			continue
+		}
+		result = append(result, entry)
+	}
+
+	result = append(result,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=/bin/false",
+		"GCM_INTERACTIVE=never",
+	)
+	config := [][2]string{
+		{"credential.helper", ""},
+		{"credential.interactive", "false"},
+		{"http.extraHeader", ""},
+		{"http.https://github.com/.extraHeader", ""},
+	}
+	if token != "" {
+		config = append(config, [2]string{"http.https://github.com/.extraHeader", githubBasicAuthorization(token)})
+	}
+	result = append(result, "GIT_CONFIG_COUNT="+fmt.Sprint(len(config)))
+	for index, item := range config {
+		result = append(result,
+			fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", index, item[0]),
+			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", index, item[1]),
+		)
+	}
+	return result
 }
 
 func (a *agent) compose(ctx context.Context, args ...string) error {

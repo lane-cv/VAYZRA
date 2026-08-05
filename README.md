@@ -201,6 +201,8 @@ cd "$HOME/apps/VAYZRA"
 
 部署完成后，管理员可以在“系统运维 → 系统设置 → GitHub 版本更新”中手动检查，页面也会每 5 分钟自动检查一次。发现新提交后点击“更新并重启”，系统会只对干净工作区执行 fast-forward 拉取，重建 App 与 Worker 镜像并重启这两个服务；数据库、Redis、AIStor 的命名卷不会被删除。工作区存在未提交修改时，更新会被阻止。
 
+在线更新不会让更新代理替换自身。如果新提交修改了 `cmd/update-agent`、`deploy/Dockerfile.update-agent` 或 `deploy/compose.github.yml` 中的更新代理配置，请在宿主机重新运行部署脚本，或使用同一组 Compose 参数显式重建镜像并重建 `update-agent` 容器。
+
 该在线更新入口仅由 `deploy-from-github.sh` 的本地/测试部署启用，生产 `compose.prod.yml` 不挂载更新代理或 Docker socket，生产环境仍须使用审批后的不可变镜像发布流程。
 
 如果 GitHub 仓库为私有仓库，更新代理不能使用宿主机 SSH 私钥。请准备一个仅有仓库 `Contents: Read` 权限的 GitHub Token 文件，并以 owner-only 权限运行部署脚本：
@@ -213,7 +215,7 @@ chmod 600 /absolute/path/to/github-token
   --github-token-file /absolute/path/to/github-token
 ```
 
-Token 只以 HTTPS Authorization header 供更新代理查询和拉取，不写入 Git，也不返回给前端。没有 Token 时，使用 SSH 完成的首次部署仍可运行，但管理员页面会提示无法检查私有仓库更新。
+更新代理通过 GitHub Smart HTTP Basic 认证查询和拉取私有仓库。Token 只从只读文件加载，认证头仅作用于 `https://github.com/`；Token 不写入远程 URL、Git 命令参数、持久化 Git 配置或应用日志，也不返回给前端。`--github-token-file` 只配置容器内的更新代理，首次 clone 以及宿主机执行的 pull 仍使用宿主机已有的 SSH Key 或 HTTPS 凭据。没有 Token 时，使用 SSH 完成的首次部署仍可运行，但管理员页面会提示无法检查私有仓库更新。
 
 部署其他分支时明确指定：
 
