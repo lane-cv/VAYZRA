@@ -86,6 +86,9 @@ for phase in phase1 phase2 phase3 phase4; do
   grep -Fq "/artifacts/results/$phase" "$script"
 done
 grep -Fq 'sanitize-e2e-artifacts.sh' "$script"
+grep -Fq 'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"' "$script"
+grep -Fq 'mc ls local >/dev/null 2>&1' "$script"
+! grep -Fq 'http://127.0.0.1:9000/minio/health/live' "$script"
 grep -Fq 'allowed_artifact_root="$repo_root/test-results"' "$script"
 grep -Fq 'artifact_input="${E2E_ARTIFACT_DIR:-$allowed_artifact_root/phase4}"' "$script"
 

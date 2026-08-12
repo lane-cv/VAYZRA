@@ -553,6 +553,17 @@ long_lived_start_line="$(
   "$long_lived_start_line" =~ ^[0-9]+$ &&
   "$aistor_init_line" -lt "$long_lived_start_line" ]] ||
   fail 'AIStor license initialization must precede long-lived dependency startup'
+for literal in \
+  'wait_for primary-AIStor "$primary_aistor" exec "$primary_aistor" /bin/sh -ceu' \
+  '. /run/phase5-secrets/runtime.env' \
+  'mc alias set primary http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1' \
+  'mc ls primary >/dev/null 2>&1'; do
+  grep -Fq -- "$literal" <<<"$start_dependencies_block" ||
+    fail 'primary AIStor must accept authenticated bucket operations before app startup'
+done
+! grep -Fq 'http://127.0.0.1:9000/minio/health/live' \
+  <<<"$start_dependencies_block" ||
+  fail 'Phase 5 dependencies used anonymous AIStor liveness'
 if grep -Fq -- \
   'compose_live up --detach --no-build postgres redis minio' "$target"; then
   fail 'long-lived dependencies can restart completed one-shot initializers'

@@ -1855,8 +1855,11 @@ start_dependencies() {
   wait_for PostgreSQL "$postgres" exec "$postgres" \
     pg_isready -U happylearn -d "$database"
   wait_for Redis "$redis" exec "$redis" redis-cli ping
-  wait_for primary-AIStor "$primary_aistor" exec "$primary_aistor" \
-    curl --fail --silent http://127.0.0.1:9000/minio/health/live
+  wait_for primary-AIStor "$primary_aistor" exec "$primary_aistor" /bin/sh -ceu '
+    . /run/phase5-secrets/runtime.env
+    mc alias set primary http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1
+    mc ls primary >/dev/null 2>&1
+  '
   wait_for remote-S3 "$remote_s3" exec "$remote_s3" \
     curl --fail --silent --cacert /certs/CAs/ca.crt \
       --resolve remote-s3:9000:127.0.0.1 \
