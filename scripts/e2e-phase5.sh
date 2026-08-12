@@ -206,6 +206,8 @@ restore_license_file="$tmpdir/restore-minio.license"
 restore_controller_tmp="$tmpdir/restore-controller-tmp"
 restore_docker_socket=''
 restore_docker_socket_group=''
+remote_s3_uid=''
+remote_s3_owner=''
 restore_host_uid=''
 restore_host_gid=''
 restore_controller_uid=''
@@ -304,6 +306,7 @@ chmod 0400 "$teacher_credential_file"
 secret_probe_containers=(
   "${prefix}_secret_probe_postgres"
   "${prefix}_secret_probe_minio"
+  "${prefix}_secret_probe_remote_s3"
   "${prefix}_secret_probe_app"
   "${prefix}_secret_probe_admin"
   "${prefix}_secret_probe_worker"
@@ -993,6 +996,14 @@ portable_file_mode() {
   else
     stat -f '%Lp' "$1"
   fi
+}
+
+resolve_remote_s3_identity() {
+  remote_s3_uid="$(id -u)" || return 1
+  [[ "$remote_s3_uid" =~ ^[0-9]+$ &&
+    "$remote_s3_uid" != 0 ]] ||
+    return 1
+  remote_s3_owner="${remote_s3_uid}:0"
 }
 
 portable_file_owner() {
@@ -1715,7 +1726,8 @@ initialize_resources() {
     -v "$primary_volume:/primary" -v "$remote_volume:/remote" \
     -v "$repository_volume:/repository" -v "$state_volume:/state" \
     "$init_image" /bin/sh -eu -c \
-    'chmod 0750 /primary /remote; chown 1000:0 /primary /remote; chmod 0700 /repository /state; chown 10003:0 /repository /state; test "$(stat -c "%u:%g:%a" /primary)" = 1000:0:750; test "$(stat -c "%u:%g:%a" /remote)" = 1000:0:750; test "$(stat -c "%u:%g:%a" /repository)" = 10003:0:700; test "$(stat -c "%u:%g:%a" /state)" = 10003:0:700'
+    'remote_owner="${1:?remote owner required}"; chmod 0750 /primary /remote; chown 1000:0 /primary; chown "$remote_owner" /remote; chmod 0700 /repository /state; chown 10003:0 /repository /state; test "$(stat -c "%u:%g:%a" /primary)" = 1000:0:750; test "$(stat -c "%u:%g:%a" /remote)" = "$remote_owner:750"; test "$(stat -c "%u:%g:%a" /repository)" = 10003:0:700; test "$(stat -c "%u:%g:%a" /state)" = 10003:0:700' \
+    phase5-data-init "$remote_s3_owner"
   docker_bounded 120 run --rm --name "$runner_init" --network none \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
@@ -1735,6 +1747,7 @@ initialize_secret_volume() {
     --memory 32m --cpus .05 --tmpfs /tmp:rw,noexec,nosuid,size=4m \
     -v "$secret_source_dir:/secrets:ro" -v "$secret_volume:/owned-secrets" \
     "$init_image" /bin/sh -eu -c '
+      remote_owner="${1:?remote owner required}"
       install_consumer() {
         consumer="$1"; owner="$2"; mode="$3"; shift 3
         case "$mode" in
@@ -1756,7 +1769,7 @@ initialize_secret_volume() {
       }
       install_consumer postgres 999:999 0400 database-password
       install_consumer primary-aistor 1000:0 0400 object-access object-secret
-      install_consumer remote-s3 1000:0 0400 restic-remote-access-key restic-remote-secret-key
+      install_consumer remote-s3 "$remote_owner" 0400 restic-remote-access-key restic-remote-secret-key
       install_consumer app 10001:10001 0400 ai-master database-password object-access object-secret metrics-bearer host-metrics-hmac webhook-url webhook-authorization login-throttle
       install_consumer worker 10002:10002 0400 database-password object-access object-secret login-throttle
       install_consumer backup 10003:0 0400 database-password restic-local-repository restic-local-password restic-remote-repository restic-remote-password restic-remote-access-key restic-remote-secret-key age-identity
@@ -1766,7 +1779,7 @@ initialize_secret_volume() {
       install_consumer browser 1000:1000 0400 admin-password student-password student-new-password provider-key control-token
       install_consumer host-sample 10004:0 0400 metrics-bearer host-metrics-hmac
       chmod 0500 /owned-secrets
-    '
+    ' phase5-secret-init "$remote_s3_owner"
 }
 
 verify_secret_consumer_reads() {
@@ -1781,9 +1794,10 @@ verify_secret_consumer_reads() {
       --mount "type=volume,src=$secret_volume,dst=/run/secrets,volume-subpath=$consumer,readonly" \
       "$init_image" /bin/sh -eu -c \
       'test "$(stat -c "%u:%g:%a" "/run/secrets/'"$secret"'")" = "'"$expected"':'"$mode"'"; test -s "/run/secrets/'"$secret"'"'
-  done <<'PROBES'
+  done <<PROBES
 secret_probe_postgres|999:999|postgres|database-password|999:999|400
 secret_probe_minio|1000:0|primary-aistor|object-access|1000:0|400
+secret_probe_remote_s3|${remote_s3_owner}|remote-s3|restic-remote-access-key|${remote_s3_owner}|400
 secret_probe_app|10001:10001|app|ai-master|10001:10001|400
 secret_probe_admin|10001:10001|admin|admin-password|10001:10001|600
 secret_probe_worker|10002:10002|worker|database-password|10002:10002|400
@@ -1825,16 +1839,17 @@ start_dependencies() {
     record_owned_container "$name" "$live_project" "$fixture_suffix"
   done
   docker_bounded 60 run -d --name "$remote_s3" --network "$network" \
-    --network-alias remote-s3 --read-only --user 1000:0 --cap-drop ALL \
+    --network-alias remote-s3 --read-only \
+    --user "$remote_s3_owner" --cap-drop ALL \
     --label "com.docker.compose.project=${live_project}" \
     --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
     --security-opt no-new-privileges --memory 384m --cpus .1 \
-    --tmpfs /tmp:rw,noexec,nosuid,size=16m,uid=1000,gid=0,mode=0700 \
+    --tmpfs "/tmp:rw,noexec,nosuid,size=16m,uid=${remote_s3_uid},gid=0,mode=0700" \
     -v "$remote_volume:/data" -v "$license_file:/minio.license:ro" \
-    --mount "type=volume,src=$runtime_secret_volume,dst=/run/phase5-secrets,volume-subpath=remote-s3,readonly" \
+    --mount "type=volume,src=$secret_volume,dst=/run/phase5-secrets,volume-subpath=remote-s3,readonly" \
     --mount "type=bind,src=$remote_cert_dir,dst=/certs,readonly" \
     --entrypoint /bin/sh "$aistor_image" -eu -c \
-    'set -a; . /run/phase5-secrets/runtime.env; set +a; exec minio server /data --address :9000 --console-address :9001 --certs-dir /certs --license /minio.license' \
+    'export MINIO_ROOT_USER="$(cat /run/phase5-secrets/restic-remote-access-key)"; export MINIO_ROOT_PASSWORD="$(cat /run/phase5-secrets/restic-remote-secret-key)"; export SSL_CERT_FILE=/certs/CAs/ca.crt; exec minio server /data --address :9000 --console-address :9001 --certs-dir /certs --license /minio.license' \
     >/dev/null
   record_owned_container "$remote_s3" "$live_project" "$fixture_suffix"
   wait_for PostgreSQL "$postgres" exec "$postgres" \
@@ -1847,9 +1862,9 @@ start_dependencies() {
       --resolve remote-s3:9000:127.0.0.1 \
       https://remote-s3:9000/minio/health/live
   docker_bounded 60 exec "$remote_s3" /bin/sh -eu -c '
-    set -a
-    . /run/phase5-secrets/runtime.env
-    set +a
+    export MINIO_ROOT_USER="$(cat /run/phase5-secrets/restic-remote-access-key)"
+    export MINIO_ROOT_PASSWORD="$(cat /run/phase5-secrets/restic-remote-secret-key)"
+    export SSL_CERT_FILE=/certs/CAs/ca.crt
     export MC_CONFIG_DIR=/tmp/mc
     client=
     for candidate in /usr/bin/mc /usr/local/bin/mc /usr/bin/mcli /usr/local/bin/mcli; do
@@ -3354,6 +3369,10 @@ if [[ "$probe_mode" == ownership_signal ]]; then
   exit 0
 fi
 
+resolve_remote_s3_identity || {
+  printf '%s\n' 'Phase 5 remote S3 requires a non-root host identity' >&2
+  exit 2
+}
 create_fixture_ca
 prepare_restore_license
 build_images

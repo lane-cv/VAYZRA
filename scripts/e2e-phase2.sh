@@ -133,7 +133,8 @@ docker_bounded 60 run -d --name "$minio" --network "$network" --network-alias mi
   minio server /data --console-address :9001 --license /minio.license >/dev/null
 wait_for PostgreSQL "$postgres" exec "$postgres" pg_isready -U happylearn -d "$database"
 wait_for Redis "$redis" exec "$redis" redis-cli ping
-wait_for AIStor "$minio" exec "$minio" curl --fail --silent http://127.0.0.1:9000/minio/health/live
+wait_for AIStor "$minio" exec "$minio" /bin/sh -ceu \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ls local >/dev/null 2>&1'
 
 common_env=(
   -e HAPPYLEARN_ENV=development

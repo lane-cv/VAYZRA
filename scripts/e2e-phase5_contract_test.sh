@@ -947,6 +947,215 @@ contract_cleanup() {
 }
 trap contract_cleanup EXIT
 
+contract_file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
+
+contract_file_owner() {
+  if stat -c '%u' "$1" >/dev/null 2>&1; then
+    stat -c '%u' "$1"
+  else
+    stat -f '%u' "$1"
+  fi
+}
+
+contract_file_group() {
+  if stat -c '%g' "$1" >/dev/null 2>&1; then
+    stat -c '%g' "$1"
+  else
+    stat -f '%g' "$1"
+  fi
+}
+
+assert_remote_s3_identity_resolution() {
+  local candidate="$1"
+  local identity_source uid
+  identity_source="$(
+    sed -n '/^resolve_remote_s3_identity()/,/^}/p' "$candidate"
+  )"
+  [[ -n "$identity_source" ]] || return 1
+  for uid in 1001 501; do
+    (
+      id() {
+        case "$1" in
+          -u) printf '%s\n' "$uid" ;;
+          -g) printf '127\n' ;;
+          *) return 2 ;;
+        esac
+      }
+      eval "$identity_source"
+      remote_s3_uid=''
+      remote_s3_owner=''
+      resolve_remote_s3_identity
+      [[ "$remote_s3_uid" == "$uid" &&
+        "$remote_s3_owner" == "$uid:0" ]]
+    ) || return 1
+  done
+  if (
+    id() {
+      case "$1" in
+        -u) printf '0\n' ;;
+        -g) printf '127\n' ;;
+        *) return 2 ;;
+      esac
+    }
+    eval "$identity_source"
+    remote_s3_uid=''
+    remote_s3_owner=''
+    resolve_remote_s3_identity
+  ); then
+    return 1
+  fi
+}
+
+assert_remote_s3_identity_wiring() {
+  local candidate="$1"
+  local literal
+  for literal in \
+    'phase5-data-init "$remote_s3_owner"' \
+    'chown "$remote_owner" /remote' \
+    'phase5-secret-init "$remote_s3_owner"' \
+    'install_consumer remote-s3 "$remote_owner" 0400 restic-remote-access-key restic-remote-secret-key' \
+    'secret_probe_remote_s3|${remote_s3_owner}|remote-s3|restic-remote-access-key|${remote_s3_owner}|400' \
+    'type=volume,src=$secret_volume,dst=/run/phase5-secrets,volume-subpath=remote-s3,readonly' \
+    'MINIO_ROOT_USER="$(cat /run/phase5-secrets/restic-remote-access-key)"' \
+    'resolve_remote_s3_identity || {' \
+    '--user "$remote_s3_owner" --cap-drop ALL' \
+    'uid=${remote_s3_uid},gid=0,mode=0700'; do
+    grep -Fq -- "$literal" "$candidate" || return 1
+  done
+}
+
+assert_remote_s3_fixture_permissions() {
+  local candidate="$1"
+  local label="$2"
+  local fixture_source fixture_root expected_uid expected_gid path
+  fixture_source="$(sed -n '/^create_fixture_ca()/,/^}/p' "$candidate")"
+  [[ -n "$fixture_source" ]] || return 1
+  fixture_root="$tmpdir/remote-s3-fixture-$label"
+  mkdir -p "$fixture_root/offline" "$fixture_root/ca-context" \
+    "$fixture_root/remote-certs/CAs"
+  chmod 0700 "$fixture_root" "$fixture_root/offline" \
+    "$fixture_root/ca-context" "$fixture_root/remote-certs" \
+    "$fixture_root/remote-certs/CAs"
+  (
+    umask 077
+    case "$(uname -s)" in
+      MINGW*|MSYS*) export MSYS2_ARG_CONV_EXCL='/CN=' ;;
+    esac
+    offline_dir="$fixture_root/offline"
+    ca_context_dir="$fixture_root/ca-context"
+    remote_cert_dir="$fixture_root/remote-certs"
+    fixture_suffix=a1b2c3d4e5f6
+    eval "$fixture_source"
+    create_fixture_ca
+  ) || return 1
+  expected_uid="$(id -u)"
+  expected_gid="$(id -g)"
+  case "$(uname -s)" in
+    MINGW*|MSYS*)
+      grep -Fq 'chmod 0400 "$remote_cert_dir/private.key"' \
+        <<<"$fixture_source" || return 1
+      ;;
+    *)
+      [[ "$(contract_file_mode "$fixture_root/remote-certs")" == 700 &&
+        "$(contract_file_mode "$fixture_root/remote-certs/CAs")" == 700 &&
+        "$(contract_file_mode "$fixture_root/remote-certs/private.key")" == 400 &&
+        "$(contract_file_mode "$fixture_root/remote-certs/public.crt")" == 600 &&
+        "$(contract_file_mode "$fixture_root/remote-certs/CAs/ca.crt")" == 444 ]] ||
+        return 1
+      ;;
+  esac
+  for path in \
+    "$fixture_root/remote-certs" \
+    "$fixture_root/remote-certs/CAs" \
+    "$fixture_root/remote-certs/private.key" \
+    "$fixture_root/remote-certs/public.crt" \
+    "$fixture_root/remote-certs/CAs/ca.crt"; do
+    [[ "$(contract_file_owner "$path")" == "$expected_uid" &&
+      "$(contract_file_group "$path")" == "$expected_gid" ]] || return 1
+  done
+}
+
+replace_once() {
+  local source="$1"
+  local destination="$2"
+  local needle="$3"
+  local replacement="$4"
+  awk -v needle="$needle" -v replacement="$replacement" '
+    !replaced {
+      position = index($0, needle)
+      if (position > 0) {
+        $0 = substr($0, 1, position - 1) replacement \
+          substr($0, position + length(needle))
+        replaced = 1
+      }
+    }
+    { print }
+    END { if (!replaced) exit 3 }
+  ' "$source" >"$destination"
+}
+
+assert_remote_s3_identity_resolution "$target" ||
+  fail 'remote S3 did not resolve to the non-root host fixture owner'
+assert_remote_s3_identity_wiring "$target" ||
+  fail 'remote S3 did not use one owner for bind mounts, volumes, and secrets'
+assert_remote_s3_fixture_permissions "$target" safe ||
+  fail 'remote S3 fixture permissions exposed its private key'
+
+identity_mutant="$tmpdir/e2e-phase5-fixed-remote-owner.sh"
+replace_once "$target" "$identity_mutant" \
+  'remote_s3_owner="${remote_s3_uid}:0"' \
+  'remote_s3_owner="1000:0"' ||
+  fail 'remote S3 owner mutation could not be constructed'
+if assert_remote_s3_identity_resolution "$identity_mutant"; then
+  fail 'remote S3 identity contract accepted a fixed container owner'
+fi
+
+runtime_mutant="$tmpdir/e2e-phase5-fixed-remote-runtime-user.sh"
+replace_once "$target" "$runtime_mutant" \
+  '--user "$remote_s3_owner" --cap-drop ALL' \
+  '--user 1000:0 --cap-drop ALL' ||
+  fail 'remote S3 runtime-user mutation could not be constructed'
+if assert_remote_s3_identity_wiring "$runtime_mutant"; then
+  fail 'remote S3 identity contract accepted a mismatched runtime user'
+fi
+
+data_mutant="$tmpdir/e2e-phase5-fixed-remote-data-owner.sh"
+replace_once "$target" "$data_mutant" \
+  'chown "$remote_owner" /remote' 'chown 1000:0 /remote' ||
+  fail 'remote S3 data-owner mutation could not be constructed'
+if assert_remote_s3_identity_wiring "$data_mutant"; then
+  fail 'remote S3 identity contract accepted mismatched data ownership'
+fi
+
+secret_mutant="$tmpdir/e2e-phase5-fixed-remote-secret-owner.sh"
+replace_once "$target" "$secret_mutant" \
+  'install_consumer remote-s3 "$remote_owner" 0400 restic-remote-access-key restic-remote-secret-key' \
+  'install_consumer remote-s3 1000:0 0400 restic-remote-access-key restic-remote-secret-key' ||
+  fail 'remote S3 secret-owner mutation could not be constructed'
+if assert_remote_s3_identity_wiring "$secret_mutant"; then
+  fail 'remote S3 identity contract accepted mismatched secret ownership'
+fi
+
+key_mutant="$tmpdir/e2e-phase5-permissive-remote-key.sh"
+replace_once "$target" "$key_mutant" \
+  'chmod 0400 "$remote_cert_dir/private.key"' \
+  'chmod 0444 "$remote_cert_dir/private.key"' ||
+  fail 'remote S3 private-key mutation could not be constructed'
+if assert_remote_s3_fixture_permissions "$key_mutant" permissive-key; then
+  fail 'remote S3 fixture contract accepted a world-readable private key'
+fi
+
+if [[ "${HAPPYLEARN_PHASE5_REMOTE_S3_CONTRACT_ONLY:-}" == 1 ]]; then
+  printf 'phase 5 remote S3 identity contract: PASS\n'
+  exit 0
+fi
+
 (
   eval "$resource_monitor_stats_source"
   stale_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
