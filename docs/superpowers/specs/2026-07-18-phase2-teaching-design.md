@@ -296,8 +296,8 @@ Phase 2 必须提供开发环境初始化、MinIO Bucket 创建、处理器健�
 ### 11.1 MinIO AIStor Free 部署策略
 
 - 单节点对象存储固定使用 MinIO AIStor Free 镜像 `quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120`；摘要是 Quay 的 Linux/amd64 image manifest，不允许改回已知受影响的 OSS 源码构建。
-- 运维人员须在仓库外下载并保管 AIStor Free 单节点许可证，将 `HAPPYLEARN_AISTOR_LICENSE_FILE` 设为该只读文件路径。Compose 以 secret 将它挂载为 `/minio.license`，不得把许可证内容写入环境变量、仓库、日志或测试夹具。许可证文件必须在服务启动前存在。
-- 数据保存在命名卷中；一次性、无网络的初始化服务只负责把卷权限交给 UID 1000，主服务以非 root `1000:0` 运行并使用精确的 `/minio/health/live` 健康端点。
+- 运维人员须在仓库外下载并保管 AIStor Free 单节点许可证，将 `HAPPYLEARN_AISTOR_LICENSE_FILE` 设为该只读文件路径。开发 Compose 以 secret 仅将它交给一次性、无网络的初始化服务；初始化服务以原子替换写入受控卷 `/license/minio.license` 并设为 `1000:0`、`0440`，长期运行的对象存储只读挂载该卷。生产 Compose 采用独立的生产 secret 挂载策略。任何部署都不得把许可证内容写入环境变量、仓库、日志或测试夹具，且许可证文件必须在服务启动前存在。
+- 数据保存在命名卷中；独立的一次性、无网络初始化服务负责把数据卷权限交给 UID 1000，主服务以非 root `1000:0` 运行并使用精确的 `/minio/health/ready` 健康端点。
 - 开发 Compose 的 S3 和控制台端口只映射到 `127.0.0.1`。Production deployment must omit S3 and console host-port mappings；生产流量只能经私有容器网络到达对象存储。
 - 升级时先从 Quay 解析目标平台的不可变 manifest digest，同时更新 Compose、策略测试和文档；随后下载官方 CycloneDX 或 SPDX SBOM 及可用的发布校验信息，用可用扫描器检查可达的 High/Critical 漏洞。摘要、许可证约束或扫描门禁未验证时不得部署新版本。
 
