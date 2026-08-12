@@ -620,7 +620,8 @@ test('@phase4-mobile unified list, channel cards, detail back focus, and streami
     await link.focus()
     await link.press('Enter')
     await expect(page.getByLabel(/生成状态：/)).toBeVisible()
-    await expect(page.locator('[aria-live="polite"]')).toBeAttached()
+    const conversation = page.getByRole('list', { name: 'AI 答疑对话' })
+    await expect(conversation.locator('[aria-live="polite"]')).toBeAttached()
     await page.getByRole('link', { name: '← 返回答疑中心' }).press('Enter')
     await expect(link).toBeFocused()
 

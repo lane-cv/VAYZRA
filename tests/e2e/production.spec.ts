@@ -72,7 +72,9 @@ test('@phase6 seeds an accepted durable write', async ({ page }) => {
   await page.goto('/admin/settings')
   await page.getByLabel('站点公告').fill(marker)
   await page.getByRole('button', { name: '保存设置' }).click()
-  await expect(page.getByRole('status')).toContainText('系统设置已保存')
+  await expect(
+    page.getByRole('status').filter({ hasText: '系统设置已保存' }),
+  ).toContainText('系统设置已保存')
 })
 
 test('@phase6 production restart preserves durable data', async ({ page }) => {

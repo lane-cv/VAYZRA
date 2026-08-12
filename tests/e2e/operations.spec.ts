@@ -174,7 +174,9 @@ test('@phase5 teacher manages operations without exposing secrets', async ({ pag
   expect(Object.keys(updatedSettings.data).sort()).toEqual(safeSettingsKeys)
   expect((updatedSettings.data.infrastructure as Array<Record<string, unknown>>).map((status) => status.key)).toEqual(infrastructureKeys)
   expectSecretFreeKeys(updatedSettings)
-  await expect(page.getByRole('status')).toContainText('系统设置已保存')
+  await expect(
+    page.getByRole('status').filter({ hasText: '系统设置已保存' }),
+  ).toContainText('系统设置已保存')
   await expect(page.getByText(new RegExp(`^版本 ${updatedSettings.data.version} ·`))).toBeVisible()
 
   await page.goto('/admin/audit')
@@ -287,7 +289,9 @@ test('@phase5-mobile operations remain usable on mobile', async ({ page }) => {
   const overflowWidth = await page.evaluate(() => document.documentElement.scrollWidth)
   expect(overflowWidth).toBeLessThanOrEqual(viewportWidth)
 
-  const menu = page.getByRole('button', { name: '打开导航' })
+  const menu = page.locator(
+    'button[aria-label="打开导航"][aria-controls="console-navigation"]',
+  )
   await menu.click()
   await expect(menu).toHaveAttribute('aria-expanded', 'true')
   await expect(page.getByRole('link', { name: '仪表盘' })).toBeFocused()
