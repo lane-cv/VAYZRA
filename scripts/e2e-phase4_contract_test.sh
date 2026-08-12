@@ -76,7 +76,7 @@ grep -Fq -- '--grep @phase4-mobile' "$script"
 grep -Fq -- '--project=mobile --grep @phase4-mobile' "$script"
 reject_fixed_pattern '--project=phase4-mobile' "$script"
 grep -Fq "name: 'mobile'" "$playwright_config"
-grep -Fq 'grepInvert: /@phase4-mobile|@phase5-mobile/' "$playwright_config"
+grep -Fq 'grepInvert: /@phase4-mobile|@phase5-mobile|@phase6/' "$playwright_config"
 grep -Fq 'grep: /@phase4-mobile|@phase5-mobile/' "$playwright_config"
 test "$(grep -Fc '@phase4-mobile|@phase5-mobile' "$playwright_config")" -eq 2
 reject_fixed_pattern "name: 'phase4-mobile'" "$playwright_config"
