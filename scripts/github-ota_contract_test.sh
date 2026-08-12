@@ -89,6 +89,10 @@ require_literal "$verify_workflow" 'docker build --file deploy/Dockerfile.update
 require_literal "$verify_workflow" 'deploy/compose.github.yml'
 require_literal "$verify_workflow" 'DOCKER_CONFIG=/tmp/docker-config'
 require_literal "$verify_workflow" 'happylearn-update-agent:ci buildx ls'
+if ! sed -n '1,/^[[:space:]]*- run: pnpm e2e-contracts$/p' "$verify_workflow" |
+  grep -Eq 'apt-get install .*([[:space:]]|^)ripgrep([[:space:]]|$)'; then
+  fail 'verify workflow must install ripgrep before running E2E contracts'
+fi
 
 require_literal "$compose_override" 'DOCKER_CONFIG: /tmp/docker-config'
 require_literal "$compose_override" '- /tmp:rw,noexec,nosuid,size=16m,uid=${HAPPYLEARN_UPDATE_HOST_UID:?set HAPPYLEARN_UPDATE_HOST_UID},gid=${HAPPYLEARN_UPDATE_HOST_GID:?set HAPPYLEARN_UPDATE_HOST_GID},mode=0700'

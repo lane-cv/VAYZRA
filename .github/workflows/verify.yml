@@ -54,7 +54,7 @@ jobs:
           HAPPYLEARN_OTA_LIVE_IMAGE_CONTRACT: '1'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y shellcheck
+          sudo apt-get install --no-install-recommends -y ripgrep shellcheck
           bash -n scripts/deploy-from-github.sh scripts/github-ota_contract_test.sh
           shellcheck scripts/deploy-from-github.sh scripts/github-ota_contract_test.sh
           bash scripts/github-ota_contract_test.sh
