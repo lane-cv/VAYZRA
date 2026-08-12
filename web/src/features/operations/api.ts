@@ -24,6 +24,7 @@ import type {
   OperationsSettings,
   OperationsSettingsUpdate,
   ApplicationUpdateStatus,
+  UpdatePhase,
   UpdateState,
   RecoveryState,
   RestoreVerification,
@@ -192,43 +193,131 @@ const updateStates = new Set<UpdateState>([
   'disabled', 'unknown', 'checking', 'current', 'available',
   'updating', 'success', 'failed', 'blocked',
 ])
+const updatePhases = new Set<UpdatePhase>([
+  'idle', 'checking', 'fetching', 'preparing', 'building', 'switching',
+  'verifying', 'merging', 'recovering', 'complete', 'failed',
+])
 const updateCommitPattern = /^[0-9a-f]{40}$/
+const updateCheckCacheMilliseconds = 15_000
+let updateCheckInFlight: Promise<ApplicationUpdateStatus> | undefined
+let cachedUpdateCheck: { status: ApplicationUpdateStatus; checkedAt: number } | undefined
+type UpdateMutationPath = '/admin/updates/apply' | '/admin/updates/rollback'
+let updateMutationInFlight: { path: UpdateMutationPath; promise: Promise<ApplicationUpdateStatus> } | undefined
+
+function boundedUpdateString(value: unknown, maximumBytes: number, multiline = false): value is string {
+  return typeof value === 'string'
+    && wellFormedUnicode(value)
+    && new TextEncoder().encode(value).byteLength <= maximumBytes
+    && [...value].every((character) => {
+      const code = character.codePointAt(0) ?? 0
+      return code >= 0x20 || (multiline && (character === '\n' || character === '\r' || character === '\t'))
+    })
+}
+
+function validGitHubReleaseURL(value: unknown): value is string {
+  if (!boundedUpdateString(value, 2048)) return false
+  if (value === '') return true
+  try {
+    const parsed = new URL(value)
+    if (
+      parsed.protocol !== 'https:'
+      || parsed.hostname !== 'github.com'
+      || parsed.username !== ''
+      || parsed.password !== ''
+      || parsed.port !== ''
+      || parsed.search !== ''
+      || parsed.hash !== ''
+    ) return false
+    const segments = parsed.pathname.split('/').filter(Boolean)
+    if (segments.length === 4 && segments[2] === 'releases' && segments[3] === 'latest') {
+      return validGitHubOwner(segments[0]) && validGitHubRepository(segments[1])
+    }
+    return segments.length === 5
+      && validGitHubOwner(segments[0])
+      && validGitHubRepository(segments[1])
+      && segments[2] === 'releases'
+      && segments[3] === 'tag'
+      && /^v?\d+\.\d+\.\d+$/.test(segments[4])
+  } catch {
+    return false
+  }
+}
+
+function validGitHubOwner(value: string): boolean {
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(value)
+}
+
+function validGitHubRepository(value: string): boolean {
+  return value !== '.' && value !== '..' && /^[A-Za-z0-9_.-]{1,100}$/.test(value)
+}
 
 function parseUpdateStatus(value: unknown): ApplicationUpdateStatus {
   const source = record(value)
   exactKeys(source, new Set([
-    'enabled', 'state', 'repository', 'ref', 'currentCommit', 'latestCommit',
-    'updateAvailable', 'dirty', 'message', 'startedAt', 'finishedAt',
+    'enabled', 'state', 'strategy', 'repository', 'ref', 'channel',
+    'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit',
+    'releaseName', 'releaseNotes', 'releaseURL', 'publishedAt',
+    'updateAvailable', 'dirty', 'canRollback', 'previousVersion', 'phase',
+    'progress', 'message', 'startedAt', 'finishedAt',
   ]))
   if (
     typeof source.enabled !== 'boolean'
     || typeof source.state !== 'string'
     || !updateStates.has(source.state as UpdateState)
-    || typeof source.repository !== 'string'
-    || typeof source.ref !== 'string'
+    || source.strategy !== 'github-release'
+    || !boundedUpdateString(source.repository, 512)
+    || !boundedUpdateString(source.ref, 128)
+    || source.channel !== 'stable'
+    || !boundedUpdateString(source.currentVersion, 128)
+    || !boundedUpdateString(source.latestVersion, 128)
     || typeof source.currentCommit !== 'string'
     || typeof source.latestCommit !== 'string'
+    || !boundedUpdateString(source.releaseName, 256)
+    || !boundedUpdateString(source.releaseNotes, 32_768, true)
+    || !validGitHubReleaseURL(source.releaseURL)
+    || (source.publishedAt !== null && typeof source.publishedAt !== 'string')
     || typeof source.updateAvailable !== 'boolean'
     || typeof source.dirty !== 'boolean'
-    || typeof source.message !== 'string'
+    || typeof source.canRollback !== 'boolean'
+    || !boundedUpdateString(source.previousVersion, 128)
+    || typeof source.phase !== 'string'
+    || !updatePhases.has(source.phase as UpdatePhase)
+    || typeof source.progress !== 'number'
+    || !Number.isSafeInteger(source.progress)
+    || source.progress < 0
+    || source.progress > 100
+    || !boundedUpdateString(source.message, 512)
     || (source.startedAt !== null && typeof source.startedAt !== 'string')
     || (source.finishedAt !== null && typeof source.finishedAt !== 'string')
   ) throw invalidResponse()
   if (
     (source.currentCommit !== '' && !updateCommitPattern.test(source.currentCommit))
     || (source.latestCommit !== '' && !updateCommitPattern.test(source.latestCommit))
+    || (source.publishedAt !== null && !validTimestamp(source.publishedAt))
     || (source.startedAt !== null && !validTimestamp(source.startedAt))
     || (source.finishedAt !== null && !validTimestamp(source.finishedAt))
   ) throw invalidResponse()
   return {
     enabled: source.enabled,
     state: source.state as UpdateState,
+    strategy: source.strategy,
     repository: source.repository,
     ref: source.ref,
+    channel: source.channel,
+    currentVersion: source.currentVersion,
+    latestVersion: source.latestVersion,
     currentCommit: source.currentCommit,
     latestCommit: source.latestCommit,
+    releaseName: source.releaseName,
+    releaseNotes: source.releaseNotes,
+    releaseURL: source.releaseURL,
+    publishedAt: source.publishedAt,
     updateAvailable: source.updateAvailable,
     dirty: source.dirty,
+    canRollback: source.canRollback,
+    previousVersion: source.previousVersion,
+    phase: source.phase as UpdatePhase,
+    progress: source.progress,
     message: source.message,
     startedAt: source.startedAt,
     finishedAt: source.finishedAt,
@@ -239,12 +328,49 @@ export async function readUpdateStatus(signal?: AbortSignal): Promise<Applicatio
   return parseUpdateStatus(await request<unknown>('/admin/updates/status', { signal }))
 }
 
-export async function checkForUpdates(): Promise<ApplicationUpdateStatus> {
-  return parseUpdateStatus(await request<unknown>('/admin/updates/check', { method: 'POST' }))
+export async function checkForUpdates(force = false): Promise<ApplicationUpdateStatus> {
+  if (updateCheckInFlight) return updateCheckInFlight
+  if (
+    !force
+    && cachedUpdateCheck
+    && Date.now() - cachedUpdateCheck.checkedAt < updateCheckCacheMilliseconds
+  ) return cachedUpdateCheck.status
+  const pending = request<unknown>('/admin/updates/check', { method: 'POST' })
+    .then(parseUpdateStatus)
+    .then((status) => {
+      cachedUpdateCheck = { status, checkedAt: Date.now() }
+      return status
+    })
+  updateCheckInFlight = pending
+  try {
+    return await pending
+  } finally {
+    if (updateCheckInFlight === pending) updateCheckInFlight = undefined
+  }
 }
 
 export async function applyApplicationUpdate(): Promise<ApplicationUpdateStatus> {
-  return parseUpdateStatus(await request<unknown>('/admin/updates/apply', { method: 'POST' }))
+  return mutateApplicationUpdate('/admin/updates/apply')
+}
+
+export async function rollbackApplicationUpdate(): Promise<ApplicationUpdateStatus> {
+  return mutateApplicationUpdate('/admin/updates/rollback')
+}
+
+async function mutateApplicationUpdate(path: UpdateMutationPath): Promise<ApplicationUpdateStatus> {
+  if (updateMutationInFlight) {
+    if (updateMutationInFlight.path === path) return updateMutationInFlight.promise
+    throw new APIError(409, 'update_operation_in_progress', '另一项版本操作正在进行，请等待完成后重试', '')
+  }
+  cachedUpdateCheck = undefined
+  const pending = request<unknown>(path, { method: 'POST' }).then(parseUpdateStatus)
+  const inFlight = { path, promise: pending }
+  updateMutationInFlight = inFlight
+  try {
+    return await pending
+  } finally {
+    if (updateMutationInFlight === inFlight) updateMutationInFlight = undefined
+  }
 }
 
 const metadataKeys = [
@@ -259,6 +385,7 @@ const metadataKeys = [
 const publicStatuses = new Set([
   'active', 'disabled',
   'normal', 'draining', 'backup', 'release',
+  'requested',
   'queued', 'snapshotting', 'encrypting', 'verifying',
   'syncing', 'succeeded', 'degraded', 'failed',
   'restoring', 'checking',
@@ -777,7 +904,7 @@ const dashboardAuditCategories = new Set([
   'operations',
   'backup',
 ])
-const dashboardAuditOutcomes = new Set(['succeeded', 'failed', 'denied', 'rejected'])
+const dashboardAuditOutcomes = new Set(['succeeded', 'failed', 'denied', 'rejected', 'attempted'])
 const alertStates = new Set(['open', 'acknowledged', 'resolved'])
 const alertSeverities = new Set(['warning', 'critical'])
 const alertCategories = new Set(['storage', 'backup', 'ai', 'processing', 'security'])

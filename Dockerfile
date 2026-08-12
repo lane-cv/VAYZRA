@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1.7
-FROM node:24.18.0-bookworm-slim AS web-build
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+FROM node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS web-build
 WORKDIR /workspace
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/pnpm/store pnpm install --frozen-lockfile
 COPY web web
 RUN pnpm build
 
-FROM golang:1.26.5-bookworm AS go-build-base
+FROM golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd AS go-build-base
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-release-manifest ./cmd/release-manifest
 
-FROM debian:12.12-slim AS runtime-base
+FROM debian:12.12-slim@sha256:d5d3f9c23164ea16f31852f95bd5959aad1c5e854332fe00f7b3a20fcc9f635c AS runtime-base
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 10001 happylearn && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin happylearn
 WORKDIR /app

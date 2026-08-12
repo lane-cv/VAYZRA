@@ -18,7 +18,9 @@ for literal in \
   'HAPPYLEARN_E2E_GROUP=all' '19800s' 'HAPPYLEARN_E2E_GROUP=security' '7200s' \
   'HAPPYLEARN_E2E_GROUP=resources' 'exactly 30 minutes' '3300s' \
   'timeout --foreground --kill-after=30s' 'test-results/phase6/*/containers.log' \
-  'actions/upload-artifact@v4.6.2' 'retention-days: 7'; do
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
+  'aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514' \
+  'persist-credentials: false' 'retention-days: 7'; do
   grep -Fq -- "$literal" "$workflow" || fail "required invariant missing: $literal"
 done
 
@@ -28,7 +30,10 @@ grep -A6 '^  phase6-resources:$' "$workflow" | grep -Fq "github.event_name == 's
 grep -A16 '^  phase6-resources:$' "$workflow" | grep -Fq 'go-version: 1.26.5' || fail 'resource host-sample builder is not pinned to the required Go version'
 
 if grep -Eq '(^|[[:space:]])continue-on-error:' "$workflow"; then fail 'required work may not continue on error'; fi
-if grep -Eq 'uses: [^@[:space:]]+@(main|master|latest)$' "$workflow"; then fail 'action is floating'; fi
+while IFS= read -r action; do
+  [[ ! $action =~ @(main|master|latest)$ ]] || fail 'action is floating'
+  [[ $action =~ @[0-9a-f]{40}$ ]] || fail "action is not pinned to a full commit SHA: $action"
+done < <(sed -nE 's/^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*([^[:space:]#]+).*/\2/p' "$workflow")
 if grep -Eq 'image: [^@[:space:]]+:(latest|edge)([[:space:]]|$)' "$workflow"; then fail 'image is floating'; fi
 while IFS=: read -r line _; do
   next=$(sed -n "$((line + 1)),$((line + 8))p" "$workflow")

@@ -252,6 +252,8 @@ var allowedMetadata = map[string]map[string]bool{
 	"operations.retention_completed": {"samples": true, "alertDeliveries": true, "alerts": true, "restoreVerifications": true, "backupRuns": true},
 	"operations.backup_requested":    {},
 	"operations.alert_acknowledged":  {"status": true},
+	"operations.update_requested":    {"status": true},
+	"operations.rollback_requested":  {"status": true},
 }
 
 var allowedTargetTypes = map[string]string{
@@ -268,6 +270,8 @@ var allowedTargetTypes = map[string]string{
 	"operations.retention_completed": "metadata_retention",
 	"operations.backup_requested":    "backup_run",
 	"operations.alert_acknowledged":  "operational_alert",
+	"operations.update_requested":    "application_update",
+	"operations.rollback_requested":  "application_update",
 }
 
 type auditOutcomeRule struct {
@@ -323,6 +327,8 @@ var auditOutcomeRules = map[string]auditOutcomeRule{
 	"operations.retention_completed": {outcome: "succeeded"},
 	"operations.backup_requested":    {outcome: "succeeded"},
 	"operations.alert_acknowledged":  {outcome: "succeeded"},
+	"operations.update_requested":    {outcome: "attempted"},
+	"operations.rollback_requested":  {outcome: "attempted"},
 	"ai.provider_tested": {
 		metadataKey: "ok",
 		metadataOutcomes: map[string]string{
@@ -450,6 +456,10 @@ func validOperationsEvent(event Event) bool {
 		return len(event.Metadata) == 1 && err == nil &&
 			id != uuid.Nil && id.String() == event.TargetID &&
 			ok && status == "acknowledged"
+	case "operations.update_requested", "operations.rollback_requested":
+		status, ok := event.Metadata["status"].(string)
+		return event.TargetID == "global" && len(event.Metadata) == 1 &&
+			ok && status == "requested"
 	case "operations.settings_rejected":
 		category, categoryOK := event.Metadata["category"].(string)
 		reason, reasonOK := event.Metadata["reason"].(string)

@@ -1,15 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeMount, onBeforeUnmount, onMounted, ref } from 'vue'
+import { storeToRefs } from 'pinia'
 import { onBeforeRouteLeave } from 'vue-router'
 import { APIError } from '../../api/client'
+import { useApplicationUpdateStore } from '../../stores/applicationUpdates'
 import { useSessionStore } from '../../stores/session'
-import {
-  applyApplicationUpdate,
-  checkForUpdates,
-  readSettings,
-  readUpdateStatus,
-  saveSettings,
-} from './api'
+import { readSettings, saveSettings } from './api'
 import type {
   ApplicationUpdateStatus,
   InfrastructureKey,
@@ -31,16 +27,22 @@ const requestId = ref('')
 const validationError = ref('')
 const conflict = ref(false)
 const savedMessage = ref('')
-const updateStatus = ref<ApplicationUpdateStatus>()
-const updateLoading = ref(false)
-const updateApplying = ref(false)
-const updateError = ref('')
 const feedback = ref<HTMLElement>()
 const pageTitle = ref<HTMLElement>()
 let generation = 0
 let alive = true
 let loadController: AbortController | undefined
-let updateTimer: number | undefined
+const updates = useApplicationUpdateStore()
+const {
+  status: updateStatus,
+  checking: updateLoading,
+  operation: updateAction,
+  error: updateError,
+  isTransient: updateTransient,
+  busy: updateBusy,
+  retryBusy: updateRetryBusy,
+  retryLabel: updateRetryLabel,
+} = storeToRefs(updates)
 
 const dirty = computed(() => (
   current.value !== undefined
@@ -81,15 +83,6 @@ function failure(reason: unknown, fallback: string) {
     : { message: fallback, requestId: '' }
 }
 
-function updateFailure(reason: unknown): string {
-  if (reason instanceof APIError && (
-    reason.status === 404 || reason.code === 'updates_disabled'
-  )) return '当前部署未启用在线更新'
-  return reason instanceof APIError && reason.message
-    ? reason.message
-    : 'GitHub 更新检查失败，请稍后重试'
-}
-
 function shortCommit(value: string): string {
   return value ? value.slice(0, 12) : '—'
 }
@@ -109,35 +102,37 @@ function updateStateLabel(value: ApplicationUpdateStatus['state']): string {
   return labels[value]
 }
 
-async function refreshUpdate(check = false) {
-  if (!isAdmin.value || updateLoading.value || updateApplying.value) return
-  updateLoading.value = true
-  updateError.value = ''
-  try {
-    updateStatus.value = check ? await checkForUpdates() : await readUpdateStatus()
-  } catch (reason) {
-    updateError.value = updateFailure(reason)
-    if (reason instanceof APIError && (
-      reason.status === 404 || reason.code === 'updates_disabled'
-    )) updateStatus.value = undefined
-  } finally {
-    updateLoading.value = false
+function updatePhaseLabel(value: ApplicationUpdateStatus['phase']): string {
+  const labels: Record<ApplicationUpdateStatus['phase'], string> = {
+    idle: '等待开始',
+    checking: '检查版本',
+    fetching: '拉取元数据',
+    preparing: '准备更新',
+    building: '构建服务',
+    switching: '切换服务',
+    verifying: '健康验证',
+    merging: '合并发布',
+    recovering: '恢复上一版本',
+    complete: '已完成',
+    failed: '已失败',
   }
+  return labels[value]
 }
 
-async function applyUpdate() {
-  if (!updateStatus.value?.updateAvailable || updateStatus.value.dirty || updateApplying.value) return
-  if (!window.confirm('确定拉取 GitHub 最新代码、重新构建并重启 App 与 Worker 吗？')) return
-  updateApplying.value = true
-  updateError.value = ''
-  try {
-    updateStatus.value = await applyApplicationUpdate()
-    window.setTimeout(() => { if (alive) void refreshUpdate() }, 3000)
-  } catch (reason) {
-    updateError.value = updateFailure(reason)
-  } finally {
-    updateApplying.value = false
-  }
+function updateTime(value: string | null): string {
+  return value ? new Date(value).toLocaleString('zh-CN') : '—'
+}
+
+function applyUpdate() {
+  void updates.runAction('update')
+}
+
+function rollbackUpdate() {
+  void updates.runAction('rollback')
+}
+
+function retryUpdate() {
+  void updates.retry()
 }
 
 async function focusFeedback() {
@@ -268,15 +263,16 @@ onBeforeRouteLeave(() => (
 ))
 onBeforeMount(() => {
   void loadSettings()
-  void refreshUpdate(true)
-  updateTimer = window.setInterval(() => { void refreshUpdate(true) }, 5 * 60 * 1000)
 })
-onMounted(() => window.addEventListener('beforeunload', beforeUnload))
+onMounted(() => {
+  updates.connect(false)
+  window.addEventListener('beforeunload', beforeUnload)
+})
 onBeforeUnmount(() => {
   alive = false
   generation++
   loadController?.abort()
-  if (updateTimer !== undefined) window.clearInterval(updateTimer)
+  updates.disconnect(false)
   window.removeEventListener('beforeunload', beforeUnload)
 })
 </script>
@@ -329,36 +325,86 @@ onBeforeUnmount(() => {
     <section class="updates" data-testid="application-updates" aria-labelledby="updates-heading">
       <div class="updates-heading">
         <div>
-          <h2 id="updates-heading">GitHub 版本更新</h2>
-          <p>每 5 分钟自动检查一次。仅管理员可以拉取代码、重建并重启 App 与 Worker。</p>
+          <h2 id="updates-heading">应用版本与 OTA 更新</h2>
+          <p>侧栏会定时检查更新；此详情页仅在管理员点击后刷新，避免重复远程请求。</p>
         </div>
-        <button type="button" :disabled="updateLoading || updateApplying" @click="refreshUpdate(true)">
+        <button data-testid="check-updates" type="button" :disabled="updateBusy" @click="updates.refresh(true)">
           {{ updateLoading ? '检查中…' : '立即检查' }}
         </button>
       </div>
-      <p v-if="updateError" class="update-feedback" role="alert">{{ updateError }}</p>
-      <div v-else-if="!updateStatus" class="update-empty" role="status">当前部署未启用在线更新。</div>
-      <template v-else>
+      <div v-if="updateError" class="update-feedback" role="alert">
+        <p>{{ updateError }}</p>
+        <button
+          data-testid="retry-update"
+          type="button"
+          :disabled="updateRetryBusy"
+          @click="retryUpdate"
+        >{{ updateRetryLabel }}</button>
+      </div>
+      <div v-if="!updateStatus" class="update-empty" role="status">点击“立即检查”获取远程版本信息。</div>
+      <template v-if="updateStatus">
         <div class="update-summary">
           <span class="update-state" :class="`state-${updateStatus.state}`">{{ updateStateLabel(updateStatus.state) }}</span>
-          <strong>{{ updateStatus.message || '暂无更新信息' }}</strong>
+          <strong :role="updateError ? undefined : 'status'" aria-live="polite">{{ updateStatus.message || '暂无更新信息' }}</strong>
         </div>
         <dl class="update-details">
+          <div><dt>当前版本</dt><dd>{{ updateStatus.currentVersion ? `v${updateStatus.currentVersion}` : '—' }}</dd></div>
+          <div><dt>最新版本</dt><dd>{{ updateStatus.latestVersion ? `v${updateStatus.latestVersion}` : '—' }}</dd></div>
           <div><dt>分支</dt><dd>{{ updateStatus.ref || '—' }}</dd></div>
+          <div><dt>更新通道</dt><dd>{{ updateStatus.channel }} · GitHub Release</dd></div>
           <div><dt>当前提交</dt><dd><code>{{ shortCommit(updateStatus.currentCommit) }}</code></dd></div>
           <div><dt>远端提交</dt><dd><code>{{ shortCommit(updateStatus.latestCommit) }}</code></dd></div>
         </dl>
+        <div v-if="updateTransient" class="update-progress">
+          <div><span>{{ updatePhaseLabel(updateStatus.phase) }}</span><strong>{{ updateStatus.progress }}%</strong></div>
+          <div
+            class="update-progress-track"
+            role="progressbar"
+            aria-label="更新进度"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            :aria-valuenow="updateStatus.progress"
+          ><span :style="{ width: `${updateStatus.progress}%` }"></span></div>
+        </div>
+        <section v-if="updateStatus.releaseName || updateStatus.releaseNotes" class="update-release" aria-label="发布说明">
+          <div>
+            <h3>{{ updateStatus.releaseName || `v${updateStatus.latestVersion}` }}</h3>
+            <time v-if="updateStatus.publishedAt" :datetime="updateStatus.publishedAt">{{ updateTime(updateStatus.publishedAt) }}</time>
+          </div>
+          <p v-if="updateStatus.releaseNotes">{{ updateStatus.releaseNotes }}</p>
+          <a
+            v-if="updateStatus.releaseURL"
+            :href="updateStatus.releaseURL"
+            target="_blank"
+            rel="noopener noreferrer"
+          >查看完整发布说明 ↗</a>
+        </section>
         <p v-if="updateStatus.dirty" class="update-feedback" role="alert">部署目录有未提交修改，自动更新已禁用。</p>
-        <p v-if="updateStatus.state === 'updating'" class="update-feedback" role="status">正在构建并重启服务，页面可能短暂断开，完成后会自动恢复。</p>
-        <div class="update-actions">
+        <p v-if="updateStatus.finishedAt" class="update-time">最近完成：<time :datetime="updateStatus.finishedAt">{{ updateTime(updateStatus.finishedAt) }}</time></p>
+        <div v-if="!updateError" class="update-actions">
           <button
-            v-if="updateStatus.updateAvailable || updateStatus.state === 'failed'"
+            v-if="updateStatus.state === 'success'"
+            data-testid="reload-application"
             type="button"
-            :disabled="updateStatus.dirty || updateApplying || updateStatus.state === 'updating'"
+            @click="updates.reloadPage"
+          >重新加载页面</button>
+          <button
+            v-if="updateStatus.updateAvailable"
+            data-testid="apply-update"
+            type="button"
+            :disabled="updateStatus.dirty || updateBusy || updateTransient"
             @click="applyUpdate"
           >
-            {{ updateApplying || updateStatus.state === 'updating' ? '更新中…' : '更新并重启' }}
+            {{ updateAction === 'update' || updateTransient ? '更新中…' : `更新到 v${updateStatus.latestVersion || '最新版本'}` }}
           </button>
+          <button
+            v-if="updateStatus.canRollback && updateStatus.previousVersion"
+            data-testid="rollback-update"
+            class="rollback-button"
+            type="button"
+            :disabled="updateBusy || updateTransient"
+            @click="rollbackUpdate"
+          >回滚到 v{{ updateStatus.previousVersion }}</button>
         </div>
       </template>
     </section>
@@ -503,4 +549,23 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .page{max-width:1080px}.page-heading{margin-bottom:24px}.page-heading h1{margin:.35rem 0;font-size:clamp(1.75rem,4vw,2.55rem)}.page-heading p:not(.eyebrow){color:#5b6b80}.page-heading a{display:inline-block;color:#1269ad;font-weight:700}.eyebrow{margin:0;color:#1673b9;font-size:.84rem;letter-spacing:.06em;font-weight:700}.infrastructure,.updates{margin-bottom:18px;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}.infrastructure h2,.updates h2{margin:0;color:#183b67;font-size:1.15rem}.infrastructure>p,.updates-heading p{color:#5b6b80}.infrastructure dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.infrastructure-row{padding:12px;border-radius:9px;background:#f5f8fc}.infrastructure-row dt{font-weight:800}.infrastructure-row dd{display:grid;gap:4px;margin:6px 0 0;color:#52657c;font-size:.9rem}.updates-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.updates-heading button,.update-actions button{border:0;border-radius:8px;background:#176eb5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}.updates-heading button:disabled,.update-actions button:disabled{opacity:.55;cursor:not-allowed}.update-summary{display:flex;align-items:center;gap:10px;margin:14px 0;color:#183b67}.update-state{display:inline-flex;border-radius:999px;padding:4px 10px;font-size:.82rem;font-weight:800}.state-current,.state-success{background:#e4f6ed;color:#167244}.state-available{background:#fff2d9;color:#8a5600}.state-checking,.state-updating{background:#e9f2fb;color:#176eb5}.state-failed,.state-blocked{background:#fbe8e7;color:#a4332d}.state-unknown{background:#eef2f6;color:#52647a}.update-details{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0}.update-details div{padding:12px;border-radius:9px;background:#f5f8fc}.update-details dt{color:#68778a;font-size:.86rem}.update-details dd{margin:5px 0 0;color:#183b67;font-weight:750}.update-details code{font-size:.88rem}.update-feedback,.update-empty{margin:14px 0 0;padding:10px 12px;border-radius:8px;background:#fff5f4;color:#862b25}.update-empty{background:#f5f8fc;color:#52647a}.update-actions{display:flex;justify-content:flex-end;margin-top:14px}form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}fieldset{display:grid;align-content:start;gap:14px;margin:0;padding:20px;border:1px solid #dbe4f0;border-radius:14px;background:#fff}legend{padding:0 7px;color:#183b67;font-weight:800}label{display:grid;gap:7px;color:#40536b;font-weight:700}input,textarea{box-sizing:border-box;width:100%;border:1px solid #b8c7d9;border-radius:8px;background:#fff;color:#172b47;padding:10px 11px;font:inherit}input[readonly]{background:#eef3f8;color:#53657a}.feedback,.form-actions{grid-column:1/-1}.feedback{padding:14px 16px;border:1px solid #a9d7b7;border-radius:10px;background:#f2fbf5;outline:none}.feedback.error{border-color:#efb3ae;background:#fff5f4;color:#862b25}.feedback p{margin:0 0 8px}.feedback p:last-child{margin-bottom:0}.feedback button,.form-actions button{border:0;border-radius:8px;background:#176eb5;color:#fff;padding:10px 15px;font:inherit;font-weight:700;cursor:pointer}.form-actions{display:flex;align-items:center;justify-content:space-between;gap:16px}.form-actions p{color:#68778a;font-size:.9rem}.form-actions button:disabled,.feedback button:disabled{opacity:.55;cursor:not-allowed}.denied{max-width:650px;padding:32px;border:1px solid #efc1be;border-radius:13px;background:#fff}@media(max-width:760px){.infrastructure dl,.update-details,form{grid-template-columns:1fr}.updates-heading{display:grid}.updates-heading button{width:100%}.form-actions{align-items:stretch;flex-direction:column}.form-actions button{width:100%}}
+</style>
+
+<style scoped>
+.update-release a{color:var(--hl-primary-strong)!important}.update-feedback button{color:var(--hl-on-primary,#fff)!important}
+.page-heading p:not(.eyebrow),.infrastructure>p,.updates-heading p,.infrastructure-row dd,.update-details dt,.form-actions p{color:var(--hl-text-muted)}
+.page-heading a,.eyebrow{color:var(--hl-primary-strong)}
+.infrastructure,.updates,fieldset,.denied{border-color:var(--hl-border);background:var(--hl-surface-solid)}
+.infrastructure h2,.updates h2,.update-summary,.update-details dd,legend{color:var(--hl-text)}
+.infrastructure-row,.update-details div,.update-empty,input[readonly]{background:var(--hl-surface-muted)}
+.update-empty,input[readonly]{color:var(--hl-text-muted)}
+.updates-heading button,.update-actions button,.feedback button,.form-actions button{background:var(--hl-primary)}
+.updates-heading button,.update-actions button,.feedback button,.form-actions button{color:var(--hl-on-primary,#fff)}
+.state-current,.state-success{background:var(--hl-success-soft);color:var(--hl-success)}
+.state-available{background:var(--hl-warning-soft);color:var(--hl-warning)}
+.state-checking,.state-updating{background:var(--hl-primary-soft);color:var(--hl-primary-strong)}
+.state-failed,.state-blocked,.update-feedback,.feedback.error{background:var(--hl-danger-soft);color:var(--hl-danger)}
+label{color:var(--hl-text)}
+input,textarea{border-color:var(--hl-border-strong);background:var(--hl-surface-solid);color:var(--hl-text)}
+.update-progress{display:grid;gap:7px;margin:14px 0 0}.update-progress>div:first-child{display:flex;justify-content:space-between;color:var(--hl-text-muted,#52657c);font-size:.86rem}.update-progress-track{height:8px;overflow:hidden;border-radius:999px;background:var(--hl-surface-muted,#dce8eb)}.update-progress-track span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--hl-primary,#238579),var(--hl-accent,#58c5b5));transition:width .25s ease}.update-release{margin-top:14px;padding:14px;border:1px solid var(--hl-border,#d8e4e8);border-radius:10px;background:var(--hl-surface-muted,#f8fbfb)}.update-release>div{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.update-release h3{margin:0;color:var(--hl-text,#244d55);font-size:1rem}.update-release time,.update-time{color:var(--hl-text-soft,#6a7c85);font-size:.82rem}.update-release p{max-height:140px;overflow:auto;margin:10px 0;color:var(--hl-text-muted,#4d636c);line-height:1.55;white-space:pre-wrap}.update-release a{color:var(--hl-primary,#207e73);font-size:.86rem;font-weight:800;text-decoration:none}.update-release a:hover{text-decoration:underline}.update-time{margin:12px 0 0}.update-actions{gap:9px}.update-actions .rollback-button{border:1px solid var(--hl-border-strong,#c3d1d6);background:var(--hl-surface-muted,#edf3f4);color:var(--hl-text-muted,#435c65)}.update-feedback p{margin:0 0 8px}.update-feedback button{border:0;border-radius:8px;background:var(--hl-primary,#176eb5);color:var(--hl-surface-solid,#fff);padding:8px 12px;font:inherit;font-weight:750;cursor:pointer}.update-feedback button:disabled{opacity:.55;cursor:not-allowed}.state-disabled{background:var(--hl-surface-muted,#eef2f6);color:var(--hl-text-muted,#52647a)}@media(max-width:760px){.update-release>div{align-items:flex-start;flex-direction:column}.update-actions{display:grid}.update-actions button{width:100%}}@media(prefers-reduced-motion:reduce){.update-progress-track span{transition:none}}
 </style>

@@ -28,6 +28,7 @@ func (h *AdminHandler) Routes() http.Handler {
 	router.Get("/status", h.status)
 	router.Post("/check", h.check)
 	router.Post("/apply", h.apply)
+	router.Post("/rollback", h.rollback)
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusNotFound, "not_found", "资源不存在")
 	})
@@ -90,6 +91,25 @@ func (h *AdminHandler) apply(w http.ResponseWriter, r *http.Request) {
 	}{Data: status})
 }
 
+func (h *AdminHandler) rollback(w http.ResponseWriter, r *http.Request) {
+	if !noQuery(r) || !emptyBody(w, r) {
+		invalid(w, r)
+		return
+	}
+	principal, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	status, err := h.service.Rollback(r.Context(), principal)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusAccepted, struct {
+		Data Status `json:"data"`
+	}{Data: status})
+}
+
 func (h *AdminHandler) principal(w http.ResponseWriter, r *http.Request) (Principal, bool) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok || user.ID == uuid.Nil || user.Role != auth.RoleAdmin || user.Status != auth.StatusActive {
@@ -139,6 +159,10 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.Error(w, r, http.StatusPreconditionFailed, "update_checkout_dirty", "部署目录有未提交修改，已停止更新")
 	case errors.Is(err, ErrUpdateUnavailable):
 		httpx.Error(w, r, http.StatusNotFound, "updates_disabled", "当前部署未启用在线更新")
+	case errors.Is(err, ErrRollbackUnavailable):
+		httpx.Error(w, r, http.StatusConflict, "rollback_unavailable", "当前更新架构不支持安全的手动回滚")
+	case errors.Is(err, ErrAgentProtocolOutdated):
+		httpx.Error(w, r, http.StatusConflict, "update_agent_protocol_outdated", "更新代理协议过旧，请在宿主机完整重新部署")
 	case errors.Is(err, ErrAgentUnavailable):
 		httpx.Error(w, r, http.StatusServiceUnavailable, "update_unavailable", "更新服务暂不可用")
 	default:

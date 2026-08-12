@@ -23,5 +23,5 @@ const filePath = (id: string, action: 'preview'|'download') => `/api/v1/question
   </section>
 </template>
 <style scoped>
-.timeline{display:grid;gap:14px}.timeline article{max-width:min(760px,92%);padding:16px;border:1px solid #d9e4ef;border-radius:12px;background:#fff}.timeline article.mine{justify-self:end;background:#eef8ff}.timeline header{display:flex;justify-content:space-between;gap:18px;color:#52657a;font-size:.86rem}.message-body{margin:.75rem 0;line-height:1.65;overflow-wrap:anywhere}.timeline ul{display:grid;gap:6px;margin:.6rem 0 0;padding:0;list-style:none}.timeline li{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.timeline a{color:#176faf}
+.timeline{display:grid;gap:14px}.timeline article{max-width:min(760px,92%);padding:16px;border:1px solid var(--hl-border);border-radius:12px;background:var(--hl-surface-solid)}.timeline article.mine{justify-self:end;background:var(--hl-primary-soft)}.timeline header{display:flex;justify-content:space-between;gap:18px;color:var(--hl-text-muted);font-size:.86rem}.message-body{margin:.75rem 0;line-height:1.65;overflow-wrap:anywhere}.timeline ul{display:grid;gap:6px;margin:.6rem 0 0;padding:0;list-style:none}.timeline li{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.timeline a{color:var(--hl-primary-strong)}
 </style>

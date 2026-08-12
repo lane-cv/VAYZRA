@@ -150,26 +150,37 @@ cd /path/to/VAYZRA
 docker build -t happylearn-app:local -f Dockerfile .
 docker build -t happylearn-worker:local -f Dockerfile.worker .
 docker build -t happylearn-update-agent:local -f deploy/Dockerfile.update-agent .
-docker pull postgres:18.4
-docker pull redis:8.8
-docker pull debian:12.12-slim
+docker pull 'postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636'
+docker pull 'redis:8.8@sha256:3eafabb4c93fcb8b36b666e07a43f096cb157bc6b07dce4b2492b895c63cf37f'
+docker pull 'debian:12.12-slim@sha256:d5d3f9c23164ea16f31852f95bd5959aad1c5e854332fe00f7b3a20fcc9f635c'
+docker pull 'alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659'
 docker pull 'quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120'
+
+# docker save/load 不保证保留多架构 index 的 RepoDigest；为当前目标架构创建离线专用别名。
+docker tag 'postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636' happylearn-offline/postgres:18.4
+docker tag 'redis:8.8@sha256:3eafabb4c93fcb8b36b666e07a43f096cb157bc6b07dce4b2492b895c63cf37f' happylearn-offline/redis:8.8
+docker tag 'debian:12.12-slim@sha256:d5d3f9c23164ea16f31852f95bd5959aad1c5e854332fe00f7b3a20fcc9f635c' happylearn-offline/debian:12.12-slim
+docker tag 'alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659' happylearn-offline/alpine:3.23.3
+docker tag 'quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120' happylearn-offline/aistor:2026-06-06
 
 docker save \
   happylearn-app:local \
   happylearn-worker:local \
   happylearn-update-agent:local \
-  postgres:18.4 \
-  redis:8.8 \
-  debian:12.12-slim \
-  'quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120' \
+  happylearn-offline/postgres:18.4 \
+  happylearn-offline/redis:8.8 \
+  happylearn-offline/debian:12.12-slim \
+  happylearn-offline/alpine:3.23.3 \
+  happylearn-offline/aistor:2026-06-06 \
   | gzip > vayzra-images.tar.gz
+sha256sum vayzra-images.tar.gz > vayzra-images.tar.gz.sha256
 ```
 
 把 `vayzra-images.tar.gz` 和仓库目录复制到目标服务器后：
 
 ```bash
 cd "$HOME/apps/VAYZRA"
+sha256sum -c /path/to/vayzra-images.tar.gz.sha256
 docker load -i /path/to/vayzra-images.tar.gz
 
 ./scripts/deploy-from-github.sh \
@@ -178,7 +189,7 @@ docker load -i /path/to/vayzra-images.tar.gz
   --license-file /home/ubuntu/minio.license
 ```
 
-`--offline` 要求目标机已有 Git checkout 和上述全部镜像；它不会执行 `git pull`，也不会构建或拉取镜像。许可证、密钥和命名数据卷仍然单独保管，不会打进镜像包。
+`--offline` 要求目标机已有 Git checkout 和上述全部离线别名；脚本只在该模式把 Compose 切换到这些本地别名，并使用 `--no-build`，不会执行 `git pull`、构建或拉取。离线包是平台相关制品，必须在与目标机相同架构上制作并随 `.sha256` 一起传输、校验；许可证、密钥和命名数据卷仍然单独保管，不会打进镜像包。
 
 ### 存储占用显示“暂无数据”
 
@@ -199,13 +210,27 @@ cd "$HOME/apps/VAYZRA"
 
 脚本只接受 fast-forward 更新。若仓库存在未提交修改、分支不是指定分支或处于 detached HEAD，会停止而不是覆盖本地内容。
 
-部署完成后，管理员可以在“系统运维 → 系统设置 → GitHub 版本更新”中手动检查，页面也会每 5 分钟自动检查一次。发现新提交后点击“更新并重启”，系统会只对干净工作区执行 fast-forward 拉取，重建 App 与 Worker 镜像并重启这两个服务；数据库、Redis、AIStor 的命名卷不会被删除。工作区存在未提交修改时，更新会被阻止。
+部署完成后，管理员可以在“系统运维 → 系统设置 → GitHub 版本更新”中手动检查，页面也会定期检查。更新代理以 GitHub Releases 中版本号最高、已启用 GitHub immutable protection 的 stable SemVer Release 为唯一在线发现来源；标签必须严格为 `vMAJOR.MINOR.PATCH`，draft、prerelease、mutable Release、build metadata 和其他标签都会跳过。启用本策略前，仓库管理员必须在 GitHub Settings 的 Releases 区域启用 release immutability；该策略只保护启用后创建的 Release，旧 Release 不作为 OTA 信任输入。Release 标签会先以非强制方式拉取到隔离的 Git ref：同一版本标签一旦被本机检查过，远端再移动或重签该标签都会被拒绝。代理也会把配置的远端分支非强制拉取到另一隔离 ref，要求 Release 提交可从该远端分支到达，并核对该提交最新一次 `verify.yml` push 工作流已经成功；旁支、未合并或未通过完整验证的提交不能触发 OTA。随后代理用 Git ancestor 关系确认 Release 能从当前提交 fast-forward；当前提交已经领先于 Release 时不会自动降级，历史分叉时也会停止。
 
-在线更新不会让更新代理替换自身。如果新提交修改了 `cmd/update-agent`、`deploy/Dockerfile.update-agent` 或 `deploy/compose.github.yml` 中的更新代理配置，请在宿主机重新运行部署脚本，或使用同一组 Compose 参数显式重建镜像并重建 `update-agent` 容器。
+从旧版 branch-pull 更新代理迁移到本策略时，必须先在每台已有本地/测试部署主机上关闭管理员在线更新入口，并由宿主机完整重跑一次 `deploy-from-github.sh`。确认 `update-agent` 已随 App、Worker 一起重建、状态接口返回 `strategy=github-release` 后，才可以创建首个启用本策略的 stable Release；旧代理无法识别下述控制面阻断规则，不能靠旧在线更新完成这次引导升级。
+
+点击“更新并重启”后，更新代理会先从现有 App、Worker 容器的 Docker `.Image` 字段捕获两个不可变 `sha256` 镜像 ID，再以已验证的候选 commit SHA（而不是可移动 ref）创建 `/var/lib/happylearn-update` 下的临时 worktree。构建前还会检查候选 `Dockerfile` 与 `Dockerfile.worker`：已声明的内部 stage 可以继续作为 `FROM`，所有外部 `FROM` 和显式 `# syntax` frontend 必须同时包含 tag 与 `sha256` digest；裸 tag 或仅 digest 均会阻止在线更新。切换前，代理会把旧/候选 commit、四个不可变镜像 ID 和操作阶段原子、`fsync` 地写入仅代理可读的 `operation.json`，随后切换服务并等待 Compose 健康检查。新版本健康失败、切换失败或健康通过后主检出无法 fast-forward 时，代理会自动用旧镜像恢复 App 与 Worker；只有新运行态健康后，才会对主 checkout 按候选 SHA 执行 `git merge --ff-only` 并重新核对 HEAD。数据库、Redis、AIStor 的命名卷不会被删除，工作区存在未提交修改、分支不匹配或检查期间发生变化时更新会被阻止。
+
+本地 OTA 会解释 Release 内的 App/Worker Dockerfile，因此所有外部 `FROM` 与 Dockerfile frontend 都必须使用可读标签加多架构 `sha256` 摘要；Compose 中由该部署路径直接拉取的 PostgreSQL、Redis、Debian 与 Alpine 也固定摘要。合同测试会拒绝重新引入裸标签。源码构建过程中 Debian 软件仓库本身仍可能随时间更新，所以这项本地/测试能力不等同于可复现的生产制品；生产仍只接受预构建、签名或登记过摘要的 Phase 6 镜像。
+
+为保证自动恢复旧镜像不会遇到已由候选版本推进且不向后兼容的数据库 schema，本地 OTA 只允许 `db/migrations` 没有任何新增、修改或删除的 Release。只要 Release 包含 migration，检查结果就会阻止在线更新；必须改用 Phase 6 的不可变镜像发布、备份验收和显式回滚流程。
+
+更新状态以原子文件方式保存在 `/var/lib/happylearn-update/status.json`，包含 Release 版本、说明、阶段和进度。若代理在切换或提交终态之间重启，它会先核对主 checkout：HEAD 仍为旧 commit 时幂等恢复并验证旧镜像，HEAD 已为候选 commit 时幂等恢复并验证候选镜像后补写成功终态；HEAD 为其他 commit、分支不匹配或工作区不干净时会保留 journal 并阻止继续自动操作，等待人工核对。只有终态成功持久化后才删除 journal，因此终态文件写入失败不会被改写成指向旧 commit 的失败结果。
+
+界面始终报告 `canRollback=false`，回滚 API 始终返回 409。原因是显式回滚发生时可能已经越过任意后续版本、数据库 schema 或 OTA 控制面边界，仅凭本地状态无法证明反向兼容，也无法安全替换正在协调更新的旧代理；即使本地 OTA 已阻止 migration 和控制面变更，也不足以为任意未来手动回滚建立这个证明。失败操作仍会在 checkout 尚未提交候选 commit 的受控窗口内，使用 journal 记录的旧不可变镜像自动恢复；需要版本级显式回滚时必须使用 Phase 6 的已审批不可变制品、备份与恢复流程。
+
+在线更新不会让更新代理替换自身。为避免新 App 与旧代理使用不兼容的状态/API 契约，或让候选版本借 Docker Compose 改写容器权限、宿主机挂载及运行命令，只要 Release 修改 `cmd/update-agent`、`internal/updates`、`deploy/Dockerfile.update-agent`、`deploy/compose.dev.yml`、`deploy/compose.github.yml` 或 `scripts/deploy-from-github.sh`，检查结果就会阻止 OTA；请在宿主机完整重新运行部署脚本，使 App、Worker 与 `update-agent` 一起更新。
 
 该在线更新入口仅由 `deploy-from-github.sh` 的本地/测试部署启用，生产 `compose.prod.yml` 不挂载更新代理或 Docker socket，生产环境仍须使用审批后的不可变镜像发布流程。
 
-如果 GitHub 仓库为私有仓库，更新代理不能使用宿主机 SSH 私钥。请准备一个仅有仓库 `Contents: Read` 权限的 GitHub Token 文件，并以 owner-only 权限运行部署脚本：
+仓库的 `github-release` 工作流只发布供本地/测试 OTA 发现的 GitHub Release 元数据；它不会构建或推送 Phase 6 所需的不可变生产镜像、SBOM 或候选 manifest。生产发布输入仍须由独立、已审批的构建与制品登记流程生成，并按方式 C 的 Phase 6 手册验收，不能把 GitHub Release 当作生产发布闭环。
+
+如果 GitHub 仓库为私有仓库，更新代理不能使用宿主机 SSH 私钥。请准备一个仅有仓库 `Contents: Read` 与 `Actions: Read` 权限的 fine-grained GitHub Token 文件，并以 owner-only 权限运行部署脚本：
 
 ```bash
 chmod 600 /absolute/path/to/github-token
@@ -215,7 +240,7 @@ chmod 600 /absolute/path/to/github-token
   --github-token-file /absolute/path/to/github-token
 ```
 
-更新代理通过 GitHub Smart HTTP Basic 认证查询和拉取私有仓库。Token 只从只读文件加载，认证头仅作用于 `https://github.com/`；Token 不写入远程 URL、Git 命令参数、持久化 Git 配置或应用日志，也不返回给前端。`--github-token-file` 只配置容器内的更新代理，首次 clone 以及宿主机执行的 pull 仍使用宿主机已有的 SSH Key 或 HTTPS 凭据。没有 Token 时，使用 SSH 完成的首次部署仍可运行，但管理员页面会提示无法检查私有仓库更新。
+更新代理通过 `https://api.github.com` 读取 Release 元数据，并通过 GitHub Smart HTTP Basic 认证拉取已验证的 Release 标签。Token 只从只读文件加载：API Bearer 头仅发送给 `api.github.com`，Git 认证头仅作用于 `https://github.com/`；Token 不写入远程 URL、Git 命令参数、状态文件、持久化 Git 配置或应用日志，也不返回给前端。`--github-token-file` 只配置容器内的更新代理，首次 clone 以及宿主机执行的 pull 仍使用宿主机已有的 SSH Key 或 HTTPS 凭据。没有 Token 时，公开仓库可以检查；使用 SSH 完成首次部署的私有仓库则会在管理员页面提示 Release 检查不可用。
 
 部署其他分支时明确指定：
 
@@ -226,7 +251,7 @@ chmod 600 /absolute/path/to/github-token
   --license-file /absolute/path/to/minio.license
 ```
 
-已有目录必须已经检出同名分支。该选项适合测试分支，不应替代正式发布审批。
+已有目录必须已经检出同名分支。在线更新仍只接受能从该分支当前提交 fast-forward、同时属于受信 `master` 发布线且该提交已通过 `master` 最新验证运行的 stable SemVer Release；feature 分支自身未经发布工作流的标签不会被接受。该选项适合在包含受信 Release 的测试分支上验证兼容性，不应替代正式发布审批。
 
 ## 处理端口冲突
 

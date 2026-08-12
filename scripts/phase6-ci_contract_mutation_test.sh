@@ -20,7 +20,8 @@ reject continue_on_error '1; /^  phase6-contracts:$/ {print "    continue-on-err
 reject production_silent_skip '{gsub(/inputs.run_production/, "false"); print}' 'required invariant missing: inputs.run_production'
 reject unsanitized_upload '{gsub(/test-results\/phase6\/\*\/containers.log/, "test-results/phase6"); print}' 'required invariant missing: test-results/phase6/*/containers.log'
 reject missing_timeout '{gsub(/timeout --foreground --kill-after=30s /, ""); print}' 'required invariant missing: timeout'
-reject floating_action '{gsub(/actions\/checkout@v6.0.2/, "actions/checkout@main"); print}' 'action is floating'
+reject floating_action '{gsub(/actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd/, "actions/checkout@main"); print}' 'action is floating'
+reject short_action_sha '{gsub(/actions\/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c/, "actions/setup-go@4a36011"); print}' 'not pinned to a full commit SHA'
 reject short_resource '{gsub(/exactly 30 minutes/, "briefly"); print}' 'required invariant missing: exactly 30 minutes'
 reject incomplete_production '{gsub(/HAPPYLEARN_E2E_GROUP=all/, "HAPPYLEARN_E2E_GROUP=release"); print}' 'required invariant missing: HAPPYLEARN_E2E_GROUP=all'
 

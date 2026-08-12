@@ -45,5 +45,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.timeline{display:grid;gap:14px;margin:0;padding:0;list-style:none}.timeline>li{padding:16px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.timeline>li.student{margin-left:clamp(0px,8vw,72px);background:#eef7fd}.timeline>li.assistant{margin-right:clamp(0px,8vw,72px)}strong{display:block;margin-bottom:8px;color:#176faf}.plain-message,pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.65}ul{margin-block:10px 0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+.timeline{display:grid;gap:14px;margin:0;padding:0;list-style:none}.timeline>li{padding:16px;border:1px solid var(--hl-border);border-radius:12px;background:var(--hl-surface-solid)}.timeline>li.student{margin-left:clamp(0px,8vw,72px);background:var(--hl-primary-soft)}.timeline>li.assistant{margin-right:clamp(0px,8vw,72px)}strong{display:block;margin-bottom:8px;color:var(--hl-primary-strong)}.plain-message,pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.65}ul{margin-block:10px 0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
 </style>

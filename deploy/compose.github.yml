@@ -17,12 +17,33 @@ services:
       update-agent:
         condition: service_healthy
 
+  update-agent-state-init:
+    image: ${HAPPYLEARN_LOCAL_STATE_INIT_IMAGE:-alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659}
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ceu
+      - |
+        chown -R "$$UPDATE_HOST_UID:$$UPDATE_HOST_GID" /state
+        chmod 0700 /state
+    environment:
+      UPDATE_HOST_UID: ${HAPPYLEARN_UPDATE_HOST_UID:?set HAPPYLEARN_UPDATE_HOST_UID}
+      UPDATE_HOST_GID: ${HAPPYLEARN_UPDATE_HOST_GID:?set HAPPYLEARN_UPDATE_HOST_GID}
+    volumes:
+      - update_agent_state:/state
+    network_mode: "none"
+    restart: "no"
+
   update-agent:
     image: ${HAPPYLEARN_UPDATE_AGENT_IMAGE:-happylearn-update-agent:local}
     build:
       context: .
       dockerfile: deploy/Dockerfile.update-agent
+    user: "${HAPPYLEARN_UPDATE_HOST_UID:?set HAPPYLEARN_UPDATE_HOST_UID}:${HAPPYLEARN_UPDATE_HOST_GID:?set HAPPYLEARN_UPDATE_HOST_GID}"
+    group_add:
+      - "${HAPPYLEARN_UPDATE_DOCKER_GID:?set HAPPYLEARN_UPDATE_DOCKER_GID}"
     environment:
+      DOCKER_CONFIG: /tmp/docker-config
       UPDATE_AGENT_LISTEN: ":8765"
       UPDATE_AGENT_REPOSITORY: /workspace
       UPDATE_AGENT_REF: ${HAPPYLEARN_UPDATE_REF:-master}
@@ -33,6 +54,7 @@ services:
       UPDATE_AGENT_LICENSE_FILE: /run/secrets/aistor-license
       UPDATE_AGENT_TOKEN_FILE: /run/secrets/update-agent-token
       UPDATE_AGENT_GITHUB_TOKEN_FILE: /run/update-agent/github-token
+      UPDATE_AGENT_STATE_DIRECTORY: /var/lib/happylearn-update
       UPDATE_AGENT_APP_PORT: ${HAPPYLEARN_APP_PORT:-8080}
       UPDATE_AGENT_INTERNAL_PORT: ${HAPPYLEARN_INTERNAL_PORT:-9090}
     volumes:
@@ -47,10 +69,13 @@ services:
         target: aistor-license
     read_only: true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=16m,mode=0700
+      - /tmp:rw,noexec,nosuid,size=16m,uid=${HAPPYLEARN_UPDATE_HOST_UID:?set HAPPYLEARN_UPDATE_HOST_UID},gid=${HAPPYLEARN_UPDATE_HOST_GID:?set HAPPYLEARN_UPDATE_HOST_GID},mode=0700
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+    depends_on:
+      update-agent-state-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/health"]
       interval: 10s

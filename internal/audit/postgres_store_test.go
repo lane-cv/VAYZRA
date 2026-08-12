@@ -211,7 +211,7 @@ func TestAuditOutcomeClassificationIsServerOwnedAndComplete(t *testing.T) {
 			t.Errorf("outcome rule %q is not an allowed action", action)
 		}
 	}
-	for _, outcome := range []string{"succeeded", "rejected", "failed"} {
+	for _, outcome := range []string{"succeeded", "rejected", "failed", "attempted"} {
 		if !IsValidOutcome(outcome) {
 			t.Errorf("classified outcome %q rejected by filter", outcome)
 		}
@@ -388,6 +388,39 @@ func TestOperationsSettingsRejectionAuditAllowsOnlyRedactedClassification(t *tes
 		if _, err := validateAndMarshal(changed); err != nil {
 			t.Fatalf("approved reason %q rejected: %v", reason, err)
 		}
+	}
+}
+
+func TestApplicationUpdateAuditAllowsOnlyRedactedRequests(t *testing.T) {
+	for _, action := range []string{"operations.update_requested", "operations.rollback_requested"} {
+		t.Run(action, func(t *testing.T) {
+			event := Event{
+				ActorUserID: uuid.New(), Action: action,
+				TargetType: "application_update", TargetID: "global",
+				Metadata:  map[string]any{"status": "requested"},
+				RequestID: "application-update-request", IP: net.ParseIP("192.0.2.42"),
+			}
+			encoded, err := validateAndMarshal(event)
+			if err != nil {
+				t.Fatalf("redacted update request rejected: %v", err)
+			}
+			if !strings.Contains(string(encoded), `"outcome":"attempted"`) {
+				t.Fatalf("request outcome not classified: %s", encoded)
+			}
+			for name, metadata := range map[string]map[string]any{
+				"unexpected status": {"status": "completed"},
+				"version detail":    {"status": "requested", "version": "1.2.3"},
+				"repository detail": {"status": "requested", "repository": "private"},
+			} {
+				t.Run(name, func(t *testing.T) {
+					changed := event
+					changed.Metadata = metadata
+					if _, err := validateAndMarshal(changed); !errors.Is(err, ErrInvalidEvent) {
+						t.Fatalf("unsafe update event error=%v", err)
+					}
+				})
+			}
+		})
 	}
 }
 

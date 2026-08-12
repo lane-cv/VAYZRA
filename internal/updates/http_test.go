@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,10 +14,12 @@ import (
 )
 
 type fakeAgent struct {
-	status     Status
-	checkCalls int
-	applyCalls int
-	applyErr   error
+	status        Status
+	checkCalls    int
+	applyCalls    int
+	rollbackCalls int
+	applyErr      error
+	rollbackErr   error
 }
 
 func (f *fakeAgent) Status(context.Context) (Status, error) { return f.status, nil }
@@ -30,6 +33,14 @@ func (f *fakeAgent) Apply(context.Context) (Status, error) {
 	f.applyCalls++
 	if f.applyErr != nil {
 		return Status{}, f.applyErr
+	}
+	return f.status, nil
+}
+
+func (f *fakeAgent) Rollback(context.Context) (Status, error) {
+	f.rollbackCalls++
+	if f.rollbackErr != nil {
+		return Status{}, f.rollbackErr
 	}
 	return f.status, nil
 }
@@ -52,6 +63,7 @@ func TestAdminHandlerAllowsActiveAdminsToCheckAndApply(t *testing.T) {
 		CurrentCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		LatestCommit:    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		UpdateAvailable: true,
+		CanRollback:     true,
 	}}
 	service, err := NewService(agent, nil)
 	if err != nil {
@@ -76,6 +88,41 @@ func TestAdminHandlerAllowsActiveAdminsToCheckAndApply(t *testing.T) {
 	}
 	if envelope.Data.State != StateAvailable {
 		t.Fatalf("unexpected state %q", envelope.Data.State)
+	}
+	rollback := updateRequest(handler, http.MethodPost, "/rollback", admin)
+	if rollback.Code != http.StatusAccepted || agent.rollbackCalls != 1 {
+		t.Fatalf("rollback status=%d calls=%d", rollback.Code, agent.rollbackCalls)
+	}
+}
+
+func TestAdminHandlerReportsUnavailableRollbackClearly(t *testing.T) {
+	agent := &fakeAgent{rollbackErr: ErrRollbackUnavailable}
+	service, err := NewService(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := updateRequest(NewAdminHandler(service, nil).Routes(), http.MethodPost, "/rollback", activeAdmin())
+	if response.Code != http.StatusConflict {
+		t.Fatalf("rollback status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "rollback_unavailable") {
+		t.Fatalf("rollback body=%s", response.Body.String())
+	}
+}
+
+func TestAdminHandlerReportsOutdatedAgentProtocolClearly(t *testing.T) {
+	agent := &fakeAgent{status: Status{LegacyProtocol: true}, applyErr: ErrAgentProtocolOutdated}
+	service, err := NewService(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := updateRequest(NewAdminHandler(service, nil).Routes(), http.MethodPost, "/apply", activeAdmin())
+	if response.Code != http.StatusConflict || agent.applyCalls != 0 {
+		t.Fatalf("apply status=%d calls=%d body=%s", response.Code, agent.applyCalls, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "update_agent_protocol_outdated") ||
+		!strings.Contains(response.Body.String(), "宿主机完整重新部署") {
+		t.Fatalf("apply body=%s", response.Body.String())
 	}
 }
 

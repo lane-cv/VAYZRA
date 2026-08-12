@@ -8,15 +8,28 @@ import "time"
 type Status struct {
 	Enabled         bool       `json:"enabled"`
 	State           string     `json:"state"`
+	Strategy        string     `json:"strategy"`
 	Repository      string     `json:"repository"`
 	Ref             string     `json:"ref"`
+	Channel         string     `json:"channel"`
+	CurrentVersion  string     `json:"currentVersion"`
+	LatestVersion   string     `json:"latestVersion"`
 	CurrentCommit   string     `json:"currentCommit"`
 	LatestCommit    string     `json:"latestCommit"`
+	ReleaseName     string     `json:"releaseName"`
+	ReleaseNotes    string     `json:"releaseNotes"`
+	ReleaseURL      string     `json:"releaseURL"`
+	PublishedAt     *time.Time `json:"publishedAt"`
 	UpdateAvailable bool       `json:"updateAvailable"`
 	Dirty           bool       `json:"dirty"`
+	CanRollback     bool       `json:"canRollback"`
+	PreviousVersion string     `json:"previousVersion"`
+	Phase           string     `json:"phase"`
+	Progress        int        `json:"progress"`
 	Message         string     `json:"message"`
 	StartedAt       *time.Time `json:"startedAt"`
 	FinishedAt      *time.Time `json:"finishedAt"`
+	LegacyProtocol  bool       `json:"-"`
 }
 
 const (
@@ -29,4 +42,19 @@ const (
 	StateSuccess   = "success"
 	StateFailed    = "failed"
 	StateBlocked   = "blocked"
+
+	StrategyGitHubRelease = "github-release"
+	ChannelStable         = "stable"
+
+	PhaseIdle       = "idle"
+	PhaseChecking   = "checking"
+	PhaseFetching   = "fetching"
+	PhasePreparing  = "preparing"
+	PhaseBuilding   = "building"
+	PhaseSwitching  = "switching"
+	PhaseVerifying  = "verifying"
+	PhaseMerging    = "merging"
+	PhaseRecovering = "recovering"
+	PhaseComplete   = "complete"
+	PhaseFailed     = "failed"
 )

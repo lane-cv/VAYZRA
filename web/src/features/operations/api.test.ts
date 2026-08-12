@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  applyApplicationUpdate,
+  checkForUpdates,
   listAudit,
   readSettings,
+  readUpdateStatus,
+  rollbackApplicationUpdate,
   saveSettings,
 } from './api'
-import type { OperationsSettings, OperationsSettingsUpdate } from './types'
+import type { ApplicationUpdateStatus, OperationsSettings, OperationsSettingsUpdate } from './types'
 
 const infrastructure: OperationsSettings['infrastructure'] = [
   { key: 'application_database', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
@@ -51,6 +55,32 @@ const settings: OperationsSettings = {
 const update: OperationsSettingsUpdate = Object.fromEntries(
   Object.entries(settings).filter(([key]) => key !== 'infrastructure' && key !== 'updatedAt'),
 ) as OperationsSettingsUpdate
+
+const applicationUpdate: ApplicationUpdateStatus = {
+  enabled: true,
+  state: 'available',
+  strategy: 'github-release',
+  repository: 'lane-cv/VAYZRA',
+  ref: 'master',
+  channel: 'stable',
+  currentVersion: '0.1.0',
+  latestVersion: '0.2.0',
+  currentCommit: '1111111111111111111111111111111111111111',
+  latestCommit: '2222222222222222222222222222222222222222',
+  releaseName: 'HappyLearn 0.2.0',
+  releaseNotes: '新增远程更新与可恢复发布。',
+  releaseURL: 'https://github.com/lane-cv/VAYZRA/releases/tag/v0.2.0',
+  publishedAt: '2026-08-12T01:02:03Z',
+  updateAvailable: true,
+  dirty: false,
+  canRollback: true,
+  previousVersion: '0.0.9',
+  phase: 'complete',
+  progress: 0,
+  message: '发现新版本 0.2.0',
+  startedAt: null,
+  finishedAt: null,
+}
 
 describe('operations API', () => {
   beforeEach(() => {
@@ -234,6 +264,154 @@ describe('operations API', () => {
     expect(String(init?.body)).not.toContain('updatedAt')
   })
 
+  it('projects the exact OTA status DTO with release and rollback metadata', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: applicationUpdate,
+    })))
+
+    await expect(readUpdateStatus()).resolves.toStrictEqual(applicationUpdate)
+    expect(Object.keys(await readUpdateStatusFrom(applicationUpdate))).toHaveLength(23)
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/admin/updates/status')
+  })
+
+  it('rejects incomplete, extended, malformed, and unsafe OTA status responses', async () => {
+    const missing: Partial<ApplicationUpdateStatus> = { ...applicationUpdate }
+    delete missing.releaseNotes
+    const invalid: unknown[] = [
+      missing,
+      { ...applicationUpdate, internalCommand: 'docker compose up -d' },
+      { ...applicationUpdate, state: 'installing' },
+      { ...applicationUpdate, currentCommit: 'not-a-commit' },
+      { ...applicationUpdate, progress: -1 },
+      { ...applicationUpdate, progress: 101 },
+      { ...applicationUpdate, progress: 1.5 },
+      { ...applicationUpdate, publishedAt: 'not-a-time' },
+      { ...applicationUpdate, startedAt: 'not-a-time' },
+    ]
+
+    for (const value of invalid) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: value })))
+      await expect(readUpdateStatus()).rejects.toMatchObject({ code: 'invalid_response' })
+    }
+  })
+
+  it('bounds OTA display strings and accepts only canonical GitHub release links', async () => {
+    const invalid: unknown[] = [
+      { ...applicationUpdate, repository: 'r'.repeat(513) },
+      { ...applicationUpdate, ref: 'r'.repeat(129) },
+      { ...applicationUpdate, currentVersion: 'v'.repeat(129) },
+      { ...applicationUpdate, latestVersion: 'v'.repeat(129) },
+      { ...applicationUpdate, releaseName: 'n'.repeat(257) },
+      { ...applicationUpdate, releaseNotes: 'n'.repeat(32_769) },
+      { ...applicationUpdate, releaseURL: 'http://github.com/lane-cv/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://example.com/lane-cv/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/lane_cv/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/lane.cv/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/-lane/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/lane-/VAYZRA/releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/lane-cv/./releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: 'https://github.com/lane-cv/../releases/tag/v0.2.0' },
+      { ...applicationUpdate, releaseURL: `${applicationUpdate.releaseURL}?token=secret` },
+      { ...applicationUpdate, releaseURL: `${applicationUpdate.releaseURL}#fragment` },
+      { ...applicationUpdate, previousVersion: 'v'.repeat(129) },
+      { ...applicationUpdate, phase: 'downloading' },
+      { ...applicationUpdate, message: 'm'.repeat(513) },
+      { ...applicationUpdate, releaseName: 'unsafe\nname' },
+    ]
+
+    for (const value of invalid) {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: value })))
+      await expect(readUpdateStatus()).rejects.toMatchObject({ code: 'invalid_response' })
+    }
+  })
+
+  it('deduplicates automatic update checks briefly while allowing an explicit forced check', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: applicationUpdate })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: applicationUpdate })))
+
+    const [first, second] = await Promise.all([checkForUpdates(), checkForUpdates()])
+    const cached = await checkForUpdates()
+    const forced = await checkForUpdates(true)
+
+    expect(first).toStrictEqual(applicationUpdate)
+    expect(second).toStrictEqual(applicationUpdate)
+    expect(cached).toStrictEqual(applicationUpdate)
+    expect(forced).toStrictEqual(applicationUpdate)
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(fetch).mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ['/api/v1/admin/updates/check', 'POST'],
+      ['/api/v1/admin/updates/check', 'POST'],
+    ])
+  })
+
+  it('posts update and rollback mutations to their distinct OTA endpoints', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...applicationUpdate, state: 'updating', phase: 'preparing', progress: 5 },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: { ...applicationUpdate, state: 'updating', phase: 'recovering', progress: 5 },
+      })))
+
+    await expect(applyApplicationUpdate()).resolves.toMatchObject({ phase: 'preparing' })
+    await expect(rollbackApplicationUpdate()).resolves.toMatchObject({ phase: 'recovering' })
+    expect(vi.mocked(fetch).mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ['/api/v1/admin/updates/apply', 'POST'],
+      ['/api/v1/admin/updates/rollback', 'POST'],
+    ])
+  })
+
+  it('deduplicates update mutations across simultaneously mounted OTA controls', async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => new Response(JSON.stringify({
+      data: {
+        ...applicationUpdate,
+        state: 'updating',
+        phase: String(input).endsWith('/rollback') ? 'recovering' : 'preparing',
+        progress: 5,
+      },
+    })))
+
+    const applies = await Promise.all([applyApplicationUpdate(), applyApplicationUpdate()])
+    const rollbacks = await Promise.all([rollbackApplicationUpdate(), rollbackApplicationUpdate()])
+
+    expect(applies).toEqual([
+      expect.objectContaining({ phase: 'preparing' }),
+      expect.objectContaining({ phase: 'preparing' }),
+    ])
+    expect(rollbacks).toEqual([
+      expect.objectContaining({ phase: 'recovering' }),
+      expect.objectContaining({ phase: 'recovering' }),
+    ])
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/admin/updates/apply',
+      '/api/v1/admin/updates/rollback',
+    ])
+  })
+
+  it('rejects a different OTA mutation while another action is still in flight', async () => {
+    let resolveApply!: (response: Response) => void
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveApply = resolve
+    }))
+
+    const apply = applyApplicationUpdate()
+    const rollback = rollbackApplicationUpdate()
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/admin/updates/apply',
+    ])
+
+    resolveApply(new Response(JSON.stringify({
+      data: { ...applicationUpdate, state: 'updating', phase: 'preparing', progress: 5 },
+    })))
+
+    await expect(apply).resolves.toMatchObject({ phase: 'preparing' })
+    await expect(rollback).rejects.toMatchObject({
+      status: 409,
+      code: 'update_operation_in_progress',
+    })
+  })
+
   it('serializes only non-empty audit filters in stable server order', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
       data: [],
@@ -335,6 +513,23 @@ describe('operations API', () => {
       nextBeforeId: 40,
     })
     expect(JSON.stringify(page)).not.toContain(secret)
+  })
+
+  it('preserves the requested status used by OTA audit events', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{
+        id: 49,
+        action: 'operations.update_requested',
+        targetType: 'application_update',
+        targetId: 'global',
+        metadata: { status: 'requested' },
+        occurredAt: '2026-08-12T01:02:03Z',
+      }],
+      meta: {},
+    })))
+
+    const page = await listAudit({})
+    expect(page.items[0].metadata).toStrictEqual({ status: 'requested' })
   })
 
   it('redacts invalid values even when they use a public audit field name', async () => {
@@ -464,4 +659,9 @@ describe('operations API', () => {
 async function readSettingsFrom(value: OperationsSettings): Promise<OperationsSettings> {
   vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: value })))
   return readSettings()
+}
+
+async function readUpdateStatusFrom(value: ApplicationUpdateStatus): Promise<ApplicationUpdateStatus> {
+  vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ data: value })))
+  return readUpdateStatus()
 }

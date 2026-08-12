@@ -140,4 +140,4 @@ defineExpose({ clear })
     </ul>
   </section>
 </template>
-<style scoped>.uploader{display:grid;gap:9px}.uploader label{display:grid;gap:7px}.uploader input{padding:10px;border:1px dashed #8da9c3;border-radius:8px;background:#fff}.uploader ul{display:grid;gap:7px;margin:0;padding:0;list-style:none}.uploader li{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px;border-radius:8px;background:#f4f7fb}.pending{color:#876108}.ready{color:#287142}.rejected,[role=alert]{color:#a33731}.uploader button{margin-left:auto}</style>
+<style scoped>.uploader{display:grid;gap:9px}.uploader label{display:grid;gap:7px}.uploader input{padding:10px;border:1px dashed var(--hl-border-strong);border-radius:8px;background:var(--hl-surface-solid);color:var(--hl-text)}.uploader ul{display:grid;gap:7px;margin:0;padding:0;list-style:none}.uploader li{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px;border-radius:8px;background:var(--hl-surface-muted)}.pending{color:#876108}.ready{color:#287142}.rejected,[role=alert]{color:#a33731}.uploader button{margin-left:auto}</style>

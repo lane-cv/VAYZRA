@@ -107,6 +107,17 @@ describe('AdminHomeView operations dashboard', () => {
     expect(wrapper.get('a[href="/admin/audit"]').text()).toContain('审计')
   })
 
+  it('labels audit intent as initiated instead of claiming success', async () => {
+    api.readDashboard.mockResolvedValueOnce({
+      ...structuredClone(dashboard),
+      recentAudit: [{ category: 'operations', outcome: 'attempted', occurredAt: observedAt }],
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="recent-audit"]').text()).toContain('运维 · 已发起')
+    expect(wrapper.get('[data-testid="recent-audit"]').text()).not.toContain('成功')
+  })
+
   it('keeps alerts, backup, service health, and queues before summaries in the mobile DOM order', async () => {
     const wrapper = mountView()
     await flushPromises()

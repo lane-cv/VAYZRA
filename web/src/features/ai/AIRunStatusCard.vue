@@ -45,5 +45,5 @@ const action = computed(() => {
 </template>
 
 <style scoped>
-.status-card{display:grid;gap:9px;padding:15px;border:1px solid #c9d9e8;border-radius:10px;background:#f8fbfe}.status-card>div{display:flex;align-items:center;gap:12px}.status-card small,.support{color:#617187}.status-card p{margin:0}.status-card button{justify-self:start;padding:8px 13px;border:1px solid #b7c9da;border-radius:7px;background:#fff;color:#244563;font:inherit}
+.status-card{display:grid;gap:9px;padding:15px;border:1px solid var(--hl-border);border-radius:10px;background:var(--hl-surface-muted)}.status-card>div{display:flex;align-items:center;gap:12px}.status-card small,.support{color:var(--hl-text-muted)}.status-card p{margin:0}.status-card button{justify-self:start;padding:8px 13px;border:1px solid var(--hl-border-strong);border-radius:7px;background:var(--hl-surface-solid);color:var(--hl-text);font:inherit}
 </style>

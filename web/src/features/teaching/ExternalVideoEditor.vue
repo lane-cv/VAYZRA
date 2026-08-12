@@ -26,5 +26,5 @@ function remove(index: number) { emit('update:modelValue', props.modelValue.filt
 </template>
 
 <style scoped>
-.videos{display:grid;gap:12px}.videos header{display:flex;justify-content:space-between;gap:16px;align-items:center}.videos h2,.videos p{margin:.2rem 0}.video-row{display:grid;grid-template-columns:1fr 2fr;gap:10px;padding:14px;border:1px solid #d7e2ed;border-radius:10px;background:#fff}.video-row label{display:grid;gap:6px}.video-row label:nth-child(3){grid-column:1/-1}.video-row input,.video-row textarea{padding:8px;border:1px solid #aac0d4;border-radius:7px;font:inherit}.video-row>button{justify-self:end}@media(max-width:700px){.video-row{grid-template-columns:1fr}}
+.videos{display:grid;gap:12px}.videos header{display:flex;justify-content:space-between;gap:16px;align-items:center}.videos h2,.videos p{margin:.2rem 0}.video-row{display:grid;grid-template-columns:1fr 2fr;gap:10px;padding:14px;border:1px solid var(--hl-border);border-radius:10px;background:var(--hl-surface-solid)}.video-row label{display:grid;gap:6px}.video-row label:nth-child(3){grid-column:1/-1}.video-row input,.video-row textarea{padding:8px;border:1px solid var(--hl-border-strong);border-radius:7px;background:var(--hl-surface-solid);color:var(--hl-text);font:inherit}.video-row>button{justify-self:end}@media(max-width:700px){.video-row{grid-template-columns:1fr}}
 </style>

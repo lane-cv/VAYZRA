@@ -61,7 +61,7 @@ describe('AuditView', () => {
     await flushPromises()
     await wrapper.get('[data-testid="audit-action"]').setValue('settings.updated')
     await wrapper.get('[data-testid="audit-target-type"]').setValue('system_settings')
-    await wrapper.get('[data-testid="audit-outcome"]').setValue('succeeded')
+    await wrapper.get('[data-testid="audit-outcome"]').setValue('attempted')
     await wrapper.get('[data-testid="audit-actor"]').setValue('11111111-1111-4111-8111-111111111111')
     await wrapper.get('[data-testid="audit-from"]').setValue('2026-07-01T00:00:00Z')
     await wrapper.get('[data-testid="audit-to"]').setValue('2026-07-28T00:00:00Z')
@@ -70,7 +70,7 @@ describe('AuditView', () => {
     expect(listAudit).toHaveBeenLastCalledWith({
       action: 'settings.updated',
       targetType: 'system_settings',
-      outcome: 'succeeded',
+      outcome: 'attempted',
       actorId: '11111111-1111-4111-8111-111111111111',
       from: '2026-07-01T00:00:00Z',
       to: '2026-07-28T00:00:00Z',

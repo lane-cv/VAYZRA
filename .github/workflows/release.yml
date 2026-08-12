@@ -1,0 +1,111 @@
+name: github-release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions: {}
+
+concurrency:
+  group: github-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      release_commit: ${{ steps.validate-tag.outputs.release_commit }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate immutable stable version tag
+        id: validate-tag
+        env:
+          RELEASE_BRANCH: master
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use stable SemVer form vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          release_commit=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+          test "$release_commit" = "$event_commit"
+          git fetch --no-tags origin "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+          git merge-base --is-ancestor "$release_commit" "refs/remotes/origin/${RELEASE_BRANCH}"
+          printf 'RELEASE_COMMIT=%s\n' "$release_commit" >> "$GITHUB_ENV"
+          printf 'release_commit=%s\n' "$release_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful full verification for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: master
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/verify.yml/runs?branch=${RELEASE_BRANCH}&head_sha=${RELEASE_COMMIT}&event=push&per_page=1")"
+          status="$(jq -r '.workflow_runs[0].status // ""' <<<"$response")"
+          conclusion="$(jq -r '.workflow_runs[0].conclusion // ""' <<<"$response")"
+          test "$status" = completed
+          test "$conclusion" = success
+
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11.9.0
+          run_install: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: 1.26.5
+          cache: true
+
+      - run: pnpm install --frozen-lockfile
+      - run: GOENV=off GOFLAGS='' go test ./cmd/update-agent ./internal/updates -count=1
+      - run: pnpm --dir web test
+      - run: pnpm --dir web typecheck
+      - run: pnpm lint
+      - run: pnpm --dir web build
+
+  publish:
+    needs: validate
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Revalidate tag and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          object_type=$(jq -r '.object.type' <<<"$tag_ref")
+          object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          for _ in {1..5}; do
+            if [[ "$object_type" == commit ]]; then
+              break
+            fi
+            [[ "$object_type" == tag ]]
+            tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")
+            object_type=$(jq -r '.object.type' <<<"$tag_object")
+            object_sha=$(jq -r '.object.sha' <<<"$tag_object")
+          done
+          [[ "$object_type" == commit && "$object_sha" == "$RELEASE_COMMIT" ]]
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

@@ -420,5 +420,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.detail{display:grid;gap:20px;max-width:920px}.detail>a{color:#176faf}.detail h1{margin:.2rem 0}.detail header p{color:#176faf;font-weight:700}.followup{padding:20px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.followup form,.followup label{display:grid;gap:9px}.followup textarea{padding:10px;border:1px solid #b9cadb;border-radius:8px;font:inherit;line-height:1.6}.followup small{justify-self:end}.followup button{justify-self:start;padding:9px 15px}[role=alert]{color:#a33731}
+.detail{display:grid;gap:20px;max-width:920px}.detail>a{color:var(--hl-primary-strong)}.detail h1{margin:.2rem 0}.detail header p{color:var(--hl-primary-strong);font-weight:700}.followup{padding:20px;border:1px solid var(--hl-border);border-radius:12px;background:var(--hl-surface-solid)}.followup form,.followup label{display:grid;gap:9px}.followup textarea{padding:10px;border:1px solid var(--hl-border-strong);border-radius:8px;background:var(--hl-surface-solid);color:var(--hl-text);font:inherit;line-height:1.6}.followup small{justify-self:end;color:var(--hl-text-muted)}.followup button{justify-self:start;padding:9px 15px}[role=alert]{color:var(--hl-danger)}
 </style>

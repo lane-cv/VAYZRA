@@ -59,15 +59,42 @@ export type UpdateState =
   | 'failed'
   | 'blocked'
 
+export type UpdateStrategy = 'github-release'
+export type UpdateChannel = 'stable'
+export type UpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'fetching'
+  | 'preparing'
+  | 'building'
+  | 'switching'
+  | 'verifying'
+  | 'merging'
+  | 'recovering'
+  | 'complete'
+  | 'failed'
+
 export type ApplicationUpdateStatus = {
   enabled: boolean
   state: UpdateState
+  strategy: UpdateStrategy
   repository: string
   ref: string
+  channel: UpdateChannel
+  currentVersion: string
+  latestVersion: string
   currentCommit: string
   latestCommit: string
+  releaseName: string
+  releaseNotes: string
+  releaseURL: string
+  publishedAt: string | null
   updateAvailable: boolean
   dirty: boolean
+  canRollback: boolean
+  previousVersion: string
+  phase: UpdatePhase
+  progress: number
   message: string
   startedAt: string | null
   finishedAt: string | null
@@ -206,7 +233,7 @@ export type DashboardAuditCategory =
   | 'ai'
   | 'operations'
   | 'backup'
-export type DashboardAuditOutcome = 'succeeded' | 'failed' | 'denied' | 'rejected'
+export type DashboardAuditOutcome = 'succeeded' | 'failed' | 'denied' | 'rejected' | 'attempted'
 
 export type ObservedSummary = {
   state: OperationsDataState

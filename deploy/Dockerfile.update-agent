@@ -1,10 +1,10 @@
-FROM golang:1.26.5-bookworm AS build
+FROM golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd/update-agent ./cmd/update-agent
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/happylearn-update-agent ./cmd/update-agent
 
-FROM docker:28.3.3-cli
+FROM docker:28.3.3-cli@sha256:0135662b510037ea581d99c2e5929c5e01185139c0b86986a418bd4da0b98a44
 RUN apk add --no-cache ca-certificates curl git
 RUN mkdir -p /run/update-agent
 COPY --from=build /out/happylearn-update-agent /usr/local/bin/happylearn-update-agent

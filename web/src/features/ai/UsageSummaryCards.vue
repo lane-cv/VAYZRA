@@ -20,5 +20,5 @@ defineProps<{ summary: UsageSummary }>()
 </template>
 
 <style scoped>
-.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin:20px 0 28px}.summary-grid article{display:grid;gap:8px;padding:16px;border:1px solid #dbe4f0;border-radius:12px;background:#fff}.summary-grid span{color:#63758a;font-size:.84rem}.summary-grid strong{overflow-wrap:anywhere;color:#183b5d;font-size:1.22rem}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin:20px 0 28px}.summary-grid article{display:grid;gap:8px;padding:16px;border:1px solid var(--hl-border);border-radius:12px;background:var(--hl-surface-solid)}.summary-grid span{color:var(--hl-text-muted);font-size:.84rem}.summary-grid strong{overflow-wrap:anywhere;color:var(--hl-text);font-size:1.22rem}
 </style>

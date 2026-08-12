@@ -1,12 +1,21 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
+import { defineComponent } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { APIError } from '../../api/client'
 import { useSessionStore } from '../../stores/session'
+import ApplicationUpdateBadge from './ApplicationUpdateBadge.vue'
 import SystemSettingsView from './SystemSettingsView.vue'
-import { readSettings, saveSettings } from './api'
-import type { OperationsSettings } from './types'
+import {
+  applyApplicationUpdate,
+  checkForUpdates,
+  readSettings,
+  readUpdateStatus,
+  rollbackApplicationUpdate,
+  saveSettings,
+} from './api'
+import type { ApplicationUpdateStatus, OperationsSettings } from './types'
 
 const infrastructure: OperationsSettings['infrastructure'] = [
   { key: 'application_database', configured: true, lastValidatedAt: '2026-07-28T01:01:01Z' },
@@ -26,6 +35,7 @@ vi.mock('./api', () => ({
   checkForUpdates: vi.fn(),
   readUpdateStatus: vi.fn(),
   applyApplicationUpdate: vi.fn(),
+  rollbackApplicationUpdate: vi.fn(),
 }))
 
 const settings: OperationsSettings = {
@@ -56,6 +66,31 @@ const settings: OperationsSettings = {
   authorizationDenialCriticalCount: 200,
   infrastructure,
   updatedAt: '2026-07-28T01:02:03Z',
+}
+const availableUpdate: ApplicationUpdateStatus = {
+  enabled: true,
+  state: 'available',
+  strategy: 'github-release',
+  repository: 'lane-cv/VAYZRA',
+  ref: 'master',
+  channel: 'stable',
+  currentVersion: '0.1.0',
+  latestVersion: '0.2.0',
+  currentCommit: '1111111111111111111111111111111111111111',
+  latestCommit: '2222222222222222222222222222222222222222',
+  releaseName: 'HappyLearn 0.2.0',
+  releaseNotes: '新增远程更新与回滚状态。',
+  releaseURL: 'https://github.com/lane-cv/VAYZRA/releases/tag/v0.2.0',
+  publishedAt: '2026-08-12T01:02:03Z',
+  updateAvailable: true,
+  dirty: false,
+  canRollback: false,
+  previousVersion: '',
+  phase: 'complete',
+  progress: 0,
+  message: '发现新版本 0.2.0',
+  startedAt: null,
+  finishedAt: '2026-08-12T01:02:04Z',
 }
 const mountedWrappers: Array<{ unmount(): void }> = []
 
@@ -92,6 +127,7 @@ describe('SystemSettingsView', () => {
   afterEach(() => {
     for (const wrapper of mountedWrappers.splice(0)) wrapper.unmount()
     vi.unstubAllGlobals()
+    vi.useRealTimers()
   })
 
   it('renders loading and explicit grouped server-range fields', async () => {
@@ -134,6 +170,175 @@ describe('SystemSettingsView', () => {
     expect(section.findAll('input')).toHaveLength(0)
     expect(section.findAll('[title], [data-config], [data-source], [data-url], [data-path]')).toHaveLength(0)
     expect(section.html()).not.toContain('/run/secrets')
+  })
+
+  it('keeps checks manual on the settings page and renders the complete release summary on demand', async () => {
+    vi.mocked(checkForUpdates).mockResolvedValueOnce(availableUpdate)
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const section = wrapper.get('[data-testid="application-updates"]')
+    expect(checkForUpdates).not.toHaveBeenCalled()
+    expect(section.text()).toContain('点击“立即检查”获取远程版本信息')
+
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    expect(section.text()).toContain('当前版本')
+    expect(section.text()).toContain('v0.1.0')
+    expect(section.text()).toContain('最新版本')
+    expect(section.text()).toContain('v0.2.0')
+    expect(section.text()).toContain('新增远程更新与回滚状态。')
+    expect(section.get('a').attributes()).toMatchObject({
+      href: availableUpdate.releaseURL,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+    })
+  })
+
+  it('preserves the last known update summary when a later manual check fails', async () => {
+    vi.mocked(checkForUpdates)
+      .mockResolvedValueOnce({
+        ...availableUpdate,
+        state: 'current',
+        updateAvailable: false,
+        currentVersion: '0.2.0',
+        latestVersion: '0.2.0',
+        message: '已是最新版本',
+      })
+      .mockRejectedValueOnce(new APIError(502, 'update_check_failed', '远程检查暂不可用', 'req-check'))
+      .mockResolvedValueOnce({
+        ...availableUpdate,
+        state: 'available',
+        message: '重新检查成功',
+      })
+
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const section = wrapper.get('[data-testid="application-updates"]')
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    expect(section.text()).toContain('已是最新版本')
+
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    expect(section.get('[role="alert"]').text()).toContain('远程检查暂不可用')
+    expect(section.text()).toContain('已是最新版本')
+    await section.get('[data-testid="retry-update"]').trigger('click')
+    await flushPromises()
+    expect(section.get('[role="status"]').text()).toContain('重新检查成功')
+  })
+
+  it('short-polls update progress to a terminal state without starting a second action', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.mocked(checkForUpdates).mockResolvedValueOnce(availableUpdate)
+    vi.mocked(applyApplicationUpdate).mockResolvedValueOnce({
+      ...availableUpdate, state: 'updating', phase: 'building', progress: 40, message: '正在构建服务',
+    })
+    vi.mocked(readUpdateStatus).mockResolvedValueOnce({
+      ...availableUpdate, state: 'success', updateAvailable: false,
+      currentVersion: '0.2.0', phase: 'complete', progress: 100, message: '更新完成',
+    })
+
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const section = wrapper.get('[data-testid="application-updates"]')
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    await section.get('[data-testid="apply-update"]').trigger('click')
+    await section.get('[data-testid="apply-update"]').trigger('click')
+    await flushPromises()
+    expect(section.get('[role="progressbar"]').attributes('aria-valuenow')).toBe('40')
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(section.get('[role="status"]').text()).toContain('更新完成')
+    expect(section.get('[data-testid="reload-application"]').text()).toBe('重新加载页面')
+    expect(vi.mocked(applyApplicationUpdate)).toHaveBeenCalledTimes(1)
+  })
+
+  it('shares one globally busy OTA action between the badge and settings page', async () => {
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.mocked(readUpdateStatus).mockResolvedValue(availableUpdate)
+    vi.mocked(checkForUpdates).mockResolvedValue(availableUpdate)
+    vi.mocked(applyApplicationUpdate).mockReturnValue(new Promise(() => {}))
+
+    const pinia = createPinia()
+    useSessionStore(pinia).setUser({
+      id: 'admin-1', username: 'admin', displayName: '张老师', role: 'admin', mustChangePassword: false,
+    })
+    const Host = defineComponent({
+      components: { ApplicationUpdateBadge, SystemSettingsView },
+      template: '<ApplicationUpdateBadge /><SystemSettingsView />',
+    })
+    const wrapper = mount(Host, { attachTo: document.body, global: { plugins: [pinia] } })
+    mountedWrappers.push(wrapper)
+    await flushPromises()
+
+    const settingsSection = wrapper.get('[data-testid="application-updates"]')
+    await settingsSection.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="application-update-trigger"]').trigger('click')
+    const badge = wrapper.get('.application-update-badge')
+    await settingsSection.get('[data-testid="apply-update"]').trigger('click')
+    await wrapper.get('[data-testid="application-update-trigger"]').trigger('click')
+
+    expect(settingsSection.get('[data-testid="apply-update"]').attributes('disabled')).toBeDefined()
+    expect(badge.get('[data-testid="apply-update"]').attributes('disabled')).toBeDefined()
+    expect(vi.mocked(applyApplicationUpdate)).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-reads authoritative status after an apply error instead of offering to replay it', async () => {
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.mocked(checkForUpdates).mockResolvedValueOnce(availableUpdate)
+    vi.mocked(applyApplicationUpdate).mockRejectedValueOnce(
+      new APIError(503, 'network_error', '更新请求结果未知', 'req-apply'),
+    )
+    vi.mocked(readUpdateStatus).mockResolvedValueOnce({
+      ...availableUpdate, state: 'success', updateAvailable: false,
+      currentVersion: '0.2.0', phase: 'complete', progress: 100, message: '服务端确认更新完成',
+    })
+
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const section = wrapper.get('[data-testid="application-updates"]')
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    await section.get('[data-testid="apply-update"]').trigger('click')
+    await flushPromises()
+
+    const retry = section.get('[data-testid="retry-update"]')
+    expect(retry.text()).toBe('重新读取状态')
+    await retry.trigger('click')
+    await flushPromises()
+    expect(section.get('[role="status"]').text()).toContain('服务端确认更新完成')
+    expect(vi.mocked(applyApplicationUpdate)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(readUpdateStatus)).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not request rollback until the administrator confirms the previous version', async () => {
+    vi.mocked(checkForUpdates).mockResolvedValueOnce({
+      ...availableUpdate, state: 'current', updateAvailable: false,
+      currentVersion: '0.2.0', latestVersion: '0.2.0',
+      canRollback: true, previousVersion: '0.1.0', message: '已是最新版本',
+    })
+    vi.mocked(rollbackApplicationUpdate).mockResolvedValueOnce({
+      ...availableUpdate, state: 'success', updateAvailable: false,
+      currentVersion: '0.1.0', canRollback: false, previousVersion: '',
+      phase: 'complete', progress: 100, message: '已回滚到 0.1.0',
+    })
+    vi.stubGlobal('confirm', vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true))
+
+    const { wrapper } = await mountSettings()
+    await flushPromises()
+    const section = wrapper.get('[data-testid="application-updates"]')
+    await section.get('[data-testid="check-updates"]').trigger('click')
+    await flushPromises()
+    const rollback = section.get('[data-testid="rollback-update"]')
+    await rollback.trigger('click')
+    expect(vi.mocked(rollbackApplicationUpdate)).not.toHaveBeenCalled()
+    await rollback.trigger('click')
+    await flushPromises()
+    expect(vi.mocked(confirm)).toHaveBeenLastCalledWith(expect.stringContaining('v0.1.0'))
+    expect(section.get('[role="status"]').text()).toContain('已回滚到 0.1.0')
   })
 
   it('validates ordered thresholds before saving', async () => {

@@ -11,12 +11,14 @@ import (
 )
 
 var (
-	ErrInvalid           = errors.New("invalid update request")
-	ErrForbidden         = errors.New("update access forbidden")
-	ErrAgentUnavailable  = errors.New("update agent unavailable")
-	ErrUpdateBusy        = errors.New("update already in progress")
-	ErrDirtyCheckout     = errors.New("update checkout is dirty")
-	ErrUpdateUnavailable = errors.New("updates are not configured")
+	ErrInvalid               = errors.New("invalid update request")
+	ErrForbidden             = errors.New("update access forbidden")
+	ErrAgentUnavailable      = errors.New("update agent unavailable")
+	ErrUpdateBusy            = errors.New("update already in progress")
+	ErrDirtyCheckout         = errors.New("update checkout is dirty")
+	ErrUpdateUnavailable     = errors.New("updates are not configured")
+	ErrRollbackUnavailable   = errors.New("update rollback is unavailable")
+	ErrAgentProtocolOutdated = errors.New("update agent protocol is outdated")
 )
 
 type Principal struct {
@@ -29,12 +31,14 @@ type Agent interface {
 	Status(context.Context) (Status, error)
 	Check(context.Context) (Status, error)
 	Apply(context.Context) (Status, error)
+	Rollback(context.Context) (Status, error)
 }
 
 type HTTPService interface {
 	Status(context.Context, Principal) (Status, error)
 	Check(context.Context, Principal) (Status, error)
 	Apply(context.Context, Principal) (Status, error)
+	Rollback(context.Context, Principal) (Status, error)
 }
 
 type service struct {
@@ -67,6 +71,13 @@ func (s *service) Apply(ctx context.Context, principal Principal) (Status, error
 	if err := authorize(principal); err != nil {
 		return Status{}, err
 	}
+	status, err := s.agent.Status(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	if status.LegacyProtocol {
+		return Status{}, ErrAgentProtocolOutdated
+	}
 	if s.audit != nil {
 		if err := s.audit.Write(ctx, audit.Event{
 			ActorUserID: principal.User.ID,
@@ -81,6 +92,33 @@ func (s *service) Apply(ctx context.Context, principal Principal) (Status, error
 		}
 	}
 	return s.agent.Apply(ctx)
+}
+
+func (s *service) Rollback(ctx context.Context, principal Principal) (Status, error) {
+	if err := authorize(principal); err != nil {
+		return Status{}, err
+	}
+	status, err := s.agent.Status(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	if !status.CanRollback {
+		return Status{}, ErrRollbackUnavailable
+	}
+	if s.audit != nil {
+		if err := s.audit.Write(ctx, audit.Event{
+			ActorUserID: principal.User.ID,
+			Action:      "operations.rollback_requested",
+			TargetType:  "application_update",
+			TargetID:    "global",
+			Metadata:    map[string]any{"status": "requested"},
+			RequestID:   principal.RequestID,
+			IP:          append(net.IP(nil), principal.IP...),
+		}); err != nil {
+			return Status{}, err
+		}
+	}
+	return s.agent.Rollback(ctx)
 }
 
 func authorize(principal Principal) error {

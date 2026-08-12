@@ -4,6 +4,7 @@
 .env
 .env.*
 !.env.example
+/.secrets/
 node_modules
 .pnpm-store
 web/node_modules

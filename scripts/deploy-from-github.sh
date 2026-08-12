@@ -7,6 +7,15 @@ readonly DEFAULT_REPOSITORY='https://github.com/lane-cv/VAYZRA.git'
 readonly DEFAULT_REF='master'
 readonly DEFAULT_PROJECT='happylearn-dev'
 readonly DEFAULT_AISTOR_IMAGE='quay.io/minio/aistor/minio:RELEASE.2026-06-06T02-44-06Z@sha256:5dbb753c0dbe6a987dd30ce564f66c0042e291e464d10e792443451d4fec2120'
+readonly DEFAULT_POSTGRES_IMAGE='postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636'
+readonly DEFAULT_REDIS_IMAGE='redis:8.8@sha256:3eafabb4c93fcb8b36b666e07a43f096cb157bc6b07dce4b2492b895c63cf37f'
+readonly DEFAULT_INIT_IMAGE='debian:12.12-slim@sha256:d5d3f9c23164ea16f31852f95bd5959aad1c5e854332fe00f7b3a20fcc9f635c'
+readonly DEFAULT_STATE_INIT_IMAGE='alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659'
+readonly OFFLINE_POSTGRES_IMAGE='happylearn-offline/postgres:18.4'
+readonly OFFLINE_REDIS_IMAGE='happylearn-offline/redis:8.8'
+readonly OFFLINE_INIT_IMAGE='happylearn-offline/debian:12.12-slim'
+readonly OFFLINE_STATE_INIT_IMAGE='happylearn-offline/alpine:3.23.3'
+readonly OFFLINE_AISTOR_IMAGE='happylearn-offline/aistor:2026-06-06'
 
 repository=$DEFAULT_REPOSITORY
 ref=$DEFAULT_REF
@@ -25,6 +34,10 @@ app_image=${HAPPYLEARN_APP_IMAGE:-happylearn-app:local}
 worker_image=${HAPPYLEARN_WORKER_IMAGE:-happylearn-worker:local}
 update_agent_image=${HAPPYLEARN_UPDATE_AGENT_IMAGE:-happylearn-update-agent:local}
 aistor_image=${HAPPYLEARN_AISTOR_IMAGE:-$DEFAULT_AISTOR_IMAGE}
+postgres_image=$DEFAULT_POSTGRES_IMAGE
+redis_image=$DEFAULT_REDIS_IMAGE
+init_image=$DEFAULT_INIT_IMAGE
+state_init_image=$DEFAULT_STATE_INIT_IMAGE
 
 usage() {
   cat <<'EOF'
@@ -131,7 +144,17 @@ while (($#)); do
   esac
 done
 
-for command in git docker openssl curl realpath stat mktemp install grep sed tr wc; do
+if [[ $offline == true ]]; then
+  postgres_image=$OFFLINE_POSTGRES_IMAGE
+  redis_image=$OFFLINE_REDIS_IMAGE
+  init_image=$OFFLINE_INIT_IMAGE
+  state_init_image=$OFFLINE_STATE_INIT_IMAGE
+  if [[ $aistor_image == "$DEFAULT_AISTOR_IMAGE" ]]; then
+    aistor_image=$OFFLINE_AISTOR_IMAGE
+  fi
+fi
+
+for command in git docker openssl curl realpath stat mktemp install grep sed tr wc id; do
   require_command "$command"
 done
 docker compose version >/dev/null 2>&1 || fail 'Docker Compose plugin is unavailable'
@@ -155,6 +178,13 @@ for port in "$app_port" "$internal_port" "$postgres_port" "$redis_port" "$aistor
   [[ -z ${seen_ports[$port]:-} ]] || fail "duplicate host port: $port"
   seen_ports[$port]=1
 done
+
+host_uid=$(id -u)
+host_gid=$(id -g)
+docker_socket=/var/run/docker.sock
+[[ -S $docker_socket && ! -L $docker_socket ]] || fail 'Docker socket is unavailable or unsafe'
+docker_gid=$(stat -c '%g' -- "$docker_socket") || fail 'cannot inspect Docker socket group'
+[[ $host_uid =~ ^[0-9]+$ && $host_gid =~ ^[0-9]+$ && $docker_gid =~ ^[0-9]+$ ]] || fail 'host identity is invalid'
 
 [[ -n $license_file ]] || fail '--license-file is required'
 [[ $license_file != *$'\n'* && $license_file != *$'\r'* ]] || fail 'license path is unsafe'
@@ -245,13 +275,24 @@ chmod 0600 "$temporary_env"
   printf 'HAPPYLEARN_WORKER_IMAGE=%s\n' "$worker_image"
   printf 'HAPPYLEARN_UPDATE_AGENT_IMAGE=%s\n' "$update_agent_image"
   printf 'HAPPYLEARN_AISTOR_IMAGE=%s\n' "$aistor_image"
+  printf 'HAPPYLEARN_LOCAL_POSTGRES_IMAGE=%s\n' "$postgres_image"
+  printf 'HAPPYLEARN_LOCAL_REDIS_IMAGE=%s\n' "$redis_image"
+  printf 'HAPPYLEARN_LOCAL_INIT_IMAGE=%s\n' "$init_image"
+  printf 'HAPPYLEARN_LOCAL_STATE_INIT_IMAGE=%s\n' "$state_init_image"
   printf 'HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:%s\n' "$app_port"
   printf 'HAPPYLEARN_UPDATE_REPOSITORY=%s\n' "$directory"
   printf 'HAPPYLEARN_UPDATE_REF=%s\n' "$ref"
   printf 'HAPPYLEARN_UPDATE_PROJECT=%s\n' "$project"
+  printf 'HAPPYLEARN_UPDATE_HOST_UID=%s\n' "$host_uid"
+  printf 'HAPPYLEARN_UPDATE_HOST_GID=%s\n' "$host_gid"
+  printf 'HAPPYLEARN_UPDATE_DOCKER_GID=%s\n' "$docker_gid"
   printf 'HAPPYLEARN_UPDATE_AGENT_TOKEN_FILE=%s\n' "$update_agent_token"
+  printf 'HAPPYLEARN_METRICS_BEARER_SECRET_FILE=%s\n' "$directory/deploy/fixtures/development-metrics-bearer-do-not-use-in-production"
+  printf 'HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE=%s\n' "$directory/deploy/fixtures/development-host-metrics-hmac-do-not-use-in-production"
   if [[ -n $github_token_file ]]; then
     printf 'HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE=%s\n' "$github_token_file"
+  else
+    printf 'HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE=%s\n' "$directory/deploy/fixtures/development-github-token-do-not-use-in-production"
   fi
 } >"$temporary_env"
 mv -f -- "$temporary_env" "$base_env"
@@ -275,14 +316,15 @@ if [[ $offline == true ]]; then
     "$app_image" \
     "$worker_image" \
     "$update_agent_image" \
-    'postgres:18.4' \
-    'redis:8.8' \
-    'debian:12.12-slim' \
+    "$postgres_image" \
+    "$redis_image" \
+    "$init_image" \
+    "$state_init_image" \
     "$aistor_image"; do
     docker image inspect "$image" >/dev/null 2>&1 ||
       fail "offline image is not loaded: $image"
   done
-  "${compose[@]}" up -d --no-build --wait --wait-timeout 300
+  "${compose[@]}" up -d --no-build --pull never --wait --wait-timeout 300
 else
   "${compose[@]}" up -d --build --wait --wait-timeout 300
 fi

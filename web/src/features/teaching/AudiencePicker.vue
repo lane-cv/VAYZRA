@@ -78,5 +78,5 @@ watch(selectedProblems, (problems) => emit('validationChange', problems.map((pro
 </template>
 
 <style scoped>
-.audience-picker{display:grid;gap:10px;margin:0;padding:16px;border:1px solid #d7e2ed;border-radius:10px}.audience-picker>label,.student-list label{display:flex;align-items:center;gap:8px}.audience-picker input[type=search]{flex:1;min-width:0;padding:8px;border:1px solid #aac0d4;border-radius:7px}.student-list{display:grid;gap:8px;max-height:220px;overflow:auto}.student-list small{color:#61758a}.problem{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0;color:#982f2a}
+.audience-picker{display:grid;gap:10px;margin:0;padding:16px;border:1px solid var(--hl-border);border-radius:10px}.audience-picker>label,.student-list label{display:flex;align-items:center;gap:8px}.audience-picker input[type=search]{flex:1;min-width:0;padding:8px;border:1px solid var(--hl-border-strong);border-radius:7px;background:var(--hl-surface-solid);color:var(--hl-text)}.student-list{display:grid;gap:8px;max-height:220px;overflow:auto}.student-list small{color:var(--hl-text-muted)}.problem{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0;color:#982f2a}
 </style>

@@ -33,7 +33,7 @@ const dashboard: OperationsDashboard = {
   },
   alerts: { state: 'healthy', observedAt, openWarning: 0, openCritical: 0 },
   recentAuditState: 'healthy',
-  recentAudit: [{ category: 'operations', outcome: 'succeeded', occurredAt: observedAt }],
+  recentAudit: [{ category: 'operations', outcome: 'attempted', occurredAt: observedAt }],
 }
 const alert: OperationalAlert = {
   id: '10000000-0000-4000-8000-000000000001',

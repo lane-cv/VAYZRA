@@ -679,7 +679,7 @@ SELECT
     ELSE 'unknown'
   END AS category,
   CASE
-    WHEN metadata->>'outcome' IN ('succeeded','failed','denied','rejected')
+    WHEN metadata->>'outcome' IN ('succeeded','failed','denied','rejected','attempted')
       THEN metadata->>'outcome'
     ELSE 'unknown'
   END AS outcome,

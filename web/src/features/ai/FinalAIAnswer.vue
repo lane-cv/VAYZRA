@@ -17,5 +17,5 @@ const rendered = computed(() => {
 </template>
 
 <style scoped>
-.final-answer{line-height:1.75;overflow-wrap:anywhere}.final-answer :deep(pre){overflow:auto;padding:12px;border-radius:8px;background:#f4f7fb}.final-answer :deep(.math-block){overflow:auto;padding-block:4px}
+.final-answer{line-height:1.75;overflow-wrap:anywhere}.final-answer :deep(pre){overflow:auto;padding:12px;border-radius:8px;background:var(--hl-surface-muted)}.final-answer :deep(.math-block){overflow:auto;padding-block:4px}
 </style>
