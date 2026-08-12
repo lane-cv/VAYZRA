@@ -380,6 +380,8 @@ require_literal "$target" \
   'compose_live_file="$repo_root/deploy/compose.backup-live.yml"'
 require_literal "$target" \
   'compose_e2e_live_file="$repo_root/deploy/compose.phase5-e2e-live.yml"'
+require_literal "$target" \
+  'aistor_license_volume="${live_project}_aistor_license_runtime"'
 require_literal "$target" 'compose_live()'
 require_literal "$target" '--project-name "$live_project"'
 require_literal "$target" '--file "$compose_file"'
@@ -521,7 +523,36 @@ require_literal "$target" \
 require_literal "$target" \
   'run_compose_one_shot minio-data-init'
 require_literal "$target" \
-  'compose_live up --detach --no-build --no-deps postgres redis minio'
+  '"$aistor_license_volume") compose_volume=aistor_license_runtime ;;'
+require_literal "$target" \
+  '"${live_project}-aistor-license-init-1"'
+require_literal "$e2e_overlay" '--license /license/minio.license'
+
+owned_volumes_block="$(sed -n '/^owned_volumes=(/,/^)/p' "$target")"
+[[ "$(grep -Fxc '  "$aistor_license_volume" \' \
+  <<<"$owned_volumes_block")" == 1 ]] ||
+  fail 'AIStor license volume must be tracked exactly once for intent and cleanup'
+
+one_shot_block="$(sed -n '/^run_compose_one_shot()/,/^}/p' "$target")"
+[[ "$(grep -Fxc \
+  '    phase5-secrets-init|postgres-tls-init|minio-data-init|aistor-license-init) ;;' \
+  <<<"$one_shot_block")" == 1 ]] ||
+  fail 'AIStor license initializer must be allowed by the one-shot helper'
+
+start_dependencies_block="$(sed -n '/^start_dependencies()/,/^}/p' "$target")"
+aistor_init_line="$(
+  grep -nFx '  run_compose_one_shot aistor-license-init' \
+    <<<"$start_dependencies_block" | cut -d: -f1
+)"
+long_lived_start_line="$(
+  grep -nFx \
+    '  if ! compose_live up --detach --no-build --no-deps postgres redis minio; then' \
+    <<<"$start_dependencies_block" | cut -d: -f1
+)"
+[[ "$aistor_init_line" =~ ^[0-9]+$ &&
+  "$long_lived_start_line" =~ ^[0-9]+$ &&
+  "$aistor_init_line" -lt "$long_lived_start_line" ]] ||
+  fail 'AIStor license initialization must precede long-lived dependency startup'
 if grep -Fq -- \
   'compose_live up --detach --no-build postgres redis minio' "$target"; then
   fail 'long-lived dependencies can restart completed one-shot initializers'
@@ -2925,6 +2956,14 @@ if (
   !hasDependency("postgres", "postgres-tls-init") ||
   !hasDependency("postgres", "phase5-secrets-init") ||
   !hasDependency("minio", "minio-data-init") ||
+  !hasDependency("minio", "aistor-license-init") ||
+  !hasTarget("minio", "/license") ||
+  !String(services.minio.command).includes(
+    "--license /license/minio.license",
+  ) ||
+  services["aistor-license-init"]?.labels?.[
+    "io.happylearn.phase5.e2e-owner"
+  ] !== "a1b2c3d4e5f6" ||
   !hasDependency("minio", "phase5-secrets-init") ||
   !String(services.worker.command).includes(
     "HAPPYLEARN_PHASE5_WORKER_EXECUTABLE:-/app/happylearn-worker",

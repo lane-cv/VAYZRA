@@ -145,6 +145,7 @@ artifact_write_probe="${prefix}_artifact_write_probe"
 age_keygen_runner="${prefix}_age_keygen"
 age_recipient_runner="${prefix}_age_recipient"
 primary_volume="${live_project}_minio_data"
+aistor_license_volume="${live_project}_aistor_license_runtime"
 remote_volume="${prefix}_remote_data"
 secret_volume="${prefix}_secrets"
 runtime_secret_volume="${live_project}_phase5_runtime_secrets"
@@ -322,6 +323,7 @@ service_containers=(
 owned_volumes=(
   "$runner_volume" "$fixture_volume" "$secret_volume" "$repository_volume"
   "$state_volume" "$remote_volume" "$primary_volume" \
+  "$aistor_license_volume" \
   "$runtime_secret_volume" "$backup_secret_volume" \
   "$postgres_tls_volume" "$app_secret_volume"
 )
@@ -338,6 +340,7 @@ persist_resource_intents() {
     "${live_project}-phase5-secrets-init-1" \
     "${live_project}-postgres-tls-init-1" \
     "${live_project}-minio-data-init-1" \
+    "${live_project}-aistor-license-init-1" \
     "${temporary_containers[@]}"; do
     printf '%s\t%s\t%s\n' \
       "$name" "$live_project" "$fixture_suffix" \
@@ -1685,6 +1688,7 @@ initialize_resources() {
     compose_volume=''
     case "$volume" in
       "$primary_volume") compose_volume=minio_data ;;
+      "$aistor_license_volume") compose_volume=aistor_license_runtime ;;
       "$runtime_secret_volume") compose_volume=phase5_runtime_secrets ;;
       "$backup_secret_volume") compose_volume=backup_secrets ;;
       "$postgres_tls_volume") compose_volume=postgres_tls ;;
@@ -1792,7 +1796,7 @@ run_compose_one_shot() {
   local service="${1:?service required}"
   local name="${live_project}-${service}-1"
   case "$service" in
-    phase5-secrets-init|postgres-tls-init|minio-data-init) ;;
+    phase5-secrets-init|postgres-tls-init|minio-data-init|aistor-license-init) ;;
     *) return 2 ;;
   esac
   if ! compose_live up --no-build --abort-on-container-exit \
@@ -1810,6 +1814,7 @@ start_dependencies() {
   run_compose_one_shot phase5-secrets-init
   run_compose_one_shot postgres-tls-init
   run_compose_one_shot minio-data-init
+  run_compose_one_shot aistor-license-init
   if ! compose_live up --detach --no-build --no-deps postgres redis minio; then
     for name in "$postgres" "$redis" "$primary_aistor"; do
       record_owned_container "$name" "$live_project" "$fixture_suffix" || true

@@ -7,6 +7,10 @@ services:
     labels:
       io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
+  aistor-license-init:
+    labels:
+      io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
+
   app-secrets-init:
     labels:
       io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
@@ -129,7 +133,8 @@ services:
         set -a
         . /run/phase5-secrets/runtime.env
         set +a
-        exec minio server /data --console-address :9001 --license /minio.license
+        exec minio server /data --console-address :9001 \
+          --license /license/minio.license
     volumes:
       - type: volume
         source: phase5_runtime_secrets
@@ -148,6 +153,7 @@ services:
       io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   app:
+    image: !reset null
     environment: !override
       HAPPYLEARN_ENV: development
       HAPPYLEARN_LISTEN: ":8080"
@@ -195,6 +201,7 @@ services:
       io.happylearn.phase5.e2e-owner: ${HAPPYLEARN_PHASE5_E2E_OWNER:?}
 
   worker:
+    image: !reset null
     environment: !override
       HAPPYLEARN_ENV: development
       HAPPYLEARN_LISTEN: ":8080"

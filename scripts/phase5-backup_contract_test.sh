@@ -1254,6 +1254,9 @@ const mountSignature = (mount) => [
   mount.bind?.create_host_path === false ? 'no-create' : '',
 ].join('|')
 const allowedMounts = new Map([
+  ['aistor-license-init', [
+    'volume|aistor_license_runtime|/license|rw||',
+  ]],
   ['phase5-secrets-init', [
     `bind|${expectedLiveRoot}/runtime-secrets|/secret-source|ro||no-create`,
     'volume|phase5_runtime_secrets|/secret-target|rw||',
@@ -1266,6 +1269,7 @@ const allowedMounts = new Map([
   ['redis', []],
   ['minio-data-init', ['volume|minio_data|/data|rw||']],
   ['minio', [
+    'volume|aistor_license_runtime|/license|ro||',
     'volume|minio_data|/data|rw||',
     'volume|phase5_runtime_secrets|/run/phase5-secrets|ro|minio|',
   ]],
@@ -1405,6 +1409,10 @@ for (const [name, expectedUser] of Object.entries(expectedUsers)) {
     if (!command.includes('. /run/phase5-secrets/runtime.env') ||
         !command.includes(expectedExecutables[name])) {
       fail(`${name} source/exec mismatch`)
+    }
+    if (name === 'minio' &&
+        !command.includes('--license /license/minio.license')) {
+      fail('minio license path mismatch')
     }
   }
 }

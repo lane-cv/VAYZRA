@@ -236,19 +236,19 @@ test "$permissions_block" = $'permissions:\n  contents: read' ||
 
 license_permission_violation="$(
   awk '
-    $0 == "          printf \047%s\047 \"\$AISTOR_LICENSE\" > \"\$license_file\"" {
+    $0 == "          printf \047%s\047 \"$AISTOR_LICENSE\" > \"$license_file\"" {
       configured++
-      if ((getline) <= 0 || $0 != "          sudo chgrp 0 \"\$license_file\"") {
+      if ((getline) <= 0 || $0 != "          sudo chgrp 0 \"$license_file\"") {
         failed = 1
         print "AIStor license must grant the container root group immediately after creation"
         exit
       }
-      if ((getline) <= 0 || $0 != "          chmod 0440 \"\$license_file\"") {
+      if ((getline) <= 0 || $0 != "          chmod 0440 \"$license_file\"") {
         failed = 1
         print "AIStor license must be made container-readable immediately after creation"
         exit
       }
-      if ((getline) <= 0 || $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"") {
+      if ((getline) <= 0 || $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"$license_file\" >> \"$GITHUB_ENV\"") {
         failed = 1
         print "AIStor license path must be exported immediately after permission hardening"
         exit
@@ -488,7 +488,7 @@ test -z "$forbidden_workflow_control" ||
 github_env_violation="$(
   awk '
     index($0, "$GITHUB_ENV") &&
-      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"" {
+      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"$license_file\" >> \"$GITHUB_ENV\"" {
       print NR
       exit
     }
@@ -505,8 +505,8 @@ secret_print_violation="$(
       exit
     }
     /(echo|printf)[^#]*(AISTOR_LICENSE|secrets\.)/ &&
-      $0 != "          printf \047%s\047 \"\$AISTOR_LICENSE\" > \"\$license_file\"" &&
-      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"\$license_file\" >> \"\$GITHUB_ENV\"" {
+      $0 != "          printf \047%s\047 \"$AISTOR_LICENSE\" > \"$license_file\"" &&
+      $0 != "          printf \047HAPPYLEARN_AISTOR_LICENSE_FILE=%s\\n\047 \"$license_file\" >> \"$GITHUB_ENV\"" {
       print NR
       exit
     }
