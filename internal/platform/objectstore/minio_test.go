@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v4"
 )
 
 func TestObjectStoreMinIOImplementsStore(t *testing.T) {
