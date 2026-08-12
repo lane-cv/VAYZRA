@@ -10,7 +10,7 @@
     "build": "vue-tsc --noEmit && vite build"
   },
   "dependencies": {
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.13",
     "element-plus": "2.14.3",
     "katex": "0.16.22",
     "markdown-it": "14.3.0",
