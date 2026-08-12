@@ -394,14 +394,14 @@ expect_rejected "phase5-wrong-timeout" "$phase5_wrong_timeout" \
 
 phase5_unpinned_checkout="$tmp_dir/phase5-unpinned-checkout.yml"
 mutate_in_job "$source_workflow" "$phase5_unpinned_checkout" '  phase5-e2e:' \
-  '      - uses: actions/checkout@v6.0.2' \
+  '      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2' \
   '      - uses: actions/checkout@main'
 expect_rejected "phase5-unpinned-checkout" "$phase5_unpinned_checkout" \
   "workflow action is not allowlisted and pinned"
 
 phase5_unknown_action="$tmp_dir/phase5-unknown-action.yml"
 mutate_in_job "$source_workflow" "$phase5_unknown_action" '  phase5-e2e:' \
-  '      - uses: actions/checkout@v6.0.2' \
+  '      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2' \
   '      - uses: third-party/unknown@v1.0.0'
 expect_rejected "phase5-unknown-action" "$phase5_unknown_action" \
   "workflow action is not allowlisted and pinned"
