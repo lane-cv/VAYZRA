@@ -1717,13 +1717,16 @@ resource_sample_source="$(
 )"
 run_resource_sample_lifecycle_case() {
   local case_name="$1"
-  local browser_result="$2"
-  local backup_result="$3"
-  local monitor_result="$4"
-  local finalizer_result="$5"
-  local evidence_result="$6"
-  local expected_status="$7"
-  local expected_events="$8"
+  local preflight_result="$2"
+  local browser_result="$3"
+  local backup_result="$4"
+  local monitor_result="$5"
+  local audit_result="$6"
+  local proof_merge_result="$7"
+  local finalizer_result="$8"
+  local evidence_result="$9"
+  local expected_status="${10}"
+  local expected_events="${11}"
   (
     eval "$resource_sample_source"
     case_root="$tmpdir/resource-lifecycle-$case_name"
@@ -1741,6 +1744,10 @@ run_resource_sample_lifecycle_case() {
     install -m 0600 /dev/null "$lifecycle_events"
     append_lifecycle_event() {
       printf '%s\n' "$1" >>"$lifecycle_events"
+    }
+    preflight_resource_one_shots() {
+      append_lifecycle_event preflight
+      return "$preflight_result"
     }
     run_resource_child() {
       local status_file="$1"
@@ -1799,6 +1806,27 @@ run_resource_sample_lifecycle_case() {
         return 94
       printf '%s\n' "$value"
     }
+    audit_resource_one_shots() {
+      local output_variable="$1"
+      [[ "$monitor_active" == false &&
+        -e "$browser_done" &&
+        -e "$backup_done" ]] ||
+        return 90
+      append_lifecycle_event proof
+      ((audit_result == 0)) || return "$audit_result"
+      printf -v "$output_variable" '%s' 'true|true'
+    }
+    merge_resource_one_shot_evidence() {
+      local evidence="$1"
+      local observation="$2"
+      [[ "$evidence" == "$case_root/resource-evidence" &&
+        -s "$evidence" &&
+        "$observation" == 'true|true' ]] ||
+        return 89
+      append_lifecycle_event proof_merge
+      ((proof_merge_result == 0)) || return "$proof_merge_result"
+      printf 'one-shot-evidence\n' >>"$evidence"
+    }
     finalize_backup_proof() {
       local observed_backup_status="$1"
       [[ "$monitor_active" == false &&
@@ -1811,9 +1839,9 @@ run_resource_sample_lifecycle_case() {
     }
     merge_resource_statuses() {
       local merged=0 candidate
-      [[ "$#" -eq 4 ]] || return 92
+      [[ "$#" -eq 5 ]] || return 92
       append_lifecycle_event \
-        "merge:$1,$2,$3,$4"
+        "merge:$1,$2,$3,$4,$5"
       for candidate in "$@"; do
         if ((merged == 0 && candidate != 0)); then
           merged="$candidate"
@@ -1844,17 +1872,26 @@ run_resource_sample_lifecycle_case() {
 }
 
 run_resource_sample_lifecycle_case \
-  success 0 0 0 0 0 0 \
-  $'monitor\nread_browser\nread_backup\nfinalize\nmerge:0,0,0,0\nvalidate'
+  success 0 0 0 0 0 0 0 0 0 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nproof_merge\nfinalize\nmerge:0,0,0,0,0\nvalidate'
 run_resource_sample_lifecycle_case \
-  browser_priority 5 6 7 8 0 5 \
-  $'monitor\nread_browser\nread_backup\nfinalize\nmerge:5,6,7,8'
+  browser_priority 0 5 6 7 0 0 8 0 5 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nproof_merge\nfinalize\nmerge:5,6,7,0,8'
 run_resource_sample_lifecycle_case \
-  finalizer_failure 0 0 0 8 0 8 \
-  $'monitor\nread_browser\nread_backup\nfinalize\nmerge:0,0,0,8'
+  audit_failure 0 0 0 0 9 0 0 0 9 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nfinalize\nmerge:0,0,0,9,0'
 run_resource_sample_lifecycle_case \
-  evidence_failure 0 0 0 0 9 9 \
-  $'monitor\nread_browser\nread_backup\nfinalize\nmerge:0,0,0,0\nvalidate'
+  proof_merge_failure 0 0 0 0 0 11 8 0 11 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nproof_merge\nfinalize\nmerge:0,0,0,11,8'
+run_resource_sample_lifecycle_case \
+  finalizer_failure 0 0 0 0 0 0 8 0 8 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nproof_merge\nfinalize\nmerge:0,0,0,0,8'
+run_resource_sample_lifecycle_case \
+  evidence_failure 0 0 0 0 0 0 0 9 9 \
+  $'preflight\nmonitor\nread_browser\nread_backup\nproof\nproof_merge\nfinalize\nmerge:0,0,0,0,0\nvalidate'
+run_resource_sample_lifecycle_case \
+  preflight_failure 10 0 0 0 0 0 0 0 10 \
+  'preflight'
 
 quiesce_source="$(
   sed -n '/^quiesce_restore_access_containers()/,/^}/p' "$target"
