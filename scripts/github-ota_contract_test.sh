@@ -77,6 +77,25 @@ require_literal "$release_workflow" 'permissions: {}'
 require_literal "$release_workflow" 'persist-credentials: false'
 require_literal "$release_workflow" 'needs: validate'
 require_literal "$release_workflow" '--repo "$GITHUB_REPOSITORY" --verify-tag'
+require_literal "$release_workflow" 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2'
+require_literal "$release_workflow" 'actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0'
+require_literal "$release_workflow" 'git archive --format=tar --prefix="${archive_root}/" "$RELEASE_COMMIT"'
+require_literal "$release_workflow" 'gzip -n > "$archive_file"'
+require_literal "$release_workflow" 'sha256sum "$archive_name" > SHA256SUMS'
+require_literal "$release_workflow" 'sha256sum --check SHA256SUMS'
+require_literal "$release_workflow" '--draft'
+require_literal "$release_workflow" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false'
+require_literal "$release_workflow" '[[ $(jq -r .immutable <<<"$release_json") == true ]]'
+require_literal "$release_workflow" 'name: github-release-package-${{ github.run_id }}'
+require_literal "$release_workflow" 'path: |'
+require_literal "$release_workflow" '${{ runner.temp }}/github-release-package/${{ steps.package.outputs.archive_name }}'
+require_literal "$release_workflow" '${{ runner.temp }}/github-release-package/SHA256SUMS'
+require_literal "$release_workflow" 'if-no-files-found: error'
+require_literal "$release_workflow" 'retention-days: 1'
+require_literal "$release_workflow" "find \"\$package_dir\" -mindepth 1 -maxdepth 1 -printf '%f\\n' | LC_ALL=C sort"
+require_literal "$release_workflow" "expected_files=\$(printf '%s\\n%s\\n' \"\$archive_name\" SHA256SUMS | LC_ALL=C sort)"
+require_literal "$release_workflow" "release_assets=\$(jq -r '[.assets[].name] | sort | .[]' <<<\"\$release_json\")"
+require_literal "$release_workflow" ' $relative_entry != */.. && $relative_entry != */../* '
 
 while IFS= read -r action; do
   [[ $action =~ @[0-9a-f]{40}$ ]] || fail "GitHub Action is not pinned to a full commit SHA: $action"

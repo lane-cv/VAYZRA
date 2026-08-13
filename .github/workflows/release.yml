@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       release_commit: ${{ steps.validate-tag.outputs.release_commit }}
+      archive_name: ${{ steps.package.outputs.archive_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -81,6 +82,44 @@ jobs:
       - run: pnpm lint
       - run: pnpm --dir web build
 
+      - name: Package deterministic release source archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_root="VAYZRA-${GITHUB_REF_NAME}"
+          archive_name="${archive_root}.tar.gz"
+          package_dir="$RUNNER_TEMP/github-release-package"
+          archive_file="$package_dir/$archive_name"
+          install -d -m 0700 "$package_dir"
+          git archive --format=tar --prefix="${archive_root}/" "$RELEASE_COMMIT" | gzip -n > "$archive_file"
+
+          mapfile -t archive_entries < <(tar -tzf "$archive_file")
+          ((${#archive_entries[@]} > 0))
+          for entry in "${archive_entries[@]}"; do
+            [[ -n $entry && $entry == "${archive_root}/"* && $entry != /* ]] || exit 1
+            relative_entry=${entry#"${archive_root}/"}
+            [[ -z $relative_entry || ( $relative_entry != .. && $relative_entry != ../* && $relative_entry != */.. && $relative_entry != */../* ) ]] || exit 1
+          done
+
+          cd "$package_dir"
+          sha256sum "$archive_name" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          for package_file in "$archive_file" "$package_dir/SHA256SUMS"; do
+            [[ -f $package_file && ! -L $package_file ]]
+          done
+          printf 'archive_name=%s\n' "$archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: github-release-package-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/github-release-package/${{ steps.package.outputs.archive_name }}
+            ${{ runner.temp }}/github-release-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     needs: validate
     permissions:
@@ -88,13 +127,42 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Revalidate tag and publish GitHub Release
+      - name: Download release package
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: github-release-package-${{ github.run_id }}
+          path: ${{ runner.temp }}/github-release-package
+
+      - name: Revalidate tag and publish immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+          ARCHIVE_NAME: ${{ needs.validate.outputs.archive_name }}
         shell: bash
         run: |
           set -euo pipefail
+          archive_root="VAYZRA-${GITHUB_REF_NAME}"
+          archive_name="$ARCHIVE_NAME"
+          package_dir="$RUNNER_TEMP/github-release-package"
+          archive_file="$package_dir/$archive_name"
+          checksum_file="$package_dir/SHA256SUMS"
+          expected_files=$(printf '%s\n%s\n' "$archive_name" SHA256SUMS | LC_ALL=C sort)
+          top_level_files=$(find "$package_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+          actual_files=$(find "$package_dir" -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
+          [[ "$top_level_files" == "$expected_files" && "$actual_files" == "$expected_files" ]]
+          for package_file in "$archive_file" "$checksum_file"; do
+            [[ -f $package_file && ! -L $package_file ]]
+          done
+          cd "$package_dir"
+          sha256sum --check SHA256SUMS
+          mapfile -t archive_entries < <(tar -tzf "$archive_file")
+          ((${#archive_entries[@]} > 0))
+          for entry in "${archive_entries[@]}"; do
+            [[ -n $entry && $entry == "${archive_root}/"* && $entry != /* ]] || exit 1
+            relative_entry=${entry#"${archive_root}/"}
+            [[ -z $relative_entry || ( $relative_entry != .. && $relative_entry != ../* && $relative_entry != */.. && $relative_entry != */../* ) ]] || exit 1
+          done
+
           tag_ref=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
           object_type=$(jq -r '.object.type' <<<"$tag_ref")
           object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
@@ -108,4 +176,15 @@ jobs:
             object_sha=$(jq -r '.object.sha' <<<"$tag_object")
           done
           [[ "$object_type" == commit && "$object_sha" == "$RELEASE_COMMIT" ]]
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME" --draft
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          release_json=$(gh api --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")
+          [[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]
+          [[ $(jq -r .draft <<<"$release_json") == false ]]
+          [[ $(jq -r .prerelease <<<"$release_json") == false ]]
+          [[ $(jq -r .immutable <<<"$release_json") == true ]]
+          release_assets=$(jq -r '[.assets[].name] | sort | .[]' <<<"$release_json")
+          [[ "$release_assets" == "$expected_files" ]]
