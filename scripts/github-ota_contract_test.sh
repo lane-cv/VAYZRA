@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 deploy_script="$repo_root/scripts/deploy-from-github.sh"
-release_workflow="$repo_root/.github/workflows/release.yml"
+release_workflow="${HAPPYLEARN_RELEASE_WORKFLOW:-$repo_root/.github/workflows/release.yml}"
 verify_workflow="$repo_root/.github/workflows/verify.yml"
 phase6_workflow="$repo_root/.github/workflows/phase6.yml"
 compose_override="$repo_root/deploy/compose.github.yml"
@@ -21,7 +21,215 @@ fail() {
 
 require_literal() {
   local file=$1 literal=$2
-  grep -Fq -- "$literal" "$file" || fail "missing contract in ${file#"$repo_root"/}: $literal"
+  grep -Fq -- "$literal" "$file" || {
+    if [[ ${HAPPYLEARN_CONTRACT_PROBE:-0} == 1 ]]; then return 1; fi
+    fail "missing contract in ${file#"$repo_root"/}: $literal"
+  }
+}
+
+require_workflow_order() {
+  local file=$1 before=$2 after=$3 before_line after_line
+  before_line=$(grep -nF -- "$before" "$file" | head -n 1 | cut -d: -f1) || return 1
+  after_line=$(grep -nF -- "$after" "$file" | head -n 1 | cut -d: -f1) || return 1
+  [[ $before_line -lt $after_line ]]
+}
+
+require_line_count() {
+  local file=$1 literal=$2 expected_count=$3 actual_count
+  actual_count=$(grep -Fxc -- "$literal" "$file" || true)
+  [[ $actual_count -eq $expected_count ]]
+}
+
+require_literal_count() {
+  local file=$1 literal=$2 expected_count=$3 actual_count
+  actual_count=$(grep -Fc -- "$literal" "$file" || true)
+  [[ $actual_count -eq $expected_count ]]
+}
+
+release_create_is_preflight_guarded() {
+  local file=$1 preflight_line else_line create_line
+  preflight_line=$(grep -nF -- '          if release_view=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets 2>/dev/null); then' "$file" | head -n 1 | cut -d: -f1) || return 1
+  else_line=$(awk -v start="$preflight_line" 'NR > start && /^          else$/ { print NR; exit }' "$file") || return 1
+  create_line=$(grep -nF -- 'gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file"' "$file" | head -n 1 | cut -d: -f1) || return 1
+  [[ -n $else_line && $preflight_line -lt $else_line && $else_line -lt $create_line ]] || return 1
+  require_literal_count "$file" 'gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file"' 1
+}
+
+validate_contract_archive() {
+  local archive_file=$1 archive_root=$2 archive_listing entry relative_entry result=0
+  declare -A seen_entries=()
+  archive_listing=$(mktemp)
+  tar -tzf "$archive_file" > "$archive_listing" || result=1
+  if ((result == 0)); then
+  mapfile -t archive_entries < "$archive_listing"
+    ((${#archive_entries[@]} > 0)) || result=1
+    for entry in "${archive_entries[@]}"; do
+      [[ -n $entry && $entry == "${archive_root}/"* && $entry != /* ]] || result=1
+      [[ -z ${seen_entries[$entry]+_} ]] || result=1
+      seen_entries["$entry"]=1
+      relative_entry=${entry#"${archive_root}/"}
+      [[ -z $relative_entry || ( $relative_entry != .. && $relative_entry != ../* && $relative_entry != */.. && $relative_entry != */../* ) ]] || result=1
+    done
+  fi
+  rm -f -- "$archive_listing"
+  return "$result"
+}
+
+validate_contract_checksum() {
+  local package_dir=$1 archive_name=$2 expected_checksum result=0
+  expected_checksum=$(mktemp)
+  (
+    cd "$package_dir"
+    sha256sum "$archive_name" > "$expected_checksum"
+    cmp -s "$expected_checksum" SHA256SUMS && sha256sum --check SHA256SUMS
+  ) || result=1
+  rm -f -- "$expected_checksum"
+  return "$result"
+}
+
+release_package_contract() {
+  local file=$1 upload_paths expected_upload_paths
+  require_literal "$file" 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2' || return 1
+  require_literal "$file" 'actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0' || return 1
+  require_literal "$file" 'git archive --format=tar --prefix="${archive_root}/" "$RELEASE_COMMIT"' || return 1
+  require_literal "$file" 'gzip -n > "$archive_file"' || return 1
+  require_literal "$file" 'tar -tzf "$archive_file" > "$archive_listing"' || return 1
+  require_literal "$file" '[[ -z ${seen_entries[$entry]+_} ]]' || return 1
+  require_literal "$file" 'sha256sum "$archive_name" > SHA256SUMS' || return 1
+  require_literal "$file" 'cmp -s "$expected_checksum" SHA256SUMS' || return 1
+  require_literal "$file" 'sha256sum --check SHA256SUMS' || return 1
+  require_literal "$file" 'name: github-release-package-${{ github.run_id }}' || return 1
+  require_literal "$file" 'if-no-files-found: error' || return 1
+  require_literal "$file" 'retention-days: 1' || return 1
+  expected_upload_paths=$'            ${{ runner.temp }}/github-release-package/${{ steps.package.outputs.archive_name }}\n            ${{ runner.temp }}/github-release-package/SHA256SUMS'
+  upload_paths=$(awk '
+    /^      - name: Upload release package$/ { upload=1 }
+    upload && /^          path: \|$/ { paths=1; next }
+    paths && /^            / { print; next }
+    paths { exit }
+  ' "$file")
+  [[ $upload_paths == "$expected_upload_paths" ]] || return 1
+  require_literal "$file" "actual_files=\$(find \"\$package_dir\" -mindepth 1 -printf '%P\\n' | LC_ALL=C sort)" || return 1
+  require_literal "$file" '[[ "$top_level_files" == "$expected_files" && "$actual_files" == "$expected_files" ]]' || return 1
+  require_literal "$file" 'gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file"' || return 1
+  require_literal "$file" '--title "$GITHUB_REF_NAME" --draft' || return 1
+  require_literal "$file" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
+  require_literal "$file" "X-GitHub-Api-Version: 2026-03-10" || return 1
+  require_literal "$file" '[[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .draft <<<"$release_json") == false ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .prerelease <<<"$release_json") == false ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .immutable <<<"$release_json") == true ]]' || return 1
+  require_literal "$file" "release_assets=\$(jq -r '[.assets[].name] | sort | .[]' <<<\"\$release_json\")" || return 1
+  require_literal "$file" '[[ "$release_assets" == "$expected_files" ]]' || return 1
+  require_literal "$file" 'gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets' || return 1
+  require_literal "$file" '[[ $(jq -r .tagName <<<"$release_view") == "$GITHUB_REF_NAME" ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .isPrerelease <<<"$release_view") == false ]]' || return 1
+  require_literal "$file" 'if [[ $(jq -r .isDraft <<<"$release_view") == true ]]; then' || return 1
+  require_literal "$file" '[[ $(jq -r .isImmutable <<<"$release_view") == false && "$release_assets" == "$expected_files" ]] || {' || return 1
+  require_literal "$file" '[[ $(jq -r .isImmutable <<<"$release_view") == true && "$release_assets" == "$expected_files" ]] || {' || return 1
+  require_literal "$file" 'Existing draft release for $GITHUB_REF_NAME is partial or unexpected' || return 1
+  require_literal "$file" 'Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state' || return 1
+  require_literal "$file" 'if [[ -z $release_view || $(jq -r .isDraft <<<"$release_view") == true ]]; then' || return 1
+  require_line_count "$file" '            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' 1 || return 1
+  release_create_is_preflight_guarded "$file" || return 1
+  require_workflow_order "$file" '--title "$GITHUB_REF_NAME" --draft' 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
+  require_workflow_order "$file" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' "X-GitHub-Api-Version: 2026-03-10" || return 1
+}
+
+release_package_negative_probes() {
+  local fixture archive_name='VAYZRA-v0.1.2.tar.gz' archive_root='VAYZRA-v0.1.2'
+  fixture=$(mktemp -d)
+  mkdir -p "$fixture/$archive_root"
+  printf 'release package probe\n' > "$fixture/$archive_root/file"
+  tar -C "$fixture" -czf "$fixture/$archive_name" "$archive_root"
+
+  cp "$fixture/$archive_name" "$fixture/truncated.tar.gz"
+  truncate -s -8 "$fixture/truncated.tar.gz"
+  if validate_contract_archive "$fixture/truncated.tar.gz" "$archive_root"; then
+    fail 'archive validator accepted a truncated archive'
+  fi
+
+  tar -C "$fixture" -cf "$fixture/duplicate.tar" "$archive_root/file"
+  tar -C "$fixture" -rf "$fixture/duplicate.tar" "$archive_root/file"
+  gzip -n < "$fixture/duplicate.tar" > "$fixture/duplicate.tar.gz"
+  if validate_contract_archive "$fixture/duplicate.tar.gz" "$archive_root"; then
+    fail 'archive validator accepted duplicate members'
+  fi
+
+  tar -C "$fixture" --transform="s#^#${archive_root}/../#" -czf "$fixture/traversal.tar.gz" "$archive_root/file"
+  if validate_contract_archive "$fixture/traversal.tar.gz" "$archive_root"; then
+    fail 'archive validator accepted a traversal member'
+  fi
+
+  (
+    cd "$fixture"
+    sha256sum "$archive_name" > SHA256SUMS
+    printf '\357\273\277' | cat - SHA256SUMS > checksum-with-bom
+    mv checksum-with-bom SHA256SUMS
+  )
+  if validate_contract_checksum "$fixture" "$archive_name"; then
+    fail 'checksum validator accepted a BOM manifest'
+  fi
+  (
+    cd "$fixture"
+    sha256sum "$archive_name" > SHA256SUMS
+    sha256sum "$archive_name" >> SHA256SUMS
+  )
+  if validate_contract_checksum "$fixture" "$archive_name"; then
+    fail 'checksum validator accepted duplicate checksum entries'
+  fi
+  rm -rf -- "$fixture"
+}
+
+release_package_workflow_mutation_probes() {
+  local fixture
+  fixture=$(mktemp)
+  cp "$release_workflow" "$fixture"
+
+  sed '/--title "\$GITHUB_REF_NAME" --draft$/s/ --draft$//' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted create without draft'; fi
+
+  awk '
+    /^            \$\{\{ runner\.temp \}\}\/github-release-package\/SHA256SUMS$/ { print; print "            ${{ runner.temp }}/github-release-package/EXTRA"; next }
+    { print }
+  ' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted an extra upload path'; fi
+
+  sed '/actual_files=$(find "\$package_dir" -mindepth 1 -printf/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing recursive downloaded-file closure'; fi
+
+  sed '/\[\[ "\$release_assets" == "\$expected_files" \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final asset closure'; fi
+
+  awk '
+    { lines[NR]=$0 }
+    /gh release create "\$GITHUB_REF_NAME" "\$archive_file" "\$checksum_file"/ { create=NR }
+    /gh release edit "\$GITHUB_REF_NAME" --repo "\$GITHUB_REPOSITORY" --draft=false/ { edit=NR }
+    END {
+      for (line=1; line<=NR; line++) {
+        if (line == create) print lines[edit]
+        if (line != edit) print lines[line]
+      }
+    }
+  ' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted edit before create'; fi
+
+  sed '/X-GitHub-Api-Version: 2026-03-10/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing API version'; fi
+
+  sed '/\[\[ $(jq -r .tag_name <<<"\$release_json") == "\$GITHUB_REF_NAME" \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final tag assertion'; fi
+
+  sed '/\[\[ $(jq -r .draft <<<"\$release_json") == false \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final draft assertion'; fi
+
+  sed '/\[\[ $(jq -r .prerelease <<<"\$release_json") == false \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final prerelease assertion'; fi
+
+  sed '/\[\[ $(jq -r .immutable <<<"\$release_json") == true \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing immutable assertion'; fi
+
+  rm -f -- "$fixture"
 }
 
 dockerfile_images_pinned() {
@@ -77,25 +285,9 @@ require_literal "$release_workflow" 'permissions: {}'
 require_literal "$release_workflow" 'persist-credentials: false'
 require_literal "$release_workflow" 'needs: validate'
 require_literal "$release_workflow" '--repo "$GITHUB_REPOSITORY" --verify-tag'
-require_literal "$release_workflow" 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2'
-require_literal "$release_workflow" 'actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0'
-require_literal "$release_workflow" 'git archive --format=tar --prefix="${archive_root}/" "$RELEASE_COMMIT"'
-require_literal "$release_workflow" 'gzip -n > "$archive_file"'
-require_literal "$release_workflow" 'sha256sum "$archive_name" > SHA256SUMS'
-require_literal "$release_workflow" 'sha256sum --check SHA256SUMS'
-require_literal "$release_workflow" '--draft'
-require_literal "$release_workflow" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false'
-require_literal "$release_workflow" '[[ $(jq -r .immutable <<<"$release_json") == true ]]'
-require_literal "$release_workflow" 'name: github-release-package-${{ github.run_id }}'
-require_literal "$release_workflow" 'path: |'
-require_literal "$release_workflow" '${{ runner.temp }}/github-release-package/${{ steps.package.outputs.archive_name }}'
-require_literal "$release_workflow" '${{ runner.temp }}/github-release-package/SHA256SUMS'
-require_literal "$release_workflow" 'if-no-files-found: error'
-require_literal "$release_workflow" 'retention-days: 1'
-require_literal "$release_workflow" "find \"\$package_dir\" -mindepth 1 -maxdepth 1 -printf '%f\\n' | LC_ALL=C sort"
-require_literal "$release_workflow" "expected_files=\$(printf '%s\\n%s\\n' \"\$archive_name\" SHA256SUMS | LC_ALL=C sort)"
-require_literal "$release_workflow" "release_assets=\$(jq -r '[.assets[].name] | sort | .[]' <<<\"\$release_json\")"
-require_literal "$release_workflow" ' $relative_entry != */.. && $relative_entry != */../* '
+release_package_contract "$release_workflow" || fail 'release package contract is incomplete'
+release_package_negative_probes
+release_package_workflow_mutation_probes
 
 while IFS= read -r action; do
   [[ $action =~ @[0-9a-f]{40}$ ]] || fail "GitHub Action is not pinned to a full commit SHA: $action"

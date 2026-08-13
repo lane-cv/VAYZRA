@@ -94,17 +94,31 @@ jobs:
           install -d -m 0700 "$package_dir"
           git archive --format=tar --prefix="${archive_root}/" "$RELEASE_COMMIT" | gzip -n > "$archive_file"
 
-          mapfile -t archive_entries < <(tar -tzf "$archive_file")
+          archive_listing=$(mktemp "$package_dir/archive-listing.XXXXXX")
+          trap 'rm -f -- "$archive_listing"' EXIT
+          tar -tzf "$archive_file" > "$archive_listing"
+          mapfile -t archive_entries < "$archive_listing"
           ((${#archive_entries[@]} > 0))
+          declare -A seen_entries=()
           for entry in "${archive_entries[@]}"; do
             [[ -n $entry && $entry == "${archive_root}/"* && $entry != /* ]] || exit 1
+            [[ -z ${seen_entries[$entry]+_} ]] || exit 1
+            seen_entries["$entry"]=1
             relative_entry=${entry#"${archive_root}/"}
             [[ -z $relative_entry || ( $relative_entry != .. && $relative_entry != ../* && $relative_entry != */.. && $relative_entry != */../* ) ]] || exit 1
           done
+          rm -f -- "$archive_listing"
+          trap - EXIT
 
           cd "$package_dir"
           sha256sum "$archive_name" > SHA256SUMS
+          expected_checksum=$(mktemp "$package_dir/expected-checksum.XXXXXX")
+          trap 'rm -f -- "$expected_checksum"' EXIT
+          sha256sum "$archive_name" > "$expected_checksum"
+          cmp -s "$expected_checksum" SHA256SUMS
           sha256sum --check SHA256SUMS
+          rm -f -- "$expected_checksum"
+          trap - EXIT
           for package_file in "$archive_file" "$package_dir/SHA256SUMS"; do
             [[ -f $package_file && ! -L $package_file ]]
           done
@@ -154,14 +168,28 @@ jobs:
             [[ -f $package_file && ! -L $package_file ]]
           done
           cd "$package_dir"
+          expected_checksum=$(mktemp "$package_dir/expected-checksum.XXXXXX")
+          trap 'rm -f -- "$expected_checksum"' EXIT
+          sha256sum "$archive_name" > "$expected_checksum"
+          cmp -s "$expected_checksum" SHA256SUMS
           sha256sum --check SHA256SUMS
-          mapfile -t archive_entries < <(tar -tzf "$archive_file")
+          rm -f -- "$expected_checksum"
+          trap - EXIT
+          archive_listing=$(mktemp "$package_dir/archive-listing.XXXXXX")
+          trap 'rm -f -- "$archive_listing"' EXIT
+          tar -tzf "$archive_file" > "$archive_listing"
+          mapfile -t archive_entries < "$archive_listing"
           ((${#archive_entries[@]} > 0))
+          declare -A seen_entries=()
           for entry in "${archive_entries[@]}"; do
             [[ -n $entry && $entry == "${archive_root}/"* && $entry != /* ]] || exit 1
+            [[ -z ${seen_entries[$entry]+_} ]] || exit 1
+            seen_entries["$entry"]=1
             relative_entry=${entry#"${archive_root}/"}
             [[ -z $relative_entry || ( $relative_entry != .. && $relative_entry != ../* && $relative_entry != */.. && $relative_entry != */../* ) ]] || exit 1
           done
+          rm -f -- "$archive_listing"
+          trap - EXIT
 
           tag_ref=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
           object_type=$(jq -r '.object.type' <<<"$tag_ref")
@@ -176,10 +204,32 @@ jobs:
             object_sha=$(jq -r '.object.sha' <<<"$tag_object")
           done
           [[ "$object_type" == commit && "$object_sha" == "$RELEASE_COMMIT" ]]
-          gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file" \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-            --title "$GITHUB_REF_NAME" --draft
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
+          release_view=''
+          if release_view=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets 2>/dev/null); then
+            release_assets=$(jq -r '[.assets[].name] | sort | .[]' <<<"$release_view")
+            [[ $(jq -r .tagName <<<"$release_view") == "$GITHUB_REF_NAME" ]]
+            [[ $(jq -r .isPrerelease <<<"$release_view") == false ]]
+            if [[ $(jq -r .isDraft <<<"$release_view") == true ]]; then
+              [[ $(jq -r .isImmutable <<<"$release_view") == false && "$release_assets" == "$expected_files" ]] || {
+                echo "Existing draft release for $GITHUB_REF_NAME is partial or unexpected; inspect it and delete it manually before retrying." >&2
+                exit 1
+              }
+            else
+              [[ $(jq -r .isImmutable <<<"$release_view") == true && "$release_assets" == "$expected_files" ]] || {
+                echo "Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state; inspect it manually." >&2
+                exit 1
+              }
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --title "$GITHUB_REF_NAME" --draft
+          fi
+
+          if [[ -z $release_view || $(jq -r .isDraft <<<"$release_view") == true ]]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
           release_json=$(gh api --header 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")
           [[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]
