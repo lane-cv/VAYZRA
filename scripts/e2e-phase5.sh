@@ -1244,7 +1244,7 @@ diagnostics() {
 
 cleanup() {
   local exit_status="${1:-$?}"
-  local sanitizer_status=0 cleanup_status=0
+  local sanitizer_status=0 cleanup_status=0 reclaim_status=0
   local resource_report="$artifact_dir/resource-samples.tsv"
   local preserved_resource_evidence="$tmpdir/preserved-resource-evidence"
   local preserve_resource_evidence=false
@@ -1256,6 +1256,10 @@ cleanup() {
   cancel_bounded_command || cleanup_status=1
   remove_active_temporary_containers || cleanup_status=1
   recover_active_restore_run || cleanup_status=1
+  if [[ -z "$probe_mode" ]]; then
+    reclaim_artifact_results || reclaim_status=$?
+  fi
+  if ((reclaim_status != 0)); then cleanup_status=1; fi
   if ((exit_status != 0)); then diagnostics || true; fi
   if [[ -e "$resource_report" ]]; then
     if [[ -f "$resource_report" &&
@@ -1267,7 +1271,9 @@ cleanup() {
       sanitizer_status=1
     fi
   fi
-  if artifact_target_is_safe; then
+  if ((reclaim_status != 0)); then
+    sanitizer_status=2
+  elif artifact_target_is_safe; then
     bash "$script_dir/sanitize-e2e-artifacts.sh" "$artifact_dir" ||
       sanitizer_status=$?
   else
@@ -1682,6 +1688,36 @@ initialize_artifact_directory() {
     --mount "type=bind,src=$artifact_dir/results,dst=/artifacts" \
     "$init_image" /bin/sh -eu -c \
     'printf "%s\n" PHASE5_ARTIFACT_WRITE_PROBE > /artifacts/.write-probe; test "$(stat -c "%u:%g:%a" /artifacts/.write-probe)" = 1000:1000:644; rm /artifacts/.write-probe'
+}
+
+reclaim_artifact_results() {
+  local host_uid host_gid results_path canonical_results helper_status=0
+  artifact_target_is_safe || return 2
+  results_path="$artifact_dir/results"
+  [[ -d "$results_path" && ! -L "$results_path" ]] || return 2
+  host_uid="$(id -u)" || return 2
+  host_gid="$(id -g)" || return 2
+  [[ "$host_uid" =~ ^[0-9]+$ && "$host_gid" =~ ^[0-9]+$ ]] || return 2
+  docker_bounded 120 run --rm --name "$artifact_init" \
+    --label "com.docker.compose.project=${live_project}" \
+    --label "io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
+    --network none --read-only --user 0:0 --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges --memory 16m --cpus .05 \
+    --tmpfs /tmp:rw,noexec,nosuid,size=4m \
+    --mount "type=bind,src=$results_path,dst=/results" \
+    "$init_image" /bin/sh -eu -c '
+      case "$1:$2" in
+        *[!0-9:]*|:*|*:) exit 2 ;;
+      esac
+      chown -Rh "$1:$2" /results
+    ' sh "$host_uid" "$host_gid" || helper_status=$?
+  ((helper_status == 0)) || return "$helper_status"
+  canonical_results="$(cd "$results_path" && pwd -P)" || return 1
+  [[ "$canonical_results" == "$results_path" ]] || return 1
+  [[ -d "$canonical_results" && ! -L "$canonical_results" &&
+    "$(portable_file_owner "$canonical_results")" == "$host_uid" &&
+    "$(portable_file_group "$canonical_results")" == "$host_gid" ]]
 }
 
 initialize_resources() {

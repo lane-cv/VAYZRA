@@ -1225,6 +1225,47 @@ require_literal "$target" 'init-e2e-artifacts.sh'
 require_literal "$target" 'PHASE5_ARTIFACT_WRITE_PROBE'
 require_literal "$target" '--user 1000:1000 --cap-drop ALL'
 cleanup_block="$(sed -n '/^cleanup()/,/^}/p' "$target")"
+artifact_reclaim_line="$(
+  grep -n 'reclaim_artifact_results' <<<"$cleanup_block" | cut -d: -f1 || true
+)"
+artifact_probe_guard_line="$(
+  grep -n 'if \[\[ -z "$probe_mode" \]\]; then' <<<"$cleanup_block" |
+    cut -d: -f1
+)"
+resource_cancel_line="$(
+  grep -n 'cancel_resource_workloads' <<<"$cleanup_block" | cut -d: -f1
+)"
+bounded_cancel_line="$(
+  grep -n 'cancel_bounded_command' <<<"$cleanup_block" | cut -d: -f1
+)"
+temporary_cancel_line="$(
+  grep -n 'remove_active_temporary_containers' <<<"$cleanup_block" | cut -d: -f1
+)"
+restore_recovery_line="$(
+  grep -n 'recover_active_restore_run' <<<"$cleanup_block" | cut -d: -f1
+)"
+diagnostics_line="$(
+  grep -n 'then diagnostics' <<<"$cleanup_block" | cut -d: -f1
+)"
+artifact_sanitize_line="$(
+  grep -n 'sanitize-e2e-artifacts.sh' <<<"$cleanup_block" | cut -d: -f1 || true
+)"
+[[ "$resource_cancel_line" =~ ^[0-9]+$ &&
+  "$bounded_cancel_line" =~ ^[0-9]+$ &&
+  "$temporary_cancel_line" =~ ^[0-9]+$ &&
+  "$restore_recovery_line" =~ ^[0-9]+$ &&
+  "$artifact_probe_guard_line" =~ ^[0-9]+$ &&
+  "$artifact_reclaim_line" =~ ^[0-9]+$ &&
+  "$diagnostics_line" =~ ^[0-9]+$ &&
+  "$artifact_sanitize_line" =~ ^[0-9]+$ &&
+  "$resource_cancel_line" -lt "$artifact_reclaim_line" &&
+  "$bounded_cancel_line" -lt "$artifact_reclaim_line" &&
+  "$temporary_cancel_line" -lt "$artifact_reclaim_line" &&
+  "$restore_recovery_line" -lt "$artifact_reclaim_line" &&
+  "$artifact_probe_guard_line" -lt "$artifact_reclaim_line" &&
+  "$artifact_reclaim_line" -lt "$diagnostics_line" &&
+  "$artifact_reclaim_line" -lt "$artifact_sanitize_line" ]] ||
+  fail 'cleanup did not quiesce writers and reclaim artifacts before diagnostics'
 if grep -Fq -- 'docker_bounded 30 rm -f "${temporary_containers[@]}"' "$target" ||
   grep -Fq -- 'docker_bounded 30 rm -f "${service_containers[@]}"' "$target" ||
   grep -Fq -- \
@@ -1254,6 +1295,84 @@ contract_cleanup() {
   rm -rf "$tmpdir"
 }
 trap contract_cleanup EXIT
+
+artifact_reclaim_source="$(
+  sed -n '/^reclaim_artifact_results()/,/^}/p' "$target"
+)"
+artifact_reclaim_helper_line="$(
+  grep -n 'docker_bounded 120 run' <<<"$artifact_reclaim_source" |
+    cut -d: -f1
+)"
+artifact_reclaim_canonical_line="$(
+  grep -n 'canonical_results=.*pwd -P' <<<"$artifact_reclaim_source" |
+    cut -d: -f1
+)"
+[[ "$artifact_reclaim_helper_line" =~ ^[0-9]+$ &&
+  "$artifact_reclaim_canonical_line" =~ ^[0-9]+$ &&
+  "$artifact_reclaim_helper_line" -lt "$artifact_reclaim_canonical_line" ]] ||
+  fail 'artifact reclaim tried to traverse the foreign 0700 tree before chown'
+run_artifact_reclaim_case() {
+  local case_name="$1"
+  local safe_target="$2"
+  local docker_status="$3"
+  local observed_owner="$4"
+  local observed_group="$5"
+  local expected_status="$6"
+  (
+    eval "$artifact_reclaim_source"
+    artifact_dir="$tmpdir/artifact-reclaim-$case_name"
+    artifact_init="phase5-artifact-init-$case_name"
+    init_image='alpine:test'
+    live_project=happylearn-phase5-live-a1b2c3d4e5f6
+    fixture_suffix=a1b2c3d4e5f6
+    mkdir -p "$artifact_dir/results"
+    docker_log="$artifact_dir/docker.log"
+    docker_complete=false
+    install -m 0600 /dev/null "$docker_log"
+    id() {
+      case "${1-}" in
+        -u) printf '%s\n' 1001 ;;
+        -g) printf '%s\n' 127 ;;
+        *) return 2 ;;
+      esac
+    }
+    artifact_target_is_safe() { [[ "$safe_target" == true ]]; }
+    cd() {
+      [[ "$docker_complete" == true ]] || return 88
+      builtin cd "$@"
+    }
+    portable_file_owner() { printf '%s\n' "$observed_owner"; }
+    portable_file_group() { printf '%s\n' "$observed_group"; }
+    docker_bounded() {
+      printf '%s\n' "$*" >>"$docker_log"
+      if ((docker_status == 0)); then docker_complete=true; fi
+      return "$docker_status"
+    }
+    actual_status=0
+    reclaim_artifact_results || actual_status=$?
+    [[ "$actual_status" -eq "$expected_status" ]] ||
+      fail "artifact reclaim $case_name returned $actual_status, expected $expected_status"
+    if [[ "$safe_target" == true ]]; then
+      grep -Fq -- '--network none --read-only --user 0:0' "$docker_log" ||
+        fail "artifact reclaim $case_name lost its isolated root helper"
+      grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE' \
+        "$docker_log" ||
+        fail "artifact reclaim $case_name broadened helper capabilities"
+      grep -Fq -- 'chown -Rh "$1:$2" /results' "$docker_log" ||
+        fail "artifact reclaim $case_name did not recursively hand ownership back"
+      grep -Fq -- 'sh 1001 127' "$docker_log" ||
+        fail "artifact reclaim $case_name did not bind the host identity positionally"
+    else
+      [[ ! -s "$docker_log" ]] ||
+        fail "artifact reclaim $case_name invoked Docker for an unsafe target"
+    fi
+  )
+}
+
+run_artifact_reclaim_case success true 0 1001 127 0
+run_artifact_reclaim_case docker_failure true 41 1001 127 41
+run_artifact_reclaim_case owner_mismatch true 0 1000 1000 1
+run_artifact_reclaim_case unsafe_target false 0 1001 127 2
 
 contract_file_mode() {
   if stat -c '%a' "$1" >/dev/null 2>&1; then
