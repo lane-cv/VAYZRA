@@ -107,6 +107,9 @@ const expected = new Map([
 const assets = release.assets;
 process.exit(
   Array.isArray(assets) && assets.length === expected.size &&
+  new Set(assets.map((asset) => asset.name)).size === expected.size &&
+  assets.some((asset) => asset.name === archiveName) &&
+  assets.some((asset) => asset.name === 'SHA256SUMS') &&
   assets.every((asset) => {
     const expectedAsset = expected.get(asset.name);
     return expectedAsset !== undefined && asset.state === 'uploaded' &&
@@ -114,6 +117,16 @@ process.exit(
   }) ? 0 : 1,
 );
 NODE
+}
+
+validate_contract_direct_annotated_tag() {
+  local repository=$1 tag_name=$2 expected_commit=$3 tag_object_sha target_object_sha
+  [[ $(git -C "$repository" cat-file -t "$tag_name") == tag ]] || return 1
+  tag_object_sha=$(git -C "$repository" rev-parse "$tag_name")
+  target_object_sha=$(git -C "$repository" cat-file -p "$tag_object_sha" | sed -n '1s/^object //p')
+  [[ $target_object_sha =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ $(git -C "$repository" cat-file -t "$target_object_sha") == commit ]] || return 1
+  [[ $target_object_sha == "$expected_commit" ]]
 }
 
 release_package_contract() {
@@ -170,6 +183,9 @@ release_package_contract() {
   require_literal "$file" '.state == "uploaded" and' || return 1
   require_literal "$file" '(.size == $archive_size and .digest == $archive_digest)' || return 1
   require_literal "$file" '(.size == $checksum_size and .digest == $checksum_digest)' || return 1
+  require_line_count "$file" '                  .state == "uploaded" and' 1 || return 1
+  require_line_count "$file" '                    (.size == $archive_size and .digest == $archive_digest)' 1 || return 1
+  require_line_count "$file" '                    (.size == $checksum_size and .digest == $checksum_digest)' 1 || return 1
   require_line_count "$file" '            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' 1 || return 1
   release_create_is_preflight_guarded "$file" || return 1
   require_workflow_order "$file" '--title "$GITHUB_REF_NAME" --draft' 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
@@ -178,6 +194,11 @@ release_package_contract() {
   require_literal "$file" 'tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")' || return 1
   require_literal "$file" "[[ \$(jq -r '.object.type' <<<\"\$tag_object\") == commit ]]" || return 1
   require_literal "$file" "[[ \$(jq -r '.object.sha' <<<\"\$tag_object\") == \"\$RELEASE_COMMIT\" ]]" || return 1
+  require_literal "$file" 'tag_object_type=$(git cat-file -t "$GITHUB_REF_NAME")' || return 1
+  require_literal "$file" '[[ "$tag_object_type" == tag ]]' || return 1
+  require_literal "$file" 'tag_target_sha=$(git cat-file -p "$tag_object_sha" | sed -n '\''1s/^object //p'\'')' || return 1
+  require_literal "$file" '[[ $(git cat-file -t "$tag_target_sha") == commit ]]' || return 1
+  require_literal "$file" 'release_commit=$(git rev-parse "$tag_target_sha^{commit}")' || return 1
 }
 
 release_package_negative_probes() {
@@ -231,7 +252,7 @@ release_package_negative_probes() {
     "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest")
   validate_contract_release_assets "$release_json" "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest" ||
     fail 'release asset validator rejected the exact uploaded local assets'
-  for mutation in state size digest duplicate; do
+  for mutation in state size digest duplicate duplicate_replace; do
     case $mutation in
       state) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
 const release = JSON.parse(process.argv[2]); release.assets[0].state = 'starter'; process.stdout.write(JSON.stringify(release));
@@ -249,11 +270,39 @@ NODE
 const release = JSON.parse(process.argv[2]); release.assets.push(release.assets[0]); process.stdout.write(JSON.stringify(release));
 NODE
 ) ;;
+      duplicate_replace) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
+const release = JSON.parse(process.argv[2]); release.assets[1] = { ...release.assets[0] }; process.stdout.write(JSON.stringify(release));
+NODE
+) ;;
     esac
     if validate_contract_release_assets "$mutated_release_json" "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest"; then
       fail "release asset validator accepted $mutation mutation"
     fi
   done
+  rm -rf -- "$fixture"
+}
+
+release_query_and_tag_behavior_probes() {
+  local fixture commit
+  fixture=$(mktemp -d)
+  git -C "$fixture" init -q
+  git -C "$fixture" -c user.name=contract -c user.email=contract@example.invalid commit --allow-empty -qm initial
+  commit=$(git -C "$fixture" rev-parse HEAD)
+  git -C "$fixture" tag lightweight
+  git -C "$fixture" -c user.name=contract -c user.email=contract@example.invalid tag -a direct -m direct "$commit"
+  git -C "$fixture" -c user.name=contract -c user.email=contract@example.invalid tag -a nested -m nested direct
+  validate_contract_direct_annotated_tag "$fixture" direct "$commit" || fail 'direct annotated tag validator rejected a direct tag'
+  if validate_contract_direct_annotated_tag "$fixture" lightweight "$commit"; then fail 'direct annotated tag validator accepted a lightweight tag'; fi
+  if validate_contract_direct_annotated_tag "$fixture" nested "$commit"; then fail 'direct annotated tag validator accepted a nested tag'; fi
+  rm -rf -- "$fixture"
+
+  fixture=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'releases_json=$(fake_gh_api)' 'printf "%s\\n" "$releases_json" >/dev/null' 'touch "$CREATE_SENTINEL"' > "$fixture/preflight.sh"
+  chmod +x "$fixture/preflight.sh"
+  if CREATE_SENTINEL="$fixture/create" bash -c 'fake_gh_api() { printf "[]"; return 1; }; export -f fake_gh_api; exec "$0"' "$fixture/preflight.sh"; then
+    fail 'checked release query accepted a non-zero API result'
+  fi
+  [[ ! -e $fixture/create ]] || fail 'checked release query attempted creation after API failure'
   rm -rf -- "$fixture"
 }
 
@@ -305,13 +354,13 @@ release_package_workflow_mutation_probes() {
   sed '/\[\[ $(jq -r .immutable <<<"\$final_release_json") == true \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing immutable assertion'; fi
 
-  sed '/releases_json=$(gh api --paginate --slurp/d' "$release_workflow" > "$fixture"
+  sed '/^          releases_json=$(gh api --paginate --slurp/ c\          releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" || printf '\''[]'\'')' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted an unguarded release-query failure'; fi
 
-  sed '/\.state == "uploaded" and/d' "$release_workflow" > "$fixture"
+  sed '/\.state == "uploaded" and/ c\                  (.state == "uploaded" or true) and' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted release assets without uploaded state checks'; fi
 
-  sed '/(\.size == \$archive_size and \.digest == \$archive_digest)/d' "$release_workflow" > "$fixture"
+  sed '/\.size == \$archive_size and \.digest == \$archive_digest/ c\                    (true or (.size == $archive_size and .digest == $archive_digest))' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted release assets without archive size and digest checks'; fi
 
   sed '/overwrite: true/d' "$release_workflow" > "$fixture"
@@ -322,6 +371,12 @@ release_package_workflow_mutation_probes() {
 
   sed '/\[\[ $(jq -r '\''.object.type'\'' <<<"\$tag_object") == commit \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted a nested annotated tag'; fi
+
+  sed '/\[\[ "\$tag_object_type" == tag \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted a lightweight tag during validation'; fi
+
+  sed '/\[\[ $(git cat-file -t "\$tag_target_sha") == commit \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted a nested tag during validation'; fi
 
   rm -f -- "$fixture"
 }
@@ -371,7 +426,7 @@ if LC_ALL=C grep -n $'\r' "$deploy_script" >/dev/null; then
 fi
 bash -n "$deploy_script"
 
-require_literal "$release_workflow" 'release_commit=$(git rev-parse "$GITHUB_REF_NAME^{commit}")'
+require_literal "$release_workflow" 'release_commit=$(git rev-parse "$tag_target_sha^{commit}")'
 require_literal "$release_workflow" 'event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")'
 require_literal "$release_workflow" 'head_sha=${RELEASE_COMMIT}'
 require_literal "$release_workflow" '.workflow_runs[0]'
@@ -381,6 +436,7 @@ require_literal "$release_workflow" 'needs: validate'
 require_literal "$release_workflow" '--repo "$GITHUB_REPOSITORY" --verify-tag'
 release_package_contract "$release_workflow" || fail 'release package contract is incomplete'
 release_package_negative_probes
+release_query_and_tag_behavior_probes
 release_package_workflow_mutation_probes
 
 while IFS= read -r action; do

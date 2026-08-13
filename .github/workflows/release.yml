@@ -39,7 +39,13 @@ jobs:
             echo "Release tags must use stable SemVer form vMAJOR.MINOR.PATCH." >&2
             exit 1
           fi
-          release_commit=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          tag_object_type=$(git cat-file -t "$GITHUB_REF_NAME")
+          [[ "$tag_object_type" == tag ]]
+          tag_object_sha=$(git rev-parse "$GITHUB_REF_NAME")
+          tag_target_sha=$(git cat-file -p "$tag_object_sha" | sed -n '1s/^object //p')
+          [[ $tag_target_sha =~ ^[0-9a-f]{40}$ ]]
+          [[ $(git cat-file -t "$tag_target_sha") == commit ]]
+          release_commit=$(git rev-parse "$tag_target_sha^{commit}")
           event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
           test "$release_commit" = "$event_commit"
           git fetch --no-tags origin "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
