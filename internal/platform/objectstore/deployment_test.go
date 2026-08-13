@@ -67,6 +67,12 @@ func TestMinIODeploymentSecurityContractRejectsUnsafeTopology(t *testing.T) {
 			"        mv -f /license/.minio.license.new /license/minio.license\n        chmod 0644 /license/minio.license\n",
 			1,
 		),
+		"server restores loopback port bindings": strings.Replace(
+			compose,
+			"      - \"0.0.0.0:${HAPPYLEARN_AISTOR_API_PORT:-59000}:9000\"\n      - \"0.0.0.0:${HAPPYLEARN_AISTOR_CONSOLE_PORT:-59001}:9001\"",
+			"      - \"127.0.0.1:59000:9000\"\n      - \"127.0.0.1:59001:9001\"",
+			1,
+		),
 	}
 	for name, mutated := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -207,7 +213,7 @@ func validateMinIODeployment(compose string) error {
 			"minio-data-init":     {Condition: "service_completed_successfully"},
 			"aistor-license-init": {Condition: "service_completed_successfully"},
 		}},
-		{"MinIO server ports", server.Ports, []string{"127.0.0.1:59000:9000", "127.0.0.1:59001:9001"}},
+		{"MinIO server ports", server.Ports, []string{"0.0.0.0:${HAPPYLEARN_AISTOR_API_PORT:-59000}:9000", "0.0.0.0:${HAPPYLEARN_AISTOR_CONSOLE_PORT:-59001}:9001"}},
 		{"MinIO server networks", server.Networks, []string{"happylearn"}},
 		{"MinIO server health check", server.Healthcheck.Test, []string{"CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/ready"}},
 	} {
