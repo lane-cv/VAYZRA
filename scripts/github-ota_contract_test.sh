@@ -449,7 +449,9 @@ deployment_public_origin_contract() {
     'https://user@host' \
     'https://host?query=1' \
     'https://host#fragment' \
-    'https://host/${COMPOSE_VARIABLE}'; do
+    'https://host/${COMPOSE_VARIABLE}' \
+    'http://[::::]' \
+    'https://host:99999'; do
     output=$(mktemp)
     if bash "$file" --directory "$side_effect_directory" --public-origin "$invalid_origin" >"$output" 2>&1; then
       rm -f -- "$output"
@@ -473,6 +475,11 @@ deployment_public_origin_mutation_probe() {
   sed '/\[\[ \$origin =~ /c\  true' "$deploy_script" >"$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
     fail 'deploy contract accepted a weakened public-origin validator'
+  fi
+
+  sed '/((10#\$port >= 1 && 10#\$port <= 65535))/c\    true' "$deploy_script" >"$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
+    fail 'deploy contract accepted an out-of-range public-origin port'
   fi
   rm -f -- "$fixture"
 }

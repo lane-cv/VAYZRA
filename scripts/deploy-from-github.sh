@@ -90,9 +90,16 @@ validate_port() {
 }
 
 validate_public_origin() {
-  local origin=$1
+  local origin=$1 authority port
   [[ $origin != *$'\n'* && $origin != *$'\r'* && $origin != *[[:space:]]* && $origin != *'$'* ]] || return 1
-  [[ $origin =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?/?$ ]]
+  [[ $origin =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?/?$ ]] || return 1
+  authority=${origin#*://}
+  authority=${authority%/}
+  if [[ $authority == *:* ]]; then
+    port=${authority##*:}
+    [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
+    ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+  fi
 }
 
 secure_file() {
