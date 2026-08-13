@@ -309,23 +309,13 @@ func (s *PostgresRunnerStore) startPreparationHeartbeat(parent context.Context, 
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				done <- nil
-				return
-			case <-preparationCtx.Done():
-				done <- preparationCtx.Err()
-				return
-			case now := <-ticker.C:
-				err := s.Heartbeat(preparationCtx, leased.Run.ID, leased.LeaseOwner, now.Add(leaseDuration).UTC())
-				if err != nil {
-					cancelPreparation()
-					done <- err
-					return
-				}
-			}
+		err := heartbeatOnTicks(preparationCtx, stop, ticker.C, time.Now, leaseDuration, func(leaseUntil time.Time) error {
+			return s.Heartbeat(preparationCtx, leased.Run.ID, leased.LeaseOwner, leaseUntil)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			cancelPreparation()
 		}
+		done <- err
 	}()
 	var once sync.Once
 	var heartbeatErr error

@@ -160,8 +160,8 @@ func (r Runner) reconciler(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
-			_ = r.Store.ReconcileExpired(ctx, now.UTC(), r.GlobalConcurrency*4)
+		case <-ticker.C:
+			_ = r.Store.ReconcileExpired(ctx, time.Now().UTC(), r.GlobalConcurrency*4)
 		}
 	}
 }
@@ -212,21 +212,16 @@ func (r Runner) execute(parent context.Context, leased LeasedRun) {
 		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-backgroundDone:
-				return
-			case now := <-ticker.C:
-				if err := r.Store.Heartbeat(ctx, leased.Run.ID, leased.LeaseOwner, now.Add(r.LeaseDuration).UTC()); err != nil {
-					buffer.mu.Lock()
-					if buffer.storeErr == nil {
-						buffer.storeErr = err
-					}
-					buffer.mu.Unlock()
-					cancel()
-					return
-				}
+		err := heartbeatOnTicks(ctx, backgroundDone, ticker.C, time.Now, r.LeaseDuration, func(leaseUntil time.Time) error {
+			return r.Store.Heartbeat(ctx, leased.Run.ID, leased.LeaseOwner, leaseUntil)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			buffer.mu.Lock()
+			if buffer.storeErr == nil {
+				buffer.storeErr = err
 			}
+			buffer.mu.Unlock()
+			cancel()
 		}
 	}()
 

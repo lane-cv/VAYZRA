@@ -285,8 +285,19 @@ func TestPostgresRunnerSlowPreparationKeepsLeaseAndLossPreventsReturn(t *testing
 			}{leased, leaseErr}
 		}()
 		<-attachments.started
-		time.Sleep(100 * time.Millisecond)
-		if err = store.ReconcileExpired(ctx, time.Now().UTC(), 10); err != nil {
+		var baselineExpiry time.Time
+		if err = pool.QueryRow(ctx, `SELECT lease_expires_at FROM ai_runs WHERE id=$1`, run.ID).Scan(&baselineExpiry); err != nil {
+			t.Fatal(err)
+		}
+		var renewedExpiry time.Time
+		waitRunnerWithin(t, time.Second, func() bool {
+			if queryErr := pool.QueryRow(ctx, `SELECT lease_expires_at FROM ai_runs WHERE id=$1`, run.ID).Scan(&renewedExpiry); queryErr != nil {
+				t.Fatalf("load renewed expiry: %v", queryErr)
+			}
+			return renewedExpiry.After(baselineExpiry)
+		})
+		cutoff := baselineExpiry.Add(renewedExpiry.Sub(baselineExpiry) / 2)
+		if err = store.ReconcileExpired(ctx, cutoff, 10); err != nil {
 			t.Fatal(err)
 		}
 		close(attachments.release)
@@ -299,8 +310,8 @@ func TestPostgresRunnerSlowPreparationKeepsLeaseAndLossPreventsReturn(t *testing
 		if err = pool.QueryRow(ctx, `SELECT status,lease_expires_at FROM ai_runs WHERE id=$1`, run.ID).Scan(&status, &expires); err != nil {
 			t.Fatal(err)
 		}
-		if status != RunStreaming || !expires.After(time.Now()) {
-			t.Fatalf("status=%s expires=%s", status, expires)
+		if status != RunStreaming || !expires.After(cutoff) {
+			t.Fatalf("status=%s expires=%s cutoff=%s", status, expires, cutoff)
 		}
 	})
 
