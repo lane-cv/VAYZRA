@@ -669,6 +669,8 @@ fi
 require_literal "$target" \
   'HAPPYLEARN_PHASE5_E2E_OWNER="$fixture_suffix"'
 require_literal "$target" \
+  'HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS=2700'
+require_literal "$target" \
   '{{index .Config.Labels "com.docker.compose.oneoff"}}'
 require_literal "$target" \
   '--env "HAPPYLEARN_RESTORE_CONTROL_DIRECTORY=$restore_control_dir"'
@@ -686,7 +688,7 @@ require_literal "$target" \
   '[[ "$timeout" =~ ^[1-9][0-9]*$ && "$timeout" -le 3600 ]]'
 require_literal "$target" '"$((duration + 300))"'
 require_literal "$target" \
-  'resource sample failed: browser=%s backup=%s monitor=%s finalize=%s'
+  'resource sample failed: browser=%s backup=%s monitor=%s proof=%s finalize=%s'
 require_literal "$target" \
   'run_resource_child "$resource_backup_status_file" run_backup_workflow &'
 require_literal "$target" 'monitor_resource_workloads'
@@ -728,12 +730,16 @@ require_literal "$target" 'resource monitor failed: category=%s'
 require_literal "$target" 'resource ephemeral identity failed: category=%s'
 resource_sample_block="$(sed -n '/^run_resource_sample()/,/^}/p' "$target")"
 for literal in \
+  'preflight_resource_one_shots || return $?' \
   'run_resource_child "$resource_browser_status_file"' \
   'run_resource_child "$resource_backup_status_file"' \
   'browser_status="$(read_resource_child_status "$resource_browser_status_file")"' \
   'backup_status="$(read_resource_child_status "$resource_backup_status_file")"' \
+  'audit_resource_one_shots one_shot_observation || proof_status=$?' \
+  'merge_resource_one_shot_evidence' \
   'finalize_backup_proof "$backup_status" || finalize_status=$?' \
-  '"$browser_status" "$backup_status" "$monitor_status" "$finalize_status" ||'; do
+  '"$browser_status" "$backup_status" "$monitor_status" "$proof_status"' \
+  '"$finalize_status" ||'; do
   grep -Fq -- "$literal" <<<"$resource_sample_block" ||
     fail "resource sample omitted durable child status handling: $literal"
 done
@@ -762,6 +768,11 @@ resource_backup_status_line="$(
     <<<"$resource_sample_block" |
     cut -d: -f1
 )"
+resource_proof_line="$(
+  grep -n 'audit_resource_one_shots one_shot_observation' \
+    <<<"$resource_sample_block" |
+    cut -d: -f1
+)"
 resource_finalize_line="$(
   grep -n 'finalize_backup_proof "$backup_status"' \
     <<<"$resource_sample_block" |
@@ -776,13 +787,15 @@ resource_merge_line="$(
   "$resource_backup_wait_line" =~ ^[0-9]+$ &&
   "$resource_browser_status_line" =~ ^[0-9]+$ &&
   "$resource_backup_status_line" =~ ^[0-9]+$ &&
+  "$resource_proof_line" =~ ^[0-9]+$ &&
   "$resource_finalize_line" =~ ^[0-9]+$ &&
   "$resource_merge_line" =~ ^[0-9]+$ &&
   "$resource_monitor_line" -lt "$resource_browser_wait_line" &&
   "$resource_browser_wait_line" -lt "$resource_backup_wait_line" &&
   "$resource_backup_wait_line" -lt "$resource_browser_status_line" &&
   "$resource_browser_status_line" -lt "$resource_backup_status_line" &&
-  "$resource_backup_status_line" -lt "$resource_finalize_line" &&
+  "$resource_backup_status_line" -lt "$resource_proof_line" &&
+  "$resource_proof_line" -lt "$resource_finalize_line" &&
   "$resource_finalize_line" -lt "$resource_merge_line" ]] ||
   fail 'resource sample did not stop monitoring before backup finalization'
 if grep -Fq 'wait "$resource_backup_pid" || backup_status=$?' \
@@ -840,6 +853,258 @@ run_backup_activity_case named_backup \
   /happylearn_phase5_a1b2c3d4e5f6_backup '' '' true
 run_backup_activity_case app \
   /happylearn_phase5_a1b2c3d4e5f6_app app '' false
+resource_heavy_source="$(
+  sed -n '/^resource_command_is_heavy()/,/^}/p' "$target"
+)"
+[[ -n "$resource_heavy_source" ]] ||
+  fail 'exact heavy-command classifier is absent'
+run_resource_heavy_case() {
+  local case_name="$1" path="$2" arguments="$3" expected="$4"
+  local actual=false
+  if (
+    eval "$resource_heavy_source"
+    resource_command_is_heavy \
+      "$path" "$arguments" 11111111-1111-4111-8111-111111111111
+  ); then
+    actual=true
+  fi
+  [[ "$actual" == "$expected" ]] ||
+    fail "heavy command mutation $case_name classified as $actual"
+}
+run_resource_heavy_case snapshot /usr/bin/timeout \
+  '["--foreground","--kill-after=10s","2700s","/app/happylearn-backup","snapshot","--run-id","11111111-1111-4111-8111-111111111111"]' true
+run_resource_heavy_case local_check /usr/bin/timeout \
+  '["--foreground","--kill-after=10s","2700s","restic","--no-cache","--repository-file","/run/secrets/local_repository","--password-file","/run/secrets/local_password","check","--read-data"]' true
+run_resource_heavy_case prepare /usr/bin/timeout \
+  '["--foreground","--kill-after=10s","2700s","/app/happylearn-backup","prepare","--run-id","11111111-1111-4111-8111-111111111111"]' false
+run_resource_heavy_case echo_spoof /bin/echo \
+  '["/app/happylearn-backup","snapshot","--run-id","11111111-1111-4111-8111-111111111111"]' false
+run_resource_heavy_case extra_argument /usr/bin/timeout \
+  '["--foreground","--kill-after=10s","2700s","/app/happylearn-backup","snapshot","--run-id","11111111-1111-4111-8111-111111111111","extra"]' false
+run_resource_heavy_case wrong_run /usr/bin/timeout \
+  '["--foreground","--kill-after=10s","2700s","/app/happylearn-backup","snapshot","--run-id","22222222-2222-4222-8222-222222222222"]' false
+resource_one_shot_failure_source="$(
+  sed -n '/^resource_one_shot_failure()/,/^}/p' "$target"
+)"
+resource_one_shot_listing_source="$(
+  sed -n '/^resource_one_shot_listing()/,/^}/p' "$target"
+)"
+resource_one_shot_preflight_source="$(
+  sed -n '/^preflight_resource_one_shots()/,/^}/p' "$target"
+)"
+resource_one_shot_audit_source="$(
+  sed -n '/^audit_resource_one_shots()/,/^}/p' "$target"
+)"
+resource_one_shot_merge_source="$(
+  sed -n '/^merge_resource_one_shot_evidence()/,/^}/p' "$target"
+)"
+for source in \
+  "$resource_one_shot_failure_source" "$resource_one_shot_listing_source" \
+  "$resource_one_shot_preflight_source" "$resource_one_shot_audit_source" \
+  "$resource_one_shot_merge_source"; do
+  [[ -n "$source" ]] || fail 'resource one-shot proof helper is absent'
+done
+for literal in \
+  'container ls --all --quiet' \
+  '--filter "label=com.docker.compose.project=${live_project}"' \
+  '--filter '\''label=com.docker.compose.oneoff=True'\'''; do
+  grep -Fq -- "$literal" <<<"$resource_one_shot_listing_source" ||
+    fail "one-shot set listing omitted: $literal"
+done
+if grep -Fq 'io.happylearn.phase5.e2e-owner' \
+  <<<"$resource_one_shot_listing_source"; then
+  fail 'one-shot set listing hid owner mutations behind an owner filter'
+fi
+run_resource_one_shot_preflight_case() {
+  local case_name="$1" expected_status="$2"
+  (
+    eval "$resource_one_shot_failure_source"
+    eval "$resource_one_shot_listing_source"
+    eval "$resource_one_shot_preflight_source"
+    local_root="$(mktemp -d)"
+    trap 'rm -rf "$local_root"' EXIT
+    coordinator_one_shot_file="$local_root/coordinator-one-shots"
+    coordinator_run_id_file="$local_root/coordinator-run-id"
+    install -m 0600 /dev/null "$coordinator_one_shot_file"
+    install -m 0600 /dev/null "$coordinator_run_id_file"
+    live_project=happylearn-phase5-live-a1b2c3d4e5f6
+    portable_file_mode() { printf '600\n'; }
+    portable_file_owner() { id -u; }
+    baseline_listing=''
+    case "$case_name" in
+      valid) ;;
+      stale_ledger) printf '%064d\n' 0 >"$coordinator_one_shot_file" ;;
+      stale_run) printf '%s\n' stale >"$coordinator_run_id_file" ;;
+      stale_container) baseline_listing="$(printf '%064d' 0)" ;;
+      *) fail "unknown one-shot preflight case: $case_name" ;;
+    esac
+    docker_capture_bounded() {
+      local output_variable="$1"
+      printf -v "$output_variable" '%s' "$baseline_listing"
+    }
+    actual_status=0
+    preflight_resource_one_shots >/dev/null 2>&1 || actual_status=$?
+    [[ "$actual_status" -eq "$expected_status" ]] ||
+      fail "one-shot preflight $case_name returned $actual_status"
+  )
+}
+run_resource_one_shot_preflight_case valid 0
+run_resource_one_shot_preflight_case stale_ledger 1
+run_resource_one_shot_preflight_case stale_run 1
+run_resource_one_shot_preflight_case stale_container 1
+run_resource_one_shot_audit_case() {
+  local case_name="$1" expected_status="$2" expected_observation="$3"
+  (
+    eval "$resource_one_shot_failure_source"
+    eval "$resource_one_shot_listing_source"
+    eval "$resource_heavy_source"
+    eval "$resource_one_shot_audit_source"
+    local_root="$(mktemp -d)"
+    trap 'rm -rf "$local_root"' EXIT
+    tmpdir="$local_root"
+    coordinator_one_shot_file="$local_root/coordinator-one-shots"
+    coordinator_run_id_file="$local_root/coordinator-run-id"
+    live_project=happylearn-phase5-live-a1b2c3d4e5f6
+    fixture_suffix=a1b2c3d4e5f6
+    backup_image=happylearn-backup:phase5-test
+    run_id=11111111-1111-4111-8111-111111111111
+    heavy_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    probe_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    printf '%s\n%s\n' "$heavy_id" "$probe_id" >"$coordinator_one_shot_file"
+    printf '%s\n' "$run_id" >"$coordinator_run_id_file"
+    chmod 0600 "$coordinator_one_shot_file" "$coordinator_run_id_file"
+    fake_listing="$heavy_id"$'\n'"$probe_id"
+    fake_owner="$fixture_suffix"
+    fake_oneoff=True
+    fake_service=backup
+    fake_state=exited
+    fake_running=false
+    fake_oom=false
+    fake_image="$backup_image"
+    fake_auto_remove=false
+    fake_restart=0
+    fake_error='""'
+    fake_started=2026-08-13T00:00:00Z
+    fake_finished=2026-08-13T00:00:01Z
+    fake_exit_code=0
+    fake_heavy_path=/usr/bin/timeout
+    fake_heavy_args='["--foreground","--kill-after=10s","2700s","/app/happylearn-backup","snapshot","--run-id","11111111-1111-4111-8111-111111111111"]'
+    case "$case_name" in
+      valid_with_exit10_probe) ;;
+      duplicate) printf '%s\n%s\n' "$heavy_id" "$heavy_id" >"$coordinator_one_shot_file" ;;
+      set_mismatch) fake_listing="$heavy_id" ;;
+      listing_duplicate)
+        fake_listing="$heavy_id"$'\n'"$heavy_id"$'\n'"$probe_id"
+        ;;
+      owner) fake_owner=ffffffffffff ;;
+      oneoff) fake_oneoff=False ;;
+      service) fake_service=app ;;
+      service_mismatch) fake_service=backup-storage-init ;;
+      image) fake_image=attacker:latest ;;
+      auto_remove) fake_auto_remove=true ;;
+      running) fake_state=running; fake_running=true ;;
+      oom) fake_oom=true ;;
+      restart) fake_restart=1 ;;
+      state_error) fake_error='"runtime error"' ;;
+      reversed_time)
+        fake_started=2026-08-13T00:00:02Z
+        fake_finished=2026-08-13T00:00:01Z
+        ;;
+      heavy_exit) fake_exit_code=1 ;;
+      echo_spoof)
+        fake_heavy_path=/bin/echo
+        fake_heavy_args='["/app/happylearn-backup","snapshot","--run-id","11111111-1111-4111-8111-111111111111"]'
+        ;;
+      *) fail "unknown one-shot audit case: $case_name" ;;
+    esac
+    portable_file_mode() { printf '600\n'; }
+    portable_file_owner() { id -u; }
+    portable_file_size() { wc -c <"$1" | tr -d '[:space:]'; }
+    docker_capture_bounded() {
+      local output_variable="$1" deadline="$2"
+      local value
+      shift 2
+      [[ "$deadline" == 15 ]] || return 95
+      if [[ "${1:-}" == container && "${2:-}" == ls ]]; then
+        printf -v "$output_variable" '%s' "$fake_listing"
+        return 0
+      fi
+      if [[ "${1:-}" == inspect && "$*" == *'{{.Path}}|{{json .Args}}'* ]]; then
+        return 93
+      fi
+      if [[ "${1:-}" == inspect && "$*" == *'{{.Path}}'* ]]; then
+        [[ "${!#}" == "$heavy_id" ]] && value="$fake_heavy_path" || value=/bin/sh
+        printf -v "$output_variable" '%s' "$value"
+        return 0
+      fi
+      if [[ "${1:-}" == inspect && "$*" == *'{{json .Args}}'* ]]; then
+        if [[ "${!#}" == "$heavy_id" ]]; then
+          value="$fake_heavy_args"
+        else
+          value='["-eu","-c","test 1 = 1 || { exit 1; }"]'
+        fi
+        printf -v "$output_variable" '%s' "$value"
+        return 0
+      fi
+      if [[ "${1:-}" == inspect ]]; then
+        current_id="${!#}"
+        current_exit="$fake_exit_code"
+        [[ "$current_id" == "$probe_id" ]] && current_exit=10
+        printf -v "$output_variable" \
+          '%s|/%s-backup-run-%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+          "$current_id" "$live_project" "${current_id:0:12}" \
+          "$live_project" "$fake_owner" "$fake_service" "$fake_oneoff" \
+          "$fake_image" "$fake_auto_remove" "$fake_state" "$fake_running" \
+          "$fake_oom" "$fake_restart" "$current_exit" "$fake_error" \
+          "$fake_started" "$fake_finished"
+        return 0
+      fi
+      return 94
+    }
+    observation=unchanged
+    actual_status=0
+    set +e
+    audit_resource_one_shots observation >/dev/null 2>&1
+    actual_status=$?
+    set -e
+    [[ "$actual_status" -eq "$expected_status" ]] ||
+      fail "one-shot audit $case_name returned $actual_status"
+    if ((expected_status == 0)); then
+      [[ "$observation" == "$expected_observation" ]] ||
+        fail "one-shot audit $case_name returned $observation"
+    else
+      [[ "$observation" == unchanged ]] ||
+        fail "one-shot audit $case_name published untrusted evidence"
+    fi
+  )
+}
+run_resource_one_shot_audit_case valid_with_exit10_probe 0 'true|true'
+for mutation in \
+  duplicate set_mismatch listing_duplicate owner oneoff service service_mismatch image auto_remove running oom \
+  restart state_error reversed_time heavy_exit; do
+  run_resource_one_shot_audit_case "$mutation" 1 unchanged
+done
+run_resource_one_shot_audit_case echo_spoof 0 'true|false'
+(
+  eval "$resource_one_shot_failure_source"
+  eval "$resource_one_shot_merge_source"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  evidence="$tmpdir/evidence"
+  printf '%s\n' 'saw_backup=false' 'saw_heavy=false' >"$evidence"
+  chmod 0600 "$evidence"
+  portable_file_mode() { printf '600\n'; }
+  portable_file_owner() { id -u; }
+  merge_resource_one_shot_evidence "$evidence" 'true|true' ||
+    fail 'valid one-shot evidence did not merge'
+  grep -Fxq 'saw_backup=true' "$evidence" &&
+    grep -Fxq 'saw_heavy=true' "$evidence" ||
+    fail 'one-shot evidence did not latch backup and heavy proof'
+  if merge_resource_one_shot_evidence "$evidence" 'true|false' \
+    >/dev/null 2>&1; then
+    fail 'non-heavy command spoof was accepted as complete resource evidence'
+  fi
+)
 for literal in \
   'roster_policy=backup_snapshot' \
   'validate_required_resource_roster "$roster_policy"' \
@@ -857,12 +1122,30 @@ done
 if grep -Fq 'production_ids' <<<"$resource_monitor_block"; then
   fail 'resource monitor retained a browser-excluding aggregate roster'
 fi
+if grep -Fq 'resource_monitor_observe_running_activity' "$target" ||
+  grep -Fq '{{json .Config.Cmd}}' <<<"$resource_monitor_block"; then
+  fail 'resource monitor retained the racy snapshot or substring command classifier'
+fi
+for literal in \
+  'preflight_resource_one_shots()' \
+  'audit_resource_one_shots()' \
+  'resource_command_is_heavy()' \
+  'merge_resource_one_shot_evidence()' \
+  '--filter '\''label=com.docker.compose.oneoff=True'\''' \
+  "'{{.Path}}'" \
+  "'{{json .Args}}'" \
+  '"$sorted_ledger" == "$sorted_listing"' \
+  '"$exit_code" == 0' \
+  'saw_heavy=true'; do
+  grep -Fq -- "$literal" "$target" ||
+    fail "resource one-shot proof omitted contract: $literal"
+done
 grep -Fq '"$backup_activity_running" == true' \
   <<<"$resource_monitor_block" ||
   fail 'worker overlap gate still depends on heavy-stage activity only'
 for category in \
   required_roster ephemeral_identity listing ownership resource_state \
-  invariant command production_stats production_parse browser_stats \
+  invariant production_stats production_parse browser_stats \
   browser_parse final_roster; do
   grep -Fq -- "resource_monitor_failure $category" \
     <<<"$resource_monitor_block" ||
@@ -874,6 +1157,20 @@ resource_ephemeral_block="$(
 resource_ephemeral_container_block="$(
   sed -n '/^validate_resource_ephemeral_container()/,/^}/p' "$target"
 )"
+grep -Fq 'resource_monitor_capture listing 15 ps --no-trunc' \
+  <<<"$resource_monitor_block" ||
+  fail 'resource monitor did not restrict its hot-path roster to running containers'
+if grep -Fq 'resource_monitor_capture listing 15 ps --all --no-trunc' \
+  <<<"$resource_monitor_block"; then
+  fail 'resource monitor rescanned exited one-shots before sampling live backup work'
+fi
+[[ "$(grep -Fc 'container ls --quiet --no-trunc' \
+  <<<"$resource_ephemeral_block")" -eq 2 ]] ||
+  fail 'ephemeral identity checks did not restrict both hot-path listings to running containers'
+if grep -Fq 'container ls --all --quiet --no-trunc' \
+  <<<"$resource_ephemeral_block"; then
+  fail 'ephemeral identity checks rescanned exited one-shots on every sample'
+fi
 for label in com.docker.compose.service com.docker.compose.oneoff; do
   grep -Fq -- \
     "{{with index .Config.Labels \"$label\"}}{{.}}{{end}}" \

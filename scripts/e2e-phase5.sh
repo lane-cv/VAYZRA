@@ -2169,6 +2169,7 @@ run_backup_workflow() {
   HAPPYLEARN_BACKUP_STATE_DIRECTORY="$backup_host_root/state" \
   HAPPYLEARN_BACKUP_LOCK_DIRECTORY="$backup_host_root/host.lock" \
   HAPPYLEARN_BACKUP_IMAGE="$backup_image" \
+  HAPPYLEARN_BACKUP_EXTERNAL_TIMEOUT_SECONDS=2700 \
   HAPPYLEARN_BACKUP_DATABASE_NAME=happylearn \
   HAPPYLEARN_BACKUP_DATABASE_SSLMODE=require \
   HAPPYLEARN_BACKUP_AGE_RECIPIENT="$HAPPYLEARN_BACKUP_AGE_RECIPIENT" \
@@ -2743,7 +2744,7 @@ resource_ephemeral_failure() {
 
 validate_resource_ephemeral_identities() {
   local listing id metadata inspected_id inspected_name extra current_listing
-  docker_capture_bounded listing 15 container ls --all --quiet --no-trunc \
+  docker_capture_bounded listing 15 container ls --quiet --no-trunc \
     --filter "name=^/${browser_runner}$" || {
     resource_ephemeral_failure browser_listing
     return 1
@@ -2759,7 +2760,7 @@ validate_resource_ephemeral_identities() {
       return 1
     }
   fi
-  docker_capture_bounded listing 15 container ls --all --quiet --no-trunc \
+  docker_capture_bounded listing 15 container ls --quiet --no-trunc \
     --filter "name=^/${live_project}-backup-run-" || {
     resource_ephemeral_failure backup_listing
     return 1
@@ -2882,6 +2883,253 @@ resource_is_backup_activity() {
   return 1
 }
 
+resource_one_shot_failure() {
+  local category="${1:?failure category required}"
+  case "$category" in
+    ledger|baseline|listing|set|identity|state|time|command|evidence) ;;
+    *) category=unavailable ;;
+  esac
+  printf 'resource one-shot proof failed: category=%s\n' "$category" >&2
+}
+
+resource_one_shot_listing() {
+  local output_variable="${1:?output variable required}"
+  [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  docker_capture_bounded "$output_variable" 15 container ls --all --quiet \
+    --no-trunc \
+    --filter "label=com.docker.compose.project=${live_project}" \
+    --filter 'label=com.docker.compose.oneoff=True'
+}
+
+preflight_resource_one_shots() {
+  local listing
+  [[ -f "$coordinator_one_shot_file" &&
+    ! -L "$coordinator_one_shot_file" &&
+    "$(portable_file_mode "$coordinator_one_shot_file")" == 600 &&
+    "$(portable_file_owner "$coordinator_one_shot_file")" == "$(id -u)" &&
+    ! -s "$coordinator_one_shot_file" &&
+    -f "$coordinator_run_id_file" &&
+    ! -L "$coordinator_run_id_file" &&
+    "$(portable_file_mode "$coordinator_run_id_file")" == 600 &&
+    "$(portable_file_owner "$coordinator_run_id_file")" == "$(id -u)" &&
+    ! -s "$coordinator_run_id_file" ]] || {
+    resource_one_shot_failure ledger
+    return 1
+  }
+  resource_one_shot_listing listing || {
+    resource_one_shot_failure listing
+    return 1
+  }
+  [[ -z "$listing" ]] || {
+    resource_one_shot_failure baseline
+    return 1
+  }
+}
+
+resource_command_is_heavy() {
+  local path="${1-}" arguments="${2-}" run_id="${3-}"
+  [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    return 1
+  [[ "$path" == /usr/bin/timeout ]] || return 1
+  case "$arguments" in
+    "[\"--foreground\",\"--kill-after=10s\",\"2700s\",\"/app/happylearn-backup\",\"snapshot\",\"--run-id\",\"${run_id}\"]"|\
+      "[\"--foreground\",\"--kill-after=10s\",\"2700s\",\"/app/happylearn-backup\",\"verify\",\"--run-id\",\"${run_id}\"]"|\
+      "[\"--foreground\",\"--kill-after=10s\",\"2700s\",\"/app/happylearn-backup\",\"sync\",\"--run-id\",\"${run_id}\"]"|\
+      "[\"--foreground\",\"--kill-after=10s\",\"2700s\",\"/app/happylearn-backup-retention\",\"--repository\",\"local\",\"--run-id\",\"${run_id}\"]"|\
+      "[\"--foreground\",\"--kill-after=10s\",\"2700s\",\"/app/happylearn-backup-retention\",\"--repository\",\"remote\",\"--run-id\",\"${run_id}\"]"|\
+      '["--foreground","--kill-after=10s","2700s","restic","--no-cache","--repository-file","/run/secrets/local_repository","--password-file","/run/secrets/local_password","check","--read-data"]')
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+audit_resource_one_shots() {
+  local output_variable="${1:?output variable required}"
+  local listing sorted_listing sorted_ledger run_id run_id_extra
+  local id listing_id metadata inspected_id inspected_name project owner service oneoff
+  local image auto_remove status running oom restart_count exit_code state_error
+  local started_at finished_at extra path arguments
+  local started_epoch finished_epoch saw_backup=false saw_heavy=false
+  local ledger_count=0 listing_count=0
+  local -A seen=() listed=()
+  [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    -f "$coordinator_one_shot_file" &&
+    ! -L "$coordinator_one_shot_file" &&
+    "$(portable_file_mode "$coordinator_one_shot_file")" == 600 &&
+    "$(portable_file_owner "$coordinator_one_shot_file")" == "$(id -u)" &&
+    -s "$coordinator_one_shot_file" &&
+    -f "$coordinator_run_id_file" &&
+    ! -L "$coordinator_run_id_file" &&
+    "$(portable_file_mode "$coordinator_run_id_file")" == 600 &&
+    "$(portable_file_owner "$coordinator_run_id_file")" == "$(id -u)" &&
+    "$(portable_file_size "$coordinator_run_id_file")" == 37 ]] || {
+    resource_one_shot_failure ledger
+    return 1
+  }
+  IFS= read -r run_id <"$coordinator_run_id_file" || {
+    resource_one_shot_failure ledger
+    return 1
+  }
+  IFS= read -r run_id_extra < <(sed -n '2p' "$coordinator_run_id_file") || true
+  [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
+    -z "$run_id_extra" ]] || {
+    resource_one_shot_failure ledger
+    return 1
+  }
+  resource_one_shot_listing listing || {
+    resource_one_shot_failure listing
+    return 1
+  }
+  [[ -n "$listing" ]] || {
+    resource_one_shot_failure set
+    return 1
+  }
+  while IFS= read -r id; do
+    [[ "$id" =~ ^[a-f0-9]{64}$ && -z "${seen[$id]+set}" ]] || {
+      resource_one_shot_failure set
+      return 1
+    }
+    seen[$id]=1
+    ((ledger_count += 1))
+  done <"$coordinator_one_shot_file"
+  ((ledger_count > 0)) || {
+    resource_one_shot_failure set
+    return 1
+  }
+  while IFS= read -r listing_id; do
+    [[ "$listing_id" =~ ^[a-f0-9]{64}$ &&
+      -z "${listed[$listing_id]+set}" ]] || {
+      resource_one_shot_failure set
+      return 1
+    }
+    listed[$listing_id]=1
+    ((listing_count += 1))
+  done <<<"$listing"
+  ((listing_count > 0)) || {
+    resource_one_shot_failure set
+    return 1
+  }
+  sorted_ledger="$(LC_ALL=C sort "$coordinator_one_shot_file")" || return 1
+  sorted_listing="$(printf '%s\n' "$listing" | LC_ALL=C sort)" || return 1
+  [[ "$sorted_ledger" == "$sorted_listing" ]] || {
+    resource_one_shot_failure set
+    return 1
+  }
+  while IFS= read -r id; do
+    docker_capture_bounded metadata 15 inspect --format \
+      '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.happylearn.phase5.e2e-owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{.Config.Image}}|{{.HostConfig.AutoRemove}}|{{.State.Status}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.RestartCount}}|{{.State.ExitCode}}|{{json .State.Error}}|{{.State.StartedAt}}|{{.State.FinishedAt}}' \
+      "$id" || {
+      resource_one_shot_failure identity
+      return 1
+    }
+    IFS='|' read -r inspected_id inspected_name project owner service oneoff \
+      image auto_remove status running oom restart_count exit_code state_error \
+      started_at finished_at extra <<<"$metadata"
+    [[ "$inspected_id" == "$id" &&
+      "$project" == "$live_project" &&
+      "$owner" == "$fixture_suffix" &&
+      "$service" =~ ^(backup|backup-storage-init|backup-secrets-init)$ &&
+      "$oneoff" == True &&
+      "$image" == "$backup_image" &&
+      "$auto_remove" == false &&
+      -z "$extra" ]] || {
+      resource_one_shot_failure identity
+      return 1
+    }
+    case "$service" in
+      backup)
+        [[ "$inspected_name" =~ ^/${live_project}-backup-run-[A-Za-z0-9_.-]+$|^/${live_project}-phase5-sync-${run_id}$ ]] || {
+          resource_one_shot_failure identity
+          return 1
+        }
+        ;;
+      backup-storage-init|backup-secrets-init)
+        [[ "$inspected_name" =~ ^/${live_project}-${service}-run-[A-Za-z0-9_.-]+$ ]] || {
+          resource_one_shot_failure identity
+          return 1
+        }
+        ;;
+    esac
+    [[ "$status" == exited && "$running" == false && "$oom" == false &&
+      "$restart_count" == 0 && "$exit_code" =~ ^([0-9]|[1-9][0-9]{1,2})$ &&
+      "$exit_code" -le 255 && "$state_error" == '""' ]] || {
+      resource_one_shot_failure state
+      return 1
+    }
+    started_epoch="$(date -u -d "$started_at" +%s%N 2>/dev/null)" || {
+      resource_one_shot_failure time
+      return 1
+    }
+    finished_epoch="$(date -u -d "$finished_at" +%s%N 2>/dev/null)" || {
+      resource_one_shot_failure time
+      return 1
+    }
+    [[ "$started_at" != 0001-01-01T00:00:00Z &&
+      "$finished_at" != 0001-01-01T00:00:00Z &&
+      "$started_epoch" =~ ^[0-9]+$ && "$finished_epoch" =~ ^[0-9]+$ &&
+      "$finished_epoch" -ge "$started_epoch" ]] || {
+      resource_one_shot_failure time
+      return 1
+    }
+    saw_backup=true
+    if [[ "$service" == backup ]]; then
+      docker_capture_bounded path 15 inspect --format '{{.Path}}' "$id" || {
+        resource_one_shot_failure command
+        return 1
+      }
+      docker_capture_bounded arguments 15 inspect --format \
+        '{{json .Args}}' "$id" || {
+        resource_one_shot_failure command
+        return 1
+      }
+      [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ &&
+        "$arguments" == \[*\] ]] || {
+        resource_one_shot_failure command
+        return 1
+      }
+      if resource_command_is_heavy "$path" "$arguments" "$run_id"; then
+        [[ "$exit_code" == 0 ]] || {
+          resource_one_shot_failure state
+          return 1
+        }
+        saw_heavy=true
+      fi
+    fi
+  done <<<"$sorted_ledger"
+  printf -v "$output_variable" '%s|%s' "$saw_backup" "$saw_heavy"
+}
+
+merge_resource_one_shot_evidence() {
+  local evidence="${1:?resource evidence required}"
+  local observation="${2:?resource observation required}"
+  local observed_backup observed_heavy extra staging
+  IFS='|' read -r observed_backup observed_heavy extra <<<"$observation"
+  [[ "$observed_backup" == true && "$observed_heavy" == true &&
+    -z "$extra" && "$evidence" == /* && -f "$evidence" &&
+    ! -L "$evidence" && "$(portable_file_mode "$evidence")" == 600 &&
+    "$(portable_file_owner "$evidence")" == "$(id -u)" ]] || {
+    resource_one_shot_failure evidence
+    return 1
+  }
+  staging="$(mktemp "$tmpdir/.resource-evidence.XXXXXX")" || return 1
+  chmod 0600 "$staging" || {
+    rm -f "$staging"
+    return 1
+  }
+  if ! awk '
+    /^saw_backup=/ { if (++backup != 1) exit 2; print "saw_backup=true"; next }
+    /^saw_heavy=/ { if (++heavy != 1) exit 2; print "saw_heavy=true"; next }
+    { print }
+    END { if (backup != 1 || heavy != 1) exit 2 }
+  ' "$evidence" >"$staging"; then
+    rm -f "$staging"
+    resource_one_shot_failure evidence
+    return 1
+  fi
+  mv -f "$staging" "$evidence"
+}
+
 resource_worker_backup_overlap_now() {
   local snapshot name service oneoff extra
   local worker_running=false backup_running=false
@@ -2920,7 +3168,7 @@ monitor_resource_workloads() {
   local resource_state current_listing container_oom restart_count
   local roster_policy
   local nano_cpus memory_bytes
-  local command worker_running heavy_running backup_activity_running browser_id
+  local worker_running backup_activity_running browser_id
   local configured_cpu configured_memory stats sample live_cpu live_memory
   local browser_stats browser_sample browser_cpu browser_memory
   local aggregate_container overlap_status
@@ -2941,7 +3189,7 @@ monitor_resource_workloads() {
       resource_monitor_failure ephemeral_identity
       return 1
     }
-    resource_monitor_capture listing 15 ps --all --no-trunc \
+    resource_monitor_capture listing 15 ps --no-trunc \
       --filter "label=com.docker.compose.project=${live_project}" \
       --filter "label=io.happylearn.phase5.e2e-owner=${fixture_suffix}" \
       --format '{{.ID}}' || {
@@ -2949,7 +3197,6 @@ monitor_resource_workloads() {
       return 1
     }
     worker_running=false
-    heavy_running=false
     backup_activity_running=false
     browser_id=''
     configured_cpu=0
@@ -3017,26 +3264,6 @@ monitor_resource_workloads() {
         resource_is_backup_activity "$inspected_name" "$service" "$oneoff"; then
         backup_activity_running=true
         saw_backup=true
-      fi
-      if [[ "$service" == backup ]]; then
-        resource_monitor_capture command 15 inspect --format \
-          '{{json .Config.Cmd}}' "$id" || {
-          resource_monitor_failure command
-          return 1
-        }
-        if {
-          [[ "$command" == *'/app/happylearn-backup'* &&
-            "$command" =~ \"(snapshot|verify|sync)\" ]]
-        } ||
-          [[ "$command" == *'happylearn-backup-retention'* ]] ||
-          {
-            [[ "$command" == *'restic'* && "$command" == *'check'* ]]
-          }; then
-          if [[ "$state" == true ]]; then
-            heavy_running=true
-            saw_heavy=true
-          fi
-        fi
       fi
       if [[ "$state" == true ]]; then
         aggregate_container=false
@@ -3169,9 +3396,11 @@ run_resource_sample() {
   local duration="${1:?duration required}"
   local report="$artifact_dir/resource-samples.tsv"
   local temporary="$tmpdir/resource-evidence"
-  local browser_status=0 backup_status=0 monitor_status=0 finalize_status=0
+  local browser_status=0 backup_status=0 monitor_status=0 proof_status=0
+  local finalize_status=0 one_shot_observation
   local validation_status=0
   local child_status_file status=0
+  preflight_resource_one_shots || return $?
   for child_status_file in \
     "$resource_browser_status_file" "$resource_backup_status_file"; do
     [[ ! -e "$child_status_file" && ! -L "$child_status_file" ]] ||
@@ -3194,15 +3423,21 @@ run_resource_sample() {
     browser_status=125
   backup_status="$(read_resource_child_status "$resource_backup_status_file")" ||
     backup_status=125
+  audit_resource_one_shots one_shot_observation || proof_status=$?
+  if ((proof_status == 0)); then
+    merge_resource_one_shot_evidence \
+      "$temporary" "$one_shot_observation" || proof_status=$?
+  fi
   finalize_backup_proof "$backup_status" || finalize_status=$?
   merge_resource_statuses \
-    "$browser_status" "$backup_status" "$monitor_status" "$finalize_status" ||
+    "$browser_status" "$backup_status" "$monitor_status" "$proof_status" \
+    "$finalize_status" ||
     status=$?
   if ((status != 0)); then
     printf \
-      'resource sample failed: browser=%s backup=%s monitor=%s finalize=%s\n' \
+      'resource sample failed: browser=%s backup=%s monitor=%s proof=%s finalize=%s\n' \
       "$browser_status" "$backup_status" "$monitor_status" \
-      "$finalize_status" >&2
+      "$proof_status" "$finalize_status" >&2
     return "$status"
   fi
   validate_resource_evidence "$temporary" || validation_status=$?
