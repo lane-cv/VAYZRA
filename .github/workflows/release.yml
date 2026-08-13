@@ -191,6 +191,31 @@ jobs:
           rm -f -- "$archive_listing"
           trap - EXIT
 
+          archive_size=$(stat -c %s "$archive_file")
+          checksum_size=$(stat -c %s "$checksum_file")
+          archive_digest="sha256:$(sha256sum "$archive_file" | awk '{print $1}')"
+          checksum_digest="sha256:$(sha256sum "$checksum_file" | awk '{print $1}')"
+          release_assets_are_complete() {
+            local release_json=$1
+            jq -e \
+              --arg archive_name "$archive_name" \
+              --arg archive_digest "$archive_digest" \
+              --arg checksum_digest "$checksum_digest" \
+              --argjson archive_size "$archive_size" \
+              --argjson checksum_size "$checksum_size" '
+                (.assets | length) == 2 and
+                ([.assets[].name] | sort) == ([$archive_name, "SHA256SUMS"] | sort) and
+                all(.assets[];
+                  .state == "uploaded" and
+                  if .name == $archive_name then
+                    (.size == $archive_size and .digest == $archive_digest)
+                  elif .name == "SHA256SUMS" then
+                    (.size == $checksum_size and .digest == $checksum_digest)
+                  else false end
+                )
+              ' <<<"$release_json" >/dev/null
+          }
+
           tag_ref=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
           object_type=$(jq -r '.object.type' <<<"$tag_ref")
           object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
@@ -205,36 +230,61 @@ jobs:
           done
           [[ "$object_type" == commit && "$object_sha" == "$RELEASE_COMMIT" ]]
 
-          release_view=''
-          if release_view=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets 2>/dev/null); then
-            release_assets=$(jq -r '[.assets[].name] | sort | .[]' <<<"$release_view")
-            [[ $(jq -r .tagName <<<"$release_view") == "$GITHUB_REF_NAME" ]]
-            [[ $(jq -r .isPrerelease <<<"$release_view") == false ]]
-            if [[ $(jq -r .isDraft <<<"$release_view") == true ]]; then
-              [[ $(jq -r .isImmutable <<<"$release_view") == false && "$release_assets" == "$expected_files" ]] || {
+          releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          matching_releases=$(jq -c --arg tag "$GITHUB_REF_NAME" '[.[] | .[] | select(.tag_name == $tag)]' <<<"$releases_json")
+          matching_count=$(jq length <<<"$matching_releases")
+          case "$matching_count" in
+            0)
+              gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file" \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+                --title "$GITHUB_REF_NAME" --draft
+              releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+              matching_releases=$(jq -c --arg tag "$GITHUB_REF_NAME" '[.[] | .[] | select(.tag_name == $tag)]' <<<"$releases_json")
+              matching_count=$(jq length <<<"$matching_releases")
+              [[ "$matching_count" == 1 ]] || {
+                echo "Release create did not yield exactly one release for $GITHUB_REF_NAME; refusing to publish." >&2
+                exit 1
+              }
+              release_json=$(jq -c '.[0]' <<<"$matching_releases")
+              ;;
+            1)
+              release_json=$(jq -c '.[0]' <<<"$matching_releases")
+              ;;
+            *)
+              echo "Existing release query returned $matching_count entries for $GITHUB_REF_NAME; refusing ambiguous mutation." >&2
+              exit 1
+              ;;
+          esac
+
+          [[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]
+          [[ $(jq -r .prerelease <<<"$release_json") == false ]]
+          if [[ $(jq -r .draft <<<"$release_json") == true ]]; then
+            [[ $(jq -r .immutable <<<"$release_json") == false ]] || {
                 echo "Existing draft release for $GITHUB_REF_NAME is partial or unexpected; inspect it and delete it manually before retrying." >&2
                 exit 1
               }
-            else
-              [[ $(jq -r .isImmutable <<<"$release_view") == true && "$release_assets" == "$expected_files" ]] || {
-                echo "Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state; inspect it manually." >&2
-                exit 1
-              }
-            fi
+            release_assets_are_complete "$release_json" || {
+              echo "Existing draft release for $GITHUB_REF_NAME is partial or unexpected; inspect it and delete it manually before retrying." >&2
+              exit 1
+            }
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
           else
-            gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file" \
-              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-              --title "$GITHUB_REF_NAME" --draft
+            [[ $(jq -r .draft <<<"$release_json") == false && $(jq -r .immutable <<<"$release_json") == true ]] || {
+              echo "Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state; inspect it manually." >&2
+              exit 1
+            }
+            release_assets_are_complete "$release_json" || {
+              echo "Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state; inspect it manually." >&2
+              exit 1
+            }
           fi
 
-          if [[ -z $release_view || $(jq -r .isDraft <<<"$release_view") == true ]]; then
-            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
-          fi
-          release_json=$(gh api --header 'X-GitHub-Api-Version: 2026-03-10' \
+          final_release_json=$(gh api --header 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")
-          [[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]
-          [[ $(jq -r .draft <<<"$release_json") == false ]]
-          [[ $(jq -r .prerelease <<<"$release_json") == false ]]
-          [[ $(jq -r .immutable <<<"$release_json") == true ]]
-          release_assets=$(jq -r '[.assets[].name] | sort | .[]' <<<"$release_json")
+          [[ $(jq -r .tag_name <<<"$final_release_json") == "$GITHUB_REF_NAME" ]]
+          [[ $(jq -r .draft <<<"$final_release_json") == false ]]
+          [[ $(jq -r .prerelease <<<"$final_release_json") == false ]]
+          [[ $(jq -r .immutable <<<"$final_release_json") == true ]]
+          release_assets=$(jq -r '[.assets[].name] | sort | .[]' <<<"$final_release_json")
           [[ "$release_assets" == "$expected_files" ]]
+          release_assets_are_complete "$final_release_json"

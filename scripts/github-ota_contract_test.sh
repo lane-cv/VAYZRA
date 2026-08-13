@@ -19,6 +19,14 @@ fail() {
   exit 1
 }
 
+contract_node() {
+  if command -v node >/dev/null 2>&1; then
+    node "$@"
+  else
+    node.exe "$@"
+  fi
+}
+
 require_literal() {
   local file=$1 literal=$2
   grep -Fq -- "$literal" "$file" || {
@@ -48,8 +56,8 @@ require_literal_count() {
 
 release_create_is_preflight_guarded() {
   local file=$1 preflight_line else_line create_line
-  preflight_line=$(grep -nF -- '          if release_view=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets 2>/dev/null); then' "$file" | head -n 1 | cut -d: -f1) || return 1
-  else_line=$(awk -v start="$preflight_line" 'NR > start && /^          else$/ { print NR; exit }' "$file") || return 1
+  preflight_line=$(grep -nF -- '          releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")' "$file" | head -n 1 | cut -d: -f1) || return 1
+  else_line=$(awk -v start="$preflight_line" 'NR > start && /^            0\)$/ { print NR; exit }' "$file") || return 1
   create_line=$(grep -nF -- 'gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file"' "$file" | head -n 1 | cut -d: -f1) || return 1
   [[ -n $else_line && $preflight_line -lt $else_line && $else_line -lt $create_line ]] || return 1
   require_literal_count "$file" 'gh release create "$GITHUB_REF_NAME" "$archive_file" "$checksum_file"' 1
@@ -87,6 +95,27 @@ validate_contract_checksum() {
   return "$result"
 }
 
+validate_contract_release_assets() {
+  local release_json=$1 archive_name=$2 archive_size=$3 archive_digest=$4 checksum_size=$5 checksum_digest=$6
+  contract_node - "$release_json" "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest" <<'NODE'
+const [releaseJson, archiveName, archiveSize, archiveDigest, checksumSize, checksumDigest] = process.argv.slice(2);
+const release = JSON.parse(releaseJson);
+const expected = new Map([
+  [archiveName, { size: Number(archiveSize), digest: archiveDigest }],
+  ['SHA256SUMS', { size: Number(checksumSize), digest: checksumDigest }],
+]);
+const assets = release.assets;
+process.exit(
+  Array.isArray(assets) && assets.length === expected.size &&
+  assets.every((asset) => {
+    const expectedAsset = expected.get(asset.name);
+    return expectedAsset !== undefined && asset.state === 'uploaded' &&
+      asset.size === expectedAsset.size && asset.digest === expectedAsset.digest;
+  }) ? 0 : 1,
+);
+NODE
+}
+
 release_package_contract() {
   local file=$1 upload_paths expected_upload_paths
   require_literal "$file" 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2' || return 1
@@ -115,21 +144,31 @@ release_package_contract() {
   require_literal "$file" '--title "$GITHUB_REF_NAME" --draft' || return 1
   require_literal "$file" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
   require_literal "$file" "X-GitHub-Api-Version: 2026-03-10" || return 1
-  require_literal "$file" '[[ $(jq -r .tag_name <<<"$release_json") == "$GITHUB_REF_NAME" ]]' || return 1
-  require_literal "$file" '[[ $(jq -r .draft <<<"$release_json") == false ]]' || return 1
-  require_literal "$file" '[[ $(jq -r .prerelease <<<"$release_json") == false ]]' || return 1
-  require_literal "$file" '[[ $(jq -r .immutable <<<"$release_json") == true ]]' || return 1
-  require_literal "$file" "release_assets=\$(jq -r '[.assets[].name] | sort | .[]' <<<\"\$release_json\")" || return 1
+  require_literal "$file" '[[ $(jq -r .tag_name <<<"$final_release_json") == "$GITHUB_REF_NAME" ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .draft <<<"$final_release_json") == false ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .prerelease <<<"$final_release_json") == false ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .immutable <<<"$final_release_json") == true ]]' || return 1
+  require_literal "$file" "release_assets=\$(jq -r '[.assets[].name] | sort | .[]' <<<\"\$final_release_json\")" || return 1
   require_literal "$file" '[[ "$release_assets" == "$expected_files" ]]' || return 1
-  require_literal "$file" 'gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,isImmutable,assets' || return 1
-  require_literal "$file" '[[ $(jq -r .tagName <<<"$release_view") == "$GITHUB_REF_NAME" ]]' || return 1
-  require_literal "$file" '[[ $(jq -r .isPrerelease <<<"$release_view") == false ]]' || return 1
-  require_literal "$file" 'if [[ $(jq -r .isDraft <<<"$release_view") == true ]]; then' || return 1
-  require_literal "$file" '[[ $(jq -r .isImmutable <<<"$release_view") == false && "$release_assets" == "$expected_files" ]] || {' || return 1
-  require_literal "$file" '[[ $(jq -r .isImmutable <<<"$release_view") == true && "$release_assets" == "$expected_files" ]] || {' || return 1
+  require_literal "$file" 'releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")' || return 1
+  require_literal "$file" "matching_releases=\$(jq -c --arg tag \"\$GITHUB_REF_NAME\" '[.[] | .[] | select(.tag_name == \$tag)]' <<<\"\$releases_json\")" || return 1
+  require_literal "$file" 'matching_count=$(jq length <<<"$matching_releases")' || return 1
+  require_literal "$file" 'case "$matching_count" in' || return 1
+  require_literal "$file" '            0)' || return 1
+  require_literal "$file" '            1)' || return 1
+  require_literal "$file" '            *)' || return 1
+  require_literal "$file" 'Existing release query returned $matching_count entries for $GITHUB_REF_NAME; refusing ambiguous mutation.' || return 1
+  require_literal "$file" 'release_assets_are_complete "$release_json"' || return 1
+  require_literal "$file" '[[ $(jq -r .draft <<<"$release_json") == true ]]' || return 1
+  require_literal "$file" '[[ $(jq -r .draft <<<"$release_json") == false && $(jq -r .immutable <<<"$release_json") == true ]] || {' || return 1
   require_literal "$file" 'Existing draft release for $GITHUB_REF_NAME is partial or unexpected' || return 1
   require_literal "$file" 'Existing published release for $GITHUB_REF_NAME is not the expected immutable terminal state' || return 1
-  require_literal "$file" 'if [[ -z $release_view || $(jq -r .isDraft <<<"$release_view") == true ]]; then' || return 1
+  require_literal "$file" 'release_assets_are_complete "$release_json" || {' || return 1
+  require_literal "$file" 'release_assets_are_complete "$final_release_json"' || return 1
+  require_literal_count "$file" 'release_assets_are_complete "$release_json" || {' 2 || return 1
+  require_literal "$file" '.state == "uploaded" and' || return 1
+  require_literal "$file" '(.size == $archive_size and .digest == $archive_digest)' || return 1
+  require_literal "$file" '(.size == $checksum_size and .digest == $checksum_digest)' || return 1
   require_line_count "$file" '            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' 1 || return 1
   release_create_is_preflight_guarded "$file" || return 1
   require_workflow_order "$file" '--title "$GITHUB_REF_NAME" --draft' 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
@@ -178,6 +217,38 @@ release_package_negative_probes() {
   if validate_contract_checksum "$fixture" "$archive_name"; then
     fail 'checksum validator accepted duplicate checksum entries'
   fi
+
+  archive_size=$(stat -c %s "$fixture/$archive_name")
+  checksum_size=$(stat -c %s "$fixture/SHA256SUMS")
+  archive_digest="sha256:$(sha256sum "$fixture/$archive_name" | awk '{print $1}')"
+  checksum_digest="sha256:$(sha256sum "$fixture/SHA256SUMS" | awk '{print $1}')"
+  release_json=$(printf '{"assets":[{"name":"%s","state":"uploaded","size":%s,"digest":"%s"},{"name":"SHA256SUMS","state":"uploaded","size":%s,"digest":"%s"}]}' \
+    "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest")
+  validate_contract_release_assets "$release_json" "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest" ||
+    fail 'release asset validator rejected the exact uploaded local assets'
+  for mutation in state size digest duplicate; do
+    case $mutation in
+      state) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
+const release = JSON.parse(process.argv[2]); release.assets[0].state = 'starter'; process.stdout.write(JSON.stringify(release));
+NODE
+) ;;
+      size) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
+const release = JSON.parse(process.argv[2]); release.assets[0].size += 1; process.stdout.write(JSON.stringify(release));
+NODE
+) ;;
+      digest) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
+const release = JSON.parse(process.argv[2]); release.assets[0].digest = 'sha256:wrong'; process.stdout.write(JSON.stringify(release));
+NODE
+) ;;
+      duplicate) mutated_release_json=$(contract_node - "$release_json" <<'NODE'
+const release = JSON.parse(process.argv[2]); release.assets.push(release.assets[0]); process.stdout.write(JSON.stringify(release));
+NODE
+) ;;
+    esac
+    if validate_contract_release_assets "$mutated_release_json" "$archive_name" "$archive_size" "$archive_digest" "$checksum_size" "$checksum_digest"; then
+      fail "release asset validator accepted $mutation mutation"
+    fi
+  done
   rm -rf -- "$fixture"
 }
 
@@ -217,17 +288,26 @@ release_package_workflow_mutation_probes() {
   sed '/X-GitHub-Api-Version: 2026-03-10/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing API version'; fi
 
-  sed '/\[\[ $(jq -r .tag_name <<<"\$release_json") == "\$GITHUB_REF_NAME" \]\]/d' "$release_workflow" > "$fixture"
+  sed '/\[\[ $(jq -r .tag_name <<<"\$final_release_json") == "\$GITHUB_REF_NAME" \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final tag assertion'; fi
 
-  sed '/\[\[ $(jq -r .draft <<<"\$release_json") == false \]\]/d' "$release_workflow" > "$fixture"
+  sed '/\[\[ $(jq -r .draft <<<"\$final_release_json") == false \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final draft assertion'; fi
 
-  sed '/\[\[ $(jq -r .prerelease <<<"\$release_json") == false \]\]/d' "$release_workflow" > "$fixture"
+  sed '/\[\[ $(jq -r .prerelease <<<"\$final_release_json") == false \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing final prerelease assertion'; fi
 
-  sed '/\[\[ $(jq -r .immutable <<<"\$release_json") == true \]\]/d' "$release_workflow" > "$fixture"
+  sed '/\[\[ $(jq -r .immutable <<<"\$final_release_json") == true \]\]/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted missing immutable assertion'; fi
+
+  sed '/releases_json=$(gh api --paginate --slurp/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted an unguarded release-query failure'; fi
+
+  sed '/\.state == "uploaded" and/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted release assets without uploaded state checks'; fi
+
+  sed '/(\.size == \$archive_size and \.digest == \$archive_digest)/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted release assets without archive size and digest checks'; fi
 
   rm -f -- "$fixture"
 }
