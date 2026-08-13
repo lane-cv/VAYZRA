@@ -432,6 +432,9 @@ deployment_public_origin_contract() {
   require_workflow_order "$file" "[[ -n \$public_origin ]] || fail '--public-origin is required'" 'for command in git docker openssl curl realpath stat mktemp install grep sed tr wc id; do' || return 1
   require_literal "$file" "printf 'HAPPYLEARN_PUBLIC_ORIGIN=%s\\n' \"\$public_origin\"" || return 1
   require_literal "$file" "printf 'commit=%s\\nproject=%s\\nweb=%s\\n' \"\$commit\" \"\$project\" \"\$public_origin\"" || return 1
+  require_literal "$file" "printf 'aistor_console_port=%s\\n' \"\$aistor_console_port\"" || return 1
+  require_literal "$file" "printf 'Use the deployment host address to open the AIStor console.\\n'" || return 1
+  ! grep -Fq -- 'aistor_console=http://127.0.0.1:' "$file" || return 1
 
   output=$(mktemp)
   if bash "$file" >"$output" 2>&1; then
@@ -451,7 +454,9 @@ deployment_public_origin_contract() {
     'https://host#fragment' \
     'https://host/${COMPOSE_VARIABLE}' \
     'http://[::::]' \
-    'https://host:99999'; do
+    'https://host:99999' \
+    'http://host:08080' \
+    'http://host:00080'; do
     output=$(mktemp)
     if bash "$file" --directory "$side_effect_directory" --public-origin "$invalid_origin" >"$output" 2>&1; then
       rm -f -- "$output"
@@ -480,6 +485,11 @@ deployment_public_origin_mutation_probe() {
   sed '/((10#\$port >= 1 && 10#\$port <= 65535))/c\    true' "$deploy_script" >"$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
     fail 'deploy contract accepted an out-of-range public-origin port'
+  fi
+
+  sed '/\[\[ \$port =~ /c\    [[ $port =~ ^[0-9]{1,5}$ ]] || return 1' "$deploy_script" >"$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
+    fail 'deploy contract accepted a leading-zero public-origin port'
   fi
   rm -f -- "$fixture"
 }

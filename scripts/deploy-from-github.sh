@@ -97,7 +97,7 @@ validate_public_origin() {
   authority=${authority%/}
   if [[ $authority == *:* ]]; then
     port=${authority##*:}
-    [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || return 1
     ((10#$port >= 1 && 10#$port <= 65535)) || return 1
   fi
 }
@@ -354,7 +354,8 @@ for _ in {1..30}; do
     commit=$(git -C "$directory" rev-parse --short=12 HEAD)
     printf 'HappyLearn deployed successfully.\n'
     printf 'commit=%s\nproject=%s\nweb=%s\n' "$commit" "$project" "$public_origin"
-    printf 'aistor_console=http://127.0.0.1:%s\n' "$aistor_console_port"
+    printf 'aistor_console_port=%s\n' "$aistor_console_port"
+    printf 'Use the deployment host address to open the AIStor console.\n'
     exit 0
   fi
   sleep 1
