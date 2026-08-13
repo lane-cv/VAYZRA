@@ -2,7 +2,7 @@
 
 HappyLearn 是一个由 Go API、Vue 管理控制台、文件处理 Worker、PostgreSQL、Redis 和 AIStor 对象存储组成的教学平台。
 
-当前初版 release：`v0.1.0`。
+当前初版 release：`v0.1.2`。
 
 本文提供从安装到部署的最短路径：可以直接使用 Docker Compose 部署本地/测试环境，也可以安装 Go、Node.js 和 pnpm 进行源码开发。它不会执行 Phase 6 生产发布、真实服务器切换或数据恢复操作；生产部署请使用 [`docs/runbooks/phase6-real-server-acceptance.md`](docs/runbooks/phase6-real-server-acceptance.md)、[`docs/runbooks/phase6-release-rollback.md`](docs/runbooks/phase6-release-rollback.md) 和已审批的发布流程。
 
@@ -16,7 +16,7 @@ HappyLearn 是一个由 Go API、Vue 管理控制台、文件处理 Worker、Pos
 
 ### 方式 A：Docker Compose 快速安装
 
-这是最简单的安装方式。它会构建应用和 Worker 镜像，并启动 PostgreSQL、Redis、AIStor、API、管理控制台和文件处理 Worker。默认端口只绑定到 `127.0.0.1`，适合个人电脑、测试机或反向代理后的内网服务。
+这是最简单的安装方式。它会构建 App、Worker 与 `update-agent` 镜像，并启动 PostgreSQL、Redis、AIStor、API、管理控制台、文件处理 Worker 和 GitHub 更新代理。默认端口只绑定到 `127.0.0.1`，适合个人电脑、测试机或反向代理后的内网服务。
 
 ```bash
 git clone git@github.com:lane-cv/VAYZRA.git "$HOME/apps/VAYZRA"
@@ -77,18 +77,21 @@ chmod 600 deploy/production.env
 在生产维护窗口中，先执行只读预检，再按发布手册运行发布协调器：
 
 ```bash
+candidate_manifest=/srv/happylearn/releases/release-input/candidate-manifest.json
+candidate_version=$(jq -er '.version' "$candidate_manifest")
+
 sudo scripts/prod-preflight.sh \
   --project-dir /srv/happylearn/current \
   --env-file /etc/happylearn/production.env \
-  --manifest /srv/happylearn/releases/release-input/candidate-manifest.json \
+  --manifest "$candidate_manifest" \
   --mode server \
   --expected-host-address '<approved-public-address>'
 
 sudo scripts/prod-release.sh \
   --project-dir /srv/happylearn/current \
   --env-file /etc/happylearn/production.env \
-  --manifest /srv/happylearn/releases/release-input/candidate-manifest.json \
-  --version 0.1.0 \
+  --manifest "$candidate_manifest" \
+  --version "$candidate_version" \
   --mode server \
   --expected-host-address '<approved-public-address>' \
   --confirm-maintenance-window
@@ -125,7 +128,7 @@ cd "$HOME/apps/VAYZRA"
 
 1. 检查当前 `master` 工作区是否干净，并以 `git pull --ff-only` 更新代码；
 2. 首次运行时生成仅供本机使用的 AI 主密钥，后续部署保持同一密钥；
-3. 验证 Compose 配置，构建 App 与 Worker 镜像；
+3. 验证 Compose 配置，构建 App、Worker 与 `update-agent` 镜像；
 4. 启动或更新 `happylearn-dev`，保留已有命名数据卷；
 5. 等待所有容器健康并验证应用 readiness 接口。
 
@@ -208,6 +211,8 @@ cd "$HOME/apps/VAYZRA"
   --license-file /absolute/path/to/minio.license
 ```
 
+该升级路径同样会重新构建 App、Worker 与 `update-agent` 镜像，并保留已有命名数据卷。
+
 脚本只接受 fast-forward 更新。若仓库存在未提交修改、分支不是指定分支或处于 detached HEAD，会停止而不是覆盖本地内容。
 
 部署完成后，管理员可以在“系统运维 → 系统设置 → GitHub 版本更新”中手动检查，页面也会定期检查。更新代理以 GitHub Releases 中版本号最高、已启用 GitHub immutable protection 的 stable SemVer Release 为唯一在线发现来源；标签必须严格为 `vMAJOR.MINOR.PATCH`，draft、prerelease、mutable Release、build metadata 和其他标签都会跳过。启用本策略前，仓库管理员必须在 GitHub Settings 的 Releases 区域启用 release immutability；该策略只保护启用后创建的 Release，旧 Release 不作为 OTA 信任输入。Release 标签会先以非强制方式拉取到隔离的 Git ref：同一版本标签一旦被本机检查过，远端再移动或重签该标签都会被拒绝。代理也会把配置的远端分支非强制拉取到另一隔离 ref，要求 Release 提交可从该远端分支到达，并核对该提交最新一次 `verify.yml` push 工作流已经成功；旁支、未合并或未通过完整验证的提交不能触发 OTA。随后代理用 Git ancestor 关系确认 Release 能从当前提交 fast-forward；当前提交已经领先于 Release 时不会自动降级，历史分叉时也会停止。
@@ -228,7 +233,7 @@ cd "$HOME/apps/VAYZRA"
 
 该在线更新入口仅由 `deploy-from-github.sh` 的本地/测试部署启用，生产 `compose.prod.yml` 不挂载更新代理或 Docker socket，生产环境仍须使用审批后的不可变镜像发布流程。
 
-仓库的 `github-release` 工作流只发布供本地/测试 OTA 发现的 GitHub Release 元数据；它不会构建或推送 Phase 6 所需的不可变生产镜像、SBOM 或候选 manifest。生产发布输入仍须由独立、已审批的构建与制品登记流程生成，并按方式 C 的 Phase 6 手册验收，不能把 GitHub Release 当作生产发布闭环。
+仓库的 `github-release` 工作流会发布供本地/测试 OTA 发现的 GitHub Release 元数据，并附带 `VAYZRA-vX.Y.Z.tar.gz` 源码归档和 `SHA256SUMS` 校验文件；这些源码资产不是生产制品。它不会构建或推送 Phase 6 所需的不可变生产镜像、SBOM 或候选 manifest。生产发布输入仍须由独立、已审批的构建与制品登记流程生成，并按方式 C 的 Phase 6 手册验收，不能把 GitHub Release 当作生产发布闭环。
 
 如果 GitHub 仓库为私有仓库，更新代理不能使用宿主机 SSH 私钥。请准备一个仅有仓库 `Contents: Read` 与 `Actions: Read` 权限的 fine-grained GitHub Token 文件，并以 owner-only 权限运行部署脚本：
 
