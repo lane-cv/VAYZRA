@@ -1,6 +1,6 @@
 # HappyLearn local development and Ubuntu container runbook
 
-This phase produces a same-origin Go/API and Vue console with unified teacher/AI Q&A plus a serial file-processing worker. It is intended for the user's Ubuntu 24.04 Docker host behind a TLS-terminating reverse proxy. PostgreSQL, Redis, AIStor S3, and the worker health endpoint remain private to the Docker network. This runbook does not deploy to a remote server. AI provider setup, safe diagnostics, master-key rotation and Phase 3 rollback are documented in [phase4-ai-qanda.md](phase4-ai-qanda.md).
+This phase produces a same-origin Go/API and Vue console with unified teacher/AI Q&A plus a serial file-processing worker. It describes a local/test stack on an Ubuntu 24.04 Docker host, including access from another device on a trusted LAN. It is not a public-Internet or production deployment. Production must use the hardened deployment behind a TLS-terminating reverse proxy and keep data services private. AI provider setup, safe diagnostics, master-key rotation and Phase 3 rollback are documented in [phase4-ai-qanda.md](phase4-ai-qanda.md).
 
 ## Shell requirement
 
@@ -18,7 +18,18 @@ export HAPPYLEARN_AISTOR_LICENSE_FILE="$PWD/.secrets/minio.license"
 test -r "$HAPPYLEARN_AISTOR_LICENSE_FILE"
 ```
 
-Complete the protected environment-file setup below before the first stack startup. After startup, wait until all services report `healthy`. The application is available at `127.0.0.1:8080`; PostgreSQL, Redis, and the AIStor S3/console development ports bind only to loopback. The worker health endpoint is private to the Compose network and is not published on the host. Production deployment must remove every database, Redis, S3, and S3-console host mapping.
+Complete the protected environment-file setup below before the first stack startup. After startup, wait until all services report `healthy`. Development Compose publishes these six host ports on every host interface:
+
+- application: `0.0.0.0:8080` to container port `8080`
+- internal application monitoring: `0.0.0.0:9090` to container port `9090`
+- PostgreSQL: `0.0.0.0:54329` to container port `5432`
+- Redis: `0.0.0.0:56379` to container port `6379`
+- AIStor S3: `0.0.0.0:59000` to container port `9000`
+- AIStor console: `0.0.0.0:59001` to container port `9001`
+
+`0.0.0.0` is a bind address, not a browser destination. On the deployment host, use `http://127.0.0.1:8080`; from another device, replace `127.0.0.1` with the deployment host's LAN IP, for example `http://192.168.1.20:8080`, and set `HAPPYLEARN_PUBLIC_ORIGIN` to that exact browser origin before starting Compose.
+
+Expose this development stack only on a trusted LAN, and configure the host firewall to allow these ports only from the intended local subnet. The development credentials and plain HTTP defaults are not safe for the public Internet or production. The worker health endpoint remains private to the Compose network and is not published on the host. Production deployment must not publish PostgreSQL, Redis, AIStor S3, or the AIStor console as host ports.
 
 The worker runs as UID/GID `10002`, with a read-only root filesystem, no Linux capabilities, and a 1024 MiB tmpfs work directory. It has no published port and its network has no public route. Each uploaded version is processed serially through type validation, ClamAV scanning, bounded Office conversion or video probing, and private preview storage. Processing fails closed when the baked-in daily ClamAV definitions are missing or older than seven days. Rebuild and redeploy `Dockerfile.worker` at least weekly (and immediately for urgent signature releases):
 
