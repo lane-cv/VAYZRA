@@ -128,6 +128,7 @@ release_package_contract() {
   require_literal "$file" 'cmp -s "$expected_checksum" SHA256SUMS' || return 1
   require_literal "$file" 'sha256sum --check SHA256SUMS' || return 1
   require_literal "$file" 'name: github-release-package-${{ github.run_id }}' || return 1
+  require_literal "$file" 'overwrite: true' || return 1
   require_literal "$file" 'if-no-files-found: error' || return 1
   require_literal "$file" 'retention-days: 1' || return 1
   expected_upload_paths=$'            ${{ runner.temp }}/github-release-package/${{ steps.package.outputs.archive_name }}\n            ${{ runner.temp }}/github-release-package/SHA256SUMS'
@@ -173,6 +174,10 @@ release_package_contract() {
   release_create_is_preflight_guarded "$file" || return 1
   require_workflow_order "$file" '--title "$GITHUB_REF_NAME" --draft' 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' || return 1
   require_workflow_order "$file" 'gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false' "X-GitHub-Api-Version: 2026-03-10" || return 1
+  require_literal "$file" "[[ \$(jq -r '.object.type' <<<\"\$tag_ref\") == tag ]]" || return 1
+  require_literal "$file" 'tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")' || return 1
+  require_literal "$file" "[[ \$(jq -r '.object.type' <<<\"\$tag_object\") == commit ]]" || return 1
+  require_literal "$file" "[[ \$(jq -r '.object.sha' <<<\"\$tag_object\") == \"\$RELEASE_COMMIT\" ]]" || return 1
 }
 
 release_package_negative_probes() {
@@ -308,6 +313,15 @@ release_package_workflow_mutation_probes() {
 
   sed '/(\.size == \$archive_size and \.digest == \$archive_digest)/d' "$release_workflow" > "$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted release assets without archive size and digest checks'; fi
+
+  sed '/overwrite: true/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted artifact uploads without rerun overwrite'; fi
+
+  sed '/\[\[ $(jq -r '\''.object.type'\'' <<<"\$tag_ref") == tag \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted a lightweight tag'; fi
+
+  sed '/\[\[ $(jq -r '\''.object.type'\'' <<<"\$tag_object") == commit \]\]/d' "$release_workflow" > "$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 release_package_contract "$fixture"); then fail 'release contract accepted a nested annotated tag'; fi
 
   rm -f -- "$fixture"
 }

@@ -133,6 +133,7 @@ jobs:
             ${{ runner.temp }}/github-release-package/SHA256SUMS
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   publish:
     needs: validate
@@ -217,18 +218,11 @@ jobs:
           }
 
           tag_ref=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
-          object_type=$(jq -r '.object.type' <<<"$tag_ref")
-          object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
-          for _ in {1..5}; do
-            if [[ "$object_type" == commit ]]; then
-              break
-            fi
-            [[ "$object_type" == tag ]]
-            tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")
-            object_type=$(jq -r '.object.type' <<<"$tag_object")
-            object_sha=$(jq -r '.object.sha' <<<"$tag_object")
-          done
-          [[ "$object_type" == commit && "$object_sha" == "$RELEASE_COMMIT" ]]
+          [[ $(jq -r '.object.type' <<<"$tag_ref") == tag ]]
+          tag_object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")
+          [[ $(jq -r '.object.type' <<<"$tag_object") == commit ]]
+          [[ $(jq -r '.object.sha' <<<"$tag_object") == "$RELEASE_COMMIT" ]]
 
           releases_json=$(gh api --paginate --slurp "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
           matching_releases=$(jq -c --arg tag "$GITHUB_REF_NAME" '[.[] | .[] | select(.tag_name == $tag)]' <<<"$releases_json")
