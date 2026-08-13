@@ -48,7 +48,7 @@ services:
       POSTGRES_PASSWORD: happylearn_dev
       POSTGRES_DB: happylearn
     ports:
-      - "127.0.0.1:54329:5432"
+      - "0.0.0.0:${HAPPYLEARN_POSTGRES_PORT:-54329}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U happylearn -d happylearn"]
       interval: 5s
@@ -68,7 +68,7 @@ services:
     logging: *default-logging
     image: ${HAPPYLEARN_LOCAL_REDIS_IMAGE:-redis:8.8@sha256:3eafabb4c93fcb8b36b666e07a43f096cb157bc6b07dce4b2492b895c63cf37f}
     ports:
-      - "127.0.0.1:56379:6379"
+      - "0.0.0.0:${HAPPYLEARN_REDIS_PORT:-56379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -127,8 +127,8 @@ services:
       MINIO_ROOT_USER: ${HAPPYLEARN_MINIO_ACCESS_KEY:-happylearn_dev}
       MINIO_ROOT_PASSWORD: ${HAPPYLEARN_MINIO_SECRET_KEY:-happylearn_minio_dev_secret}
     ports:
-      - "127.0.0.1:59000:9000"
-      - "127.0.0.1:59001:9001"
+      - "0.0.0.0:${HAPPYLEARN_AISTOR_API_PORT:-59000}:9000"
+      - "0.0.0.0:${HAPPYLEARN_AISTOR_CONSOLE_PORT:-59001}:9001"
     volumes:
       - minio_data:/data
       - aistor_license_runtime:/license:ro
@@ -214,7 +214,7 @@ services:
       HAPPYLEARN_DATABASE_URL: postgres://happylearn:happylearn_dev@postgres:5432/happylearn?sslmode=disable
       HAPPYLEARN_REDIS_URL: redis://redis:6379/0
       HAPPYLEARN_LOGIN_THROTTLE_SECRET: development-only-app-secret-at-least-32-bytes
-      HAPPYLEARN_PUBLIC_ORIGIN: http://127.0.0.1:8080
+      HAPPYLEARN_PUBLIC_ORIGIN: ${HAPPYLEARN_PUBLIC_ORIGIN:-http://127.0.0.1:8080}
       HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer
       HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac
       HAPPYLEARN_AI_MASTER_KEY: ${HAPPYLEARN_AI_MASTER_KEY:-}
@@ -229,8 +229,8 @@ services:
       HAPPYLEARN_MINIO_ORIGINALS_BUCKET: happylearn-originals
       HAPPYLEARN_MINIO_PREVIEWS_BUCKET: happylearn-previews
     ports:
-      - "127.0.0.1:8080:8080"
-      - "127.0.0.1:9090:9090"
+      - "0.0.0.0:${HAPPYLEARN_APP_PORT:-8080}:8080"
+      - "0.0.0.0:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"
     volumes:
       - app_secrets:/run/secrets:ro
     read_only: true

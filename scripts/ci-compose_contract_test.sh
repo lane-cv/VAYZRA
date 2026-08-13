@@ -62,6 +62,39 @@ assert_expected_services() {
   return 1
 }
 
+assert_all_interface_ports() {
+  local config="$1"
+  local label="$2"
+  local expected_ports='[
+    {"service":"app","host_ip":"0.0.0.0","published":"8080","target":8080},
+    {"service":"app","host_ip":"0.0.0.0","published":"9090","target":9090},
+    {"service":"minio","host_ip":"0.0.0.0","published":"59000","target":9000},
+    {"service":"minio","host_ip":"0.0.0.0","published":"59001","target":9001},
+    {"service":"postgres","host_ip":"0.0.0.0","published":"54329","target":5432},
+    {"service":"redis","host_ip":"0.0.0.0","published":"56379","target":6379}
+  ]'
+
+  if jq -e --argjson expected "$expected_ports" '
+    [
+      .services | to_entries[] |
+      .key as $service |
+      .value.ports[]? |
+      {
+        service: $service,
+        host_ip,
+        published: (.published | tostring),
+        target
+      }
+    ] | sort_by(.service, .host_ip, .published, .target) ==
+      ($expected | sort_by(.service, .host_ip, .published, .target))
+  ' "$config" >/dev/null; then
+    return 0
+  fi
+
+  echo "CI Compose host-port contract: FAIL: $label must expose exactly the six all-interface mappings" >&2
+  return 1
+}
+
 verify_log_rotation_mutations() {
   local config="$1"
   local label="$2"
@@ -162,6 +195,18 @@ assert_log_rotation "$merged_json" "base+CI merged Compose config" ||
 verify_log_rotation_mutations "$base_json" "base Compose config"
 verify_log_rotation_mutations "$merged_json" "base+CI merged Compose config"
 
+assert_all_interface_ports "$base_json" "base Compose config" ||
+  fail "base all-interface port contract is not satisfied"
+assert_all_interface_ports "$merged_json" "base+CI merged Compose config" ||
+  fail "merged all-interface port contract is not satisfied"
+
+mutated_ports_json="$tmp_dir/all-interface-ports-mutated.json"
+jq '(.services.app.ports[] | select(.target == 8080).host_ip) = "127.0.0.1"' \
+  "$base_json" >"$mutated_ports_json"
+if assert_all_interface_ports "$mutated_ports_json" "App host-IP mutation" >/dev/null 2>&1; then
+  fail "all-interface port assertion accepted an App loopback host-IP mutation"
+fi
+
 jq -e '.networks.happylearn.internal == true' "$base_json" >/dev/null ||
   fail "base networks.happylearn.internal must be true"
 jq -e '
@@ -170,15 +215,6 @@ jq -e '
    .networks.happylearn.internal == false)
 ' "$merged_json" >/dev/null ||
   fail "merged networks.happylearn.internal must be effectively false"
-
-for config in "$base_json" "$merged_json"; do
-  jq -e '
-    [.services[]?.ports[]?] as $ports |
-    ($ports | length) > 0 and
-    all($ports[]; .host_ip == "127.0.0.1")
-  ' "$config" >/dev/null ||
-    fail "every published port must bind strictly to 127.0.0.1"
-done
 
 verify_job_line="$(exact_line '  verify:')"
 verify_job_end="$(

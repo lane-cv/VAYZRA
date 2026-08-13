@@ -531,6 +531,11 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
     --project-directory "$repo_root" -f "$compose_base" -f "$compose_override" config --images)
   compose_images_controlled <<<"$compose_images" || fail 'rendered Compose config contains an uncontrolled image reference'
 
+  rendered_compose=$(env "${compose_environment[@]}" docker compose --profile '*' \
+    --project-directory "$repo_root" -f "$compose_base" -f "$compose_override" config --format json)
+  jq -e '(.services["update-agent"].ports? // []) | length == 0' <<<"$rendered_compose" >/dev/null ||
+    fail 'update-agent must not publish a host port'
+
   negative_images=$(printf 'services:\n  movable-image-regression-probe:\n    image: attacker-controlled:latest\n' | \
     env "${compose_environment[@]}" docker compose --profile '*' --project-directory "$repo_root" \
       -f "$compose_base" -f "$compose_override" -f - config --images)
