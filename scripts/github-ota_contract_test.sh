@@ -419,12 +419,50 @@ compose_images_controlled() {
   done
 }
 
+deployment_public_origin_contract() {
+  local file=$1 output
+
+  require_literal "$file" 'Usage: deploy-from-github.sh --license-file PATH --public-origin URL [options]' || return 1
+  require_literal "$file" '  --public-origin URL       Browser-visible web origin (required)' || return 1
+  require_literal "$file" "public_origin=''" || return 1
+  require_literal "$file" '--public-origin|--app-port' || return 1
+  require_literal "$file" '--public-origin) public_origin=$2 ;;' || return 1
+  require_literal "$file" "[[ -n \$public_origin ]] || fail '--public-origin is required'" || return 1
+  require_literal "$file" "[[ \$public_origin != *\$'\\n'* && \$public_origin != *\$'\\r'* && \$public_origin != *[[:space:]]* ]] ||" || return 1
+  require_literal "$file" "fail '--public-origin is invalid'" || return 1
+  require_literal "$file" '  http://*|https://*) ;;' || return 1
+  require_workflow_order "$file" "[[ -n \$public_origin ]] || fail '--public-origin is required'" 'for command in git docker openssl curl realpath stat mktemp install grep sed tr wc id; do' || return 1
+  require_literal "$file" "printf 'HAPPYLEARN_PUBLIC_ORIGIN=%s\\n' \"\$public_origin\"" || return 1
+  require_literal "$file" "printf 'commit=%s\\nproject=%s\\nweb=%s\\n' \"\$commit\" \"\$project\" \"\$public_origin\"" || return 1
+
+  output=$(mktemp)
+  if bash "$file" >"$output" 2>&1; then
+    rm -f -- "$output"
+    return 1
+  fi
+  grep -Fxc 'deploy-from-github: --public-origin is required' "$output" >/dev/null
+  rm -f -- "$output"
+}
+
+deployment_public_origin_mutation_probe() {
+  local fixture
+  fixture=$(mktemp)
+  sed '/\[\[ -n \$public_origin \]\] || fail '\''--public-origin is required'\''/d' "$deploy_script" >"$fixture"
+  if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
+    fail 'deploy contract accepted missing required public-origin validation'
+  fi
+  rm -f -- "$fixture"
+}
+
 [[ $(git -C "$repo_root" check-attr eol -- scripts/deploy-from-github.sh) == 'scripts/deploy-from-github.sh: eol: lf' ]] ||
   fail 'deploy shell scripts must be checked out with LF line endings'
 if LC_ALL=C grep -n $'\r' "$deploy_script" >/dev/null; then
   fail 'deploy shell script contains CR bytes despite the LF checkout contract'
 fi
 bash -n "$deploy_script"
+deployment_public_origin_contract "$deploy_script" ||
+  fail 'deploy contract does not require and persist the browser public origin'
+deployment_public_origin_mutation_probe
 
 require_literal "$release_workflow" 'release_commit=$(git rev-parse "$tag_target_sha^{commit}")'
 require_literal "$release_workflow" 'event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")'

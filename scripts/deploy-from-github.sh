@@ -23,6 +23,7 @@ project=$DEFAULT_PROJECT
 directory="$PWD/VAYZRA"
 license_file=${HAPPYLEARN_AISTOR_LICENSE_FILE:-}
 github_token_file=${HAPPYLEARN_UPDATE_AGENT_GITHUB_TOKEN_FILE:-}
+public_origin=''
 app_port=8080
 internal_port=9090
 postgres_port=54329
@@ -41,7 +42,7 @@ state_init_image=$DEFAULT_STATE_INIT_IMAGE
 
 usage() {
   cat <<'EOF'
-Usage: deploy-from-github.sh --license-file PATH [options]
+Usage: deploy-from-github.sh --license-file PATH --public-origin URL [options]
 
 Clone or fast-forward a clean HappyLearn checkout, build its images, and deploy
 the local Docker Compose stack without deleting existing named volumes. With
@@ -53,13 +54,14 @@ Options:
   --directory PATH           Checkout/deployment directory (default: ./VAYZRA)
   --project NAME             Compose project (default: happylearn-dev)
   --license-file PATH        Readable AIStor minio.license file (required)
+  --public-origin URL       Browser-visible web origin (required)
   --github-token-file PATH   Optional GitHub token file for private repository updates
-  --app-port PORT            Web/API loopback port (default: 8080)
-  --internal-port PORT       Internal API loopback port (default: 9090)
-  --postgres-port PORT       PostgreSQL loopback port (default: 54329)
-  --redis-port PORT          Redis loopback port (default: 56379)
-  --aistor-api-port PORT     AIStor S3 loopback port (default: 59000)
-  --aistor-console-port PORT AIStor console loopback port (default: 59001)
+  --app-port PORT            Web/API host port (default: 8080)
+  --internal-port PORT       Internal API host port (default: 9090)
+  --postgres-port PORT       PostgreSQL host port (default: 54329)
+  --redis-port PORT          Redis host port (default: 56379)
+  --aistor-api-port PORT     AIStor S3 host port (default: 59000)
+  --aistor-console-port PORT AIStor console host port (default: 59001)
   --offline                  Use preloaded images; require an existing checkout
   -h, --help                 Show this help
 
@@ -114,7 +116,7 @@ validate_ai_env() {
 
 while (($#)); do
   case $1 in
-    --repository|--ref|--directory|--project|--license-file|--github-token-file|--app-port|--internal-port|--postgres-port|--redis-port|--aistor-api-port|--aistor-console-port)
+    --repository|--ref|--directory|--project|--license-file|--github-token-file|--public-origin|--app-port|--internal-port|--postgres-port|--redis-port|--aistor-api-port|--aistor-console-port)
       require_value "$@"
       case $1 in
         --repository) repository=$2 ;;
@@ -123,6 +125,7 @@ while (($#)); do
         --project) project=$2 ;;
         --license-file) license_file=$2 ;;
         --github-token-file) github_token_file=$2 ;;
+        --public-origin) public_origin=$2 ;;
         --app-port) app_port=$2 ;;
         --internal-port) internal_port=$2 ;;
         --postgres-port) postgres_port=$2 ;;
@@ -143,6 +146,14 @@ while (($#)); do
     *) fail "unknown argument: $1" ;;
   esac
 done
+
+[[ -n $public_origin ]] || fail '--public-origin is required'
+[[ $public_origin != *$'\n'* && $public_origin != *$'\r'* && $public_origin != *[[:space:]]* ]] ||
+  fail '--public-origin is invalid'
+case $public_origin in
+  http://*|https://*) ;;
+  *) fail '--public-origin is invalid' ;;
+esac
 
 if [[ $offline == true ]]; then
   postgres_image=$OFFLINE_POSTGRES_IMAGE
@@ -279,7 +290,7 @@ chmod 0600 "$temporary_env"
   printf 'HAPPYLEARN_LOCAL_REDIS_IMAGE=%s\n' "$redis_image"
   printf 'HAPPYLEARN_LOCAL_INIT_IMAGE=%s\n' "$init_image"
   printf 'HAPPYLEARN_LOCAL_STATE_INIT_IMAGE=%s\n' "$state_init_image"
-  printf 'HAPPYLEARN_PUBLIC_ORIGIN=http://127.0.0.1:%s\n' "$app_port"
+  printf 'HAPPYLEARN_PUBLIC_ORIGIN=%s\n' "$public_origin"
   printf 'HAPPYLEARN_UPDATE_REPOSITORY=%s\n' "$directory"
   printf 'HAPPYLEARN_UPDATE_REF=%s\n' "$ref"
   printf 'HAPPYLEARN_UPDATE_PROJECT=%s\n' "$project"
@@ -334,7 +345,7 @@ for _ in {1..30}; do
   if curl --fail --silent --show-error "$ready_url" >/dev/null 2>&1; then
     commit=$(git -C "$directory" rev-parse --short=12 HEAD)
     printf 'HappyLearn deployed successfully.\n'
-    printf 'commit=%s\nproject=%s\nweb=http://127.0.0.1:%s\n' "$commit" "$project" "$app_port"
+    printf 'commit=%s\nproject=%s\nweb=%s\n' "$commit" "$project" "$public_origin"
     printf 'aistor_console=http://127.0.0.1:%s\n' "$aistor_console_port"
     exit 0
   fi

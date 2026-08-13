@@ -2,7 +2,7 @@
 
 HappyLearn 是一个由 Go API、Vue 管理控制台、文件处理 Worker、PostgreSQL、Redis 和 AIStor 对象存储组成的教学平台。
 
-当前初版 release：`v0.1.2`。
+当前初版 release：`v0.1.3`。
 
 本文提供从安装到部署的最短路径：可以直接使用 Docker Compose 部署本地/测试环境，也可以安装 Go、Node.js 和 pnpm 进行源码开发。它不会执行 Phase 6 生产发布、真实服务器切换或数据恢复操作；生产部署请使用 [`docs/runbooks/phase6-real-server-acceptance.md`](docs/runbooks/phase6-real-server-acceptance.md)、[`docs/runbooks/phase6-release-rollback.md`](docs/runbooks/phase6-release-rollback.md) 和已审批的发布流程。
 
@@ -16,7 +16,7 @@ HappyLearn 是一个由 Go API、Vue 管理控制台、文件处理 Worker、Pos
 
 ### 方式 A：Docker Compose 快速安装
 
-这是最简单的安装方式。它会构建 App、Worker 与 `update-agent` 镜像，并启动 PostgreSQL、Redis、AIStor、API、管理控制台、文件处理 Worker 和 GitHub 更新代理。默认端口只绑定到 `127.0.0.1`，适合个人电脑、测试机或反向代理后的内网服务。
+这是最简单的安装方式。它会构建 App、Worker 与 `update-agent` 镜像，并启动 PostgreSQL、Redis、AIStor、API、管理控制台、文件处理 Worker 和 GitHub 更新代理。默认端口绑定到所有接口，适合受信任局域网中的测试机；运行前必须把示例地址替换为该主机实际可被浏览器访问的地址。
 
 ```bash
 git clone git@github.com:lane-cv/VAYZRA.git "$HOME/apps/VAYZRA"
@@ -27,7 +27,8 @@ chmod 600 /absolute/path/to/minio.license
 
 ./scripts/deploy-from-github.sh \
   --directory "$PWD" \
-  --license-file /absolute/path/to/minio.license
+  --license-file /absolute/path/to/minio.license \
+  --public-origin http://192.168.1.20:8080
 ```
 
 没有 SSH Key 时，可将第一行替换为：
@@ -121,7 +122,8 @@ cd "$HOME/apps/VAYZRA"
 
 ./scripts/deploy-from-github.sh \
   --directory "$PWD" \
-  --license-file /absolute/path/to/minio.license
+  --license-file /absolute/path/to/minio.license \
+  --public-origin http://192.168.1.20:8080
 ```
 
 脚本会完成以下操作：
@@ -132,16 +134,16 @@ cd "$HOME/apps/VAYZRA"
 4. 启动或更新 `happylearn-dev`，保留已有命名数据卷；
 5. 等待所有容器健康并验证应用 readiness 接口。
 
-默认访问地址：
+默认公开映射为六个全部接口绑定：
 
-- Web 与 API：<http://127.0.0.1:8080>
-- 内部接口：`127.0.0.1:9090`
-- PostgreSQL：`127.0.0.1:54329`
-- Redis：`127.0.0.1:56379`
-- AIStor S3：`127.0.0.1:59000`
-- AIStor 控制台：<http://127.0.0.1:59001>
+- Web 与 API：`0.0.0.0:8080 -> app:8080`，浏览器地址为示例中的 <http://192.168.1.20:8080>
+- 内部接口：`0.0.0.0:9090 -> app:9090`
+- PostgreSQL：`0.0.0.0:54329 -> postgres:5432`
+- Redis：`0.0.0.0:56379 -> redis:6379`
+- AIStor S3：`0.0.0.0:59000 -> minio:9000`
+- AIStor 控制台：`0.0.0.0:59001 -> minio:9001`
 
-所有端口只绑定本机回环地址，不对局域网或公网开放。
+这些端口会暴露到主机的所有网络接口。只允许受信任局域网访问：必须在主机防火墙和上游网络设备中仅放行需要的端口和可信网段，不能把它们直接暴露到公网。该本地/测试配置明确不适用于生产；生产仍使用 `compose.prod.yml`、已审批的不可变镜像和 Phase 6 发布流程。
 
 ### Docker 镜像离线部署
 
@@ -189,7 +191,8 @@ docker load -i /path/to/vayzra-images.tar.gz
 ./scripts/deploy-from-github.sh \
   --offline \
   --directory "$PWD" \
-  --license-file /home/ubuntu/minio.license
+  --license-file /home/ubuntu/minio.license \
+  --public-origin http://192.168.1.20:8080
 ```
 
 `--offline` 要求目标机已有 Git checkout 和上述全部离线别名；脚本只在该模式把 Compose 切换到这些本地别名，并使用 `--no-build`，不会执行 `git pull`、构建或拉取。离线包是平台相关制品，必须在与目标机相同架构上制作并随 `.sha256` 一起传输、校验；许可证、密钥和命名数据卷仍然单独保管，不会打进镜像包。
@@ -208,7 +211,8 @@ docker load -i /path/to/vayzra-images.tar.gz
 cd "$HOME/apps/VAYZRA"
 ./scripts/deploy-from-github.sh \
   --directory "$PWD" \
-  --license-file /absolute/path/to/minio.license
+  --license-file /absolute/path/to/minio.license \
+  --public-origin http://192.168.1.20:8080
 ```
 
 该升级路径同样会重新构建 App、Worker 与 `update-agent` 镜像，并保留已有命名数据卷。
@@ -242,7 +246,8 @@ chmod 600 /absolute/path/to/github-token
 ./scripts/deploy-from-github.sh \
   --directory "$PWD" \
   --license-file /absolute/path/to/minio.license \
-  --github-token-file /absolute/path/to/github-token
+  --github-token-file /absolute/path/to/github-token \
+  --public-origin http://192.168.1.20:8080
 ```
 
 更新代理通过 `https://api.github.com` 读取 Release 元数据，并通过 GitHub Smart HTTP Basic 认证拉取已验证的 Release 标签。Token 只从只读文件加载：API Bearer 头仅发送给 `api.github.com`，Git 认证头仅作用于 `https://github.com/`；Token 不写入远程 URL、Git 命令参数、状态文件、持久化 Git 配置或应用日志，也不返回给前端。`--github-token-file` 只配置容器内的更新代理，首次 clone 以及宿主机执行的 pull 仍使用宿主机已有的 SSH Key 或 HTTPS 凭据。没有 Token 时，公开仓库可以检查；使用 SSH 完成首次部署的私有仓库则会在管理员页面提示 Release 检查不可用。
@@ -253,7 +258,8 @@ chmod 600 /absolute/path/to/github-token
 ./scripts/deploy-from-github.sh \
   --directory "$PWD" \
   --ref feature/example \
-  --license-file /absolute/path/to/minio.license
+  --license-file /absolute/path/to/minio.license \
+  --public-origin http://192.168.1.20:8080
 ```
 
 已有目录必须已经检出同名分支。在线更新仍只接受能从该分支当前提交 fast-forward、同时属于受信 `master` 发布线且该提交已通过 `master` 最新验证运行的 stable SemVer Release；feature 分支自身未经发布工作流的标签不会被接受。该选项适合在包含受信 Release 的测试分支上验证兼容性，不应替代正式发布审批。
@@ -271,10 +277,11 @@ chmod 600 /absolute/path/to/github-token
   --postgres-port 55429 \
   --redis-port 56380 \
   --aistor-api-port 59002 \
-  --aistor-console-port 59003
+  --aistor-console-port 59003 \
+  --public-origin http://192.168.1.20:18080
 ```
 
-此时 Web 地址为 <http://127.0.0.1:18080>。脚本会把本机配置写入被 Git 忽略的 `.env.github-deploy`，密钥保存在 `.secrets/github-deploy/`。
+此时 Web 地址为 <http://192.168.1.20:18080>。`--public-origin` 必须与浏览器实际使用的 Web 地址一致；脚本会把该地址和本机配置写入被 Git 忽略的 `.env.github-deploy`，密钥保存在 `.secrets/github-deploy/`。
 
 ## 查看状态和日志
 
