@@ -71,7 +71,7 @@ require_compose_literal() {
 require_compose_literal 'HAPPYLEARN_INTERNAL_LISTEN: ":9090"'
 require_compose_literal 'HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer'
 require_compose_literal 'HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac'
-require_compose_literal '"127.0.0.1:9090:9090"'
+require_compose_literal '"0.0.0.0:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"'
 require_compose_literal '  app-secrets-init:'
 require_compose_literal 'source: metrics_bearer_secret'
 require_compose_literal 'target: /source/metrics-bearer'
@@ -146,7 +146,7 @@ validate_monitoring_compose() {
     --arg metrics_source "$metrics_bearer_file" \
     --arg hmac_source "$host_hmac_file" '
     any(.services.app.ports[]?;
-      .host_ip == "127.0.0.1" and
+      .host_ip == "0.0.0.0" and
       (.published | tostring) == "9090" and
       (.target | tostring) == "9090") and
     .services.app.environment.HAPPYLEARN_INTERNAL_LISTEN == ":9090" and
@@ -217,6 +217,17 @@ remove_exact_line() {
   awk -v exact="$line" '$0 != exact' "$source" >"$destination"
 }
 
+replace_exact_line() {
+  local source="$1"
+  local line="$2"
+  local replacement="$3"
+  local destination="$4"
+  awk -v exact="$line" -v replacement="$replacement" '
+    $0 == exact { print replacement; next }
+    { print }
+  ' "$source" >"$destination"
+}
+
 remove_secret_mount() {
   local source="$1"
   local secret="$2"
@@ -265,7 +276,7 @@ remove_app_secret_volume() {
 }
 
 for mutation in \
-  'port|      - "127.0.0.1:9090:9090"' \
+  'port|      - "0.0.0.0:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"' \
   'metrics_env|      HAPPYLEARN_METRICS_BEARER_SECRET_FILE: /run/secrets/metrics-bearer' \
   'host_env|      HAPPYLEARN_HOST_METRICS_HMAC_SECRET_FILE: /run/secrets/host-metrics-hmac'; do
   name="${mutation%%|*}"
@@ -279,6 +290,19 @@ for mutation in \
     fail "development Compose mutation was accepted: $name"
   fi
 done
+
+mutated="$fixture_root/compose-port-loopback.yml"
+mutated_json="$fixture_root/compose-port-loopback.json"
+replace_exact_line \
+  "$compose" \
+  '      - "0.0.0.0:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"' \
+  '      - "127.0.0.1:${HAPPYLEARN_INTERNAL_PORT:-9090}:9090"' \
+  "$mutated"
+render_monitoring_compose "$mutated" "$mutated_json" ||
+  fail "development Compose loopback port mutation did not render"
+if validate_monitoring_compose "$mutated_json"; then
+  fail "development Compose loopback host IP mutation was accepted"
+fi
 
 for secret in metrics_bearer_secret host_metrics_hmac_secret; do
   mutated="$fixture_root/compose-mount-$secret.yml"
