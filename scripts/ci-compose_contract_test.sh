@@ -65,14 +65,7 @@ assert_expected_services() {
 assert_all_interface_ports() {
   local config="$1"
   local label="$2"
-  local expected_ports='[
-    {"service":"app","host_ip":"0.0.0.0","published":"8080","target":8080},
-    {"service":"app","host_ip":"0.0.0.0","published":"9090","target":9090},
-    {"service":"minio","host_ip":"0.0.0.0","published":"59000","target":9000},
-    {"service":"minio","host_ip":"0.0.0.0","published":"59001","target":9001},
-    {"service":"postgres","host_ip":"0.0.0.0","published":"54329","target":5432},
-    {"service":"redis","host_ip":"0.0.0.0","published":"56379","target":6379}
-  ]'
+  local expected_ports="$3"
 
   if jq -e --argjson expected "$expected_ports" '
     [
@@ -93,6 +86,19 @@ assert_all_interface_ports() {
 
   echo "CI Compose host-port contract: FAIL: $label must expose exactly the six all-interface mappings" >&2
   return 1
+}
+
+assert_app_public_origin() {
+  local config="$1"
+  local label="$2"
+  local expected_origin="$3"
+
+  jq -e --arg expected "$expected_origin" \
+    '.services.app.environment.HAPPYLEARN_PUBLIC_ORIGIN == $expected' \
+    "$config" >/dev/null || {
+    echo "CI Compose host-port contract: FAIL: $label must preserve the exact App public origin" >&2
+    return 1
+  }
 }
 
 verify_log_rotation_mutations() {
@@ -184,6 +190,39 @@ merged_json="$tmp_dir/merged.json"
 docker compose --profile '*' -f "$base" config --format json >"$base_json"
 docker compose --profile '*' -f "$base" -f "$ci" config --format json >"$merged_json"
 
+default_ports='[
+  {"service":"app","host_ip":"0.0.0.0","published":"8080","target":8080},
+  {"service":"app","host_ip":"0.0.0.0","published":"9090","target":9090},
+  {"service":"minio","host_ip":"0.0.0.0","published":"59000","target":9000},
+  {"service":"minio","host_ip":"0.0.0.0","published":"59001","target":9001},
+  {"service":"postgres","host_ip":"0.0.0.0","published":"54329","target":5432},
+  {"service":"redis","host_ip":"0.0.0.0","published":"56379","target":6379}
+]'
+custom_ports='[
+  {"service":"app","host_ip":"0.0.0.0","published":"18080","target":8080},
+  {"service":"app","host_ip":"0.0.0.0","published":"19090","target":9090},
+  {"service":"minio","host_ip":"0.0.0.0","published":"59002","target":9000},
+  {"service":"minio","host_ip":"0.0.0.0","published":"59003","target":9001},
+  {"service":"postgres","host_ip":"0.0.0.0","published":"55429","target":5432},
+  {"service":"redis","host_ip":"0.0.0.0","published":"56380","target":6379}
+]'
+custom_origin='http://192.168.1.20:18080'
+custom_environment=(
+  'HAPPYLEARN_APP_PORT=18080'
+  'HAPPYLEARN_INTERNAL_PORT=19090'
+  'HAPPYLEARN_POSTGRES_PORT=55429'
+  'HAPPYLEARN_REDIS_PORT=56380'
+  'HAPPYLEARN_AISTOR_API_PORT=59002'
+  'HAPPYLEARN_AISTOR_CONSOLE_PORT=59003'
+  "HAPPYLEARN_PUBLIC_ORIGIN=$custom_origin"
+)
+custom_base_json="$tmp_dir/custom-base.json"
+custom_merged_json="$tmp_dir/custom-merged.json"
+env "${custom_environment[@]}" docker compose --profile '*' -f "$base" \
+  config --format json >"$custom_base_json"
+env "${custom_environment[@]}" docker compose --profile '*' -f "$base" -f "$ci" \
+  config --format json >"$custom_merged_json"
+
 assert_expected_services "$base_json" "base Compose config" ||
   fail "base Compose service-set contract is not satisfied"
 assert_expected_services "$merged_json" "base+CI merged Compose config" ||
@@ -195,15 +234,23 @@ assert_log_rotation "$merged_json" "base+CI merged Compose config" ||
 verify_log_rotation_mutations "$base_json" "base Compose config"
 verify_log_rotation_mutations "$merged_json" "base+CI merged Compose config"
 
-assert_all_interface_ports "$base_json" "base Compose config" ||
+assert_all_interface_ports "$base_json" "base Compose config" "$default_ports" ||
   fail "base all-interface port contract is not satisfied"
-assert_all_interface_ports "$merged_json" "base+CI merged Compose config" ||
+assert_all_interface_ports "$merged_json" "base+CI merged Compose config" "$default_ports" ||
   fail "merged all-interface port contract is not satisfied"
+assert_all_interface_ports "$custom_base_json" "custom base Compose config" "$custom_ports" ||
+  fail "custom base all-interface port contract is not satisfied"
+assert_all_interface_ports "$custom_merged_json" "custom base+CI merged Compose config" "$custom_ports" ||
+  fail "custom merged all-interface port contract is not satisfied"
+assert_app_public_origin "$custom_base_json" "custom base Compose config" "$custom_origin" ||
+  fail "custom base public-origin contract is not satisfied"
+assert_app_public_origin "$custom_merged_json" "custom base+CI merged Compose config" "$custom_origin" ||
+  fail "custom merged public-origin contract is not satisfied"
 
 mutated_ports_json="$tmp_dir/all-interface-ports-mutated.json"
 jq '(.services.app.ports[] | select(.target == 8080).host_ip) = "127.0.0.1"' \
   "$base_json" >"$mutated_ports_json"
-if assert_all_interface_ports "$mutated_ports_json" "App host-IP mutation" >/dev/null 2>&1; then
+if assert_all_interface_ports "$mutated_ports_json" "App host-IP mutation" "$default_ports" >/dev/null 2>&1; then
   fail "all-interface port assertion accepted an App loopback host-IP mutation"
 fi
 

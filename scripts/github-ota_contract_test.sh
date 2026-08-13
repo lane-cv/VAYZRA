@@ -419,6 +419,40 @@ compose_images_controlled() {
   done
 }
 
+assert_custom_compose_contract() {
+  local config=$1 label=$2
+  local expected_origin='http://192.168.1.20:18080'
+  local expected_ports='[
+    {"service":"app","host_ip":"0.0.0.0","published":"18080","target":8080},
+    {"service":"app","host_ip":"0.0.0.0","published":"19090","target":9090},
+    {"service":"minio","host_ip":"0.0.0.0","published":"59002","target":9000},
+    {"service":"minio","host_ip":"0.0.0.0","published":"59003","target":9001},
+    {"service":"postgres","host_ip":"0.0.0.0","published":"55429","target":5432},
+    {"service":"redis","host_ip":"0.0.0.0","published":"56380","target":6379}
+  ]'
+
+  jq -e --argjson expected "$expected_ports" --arg origin "$expected_origin" '
+    (
+      [
+        .services | to_entries[] |
+        .key as $service |
+        .value.ports[]? |
+        {
+          service: $service,
+          host_ip,
+          published: (.published | tostring),
+          target
+        }
+      ] | sort_by(.service, .host_ip, .published, .target)
+    ) == ($expected | sort_by(.service, .host_ip, .published, .target)) and
+    .services.app.environment.HAPPYLEARN_PUBLIC_ORIGIN == $origin and
+    ((.services["update-agent"].ports? // []) | length == 0)
+  ' <<<"$config" >/dev/null || {
+    printf 'GitHub OTA contract: FAIL: %s must preserve custom all-interface ports, App origin, and an unpublished update-agent\n' "$label" >&2
+    return 1
+  }
+}
+
 deployment_public_origin_contract() {
   local file=$1 output invalid_origin side_effect_directory
 
@@ -613,6 +647,25 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
     --project-directory "$repo_root" -f "$compose_base" -f "$compose_override" config --format json)
   jq -e '(.services["update-agent"].ports? // []) | length == 0' <<<"$rendered_compose" >/dev/null ||
     fail 'update-agent must not publish a host port'
+
+  custom_compose_environment=(
+    "${compose_environment[@]}"
+    'HAPPYLEARN_APP_PORT=18080'
+    'HAPPYLEARN_INTERNAL_PORT=19090'
+    'HAPPYLEARN_POSTGRES_PORT=55429'
+    'HAPPYLEARN_REDIS_PORT=56380'
+    'HAPPYLEARN_AISTOR_API_PORT=59002'
+    'HAPPYLEARN_AISTOR_CONSOLE_PORT=59003'
+    'HAPPYLEARN_PUBLIC_ORIGIN=http://192.168.1.20:18080'
+  )
+  custom_base_compose=$(env "${custom_compose_environment[@]}" docker compose --profile '*' \
+    --project-directory "$repo_root" -f "$compose_base" config --format json)
+  custom_merged_compose=$(env "${custom_compose_environment[@]}" docker compose --profile '*' \
+    --project-directory "$repo_root" -f "$compose_base" -f "$compose_override" config --format json)
+  assert_custom_compose_contract "$custom_base_compose" 'custom base Compose config' ||
+    fail 'custom base Compose contract is not satisfied'
+  assert_custom_compose_contract "$custom_merged_compose" 'custom merged Compose config' ||
+    fail 'custom merged Compose contract is not satisfied'
 
   negative_images=$(printf 'services:\n  movable-image-regression-probe:\n    image: attacker-controlled:latest\n' | \
     env "${compose_environment[@]}" docker compose --profile '*' --project-directory "$repo_root" \
