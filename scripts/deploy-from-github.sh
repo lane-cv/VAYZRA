@@ -89,6 +89,12 @@ validate_port() {
   ((value >= 1024 && value <= 65535)) || fail "$label must be between 1024 and 65535"
 }
 
+validate_public_origin() {
+  local origin=$1
+  [[ $origin != *$'\n'* && $origin != *$'\r'* && $origin != *[[:space:]]* && $origin != *'$'* ]] || return 1
+  [[ $origin =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?/?$ ]]
+}
+
 secure_file() {
   local path=$1 label=$2 mode owner
   [[ -f $path && ! -L $path && -s $path ]] || fail "$label is missing, empty, or a symlink"
@@ -148,12 +154,7 @@ while (($#)); do
 done
 
 [[ -n $public_origin ]] || fail '--public-origin is required'
-[[ $public_origin != *$'\n'* && $public_origin != *$'\r'* && $public_origin != *[[:space:]]* ]] ||
-  fail '--public-origin is invalid'
-case $public_origin in
-  http://*|https://*) ;;
-  *) fail '--public-origin is invalid' ;;
-esac
+validate_public_origin "$public_origin" || fail '--public-origin is invalid'
 
 if [[ $offline == true ]]; then
   postgres_image=$OFFLINE_POSTGRES_IMAGE

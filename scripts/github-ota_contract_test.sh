@@ -420,7 +420,7 @@ compose_images_controlled() {
 }
 
 deployment_public_origin_contract() {
-  local file=$1 output
+  local file=$1 output invalid_origin side_effect_directory
 
   require_literal "$file" 'Usage: deploy-from-github.sh --license-file PATH --public-origin URL [options]' || return 1
   require_literal "$file" '  --public-origin URL       Browser-visible web origin (required)' || return 1
@@ -428,9 +428,7 @@ deployment_public_origin_contract() {
   require_literal "$file" '--public-origin|--app-port' || return 1
   require_literal "$file" '--public-origin) public_origin=$2 ;;' || return 1
   require_literal "$file" "[[ -n \$public_origin ]] || fail '--public-origin is required'" || return 1
-  require_literal "$file" "[[ \$public_origin != *\$'\\n'* && \$public_origin != *\$'\\r'* && \$public_origin != *[[:space:]]* ]] ||" || return 1
   require_literal "$file" "fail '--public-origin is invalid'" || return 1
-  require_literal "$file" '  http://*|https://*) ;;' || return 1
   require_workflow_order "$file" "[[ -n \$public_origin ]] || fail '--public-origin is required'" 'for command in git docker openssl curl realpath stat mktemp install grep sed tr wc id; do' || return 1
   require_literal "$file" "printf 'HAPPYLEARN_PUBLIC_ORIGIN=%s\\n' \"\$public_origin\"" || return 1
   require_literal "$file" "printf 'commit=%s\\nproject=%s\\nweb=%s\\n' \"\$commit\" \"\$project\" \"\$public_origin\"" || return 1
@@ -442,14 +440,39 @@ deployment_public_origin_contract() {
   fi
   grep -Fxc 'deploy-from-github: --public-origin is required' "$output" >/dev/null
   rm -f -- "$output"
+
+  side_effect_directory=$(mktemp -d)
+  rmdir -- "$side_effect_directory"
+  for invalid_origin in \
+    'http://' \
+    'https://host/path' \
+    'https://user@host' \
+    'https://host?query=1' \
+    'https://host#fragment' \
+    'https://host/${COMPOSE_VARIABLE}'; do
+    output=$(mktemp)
+    if bash "$file" --directory "$side_effect_directory" --public-origin "$invalid_origin" >"$output" 2>&1; then
+      rm -f -- "$output"
+      return 1
+    fi
+    grep -Fxc 'deploy-from-github: --public-origin is invalid' "$output" >/dev/null || {
+      rm -f -- "$output"
+      return 1
+    }
+    [[ ! -e $side_effect_directory ]] || {
+      rm -f -- "$output"
+      return 1
+    }
+    rm -f -- "$output"
+  done
 }
 
 deployment_public_origin_mutation_probe() {
   local fixture
   fixture=$(mktemp)
-  sed '/\[\[ -n \$public_origin \]\] || fail '\''--public-origin is required'\''/d' "$deploy_script" >"$fixture"
+  sed '/\[\[ \$origin =~ /c\  true' "$deploy_script" >"$fixture"
   if (HAPPYLEARN_CONTRACT_PROBE=1 deployment_public_origin_contract "$fixture"); then
-    fail 'deploy contract accepted missing required public-origin validation'
+    fail 'deploy contract accepted a weakened public-origin validator'
   fi
   rm -f -- "$fixture"
 }
